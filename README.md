@@ -2,7 +2,7 @@
 
 **Want to have stexx with me?**
 
-An open-source, ad-free, privacy-first gay dating and hookup app. A Grindr alternative built by queer nerds who are tired of full-screen ads, sold data, and paywalls on basic features.
+An open-source, ad-free, privacy-first gay dating and hookup app. A Grindr alternative built by queer STEM nerds who are tired of full-screen ads, sold data, and paywalls on basic features.
 
 ## Why
 
