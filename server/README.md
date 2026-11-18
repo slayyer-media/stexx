@@ -111,6 +111,12 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `APPLE_APP_APPLE_ID` | unset | Required when `APPLE_ENVIRONMENT=Production`. |
 | `APPLE_ROOT_CA_DIR` | unset | Directory of Apple root `.cer` files (the repo ships `certs/`). Unset: `POST /subscriptions/apple` returns 503. |
 | `APPLE_PLUS_PRODUCT_ID` | `gay.stexx.app.plus.monthly` | |
+| `ATTESTATION_MODE` | `dev` (prod: `enforce` if `APPLE_TEAM_ID` set, else `off`) | `off` / `dev` / `enforce`. `dev` accepts the simulator bypass header and is refused in production. See [`docs/security.md`](../docs/security.md). |
+| `APPLE_TEAM_ID` | unset | App Attest app ID is `TEAMID.APPLE_BUNDLE_ID`. |
+| `DEVICECHECK_KEY_ID`, `DEVICECHECK_PRIVATE_KEY` / `_PATH`, `DEVICECHECK_ENVIRONMENT` | unset | DeviceCheck fallback and per-device bits. |
+| `APP_ATTEST_ENVIRONMENTS`, `APP_ATTEST_ROOT_CA` | see security.md | |
+| `MAX_ACCOUNTS_PER_DEVICE` | `1` | |
+| `TRUST_RAMP_*`, `RATE_LIMIT_*` | see security.md | New-account limits and sliding-window rate limits. |
 | `TRUST_PROXY` | `1` | Trust `CF-Connecting-IP` / `X-Forwarded-For` only from a loopback peer; used transiently for hashed rate-limit keys. |
 | `STEXX_DEV_AUTH` | off | `/auth/register` returns a session; mounts `/v1/dev/*`. **Production refuses to boot if set.** |
 | `STEXX_DEV_DEFAULT_LOCATION` | unset | `lat,lon`; new dev users get this (snapped) cell. Production refuses. |

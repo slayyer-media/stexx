@@ -53,8 +53,10 @@ Build configurations:
 | Configuration | Backend | Notes |
 | --- | --- | --- |
 | `Debug` (scheme **Stexx**) | Mock | No server needed |
-| `Local` (scheme **Stexx Local**) | `http://127.0.0.1:8787` | Run `../server` in dev mode. ATS allows plain HTTP to local hosts only in this configuration. Purchases use `StoreKit/Stexx.storekit`; see [`STOREKIT-LOCAL.md`](STOREKIT-LOCAL.md). |
-| `Release` | As configured | ATS is not relaxed |
+| `Local` (scheme **Stexx Local**) | `http://127.0.0.1:8787` | Run `../server` in dev mode. ATS allows plain HTTP to local hosts only in this configuration. Purchases use `StoreKit/Stexx.storekit`; see [`STOREKIT-LOCAL.md`](STOREKIT-LOCAL.md). Sends the `dev-bypass` attestation header, which only a dev server accepts. |
+| `Release` | As configured | ATS is not relaxed. App Attest uses the production environment. |
+
+Device attestation (App Attest with a DeviceCheck fallback) is described in [`../docs/security.md`](../docs/security.md). `xcodegen` writes the App Attest entitlement to `Stexx/Stexx.entitlements` (generated, git-ignored).
 
 The API contract lives in [`../docs/api.md`](../docs/api.md).
 

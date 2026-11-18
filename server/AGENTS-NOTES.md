@@ -123,6 +123,19 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `clientKey(c)` salted IP hash (forwarded headers trusted only from loopback). Tests: `resetRateLimits()`,
   `setRateLimitsDisabled(bool)`.
 
+### abuse/ (anti-spam, see docs/security.md)
+- `attestation.ts`: `attest(purpose)` middleware (`signup|login|message|photo|optional`), `deviceOf(c)` →
+  `{kind, deviceId, deviceCheckToken}` or null. Signup/login rules: `assertSignupAllowed`, `recordSignup`,
+  `afterSignup`, `assertLoginAllowed`, `afterAccountDeleted`, `banDevicesOfUser`. Errors are 403 `attestation_*`,
+  `device_banned`, `device_account_limit`. Tests: `overrideAttestationForTests`, `setMaxAccountsPerDeviceForTests`.
+- `appattest.ts` (pure verification) · `devicecheck.ts` (Apple HTTP client; `setDeviceCheckForTests`).
+- `limits.ts`: `hitAbuseLimits(action, subjectOf(c, {deviceId, userId}))` → 429 `rate_limited` with Retry-After.
+  Tests: `resetAbuseLimits()`, `setAbuseLimitForTests`. Honours `setRateLimitsDisabled`.
+- `email.ts`: `assertNotDisposable(email)` → 400 `disposable_email`. `trust.ts`: `assertMessageAllowed(...)` →
+  403 `links_not_allowed` / `new_account_limit` / `duplicate_message`; `overrideTrustForTests`.
+- Tests run with `ATTESTATION_MODE=off`; `test/attest-helpers.ts` builds real assertions from
+  `test/fixtures/app-attest/fixtures.json` (synthetic root, regenerate with `generate.ts`).
+
 ### media.ts
 - `sanitizeImage(bytes) → Buffer` (jpeg/png/webp/heif-if-supported → 400 `invalid_image` otherwise; 40 MP cap,
   rotate, strip metadata, ≤2048 px, JPEG q82 mozjpeg) · `storeJpeg(buf) → key` · `storeImage(bytes) → key`.
