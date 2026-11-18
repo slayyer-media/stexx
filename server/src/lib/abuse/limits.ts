@@ -3,17 +3,20 @@
  * counted per IP, per /24 (IPv4) or /48 (IPv6) network, per attested device and per account.
  *
  * These sit ON TOP of the per-route token buckets in lib/ratelimit.ts (which smooth bursts per minute): the
- * windows here cap volume over hours and days. Keys are salted hashes (ratelimit.ts) or opaque ids; no raw IP
- * is kept. Storage is in-memory behind `LimiterStore`, which is right for the single API process Stexx runs;
- * a Postgres or Redis store can implement the same interface if the API is ever scaled out.
+ * windows here cap volume over hours and days, so they live in Postgres (`abuse_counters`, migration 105) and
+ * survive restarts and deploys without an extra service. Keys are opaque ids (devices, accounts) or keyed
+ * hashes of the IP / network (`abuseKeyHash`, HMAC with a key derived from EMAIL_PEPPER); no raw IP is stored,
+ * and rows are deleted by the retention job once both of their windows have passed.
  *
  * Defaults below; override any of them with RATE_LIMIT_<NAME>=<count>/<window>, e.g. RATE_LIMIT_SIGNUP_IP=5/1h
  * (window units s, m, h, d). docs/security.md lists them.
  */
+import { createHmac, randomBytes } from "node:crypto";
 import type { Context } from "hono";
 import { config } from "../../config.ts";
 import { tooManyRequests } from "../errors.ts";
-import { clientIp, hashClientPart, rateLimitsDisabled } from "../ratelimit.ts";
+import { sql as defaultSql } from "../../db/sql.ts";
+import { clientIp, rateLimitsDisabled } from "../ratelimit.ts";
 import { DAY, HOUR, MINUTE, SECOND } from "../time.ts";
 
 export interface WindowSpec {
@@ -77,14 +80,19 @@ export function setAbuseLimitForTests(name: AbuseLimitName, spec: WindowSpec): (
 
 // ---- Store ----------------------------------------------------------------------------
 
+export type LimiterEntry = [key: string, spec: WindowSpec];
+
 export interface LimiterStore {
-  /** Milliseconds until one more hit would be allowed (0 = allowed now). Does not record. */
-  check(key: string, spec: WindowSpec, now: number): number;
-  record(key: string, spec: WindowSpec, now: number): void;
+  /**
+   * Atomically: if every key has room for one more hit, count it in all of them and return 0; otherwise count
+   * nothing and return the longest wait in milliseconds.
+   */
+  hit(entries: LimiterEntry[], now: number): Promise<number>;
+  /** Tests: forget every counter. */
   clear(): void;
 }
 
-interface Counter {
+export interface Counter {
   windowStart: number;
   current: number;
   previous: number;
@@ -92,46 +100,57 @@ interface Counter {
 
 /**
  * Sliding-window counter (two fixed windows, the previous one weighted by how much of it still overlaps the
- * sliding window). O(1) memory per key, accurate to within one window boundary.
+ * sliding window). O(1) state per key, accurate to within one window boundary. Pure; shared by both stores.
  */
-export class MemorySlidingWindowStore implements LimiterStore {
-  private counters = new Map<string, Counter>();
+export function rollCounter(c: Counter | undefined, spec: WindowSpec, now: number): Counter {
+  const start = now - (now % spec.windowMs);
+  if (!c) return { windowStart: start, current: 0, previous: 0 };
+  if (c.windowStart === start) return { ...c };
+  const previous = c.windowStart === start - spec.windowMs ? c.current : 0;
+  return { windowStart: start, current: 0, previous };
+}
 
-  private roll(key: string, spec: WindowSpec, now: number): Counter {
-    const start = now - (now % spec.windowMs);
+/** Milliseconds until one more hit fits in a rolled counter (0 = now). */
+export function waitForRoom(c: Counter, spec: WindowSpec, now: number): number {
+  const t = now - c.windowStart;
+  const W = spec.windowMs;
+  const room = spec.limit - 1; // need estimate ≤ limit - 1 before this hit
+  const estimate = c.previous * (1 - t / W) + c.current;
+  if (estimate <= room) return 0;
+  if (c.current <= room && c.previous > 0) {
+    // Wait for the previous window's weight to decay within this window.
+    const tPrime = W * (1 - (room - c.current) / c.previous);
+    return Math.max(1, Math.ceil(tPrime - t));
+  }
+  // Wait past this window; then the current count becomes the decaying previous one.
+  const s = c.current > 0 ? W * (1 - room / c.current) : 0;
+  return Math.max(1, Math.ceil(W - t + s));
+}
+
+/** In-process store: unit tests of the window maths, or a deployment without the database. */
+export class MemorySlidingWindowStore implements LimiterStore {
+  private counters = new Map<string, Counter & { windowMs: number }>();
+
+  private get(key: string, spec: WindowSpec, now: number): Counter {
     const c = this.counters.get(key);
-    if (!c) return { windowStart: start, current: 0, previous: 0 };
-    if (c.windowStart === start) return c;
-    const previous = c.windowStart === start - spec.windowMs ? c.current : 0;
-    return { windowStart: start, current: 0, previous };
+    return rollCounter(c && c.windowMs === spec.windowMs ? c : undefined, spec, now);
   }
 
   check(key: string, spec: WindowSpec, now: number): number {
-    const c = this.roll(key, spec, now);
-    const t = now - c.windowStart;
-    const W = spec.windowMs;
-    const room = spec.limit - 1; // need estimate ≤ limit - 1 before this hit
-    const estimate = c.previous * (1 - t / W) + c.current;
-    if (estimate <= room) return 0;
-    if (c.current <= room && c.previous > 0) {
-      // Wait for the previous window's weight to decay within this window.
-      const tPrime = W * (1 - (room - c.current) / c.previous);
-      return Math.max(1, Math.ceil(tPrime - t));
-    }
-    // Wait past this window; then the current count becomes the decaying previous one.
-    const s = c.current > 0 ? W * (1 - room / c.current) : 0;
-    return Math.max(1, Math.ceil(W - t + s));
+    return waitForRoom(this.get(key, spec, now), spec, now);
   }
 
   record(key: string, spec: WindowSpec, now: number): void {
-    const c = this.roll(key, spec, now);
-    c.current += 1;
-    this.counters.set(key, c);
+    const c = this.get(key, spec, now);
+    this.counters.set(key, { ...c, current: c.current + 1, windowMs: spec.windowMs });
   }
 
-  /** Drop counters with nothing left in either window. */
-  sweep(now: number, maxWindowMs: number): void {
-    for (const [k, c] of this.counters) if (now - c.windowStart > 2 * maxWindowMs) this.counters.delete(k);
+  async hit(entries: LimiterEntry[], now: number): Promise<number> {
+    let wait = 0;
+    for (const [key, spec] of entries) wait = Math.max(wait, this.check(key, spec, now));
+    if (wait > 0) return wait;
+    for (const [key, spec] of entries) this.record(key, spec, now);
+    return 0;
   }
 
   clear(): void {
@@ -139,13 +158,98 @@ export class MemorySlidingWindowStore implements LimiterStore {
   }
 }
 
-const store = new MemorySlidingWindowStore();
-const sweeper = setInterval(() => store.sweep(Date.now(), DAY), 10 * MINUTE);
-sweeper.unref?.();
+interface CounterRow {
+  key: string;
+  window_ms: number;
+  window_start: string;
+  current_count: number;
+  previous_count: number;
+}
+
+/**
+ * The default store: one row per key in `abuse_counters`. A hit takes transaction-scoped advisory locks on its
+ * keys (in sorted order, so concurrent hits can't deadlock), reads the rows, and upserts them only when every
+ * window has room. A handful of loopback round trips per signup, login, message or photo.
+ *
+ * `namespace` prefixes every key. Tests give each run its own (the test database is shared and never wiped),
+ * and `clear()` just switches to a fresh one; old rows expire on their own.
+ */
+export class PostgresSlidingWindowStore implements LimiterStore {
+  constructor(
+    private readonly db: typeof defaultSql = defaultSql,
+    private namespace = "",
+  ) {}
+
+  async hit(entries: LimiterEntry[], now: number): Promise<number> {
+    if (entries.length === 0) return 0;
+    const byKey = new Map(entries.map(([k, spec]) => [this.namespace + k, spec]));
+    const keys = [...byKey.keys()].sort();
+    return this.db.begin(async (tx) => {
+      for (const key of keys) await tx`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 7302))`;
+      const rows = await tx<CounterRow[]>`
+        SELECT key, window_ms, window_start, current_count, previous_count
+          FROM abuse_counters WHERE key = ANY(${keys}::text[])`;
+      const stored = new Map(rows.map((r) => [r.key, r]));
+      const rolled = keys.map((key) => {
+        const spec = byKey.get(key)!;
+        const r = stored.get(key);
+        const prev =
+          r && r.window_ms === spec.windowMs
+            ? { windowStart: Number(r.window_start), current: r.current_count, previous: r.previous_count }
+            : undefined;
+        return { key, spec, counter: rollCounter(prev, spec, now) };
+      });
+      let wait = 0;
+      for (const { spec, counter } of rolled) wait = Math.max(wait, waitForRoom(counter, spec, now));
+      if (wait > 0) return wait;
+      for (const { key, spec, counter } of rolled) {
+        const expiresAt = new Date(counter.windowStart + 2 * spec.windowMs);
+        await tx`
+          INSERT INTO abuse_counters (key, window_ms, window_start, current_count, previous_count, expires_at)
+          VALUES (${key}, ${spec.windowMs}, ${counter.windowStart}, ${counter.current + 1}, ${counter.previous}, ${expiresAt})
+          ON CONFLICT (key) DO UPDATE SET
+            window_ms = EXCLUDED.window_ms, window_start = EXCLUDED.window_start,
+            current_count = EXCLUDED.current_count, previous_count = EXCLUDED.previous_count,
+            expires_at = EXCLUDED.expires_at`;
+      }
+      return 0;
+    });
+  }
+
+  clear(): void {
+    this.namespace = testNamespace();
+  }
+}
+
+function testNamespace(): string {
+  return `t${randomBytes(6).toString("hex")}:`;
+}
+let store: LimiterStore = new PostgresSlidingWindowStore(defaultSql, config.isTest ? testNamespace() : "");
 
 /** Tests: forget every counter. */
 export function resetAbuseLimits(): void {
   store.clear();
+}
+
+/** Tests: swap the store (e.g. for a MemorySlidingWindowStore); returns a restore function. */
+export function setLimiterStoreForTests(next: LimiterStore): () => void {
+  if (config.isProduction) throw new Error("not in production");
+  const prev = store;
+  store = next;
+  return () => {
+    store = prev;
+  };
+}
+
+const ABUSE_KEY = createHmac("sha256", config.emailPepper).update("stexx abuse-limit keys v1").digest();
+
+/**
+ * Keyed hash for IP and network keys that go to the database. Stable across restarts (unlike the in-memory
+ * salt in ratelimit.ts) so windows survive a deploy; without EMAIL_PEPPER (never in the database or backups) the
+ * stored value can't be turned back into an address.
+ */
+export function abuseKeyHash(value: string): string {
+  return createHmac("sha256", ABUSE_KEY).update(value).digest("base64url").slice(0, 22);
 }
 
 /** IPv4 → /24, IPv6 → /48 (one home or carrier block), salted and hashed like clientKey. */
@@ -182,26 +286,24 @@ const PLAN: Record<AbuseAction, [AbuseLimitName, keyof AbuseSubject][]> = {
  * `rate_limited` with Retry-After = the longest wait, and counts nothing (a blocked request doesn't burn the
  * other windows).
  */
-export function hitAbuseLimits(action: AbuseAction, subject: AbuseSubject, now = Date.now()): void {
+export async function hitAbuseLimits(action: AbuseAction, subject: AbuseSubject, now = Date.now()): Promise<void> {
   if (rateLimitsDisabled()) return;
-  const keys: [string, WindowSpec][] = [];
+  const keys: LimiterEntry[] = [];
   for (const [name, field] of PLAN[action]) {
     const value = subject[field];
     if (!value) continue;
     keys.push([`${name}:${value}`, limits[name]]);
   }
-  let waitMs = 0;
-  for (const [key, spec] of keys) waitMs = Math.max(waitMs, store.check(key, spec, now));
+  const waitMs = await store.hit(keys, now);
   if (waitMs > 0) throw tooManyRequests(waitMs / 1000);
-  for (const [key, spec] of keys) store.record(key, spec, now);
 }
 
-/** The subject for a request: hashed IP + network, the attested device (if any) and the signed-in user. */
+/** The subject for a request: keyed hashes of the IP and network, the attested device (if any) and the signed-in user. */
 export function subjectOf(c: Context, extra: { deviceId?: string | null; userId?: string | null } = {}): AbuseSubject {
   const ip = clientIp(c);
   return {
-    ip: hashClientPart(ip),
-    network: hashClientPart(networkOf(ip)),
+    ip: abuseKeyHash(ip),
+    network: abuseKeyHash(networkOf(ip)),
     deviceId: extra.deviceId ?? null,
     userId: extra.userId ?? null,
   };

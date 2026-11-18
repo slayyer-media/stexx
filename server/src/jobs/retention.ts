@@ -195,6 +195,16 @@ export async function purgeIdleDevices(now: Date = new Date()): Promise<DevicePu
   return { devices, attestChallenges };
 }
 
+/** Abuse-limit windows (lib/abuse/limits.ts) that can no longer affect a decision. */
+export async function purgeAbuseCounters(now: Date = new Date()): Promise<number> {
+  return inBatches(async () => {
+    const r = await sql`
+      DELETE FROM abuse_counters WHERE key IN (
+        SELECT key FROM abuse_counters WHERE expires_at <= ${now} LIMIT ${BATCH})`;
+    return r.count;
+  });
+}
+
 /** Clear finished boosts so the column only holds live ones. */
 export async function clearEndedBoosts(now: Date = new Date()): Promise<number> {
   return inBatches(async () => {
@@ -279,7 +289,7 @@ export async function runFastJobs(now: Date = new Date()) {
   return { expired, viewOnce, trashed };
 }
 
-/** Every 10 min: the 14-day caps (unread expiring messages, unopened view-once photos), unsent uploads, profile views, expired credentials, finished boosts. */
+/** Every 10 min: the 14-day caps (unread expiring messages, unopened view-once photos), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows. */
 export async function runSlowJobs(now: Date = new Date()) {
   const unreadCapped = await purgeUnreadExpiringMessages(now);
   const unopenedViewOnce = await purgeUnopenedViewOnceAttachments(now);
@@ -288,5 +298,6 @@ export async function runSlowJobs(now: Date = new Date()) {
   const auth = await purgeExpiredAuth(now);
   const boosts = await clearEndedBoosts(now);
   const devices = await purgeIdleDevices(now);
-  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts, devices };
+  const abuseCounters = await purgeAbuseCounters(now);
+  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts, devices, abuseCounters };
 }

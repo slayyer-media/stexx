@@ -5,14 +5,18 @@ import {
   DEFAULT_ABUSE_LIMITS,
   envNameFor,
   hitAbuseLimits,
+  abuseKeyHash,
   MemorySlidingWindowStore,
   networkOf,
+  PostgresSlidingWindowStore,
   parseWindowSpec,
   resetAbuseLimits,
   setAbuseLimitForTests,
+  setLimiterStoreForTests,
 } from "../src/lib/abuse/limits.ts";
+import { purgeAbuseCounters } from "../src/jobs/retention.ts";
 import { HOUR, MINUTE } from "../src/lib/time.ts";
-import { as, createUser, expectError, expectJson, expectNoContent, makeJpeg, post, uniq } from "./helpers.ts";
+import { as, createUser, expectError, expectJson, expectNoContent, makeJpeg, post, sql, uniq } from "./helpers.ts";
 
 const restores: (() => void)[] = [];
 afterEach(() => {
@@ -63,14 +67,84 @@ describe("sliding window", () => {
     expect(networkOf("2001:db8:abcd:12::1")).toBe("2001:db8:abcd::/48");
   });
 
-  test("a blocked hit counts nowhere, and every window must have room", () => {
+  test("a blocked hit counts nowhere, and every window must have room", async () => {
     restores.push(setAbuseLimitForTests("loginIp", { limit: 1, windowMs: HOUR }));
     restores.push(setAbuseLimitForTests("loginDevice", { limit: 5, windowMs: HOUR }));
-    hitAbuseLimits("login", { ip: "ip1", deviceId: "d1" });
-    expect(() => hitAbuseLimits("login", { ip: "ip1", deviceId: "d1" })).toThrow();
+    await hitAbuseLimits("login", { ip: "ip1", deviceId: "d1" });
+    await expect(hitAbuseLimits("login", { ip: "ip1", deviceId: "d1" })).rejects.toThrow();
     // d1 only used 1 of 5: from another IP it still works.
-    for (let i = 0; i < 4; i++) hitAbuseLimits("login", { ip: `ip-${i}-${uniq()}`, deviceId: "d1" });
-    expect(() => hitAbuseLimits("login", { ip: "ip-new", deviceId: "d1" })).toThrow();
+    for (let i = 0; i < 4; i++) await hitAbuseLimits("login", { ip: `ip-${i}-${uniq()}`, deviceId: "d1" });
+    await expect(hitAbuseLimits("login", { ip: "ip-new", deviceId: "d1" })).rejects.toThrow();
+  });
+});
+
+describe("Postgres store", () => {
+  const ns = () => `t${uniq()}:`;
+
+  test("counts persist in abuse_counters and a new store instance sees them (survives a restart)", async () => {
+    const prefix = ns();
+    const spec = { limit: 2, windowMs: HOUR };
+    const now = Date.now();
+    const a = new PostgresSlidingWindowStore(sql, prefix);
+    expect(await a.hit([["k", spec]], now)).toBe(0);
+    expect(await a.hit([["k", spec]], now)).toBe(0);
+    const b = new PostgresSlidingWindowStore(sql, prefix); // e.g. after a deploy
+    const wait = await b.hit([["k", spec]], now);
+    expect(wait).toBeGreaterThan(0);
+    const [row] = await sql<{ current_count: number; window_ms: number }[]>`
+      SELECT current_count, window_ms FROM abuse_counters WHERE key = ${prefix + "k"}`;
+    expect(row).toEqual({ current_count: 2, window_ms: HOUR });
+  });
+
+  test("matches the in-memory maths, including the weighted previous window", async () => {
+    const pg = new PostgresSlidingWindowStore(sql, ns());
+    const mem = new MemorySlidingWindowStore();
+    const spec = { limit: 4, windowMs: 60_000 };
+    // Future windows, so no retention run can expire the row mid-test.
+    const start = Math.floor(Date.now() / 60_000) * 60_000 + 10 * 60_000;
+    for (const t of [start + 1_000, start + 59_000, start + 59_500, start + 61_000, start + 61_000, start + 105_000, start + 106_000]) {
+      expect(await pg.hit([["k", spec]], t)).toBe(await mem.hit([["k", spec]], t));
+    }
+  });
+
+  test("all-or-nothing across keys, and concurrent hits never overshoot the limit", async () => {
+    const pg = new PostgresSlidingWindowStore(sql, ns());
+    const tight = { limit: 1, windowMs: HOUR };
+    const loose = { limit: 10, windowMs: HOUR };
+    const now = Date.now();
+    expect(await pg.hit([["a", tight], ["b", loose]], now)).toBe(0);
+    expect(await pg.hit([["a", tight], ["b", loose]], now)).toBeGreaterThan(0);
+    // "b" was only counted once: 9 more fit.
+    const results = await Promise.all(Array.from({ length: 15 }, () => pg.hit([["b", loose]], now)));
+    expect(results.filter((w) => w === 0).length).toBe(9);
+  });
+
+  test("a changed window size starts the key over; the retention job deletes expired rows", async () => {
+    const prefix = ns();
+    const pg = new PostgresSlidingWindowStore(sql, prefix);
+    const now = Date.now();
+    expect(await pg.hit([["k", { limit: 1, windowMs: HOUR }]], now)).toBe(0);
+    expect(await pg.hit([["k", { limit: 1, windowMs: MINUTE }]], now)).toBe(0);
+    await purgeAbuseCounters(new Date(now + 3 * MINUTE));
+    const rows = await sql`SELECT 1 FROM abuse_counters WHERE key LIKE ${prefix + "%"}`;
+    expect(rows.length).toBe(0);
+  });
+
+  test("IP keys are keyed hashes: stable, and never the address itself", () => {
+    expect(abuseKeyHash("203.0.113.7")).toBe(abuseKeyHash("203.0.113.7"));
+    expect(abuseKeyHash("203.0.113.7")).not.toBe(abuseKeyHash("203.0.113.8"));
+    expect(abuseKeyHash("203.0.113.7")).not.toContain("203");
+  });
+
+  test("the memory store can stand in (setLimiterStoreForTests)", async () => {
+    const restore = setLimiterStoreForTests(new MemorySlidingWindowStore());
+    try {
+      restores.push(setAbuseLimitForTests("loginIp", { limit: 1, windowMs: HOUR }));
+      await hitAbuseLimits("login", { ip: "same" });
+      await expect(hitAbuseLimits("login", { ip: "same" })).rejects.toThrow();
+    } finally {
+      restore();
+    }
   });
 });
 

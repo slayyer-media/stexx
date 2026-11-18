@@ -213,7 +213,7 @@ authRoutes.post("/auth/register", rateLimit("auth"), attest("signup"), async (c)
     assertNotDisposable(body.email);
     hmac = emailHmac(body.email);
   }
-  hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
+  await hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
   const check = await assertSignupAllowed(device);
   try {
     const session = await sql.begin(async (tx) => {
@@ -282,7 +282,7 @@ authRoutes.post("/auth/passkey/register/finish", rateLimit("auth"), attest("sign
   const cred = verified.registrationInfo.credential;
 
   const device = deviceOf(c);
-  hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
+  await hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
   const check = await assertSignupAllowed(device);
   try {
     const session = await sql.begin(async (tx) => {
@@ -318,7 +318,7 @@ authRoutes.post("/auth/passkey/login/options", rateLimit("auth"), async (c) => {
 
 authRoutes.post("/auth/passkey/login/finish", rateLimit("auth"), attest("login"), async (c) => {
   const device = deviceOf(c);
-  hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
+  await hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
   const credential = await parseJson(c, authenticationBodySchema);
   const challenge = challengeOf(credential.response.clientDataJSON);
 
@@ -364,7 +364,7 @@ authRoutes.post("/auth/email/link", rateLimit("auth"), attest("login"), async (c
   const body = await parseJson(c, emailLinkSchema);
   const address = normalizeEmail(body.email);
   assertNotDisposable(address);
-  hitAbuseLimits("login", subjectOf(c, { deviceId: deviceOf(c).deviceId }));
+  await hitAbuseLimits("login", subjectOf(c, { deviceId: deviceOf(c).deviceId }));
   const hmac = emailHmac(address);
   // Per (address, client) limit (3 / 15 min), plus a looser per-address cap across all clients. Keying the tight
   // limit on the client too means a third party cannot exhaust the owner's allowance (a lockout). Same for known
@@ -395,7 +395,7 @@ class NeedsRegistration extends Error {}
 
 authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async (c) => {
   const device = deviceOf(c);
-  hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
+  await hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
   const { token } = await parseJson(c, emailVerifySchema);
   await assertLoginAllowed(device); // banned devices (DeviceCheck bit1) can neither sign in nor sign up
   const invalid = () => badRequest("This sign-in link is invalid or has expired.", "invalid_link");
@@ -417,7 +417,7 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async 
         // First sign-in for this address: needs the pending registration that travelled with the link.
         if (!link.display_name || link.confirmed_adult !== true) throw new NeedsRegistration();
         // Throwing here rolls the transaction back, so a refused sign-up doesn't burn the link.
-        hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
+        await hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
         signupCheck = await assertSignupAllowed(device, tx);
         const id = newId("user");
         const [created] = await tx<{ id: string }[]>`

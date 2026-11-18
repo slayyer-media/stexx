@@ -360,7 +360,7 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
 
   // Anti-spam (after the idempotent replay, so retries of a sent message never count): volume windows per
   // account/device/IP, then the new-account limits (lib/abuse/trust.ts).
-  hitAbuseLimits("message", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
+  await hitAbuseLimits("message", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
   await assertMessageAllowed({ senderId: me, conversationId, otherId, text });
 
   // Attachment: either one of the sender's private chat uploads (POST /me/attachments), whose file is handed over

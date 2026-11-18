@@ -155,7 +155,7 @@ async function ownPhotos(userId: string): Promise<PhotoRow[]> {
 /** Raw image body (jpeg, png, webp). Re-encoded server-side: orientation applied, ALL metadata stripped. */
 meRoutes.post("/me/photos", rateLimit("photoUploads"), attest("photo"), async (c) => {
   const me = c.get("userId");
-  hitAbuseLimits("photo", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
+  await hitAbuseLimits("photo", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
   const type = (c.req.header("Content-Type") ?? "").toLowerCase();
   if (!type.startsWith("image/")) throw badRequest("Send the photo as an image body.", "invalid_image");
 
@@ -199,7 +199,7 @@ export const MAX_PENDING_ATTACHMENTS = 10;
  */
 meRoutes.post("/me/attachments", rateLimit("attachments"), attest("photo"), async (c) => {
   const me = c.get("userId");
-  hitAbuseLimits("photo", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
+  await hitAbuseLimits("photo", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
   const type = (c.req.header("Content-Type") ?? "").toLowerCase();
   if (!type.startsWith("image/")) throw badRequest("Send the photo as an image body.", "invalid_image");
 
