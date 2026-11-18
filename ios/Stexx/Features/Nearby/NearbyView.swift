@@ -4,8 +4,8 @@ import SwiftUI
 ///
 /// A uniform grid: three equal columns of 3:4 tiles on 2pt gutters. Every
 /// profile gets the same tile; nobody is featured or given extra weight.
-/// The tab header is one compact row: the xx mark, inline quick-filter
-/// chips and the filters button.
+/// The tab header's compact row holds the quick filters and the filters
+/// button, under the centered xx logo row.
 struct NearbyView: View {
     enum QuickFilter: Hashable, CaseIterable {
         case all, online, rightNow, favorites
@@ -89,6 +89,7 @@ struct NearbyView: View {
                         .padding(.top, 80)
                 }
             }
+            .collapsesTabHeaderLogo()
             .overlay {
                 if !isLoading && visible.isEmpty {
                     emptyState
@@ -99,6 +100,7 @@ struct NearbyView: View {
             } trailing: {
                 filtersButton
             }
+            .sensoryFeedback(.selection, trigger: quickFilter)
             .stexxBackground()
             .refreshable { await reload() }
             .task(id: query) {
@@ -135,20 +137,27 @@ struct NearbyView: View {
                 HStack(spacing: 6) {
                     ForEach(QuickFilter.allCases, id: \.self) { filter in
                         GlassChip(chipTitle(filter, onlineCount: onlineCount), systemImage: filter.systemImage, isSelected: quickFilter == filter) {
-                            withAnimation(Motion.animation(Motion.quick, reduceMotion: reduceMotion)) {
-                                quickFilter = filter
-                            }
+                            selectQuickFilter(filter)
                         }
                     }
                     GlassChip("More filters", isSelected: hasActiveAdvancedFilters, isLocked: !appState.hasPlus) {
-                        if appState.requirePlus() { isShowingFilters = true }
+                        openAdvancedFilters()
                     }
                 }
                 .padding(.vertical, 2)
             }
         }
         .scrollIndicators(.hidden)
-        .sensoryFeedback(.selection, trigger: quickFilter)
+    }
+
+    private func selectQuickFilter(_ filter: QuickFilter) {
+        withAnimation(Motion.animation(Motion.quick, reduceMotion: reduceMotion)) {
+            quickFilter = filter
+        }
+    }
+
+    private func openAdvancedFilters() {
+        if appState.requirePlus() { isShowingFilters = true }
     }
 
     private func chipTitle(_ filter: QuickFilter, onlineCount: Int) -> Text {
@@ -160,7 +169,7 @@ struct NearbyView: View {
 
     private var filtersButton: some View {
         Button {
-            if appState.requirePlus() { isShowingFilters = true }
+            openAdvancedFilters()
         } label: {
             TabHeaderIconLabel(
                 title: "Filters",

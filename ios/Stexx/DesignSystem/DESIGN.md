@@ -87,17 +87,28 @@ Screen margin is 20 (`Theme.Spacing.screen`). Leave 24–32 between sections
   `.stexxGlass(in:)`. Use it for floating action bars, sheets, the composer,
   and chips over photos.
 - **Tab header** (`TabHeaderBar`, applied with `.tabHeader { } trailing: { }`):
-  each tab root (Nearby, Chats, You) gets one compact row, about 46pt plus
-  the status bar, instead of a navigation bar and a big title. Leading is
-  the xx app mark (`StexxAppIconMark`, asset `StexxAppMark`, ~29pt,
-  unmodified), the middle is a flexible slot (a small lowercase heavy title
-  via `TabHeaderTitle`, or Nearby's inline quick-filter chips) and trailing
-  holds icon buttons or a mono count. Its background is black frosted glass
-  that is close to opaque (ultra-thin material under ink @ 0.85; solid ink
-  under Reduce Transparency), runs up under the status bar and ends in a
-  0.5pt `line` hairline, so scrolled content doesn't bleed through. The
-  system navigation bar is hidden on tab roots only; pushed screens keep
-  their normal bars and back buttons.
+  each tab root (Nearby, Chats, You) gets a compact header instead of a
+  navigation bar and a big title. Two rows on one background:
+  - a centered logo row (~40pt) holding the vector xx mark
+    (`StexxHeaderMark`, from asset `StexxMark`: the bare rim-lit XX, ~30pt,
+    no tile; VoiceOver label "Stexx");
+  - a compact row (~40pt): a flexible middle slot (a small lowercase heavy
+    title via `TabHeaderTitle`, or Nearby's inline quick-filter chips) and
+    trailing controls (icon buttons or a mono count).
+
+  Both sit on one near-opaque black frosted glass background (ultra-thin
+  material under ink @ 0.85; solid ink under Reduce Transparency) that runs
+  up under the status bar and ends in a 0.5pt `line` hairline, so scrolled
+  content doesn't bleed through. The logo row slides away when the content
+  scrolls down (height to 0 with a fade, ~0.25s ease-in-out; the background
+  and the content inset shrink with it) and returns on scroll up (after
+  ~8pt in the new direction) or within ~10pt of the top. The compact row
+  stays pinned, just under the status bar while the logo row is hidden.
+  Under Reduce Motion the logo row only fades; its height changes without
+  animation. Mark the tab's vertical ScrollView or List with
+  `.collapsesTabHeaderLogo()` (inside `.tabHeader`). The system navigation
+  bar is hidden on tab roots only; pushed screens keep their normal bars
+  and back buttons.
 - **Flat**: `ink1` with a 0.5pt `line` (`GlassCard`, rows), or plain whitespace
   with `HairlineDivider`.
 - **Rim light** (`.rimLight()`): a 0.75pt accent stroke at 0.9 opacity from
@@ -138,7 +149,7 @@ sparingly: `.selection` for tabs, favourites and filters, and a light
 | Accent: flare | violet `#7B5CFF` (`Theme.flare`) |
 | Motif | the 500 m cell |
 | Mark | the "xx" (`StexxMark`, asset `StexxMark`) |
-| App mark | the app icon, a glassy XX on a dark squircle (`StexxAppIconMark`, asset `StexxAppMark`), at the leading edge of every tab header |
+| Header mark | the bare vector XX (`StexxHeaderMark`, asset `StexxMark`), centered in the logo row of every tab header |
 | Voice | lowercase heavy titles: "chats", "you" |
 | Tagline | **No ads. Just stexx.** (`Tagline`) |
 

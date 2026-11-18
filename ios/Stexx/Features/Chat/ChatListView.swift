@@ -54,6 +54,7 @@ struct ChatListView: View {
                 }
             }
             .listStyle(.plain)
+            .collapsesTabHeaderLogo()
             .overlay {
                 if chatStore.isLoading && visible.isEmpty {
                     ProgressView()

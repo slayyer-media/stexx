@@ -70,6 +70,61 @@ struct StexxMark: View {
     }
 }
 
+/// The header-sized mark, drawn from the VECTOR asset `StexxMark` (never the
+/// raster app icon) so it stays crisp at 24–44pt: just the XX (about `size`
+/// wide) in frost with the violet rim light on its top-leading edges, like
+/// `StexxMark`. No tile. The tab header's logo row uses it at 30pt.
+///
+/// Fixed size: brand art.
+struct StexxHeaderMark: View {
+    var size: CGFloat = 30
+
+    /// The XX path spans ~74% of the asset's square viewBox (132…892 of
+    /// 1024); dividing by this sizes the frame from the visible glyph width.
+    private static let glyphFill: CGFloat = 760.0 / 1024.0
+
+    var body: some View {
+        bare
+            .frame(width: size, height: size)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: "Stexx"))
+    }
+
+    private var bare: some View {
+        // ~2px at 3x: enough to read as a lit edge without blurring the glyph.
+        let edge = max(0.67, size * 0.016)
+        return ZStack {
+            glyph(visibleWidth: size)
+                .foregroundStyle(
+                    LinearGradient(
+                        stops: [
+                            .init(color: Theme.rim.opacity(0.95), location: 0),
+                            .init(color: Theme.rim.opacity(0), location: 0.45),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .offset(x: -edge, y: -edge)
+            glyph(visibleWidth: size)
+                .foregroundStyle(Theme.frost)
+        }
+        .shadow(color: Theme.rim.opacity(0.22), radius: min(4, size * 0.1))
+    }
+
+    /// The vector glyph, sized so its visible XX is `visibleWidth` wide. The
+    /// frame may exceed the mark's box; the overflow is transparent padding.
+    private func glyph(visibleWidth: CGFloat) -> some View {
+        let box = visibleWidth / Self.glyphFill
+        return Image("StexxMark")
+            .renderingMode(.template)
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
+            .frame(width: box, height: box)
+    }
+}
+
 /// The mark on a flat ink1 square (radius 0.22 × size) with a top-lit edge
 /// and the cell's corner ticks around it.
 struct StexxLogoTile: View {
@@ -127,6 +182,11 @@ struct Tagline: View {
         Wordmark(size: 56)
         Wordmark(size: 22)
         StexxMark(size: 40, glows: false)
+        HStack(spacing: 20) {
+            StexxHeaderMark(size: 24)
+            StexxHeaderMark(size: 30)
+            StexxHeaderMark(size: 44)
+        }
         PlusBadge()
         Tagline()
     }

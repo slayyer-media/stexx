@@ -45,6 +45,7 @@ struct MyProfileView: View {
                 .padding(.horizontal, Theme.Spacing.screen)
                 .padding(.bottom, Theme.Spacing.xxl)
             }
+            .collapsesTabHeaderLogo()
             .tabHeader {
                 TabHeaderTitle(String(localized: "You"))
             } trailing: {
