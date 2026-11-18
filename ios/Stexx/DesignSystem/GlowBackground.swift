@@ -11,6 +11,9 @@ struct GlowBackground: View {
     /// Scales the brightness of the glow. 1 is the default; use less behind
     /// dense content (forms, chat) and more on hero screens.
     var intensity: Double = 1
+    /// Vertical scroll offset of the content above, in points. The glow
+    /// shifts gently with it (parallax). 0 = no reaction.
+    var scrollOffset: CGFloat = 0
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
@@ -24,6 +27,8 @@ struct GlowBackground: View {
                     blob.draw(in: &context, size: size, time: isPaused ? 0 : time, intensity: intensity)
                 }
             }
+            .offset(y: reduceMotion ? 0 : -min(max(scrollOffset, 0), 600) * 0.12)
+            .scaleEffect(1.15)
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
@@ -80,10 +85,10 @@ struct GlowBackground: View {
 extension View {
     /// Places the Stexx glow behind a view (typically a `ScrollView`, `List`
     /// or `Form`) and hides the default scroll background.
-    func stexxBackground(intensity: Double = 1) -> some View {
+    func stexxBackground(intensity: Double = 1, scrollOffset: CGFloat = 0) -> some View {
         self
             .scrollContentBackground(.hidden)
-            .background { GlowBackground(intensity: intensity) }
+            .background { GlowBackground(intensity: intensity, scrollOffset: scrollOffset) }
     }
 }
 
