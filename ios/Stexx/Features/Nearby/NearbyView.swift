@@ -44,9 +44,6 @@ struct NearbyView: View {
     @State private var isShowingFilters = false
     @State private var loadedQuery: NearbyQuery?
     @State private var path = NavigationPath()
-    /// Scroll position for the glow, kept out of this view's body so
-    /// scrolling only redraws the background, not the grid.
-    @State private var scrollGlow = NearbyScrollGlow()
 
     @Namespace private var zoomNamespace
 
@@ -75,11 +72,12 @@ struct NearbyView: View {
         NavigationStack(path: $path) {
             ScrollView {
                 header(for: visible)
-                    .padding(.horizontal, Theme.Spacing.l)
+                    .padding(.horizontal, Theme.Spacing.screen)
                     .padding(.top, Theme.Spacing.s)
+                    .padding(.bottom, Theme.Spacing.l)
 
                 filterBar
-                    .padding(.bottom, Theme.Spacing.m)
+                    .padding(.bottom, Theme.Spacing.l)
 
                 LazyVStack(spacing: NearbyGridMetrics.spacing) {
                     ForEach(blocks) { block in
@@ -89,29 +87,22 @@ struct NearbyView: View {
                             }
                     }
                 }
-                .padding(.horizontal, NearbyGridMetrics.spacing + 2)
-                .padding(.bottom, Theme.Spacing.l)
+                .padding(.horizontal, NearbyGridMetrics.spacing)
+                .padding(.bottom, Theme.Spacing.xl)
 
                 if isLoading && profiles.isEmpty {
                     ProgressView()
-                        .controlSize(.large)
-                        .tint(Theme.violetBright)
+                        .controlSize(.regular)
+                        .tint(Theme.steel)
                         .padding(.top, 80)
                 }
-            }
-            .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                geometry.contentOffset.y + geometry.contentInsets.top
-            } action: { _, newValue in
-                guard !reduceMotion else { return }
-                scrollGlow.update(newValue)
             }
             .overlay {
                 if !isLoading && visible.isEmpty {
                     emptyState
                 }
             }
-            .scrollContentBackground(.hidden)
-            .background { NearbyGlowBackground(glow: scrollGlow, intensity: 0.85) }
+            .stexxBackground()
             .refreshable { await reload() }
             .task(id: query) {
                 // Runs on first appearance and whenever a filter changes;
@@ -123,7 +114,7 @@ struct NearbyView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .principal) {
-                    Wordmark(size: 24)
+                    Wordmark(size: 22, glows: false)
                 }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
@@ -131,7 +122,7 @@ struct NearbyView: View {
                     } label: {
                         Label("Stexx+", systemImage: "sparkles")
                     }
-                    .tint(Theme.violetBright)
+                    .tint(Theme.steel)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -144,7 +135,7 @@ struct NearbyView: View {
                                 : "line.3.horizontal.decrease"
                         )
                     }
-                    .tint(hasActiveAdvancedFilters ? Theme.violetBright : nil)
+                    .tint(hasActiveAdvancedFilters ? Theme.ice : Theme.steel)
                 }
             }
             .navigationDestination(for: Profile.self) { profile in
@@ -166,30 +157,34 @@ struct NearbyView: View {
 
     // MARK: Header
 
+    /// Lowercase heavy title with a mono-caps live count on its baseline.
     private func header(for visible: [Profile]) -> some View {
         let onlineCount = visible.filter(\.isOnline).count
 
-        return VStack(alignment: .leading, spacing: 6) {
-            Text("Nearby")
-                .font(.stexxHero)
-                .tracking(Theme.Tracking.display)
-                .foregroundStyle(Theme.textPrimary)
+        return HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.m) {
+            Text("nearby")
+                .stexxTitleStyle()
+                .accessibilityLabel(Text("Nearby"))
                 .accessibilityAddTraits(.isHeader)
 
+            Spacer(minLength: 0)
+
             if !visible.isEmpty {
-                HStack(spacing: 8) {
+                HStack(spacing: Theme.Spacing.s) {
                     if onlineCount > 0 {
-                        OnlineGlow(size: 7)
+                        OnlineDot()
                             .accessibilityHidden(true)
-                        Text("\(onlineCount) online now")
-                            .foregroundStyle(Theme.textPrimary)
-                        Text(verbatim: "·")
+                        Text("\(onlineCount) online")
+                            .stexxLabelStyle(color: Theme.frost)
+                        Text(verbatim: "/")
+                            .stexxLabelStyle(color: Theme.slate)
                             .accessibilityHidden(true)
                     }
-                    Text("\(visible.count) around you")
+                    Text("\(visible.count) around")
+                        .stexxLabelStyle()
                 }
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
                 .accessibilityElement(children: .combine)
                 .transition(.opacity)
             }
@@ -203,7 +198,7 @@ struct NearbyView: View {
                 HStack(spacing: 8) {
                     ForEach(QuickFilter.allCases, id: \.self) { filter in
                         GlassChip(filter.title, systemImage: filter.systemImage, isSelected: quickFilter == filter) {
-                            withAnimation(Motion.animation(Motion.snappy, reduceMotion: reduceMotion)) {
+                            withAnimation(Motion.animation(Motion.quick, reduceMotion: reduceMotion)) {
                                 quickFilter = filter
                             }
                         }
@@ -212,8 +207,8 @@ struct NearbyView: View {
                         if appState.requirePlus() { isShowingFilters = true }
                     }
                 }
-                .padding(.horizontal, Theme.Spacing.l)
-                .padding(.vertical, 4)
+                .padding(.horizontal, Theme.Spacing.screen)
+                .padding(.vertical, 2)
             }
         }
         .scrollIndicators(.hidden)
@@ -264,6 +259,8 @@ struct NearbyView: View {
                 Label("Couldn't load the grid", systemImage: "wifi.exclamationmark")
             } description: {
                 Text(errorMessage)
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
             } actions: {
                 Button("Try again") { Task { await reload() } }
                     .stexxSecondaryButton()
@@ -272,14 +269,18 @@ struct NearbyView: View {
             ContentUnavailableView {
                 Label {
                     Text("Nobody here yet")
-                        .font(.stexxName)
-                        .tracking(Theme.Tracking.tight)
+                        .stexxTitleStyle(.title)
                 } icon: {
-                    StexxMark(size: 44)
+                    StexxMark(size: 40, glows: false)
+                        .padding(Theme.Spacing.m)
+                        .cellCorners()
+                        .padding(.bottom, Theme.Spacing.s)
                         .accessibilityHidden(true)
                 }
             } description: {
                 Text("Try fewer filters, or check back in a bit.")
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
             }
         }
     }
@@ -323,100 +324,84 @@ struct NearbyView: View {
 
 // MARK: - Tile
 
-/// A photo tile in the grid: photo, name, distance and online status.
-/// Featured tiles are larger, glow more, and show a glass distance chip and
-/// the headline.
+/// A photo tile in the grid: photo, name, mono distance and a static online
+/// dot. Featured tiles are the block's hero surface: the cell corners and
+/// the violet rim light, nothing else.
 struct ProfileTile: View {
     let profile: Profile
     var isFeatured = false
 
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-
-    private var cornerRadius: CGFloat {
-        isFeatured ? Theme.Radius.card - 2 : 14
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous)
     }
 
     var body: some View {
         Color.clear
             .overlay { ProfilePhotoView(profile: profile) }
             .overlay(alignment: .bottom) { caption }
-            .overlay(alignment: .top) { topBar }
-            .glowFrame(cornerRadius: cornerRadius, glow: isFeatured ? 1.25 : 0.35)
-            .contentShape(.rect(cornerRadius: cornerRadius))
+            .overlay(alignment: .topTrailing) { favoriteMark }
+            .clipShape(shape)
+            .overlay {
+                if isFeatured {
+                    shape
+                        .strokeBorder(Theme.line, lineWidth: 0.5)
+                        .rimLight(shape)
+                        .cellCorners(outset: -8)
+                        .allowsHitTesting(false)
+                }
+            }
+            .contentShape(shape)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(accessibilityText)
             .accessibilityAddTraits(.isButton)
     }
 
     private var caption: some View {
-        VStack(alignment: .leading, spacing: isFeatured ? 4 : 1) {
-            if isFeatured, profile.lookingFor.contains(.rightNow) {
-                XXBadge("Right now")
-                    .padding(.bottom, 2)
-            }
-            HStack(spacing: isFeatured ? 7 : 5) {
+        VStack(alignment: .leading, spacing: isFeatured ? 4 : 2) {
+            HStack(spacing: 5) {
                 if profile.isOnline {
-                    OnlineGlow(size: isFeatured ? 9 : 7)
+                    OnlineDot()
                 }
                 Text(isFeatured ? profile.nameAndAge : profile.displayName)
-                    .font(isFeatured ? .stexxName : .stexxNameSmall)
-                    .tracking(isFeatured ? Theme.Tracking.display : Theme.Tracking.tight)
+                    .font(.system(isFeatured ? .subheadline : .footnote, weight: .semibold))
+                    .foregroundStyle(Theme.frost)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
             }
-            if isFeatured {
-                if let headline = profile.headline, !headline.isEmpty {
-                    Text(headline)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.82))
-                        .lineLimit(1)
-                }
-            } else if let distance = profile.distanceMeters {
-                Text(StexxFormat.distance(distance))
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.75))
+            if let meta = metaText {
+                Text(meta)
+                    .stexxLabelStyle(.micro, color: Theme.frost.opacity(0.7))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
         }
-        .foregroundStyle(.white)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, isFeatured ? 14 : 8)
-        .padding(.top, isFeatured ? 48 : 26)
-        .padding(.bottom, isFeatured ? 14 : 7)
+        .padding(.horizontal, isFeatured ? 12 : 7)
+        .padding(.top, isFeatured ? 40 : 24)
+        .padding(.bottom, isFeatured ? 12 : 7)
         .background(Theme.photoScrim)
     }
 
-    private var topBar: some View {
-        HStack(alignment: .top) {
-            if isFeatured, let distance = profile.distanceMeters {
-                distanceChip(StexxFormat.distance(distance))
-            }
-            Spacer(minLength: 0)
-            if profile.isFavorite {
-                Image(systemName: "star.fill")
-                    .font(isFeatured ? .footnote : .caption2)
-                    .foregroundStyle(Theme.warning)
-                    .shadow(color: .black.opacity(0.5), radius: 3)
-                    .padding(isFeatured ? 4 : 0)
-            }
+    /// Mono meta under the name: distance, plus "right now" on featured tiles.
+    private var metaText: String? {
+        var parts: [String] = []
+        if let distance = profile.distanceMeters {
+            parts.append(StexxFormat.distance(distance))
         }
-        .padding(isFeatured ? 10 : 6)
+        if isFeatured, profile.lookingFor.contains(.rightNow) {
+            parts.append(String(localized: "Right now"))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     @ViewBuilder
-    private func distanceChip(_ text: String) -> some View {
-        let label = Label(text, systemImage: "location.fill")
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.white)
-            .lineLimit(1)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-
-        // Glass only on featured tiles (a few per screen), never per small tile.
-        if reduceTransparency {
-            label.background(Color.black.opacity(0.65), in: .capsule)
-        } else {
-            label.glassEffect(.regular.tint(Theme.violet.opacity(0.18)), in: .capsule)
+    private var favoriteMark: some View {
+        if profile.isFavorite {
+            Image(systemName: "star.fill")
+                .font(.system(size: isFeatured ? 11 : 9, weight: .semibold))
+                .foregroundStyle(Theme.frost)
+                .shadow(color: .black.opacity(0.45), radius: 2)
+                .padding(isFeatured ? 12 : 6)
         }
     }
 
@@ -433,9 +418,10 @@ struct ProfileTile: View {
 
 private enum NearbyGridMetrics {
     static let columns = 3
-    static let spacing: CGFloat = 6
-    /// Width / height of a small tile.
-    static let tileAspect: CGFloat = 0.78
+    /// 2pt gutters on ink, so the gaps read as grid lines.
+    static let spacing: CGFloat = Theme.Spacing.gridGutter
+    /// Width / height of a small tile (3:4).
+    static let tileAspect: CGFloat = 0.75
     /// Dense rows between featured blocks.
     static let rowsPerCycle = 3
 }
@@ -545,7 +531,7 @@ private struct NearbyFeaturedLayout: Layout {
 
 // MARK: - Motion helpers
 
-/// Tiles sink slightly with a spring when pressed; just dim under Reduce Motion.
+/// Tiles sink slightly when pressed (no bounce); just dim under Reduce Motion.
 private struct NearbyTilePressStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         NearbyTilePressBody(configuration: configuration)
@@ -559,10 +545,10 @@ private struct NearbyTilePressBody: View {
 
     var body: some View {
         configuration.label
-            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.95 : 1)
-            .brightness(configuration.isPressed ? -0.08 : 0)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.98 : 1)
+            .opacity(configuration.isPressed ? 0.85 : 1)
             .animation(
-                reduceMotion ? nil : (configuration.isPressed ? Motion.snappy : Motion.cardSpring),
+                reduceMotion ? Motion.fade : (configuration.isPressed ? Motion.press : Motion.quick),
                 value: configuration.isPressed
             )
     }
@@ -585,45 +571,19 @@ private struct NearbyZoomTransition: ViewModifier {
     }
 }
 
-// MARK: - Scroll-reactive glow
-
-/// Holds the grid's scroll offset. Only `NearbyGlowBackground` reads it, so
-/// scrolling invalidates the background and nothing else.
-@MainActor
-@Observable
-private final class NearbyScrollGlow {
-    private(set) var offset: CGFloat = 0
-
-    func update(_ rawOffset: CGFloat) {
-        // Whole points, clamped: the glow only drifts near the top, so deep
-        // scrolling stops causing redraws.
-        let value = min(max(rawOffset, 0), 1200).rounded()
-        if value != offset { offset = value }
-    }
-}
-
-private struct NearbyGlowBackground: View {
-    let glow: NearbyScrollGlow
-    let intensity: Double
-
-    var body: some View {
-        GlowBackground(intensity: intensity, scrollOffset: glow.offset)
-    }
-}
-
 #Preview("Nearby") {
     NearbyView()
         .previewEnvironment()
 }
 
 #Preview("Tiles") {
-    HStack(alignment: .top, spacing: 8) {
+    HStack(alignment: .top, spacing: 2) {
         ProfileTile(profile: MockData.profiles[0], isFeatured: true)
             .frame(width: 236, height: 306)
         ProfileTile(profile: MockData.profiles[1])
             .frame(width: 115, height: 148)
     }
     .padding()
-    .background(GlowBackground())
+    .background(Theme.ink)
     .preferredColorScheme(.dark)
 }

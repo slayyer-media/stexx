@@ -30,22 +30,22 @@ struct ViewersView: View {
                     ViewerRow(profile: profile, zoomNamespace: zoomNamespace)
                 }
                 .listRowBackground(Color.clear)
-                .listRowSeparatorTint(Theme.hairline)
+                .listRowSeparatorTint(Theme.line)
+                .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] + 64 }
             }
         }
         .listStyle(.plain)
         .overlay {
             if isLoading {
                 ProgressView()
-                    .controlSize(.large)
-                    .tint(Theme.violetBright)
+                    .tint(Theme.steel)
             } else if let errorMessage {
                 ContentUnavailableView("Couldn't load viewers", systemImage: "eyes", description: Text(errorMessage))
             } else if viewers.isEmpty {
                 ContentUnavailableView("No views yet", systemImage: "eyes", description: Text("People who view your profile show up here for 7 days."))
             }
         }
-        .stexxBackground(intensity: 0.5)
+        .stexxBackground(intensity: 0.4)
         .navigationTitle("Who viewed you")
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(for: Profile.self) { profile in
@@ -60,14 +60,8 @@ struct ViewersView: View {
     }
 
     private func summary(count: Int) -> some View {
-        HStack(spacing: Theme.Spacing.s) {
-            XXBadge(verbatim: "\(count)")
-                .accessibilityHidden(true)
-            Text("\(count) people in the last 7 days")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.textSecondary)
-        }
-        .accessibilityElement(children: .combine)
+        SectionLabel("\(count) people in the last 7 days")
+            .padding(.top, Theme.Spacing.s)
     }
 
     private func load() async {
@@ -82,42 +76,36 @@ struct ViewersView: View {
     }
 }
 
-/// One viewer: glowing avatar, heavy name, last seen and distance.
+/// One viewer: square avatar with a static online dot, name, and a
+/// mono-caps last seen / distance line.
 private struct ViewerRow: View {
     let profile: Profile
     let zoomNamespace: Namespace.ID
 
     var body: some View {
         HStack(spacing: Theme.Spacing.m) {
-            AvatarView(profile: profile, size: 52, showsOnline: false)
-                .glowFrame(cornerRadius: 26, glow: 0.6)
-                .overlay(alignment: .bottomTrailing) {
-                    if profile.isOnline {
-                        OnlineGlow(size: 11)
-                            .padding(2)
-                    }
-                }
+            AvatarView(profile: profile, size: 52)
                 .matchedTransitionSource(id: profile.id, in: zoomNamespace)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 5) {
                 Text(profile.nameAndAge)
-                    .font(.system(.headline, weight: .heavy))
-                    .tracking(Theme.Tracking.tight)
-                    .foregroundStyle(Theme.textPrimary)
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
                     .lineLimit(1)
                 HStack(spacing: 6) {
                     Text(StexxFormat.lastSeen(profile.lastActiveAt, isOnline: profile.isOnline))
                     if let distance = profile.distanceMeters {
-                        Text(verbatim: "·")
+                        Text(verbatim: "/")
+                            .foregroundStyle(Theme.slate)
                             .accessibilityHidden(true)
                         Text(StexxFormat.distance(distance))
                     }
                 }
-                .font(.caption.weight(.medium))
-                .foregroundStyle(Theme.textSecondary)
+                .stexxLabelStyle()
+                .lineLimit(1)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 }
 

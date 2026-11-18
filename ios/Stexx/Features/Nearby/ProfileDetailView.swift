@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// Full profile: a glowing hero gallery (the grid tile zooms into it), glass
-/// info cards, and the favorite / tap / message action bar. Block and report
+/// Full profile: a rim-lit hero gallery in a cell frame (the grid tile zooms
+/// into it), hairline-separated sections, and the favorite / tap / message
+/// black-glass action bar. Block and report
 /// are always one tap away in the menu.
 struct ProfileDetailView: View {
     @State private var profile: Profile
@@ -26,58 +27,53 @@ struct ProfileDetailView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: Theme.Spacing.m) {
+            VStack(alignment: .leading, spacing: 0) {
                 hero
-                    .padding(.horizontal, Theme.Spacing.s + 2)
-                    .padding(.bottom, Theme.Spacing.xs)
+                    .padding(.horizontal, Theme.Spacing.m)
+                    .padding(.top, Theme.Spacing.s)
 
-                VStack(spacing: Theme.Spacing.m) {
+                identity
+                    .padding(.top, Theme.Spacing.xl)
+                    .padding(.horizontal, Theme.Spacing.screen)
+
+                VStack(alignment: .leading, spacing: 0) {
                     if hasHeaderContent {
-                        headerCard
+                        headerSection
                             .modifier(DetailEntrance(index: 0, isVisible: hasAppeared))
                     }
                     if let about = profile.about, !about.isEmpty {
-                        GlassCard {
-                            VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-                                DetailCardTitle("About")
-                                Text(about)
-                                    .font(.body)
-                                    .foregroundStyle(Theme.textPrimary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
+                        DetailSection("About") {
+                            Text(about)
+                                .font(.stexxBody)
+                                .foregroundStyle(Theme.frost)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         .modifier(DetailEntrance(index: 1, isVisible: hasAppeared))
                     }
                     if !profile.lookingFor.isEmpty {
-                        GlassCard {
-                            VStack(alignment: .leading, spacing: Theme.Spacing.m) {
-                                DetailCardTitle("Looking for")
-                                FlowLayout {
-                                    ForEach(profile.lookingFor) { item in
-                                        DetailPill(systemImage: item.systemImage, text: Text(item.title))
-                                    }
+                        DetailSection("Looking for") {
+                            FlowLayout {
+                                ForEach(profile.lookingFor) { item in
+                                    DetailTag(systemImage: item.systemImage, text: Text(item.title))
                                 }
                             }
                         }
                         .modifier(DetailEntrance(index: 2, isVisible: hasAppeared))
                     }
                     if !profile.tags.isEmpty {
-                        GlassCard {
-                            VStack(alignment: .leading, spacing: Theme.Spacing.m) {
-                                DetailCardTitle("Into")
-                                FlowLayout {
-                                    ForEach(profile.tags, id: \.self) { TagChip(text: $0) }
-                                }
+                        DetailSection("Into") {
+                            FlowLayout {
+                                ForEach(profile.tags, id: \.self) { TagChip(text: $0) }
                             }
                         }
                         .modifier(DetailEntrance(index: 3, isVisible: hasAppeared))
                     }
                 }
-                .padding(.horizontal, Theme.Spacing.m)
+                .padding(.horizontal, Theme.Spacing.screen)
             }
-            .padding(.bottom, 96)
+            .padding(.bottom, 112)
         }
-        .stexxBackground(intensity: 0.7)
+        .stexxBackground(intensity: 0.6)
         .safeAreaInset(edge: .bottom) { actionBar }
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .tabBar)
@@ -119,13 +115,17 @@ struct ProfileDetailView: View {
 
     // MARK: Hero
 
+    /// The screen's one hero surface: cell corners and the rim light.
     private var hero: some View {
-        Color.clear
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return Color.clear
             .aspectRatio(4.0 / 5.0, contentMode: .fit)
             .overlay { gallery }
-            .overlay(alignment: .bottom) { heroCaption }
             .overlay(alignment: .top) { pageIndicator }
-            .glowFrame(cornerRadius: Theme.Radius.card + 6, glow: 1.3)
+            .clipShape(shape)
+            .overlay { shape.strokeBorder(Theme.line, lineWidth: 0.5).allowsHitTesting(false) }
+            .rimLight(shape)
+            .cellCorners(outset: 5)
     }
 
     private var gallery: some View {
@@ -148,117 +148,118 @@ struct ProfileDetailView: View {
         return Text("Photo \(photoIndex + 1) of \(profile.photos.count)")
     }
 
-    /// Story-style page bars across the top of the photo.
+    /// Thin story-style page bars across the top of the photo.
     @ViewBuilder
     private var pageIndicator: some View {
         if profile.photos.count > 1 {
-            HStack(spacing: 4) {
+            HStack(spacing: 3) {
                 ForEach(profile.photos.indices, id: \.self) { index in
-                    Capsule()
-                        .fill(index == photoIndex ? Color.white : Color.white.opacity(0.32))
-                        .frame(height: 3)
-                        .shadow(color: index == photoIndex ? Theme.edgeGlow : .clear, radius: 4)
+                    Rectangle()
+                        .fill(index == photoIndex ? Theme.frost : Theme.frost.opacity(0.28))
+                        .frame(height: 2)
                 }
             }
             .padding(.horizontal, Theme.Spacing.l)
             .padding(.top, Theme.Spacing.m)
-            .animation(Motion.snappy, value: photoIndex)
+            .animation(Motion.quick, value: photoIndex)
             .allowsHitTesting(false)
             .accessibilityHidden(true)
         }
     }
 
-    private var heroCaption: some View {
-        VStack(alignment: .leading, spacing: 6) {
+    /// Name in heavy display, then a mono-caps meta line.
+    private var identity: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
             HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.s) {
                 Text(profile.nameAndAge)
-                    .font(.stexxHero)
-                    .tracking(Theme.Tracking.display)
+                    .stexxTitleStyle()
                     .lineLimit(2)
                     .minimumScaleFactor(0.7)
                     .accessibilityAddTraits(.isHeader)
                 if let pronouns = profile.pronouns, !pronouns.isEmpty {
                     Text(pronouns)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.72))
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.steel)
                 }
             }
             HStack(spacing: Theme.Spacing.s) {
                 if profile.isOnline {
-                    OnlineGlow(size: 9)
+                    OnlineDot()
                         .accessibilityHidden(true)
                 }
                 Text(StexxFormat.lastSeen(profile.lastActiveAt, isOnline: profile.isOnline))
+                    .stexxLabelStyle(color: profile.isOnline ? Theme.frost : Theme.steel)
                 if let distance = profile.distanceMeters {
-                    Text(verbatim: "·")
+                    Text(verbatim: "/")
+                        .stexxLabelStyle(color: Theme.slate)
                         .accessibilityHidden(true)
-                    Label(StexxFormat.distance(distance), systemImage: "location.fill")
-                        .labelStyle(.titleAndIcon)
+                    Text(StexxFormat.distance(distance))
+                        .stexxLabelStyle()
                 }
             }
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(.white.opacity(0.85))
+            .lineLimit(1)
         }
-        .foregroundStyle(.white)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, Theme.Spacing.l + 2)
-        .padding(.top, 72)
-        .padding(.bottom, Theme.Spacing.l + 2)
-        .background(Theme.photoScrim)
-        .allowsHitTesting(false)
         .accessibilityElement(children: .combine)
     }
 
-    // MARK: Cards
+    // MARK: Sections
 
     private var hasHeaderContent: Bool {
         (profile.headline.map { !$0.isEmpty } ?? false) || profile.heightCm != nil || profile.position != nil
     }
 
-    private var headerCard: some View {
-        GlassCard(tint: Theme.violet.opacity(0.08)) {
-            VStack(alignment: .leading, spacing: Theme.Spacing.m) {
-                if let headline = profile.headline, !headline.isEmpty {
-                    Text(headline)
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(Theme.textPrimary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.leading, 14)
-                        .overlay(alignment: .leading) {
-                            Capsule()
-                                .fill(Theme.accentGradient)
-                                .frame(width: 4)
-                                .shadow(color: Theme.edgeGlow.opacity(0.6), radius: 4)
-                        }
-                }
-                if profile.heightCm != nil || profile.position != nil {
-                    FlowLayout {
+    /// Headline as plain body text, then the stats as a hairline-ruled
+    /// mono-caps row.
+    private var headerSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.l) {
+            if let headline = profile.headline, !headline.isEmpty {
+                Text(headline)
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if profile.heightCm != nil || profile.position != nil {
+                VStack(spacing: 0) {
+                    HairlineDivider()
+                    HStack(spacing: 0) {
                         if let height = profile.heightCm {
                             let value = StexxFormat.height(cm: height)
-                            DetailPill(
-                                systemImage: "ruler",
-                                text: Text(value),
+                            DetailStat(
+                                title: Text("Height"),
+                                value: Text(value),
                                 accessibilityText: Text("Height: \(value)")
                             )
                         }
+                        if profile.heightCm != nil && profile.position != nil {
+                            Rectangle()
+                                .fill(Theme.line)
+                                .frame(width: 0.5)
+                                .padding(.vertical, Theme.Spacing.s)
+                                .accessibilityHidden(true)
+                        }
                         if let position = profile.position {
-                            DetailPill(
-                                systemImage: "arrow.up.arrow.down",
-                                text: Text(position.title),
+                            DetailStat(
+                                title: Text("Position"),
+                                value: Text(position.title),
                                 accessibilityText: Text("Position: \(String(localized: position.title))")
                             )
                         }
                     }
+                    .fixedSize(horizontal: false, vertical: true)
+                    HairlineDivider()
                 }
             }
         }
+        .padding(.top, Theme.Spacing.xl)
     }
 
     // MARK: Actions
 
+    /// Floating black-glass bar: favorite, tap, and the frost Message button.
     private var actionBar: some View {
-        GlassEffectContainer(spacing: Theme.Spacing.m) {
-            HStack(spacing: Theme.Spacing.m) {
+        GlassEffectContainer(spacing: Theme.Spacing.s) {
+            HStack(spacing: Theme.Spacing.s) {
                 GlassIconButton(
                     profile.isFavorite ? "Remove favorite" : "Favorite",
                     systemImage: profile.isFavorite ? "star.fill" : "star",
@@ -267,7 +268,7 @@ struct ProfileDetailView: View {
                     favoriteTaps += 1
                     Task { await toggleFavorite() }
                 }
-                .sensoryFeedback(.impact(weight: .light), trigger: favoriteTaps)
+                .sensoryFeedback(.selection, trigger: favoriteTaps)
 
                 GlassIconButton(didTap ? "Tapped" : "Send a tap", systemImage: didTap ? "hand.wave.fill" : "hand.wave") {
                     Task { await sendTap() }
@@ -281,29 +282,15 @@ struct ProfileDetailView: View {
                     WideLabel("Message", systemImage: "bubble.left.fill")
                 }
                 .stexxPrimaryButton()
-                .sensoryFeedback(.impact(weight: .medium), trigger: isShowingChat) { _, isShowing in
+                .sensoryFeedback(.impact(weight: .light), trigger: isShowingChat) { _, isShowing in
                     isShowing
                 }
             }
+            .padding(Theme.Spacing.s)
         }
+        .blackGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
         .padding(.horizontal, Theme.Spacing.l)
-        .padding(.top, Theme.Spacing.xl)
         .padding(.bottom, Theme.Spacing.s)
-        // Fade the scrolled cards out under the floating actions so text
-        // never shows through the glass buttons.
-        .background {
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.background.opacity(0), location: 0),
-                    .init(color: Theme.background.opacity(0.92), location: 0.28),
-                    .init(color: Theme.background, location: 0.5),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .ignoresSafeArea(edges: .bottom)
-            .allowsHitTesting(false)
-        }
     }
 
     private func toggleFavorite() async {
@@ -339,56 +326,80 @@ struct ProfileDetailView: View {
 
 // MARK: - Pieces
 
-/// Heavy card heading with a small violet accent.
-private struct DetailCardTitle: View {
+/// A content section on the plain background: hairline on top, "× TITLE"
+/// mono label, then the content. No card.
+private struct DetailSection<Content: View>: View {
     let title: LocalizedStringKey
+    let content: Content
 
-    init(_ title: LocalizedStringKey) {
+    init(_ title: LocalizedStringKey, @ViewBuilder content: () -> Content) {
         self.title = title
+        self.content = content()
     }
 
     var body: some View {
-        HStack(spacing: 6) {
-            Capsule()
-                .fill(Theme.accentGradient)
-                .frame(width: 10, height: 4)
-                .accessibilityHidden(true)
-            Text(title)
-                .font(.headline.weight(.heavy))
-                .tracking(Theme.Tracking.tight)
-                .foregroundStyle(Theme.textPrimary)
+        VStack(alignment: .leading, spacing: 0) {
+            HairlineDivider()
+                .padding(.top, Theme.Spacing.xl)
+            VStack(alignment: .leading, spacing: Theme.Spacing.m) {
+                SectionLabel(title)
+                content
+            }
+            .padding(.top, Theme.Spacing.l)
         }
-        .accessibilityAddTraits(.isHeader)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-/// Violet-tinted pill for facts like height, position, or what someone is
-/// looking for.
-private struct DetailPill: View {
+/// One cell of the stats row: micro label over a mono-caps value.
+private struct DetailStat: View {
+    let title: Text
+    let value: Text
+    let accessibilityText: Text
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            title
+                .stexxLabelStyle(.micro, color: Theme.slate)
+            value
+                .stexxLabelStyle(color: Theme.frost)
+        }
+        .lineLimit(1)
+        .minimumScaleFactor(0.8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, Theme.Spacing.m)
+        .padding(.leading, Theme.Spacing.m)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityText)
+    }
+}
+
+/// Static tag with an icon (what someone is looking for): radius 4, ink1,
+/// hairline, mono caps steel.
+private struct DetailTag: View {
     let systemImage: String
     let text: Text
-    var accessibilityText: Text?
 
     var body: some View {
-        HStack(spacing: 6) {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous)
+        HStack(spacing: 5) {
             Image(systemName: systemImage)
-                .foregroundStyle(Theme.violetBright)
+                .imageScale(.small)
                 .accessibilityHidden(true)
             text
-                .foregroundStyle(Theme.textPrimary)
         }
-        .font(.subheadline.weight(.semibold))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(Theme.violet.opacity(0.16), in: .capsule)
-        .overlay(Capsule().strokeBorder(Theme.violet.opacity(0.35), lineWidth: 0.5))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityText ?? text)
+        .stexxLabelStyle()
+        .lineLimit(1)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(shape.fill(Theme.ink1))
+        .overlay(shape.strokeBorder(Theme.line, lineWidth: 0.5))
+        .accessibilityElement(children: .combine)
     }
 }
 
-/// Cards rise into place with a staggered spring. Under Reduce Motion they
-/// are simply there.
+/// Sections fade up a few points into place. Under Reduce Motion they are
+/// simply there.
 private struct DetailEntrance: ViewModifier {
     let index: Int
     let isVisible: Bool
@@ -402,9 +413,8 @@ private struct DetailEntrance: ViewModifier {
         } else {
             content
                 .opacity(isVisible ? 1 : 0)
-                .offset(y: isVisible ? 0 : 28)
-                .scaleEffect(isVisible ? 1 : 0.96, anchor: .top)
-                .animation(Motion.cardSpring.delay(0.12 + 0.06 * Double(index)), value: isVisible)
+                .offset(y: isVisible ? 0 : 8)
+                .animation(Motion.standard.delay(0.08 + 0.04 * Double(index)), value: isVisible)
         }
     }
 }
