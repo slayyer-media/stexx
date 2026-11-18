@@ -12,7 +12,23 @@ enum RealtimeEvent: Hashable, Sendable {
     case messageRead(ReadReceipt)
     case conversationUpdated(Conversation)
     case tapReceived(Tap)
+    /// `identity.changed`: a chat partner re-registered with a new identity
+    /// key (a reinstall or a new phone). The app re-checks the key and holds
+    /// the change until the user accepts it.
+    case identityChanged(IdentityChange)
+    /// `keys.low`: this account's one-time prekeys ran low; replenish.
+    case keysLow(KeysLow)
     case unknown(type: String)
+
+    struct IdentityChange: Codable, Hashable, Sendable {
+        var userID: Profile.ID
+        var identityKeyChangedAt: Date?
+    }
+
+    struct KeysLow: Codable, Hashable, Sendable {
+        var preKeyCount: Int
+        var pqPreKeyCount: Int
+    }
 
     /// `message.read`: the other participant read messages in a conversation.
     struct ReadReceipt: Codable, Hashable, Sendable {
@@ -80,6 +96,10 @@ enum RealtimeEvent: Hashable, Sendable {
             return .conversationUpdated(try decoder.decode(DataEnvelope<Conversation>.self, from: data).payload)
         case "tap.received":
             return .tapReceived(try decoder.decode(DataEnvelope<TapPayload>.self, from: data).payload.tap)
+        case "identity.changed":
+            return .identityChanged(try decoder.decode(DataEnvelope<IdentityChange>.self, from: data).payload)
+        case "keys.low":
+            return .keysLow(try decoder.decode(DataEnvelope<KeysLow>.self, from: data).payload)
         default:
             return .unknown(type: type)
         }

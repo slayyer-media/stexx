@@ -7,6 +7,7 @@ struct ChatThreadView: View {
 
     @Environment(AppState.self) private var appState
     @Environment(ChatStore.self) private var chatStore
+    @Environment(E2EStatus.self) private var e2e
     @Environment(\.apiClient) private var api
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -30,6 +31,7 @@ struct ChatThreadView: View {
     @State private var landingKeys: Set<String> = []
     /// Bumped on every send, for haptics.
     @State private var sendCount = 0
+    @State private var isAcceptingKeyChange = false
     @FocusState private var isComposerFocused: Bool
 
     private var participant: Profile { route.participant }
@@ -46,6 +48,10 @@ struct ChatThreadView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
+                    if e2e.isEncrypted(with: participant.id) {
+                        EncryptedThreadLabel()
+                            .padding(.bottom, Theme.Spacing.s)
+                    }
                     if !isLoading && messages.isEmpty {
                         emptyThread
                     }
@@ -56,6 +62,7 @@ struct ChatThreadView: View {
                         MessageBubble(
                             message: message,
                             isMine: isMine,
+                            senderName: participant.displayName,
                             showsTimestamp: showsTimestamp(at: index),
                             isFirstInGroup: !continues,
                             isLastInGroup: isLastInGroup(at: index),
@@ -90,6 +97,15 @@ struct ChatThreadView: View {
             if isLoading { ProgressView().tint(Theme.steel) }
         }
         .stexxBackground()
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if e2e.hasKeyChange(for: participant.id) {
+                KeyChangeBanner(name: participant.displayName, isAccepting: isAcceptingKeyChange) {
+                    Task { await acceptKeyChange() }
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: e2e.hasKeyChange(for: participant.id))
         .safeAreaInset(edge: .bottom) { composer }
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .tabBar)
@@ -144,6 +160,8 @@ struct ChatThreadView: View {
         .task(id: conversation?.id) {
             // Realtime: new messages and read receipts while the thread is open.
             guard let id = conversation?.id else { return }
+            // Encrypted chats: is there a session, and did their key change?
+            Task { await e2e.threadOpened(with: participant.id) }
             for await update in chatStore.threadUpdates(for: id) {
                 if update == .resync {
                     // The socket was down: refetch what was missed.
@@ -457,16 +475,31 @@ struct ChatThreadView: View {
     }
 
     /// The server's explanation for a refused send (429 or a 403 anti-spam
-    /// limit), or nil for plain failures, which the bubble already shows.
+    /// limit), the app's own for encryption and the in-app text rules, or nil
+    /// for plain failures, which the bubble already shows.
     static func notice(for error: any Error) -> String? {
+        if error is E2EError || error is E2EContentRules.Violation {
+            return error.localizedDescription
+        }
         switch error as? APIError {
         case .rateLimited?:
             return error.localizedDescription
         case .server(let status, let message?)? where status == 403 || status == 400:
             return message
+        case .e2e(let code, _)? where code == E2EErrorCode.encryptionRequired:
+            return error.localizedDescription
         default:
             return nil
         }
+    }
+
+    /// The user accepted the new key: messages held back by it decrypt on the refetch.
+    private func acceptKeyChange() async {
+        isAcceptingKeyChange = true
+        defer { isAcceptingKeyChange = false }
+        guard await e2e.acceptKeyChange(of: participant.id) else { return }
+        sendNotice = nil
+        if let id = conversation?.id { try? await refreshMessages(in: id) }
     }
 
     private func block() async {
@@ -485,6 +518,8 @@ struct ChatThreadView: View {
 struct MessageBubble: View {
     let message: Message
     let isMine: Bool
+    /// The other person's name, for the placeholder of a message held back by a key change.
+    var senderName: String = ""
     var showsTimestamp = false
     var isFirstInGroup = true
     var isLastInGroup = true
@@ -516,6 +551,8 @@ struct MessageBubble: View {
                             .padding(.vertical, 9)
                             .background { bubbleBackground }
                             .opacity(message.status == .sending ? 0.7 : 1)
+                    } else if let placeholder = encryptedPlaceholder {
+                        UnreadableMessageBubble(text: placeholder, systemImage: placeholderIcon, shape: bubbleShape)
                     }
                     if isMine, let status = statusText {
                         HStack(spacing: 4) {
@@ -570,6 +607,25 @@ struct MessageBubble: View {
                 .fill(Theme.ink1)
                 .overlay(shape.stroke(Theme.line, lineWidth: 0.5))
         }
+    }
+
+    /// What to show instead of text for an encrypted message this device
+    /// can't read (never blank).
+    private var encryptedPlaceholder: String? {
+        switch message.encryption {
+        case .unavailable?:
+            return String(localized: "Encrypted message. It can't be shown on this phone, for example after reinstalling Stexx.")
+        case .awaitingKeyConfirmation?:
+            return String(localized: "Sent with \(senderName)'s new security key. Accept the key change at the top to read it.")
+        case .unsupported?:
+            return String(localized: "This message needs a newer version of Stexx.")
+        case .decrypted?, nil:
+            return nil
+        }
+    }
+
+    private var placeholderIcon: String {
+        message.encryption == .awaitingKeyConfirmation ? "key" : "lock.slash"
     }
 
     private var statusText: LocalizedStringKey? {
@@ -696,4 +752,93 @@ private struct SendNoticeRow: View {
         .padding(.top, Theme.Spacing.s)
         .accessibilityElement(children: .combine)
     }
+}
+
+/// A quiet, dashed bubble for an encrypted message that can't be shown here.
+private struct UnreadableMessageBubble: View {
+    let text: String
+    let systemImage: String
+    let shape: UnevenRoundedRectangle
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12, weight: .medium))
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.stexxSub)
+                .italic()
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(Theme.steel)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background {
+            shape
+                .fill(Theme.ink1.opacity(0.6))
+                .overlay(shape.stroke(Theme.lineStrong, style: StrokeStyle(lineWidth: 0.75, dash: [4, 3])))
+        }
+    }
+}
+
+/// One centered line at the top of an encrypted thread.
+private struct EncryptedThreadLabel: View {
+    var body: some View {
+        Label("Messages are end-to-end encrypted", systemImage: "lock.fill")
+            .stexxLabelStyle(.micro, color: Theme.slate)
+            .frame(maxWidth: .infinity)
+            .padding(.top, Theme.Spacing.xs)
+            .accessibilityElement(children: .combine)
+    }
+}
+
+/// Warning that the other person's identity key changed. Until the user
+/// accepts it, nothing is sent to them and messages under the new key stay
+/// hidden (`E2EEngine`). The full safety-number comparison comes later.
+struct KeyChangeBanner: View {
+    let name: String
+    var isAccepting = false
+    let accept: () -> Void
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+            Label {
+                Text("\(name)'s security key changed")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.frost)
+            } icon: {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .foregroundStyle(Theme.warning)
+            }
+            Text("This usually means they reinstalled Stexx or got a new phone. It could also mean someone else is trying to join this chat. Messages to and from \(name) are on hold until you accept the new key.")
+                .font(.stexxSub)
+                .foregroundStyle(Theme.steel)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(action: accept) {
+                HStack(spacing: Theme.Spacing.s) {
+                    if isAccepting { ProgressView().tint(Theme.ink) }
+                    Text("Accept new key")
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.ink)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 40)
+                .background(Theme.frost, in: shape)
+            }
+            .buttonStyle(.plain)
+            .disabled(isAccepting)
+        }
+        .padding(Theme.Spacing.m)
+        .background(Theme.ink1, in: shape)
+        .overlay(shape.stroke(Theme.warning.opacity(0.45), lineWidth: 0.75))
+        .padding(.horizontal, Theme.Spacing.m)
+        .padding(.vertical, Theme.Spacing.s)
+        .accessibilityElement(children: .contain)
+    }
+}
+
+#Preview("Key change") {
+    KeyChangeBanner(name: "Alex") {}
+        .stexxBackground()
 }

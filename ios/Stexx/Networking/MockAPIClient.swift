@@ -278,6 +278,10 @@ actor MockAPIClient: APIClient {
         let attachment = draft.attachmentPhotoID.map { photoID in
             Message.Attachment(kind: .photo, url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url)
         }
+        // The mock backend behaves like a server with `E2E_MODE=off`.
+        if draft.envelope != nil {
+            throw APIError.e2e(code: E2EErrorCode.disabled, message: "End-to-end encryption isn't switched on for this server yet.")
+        }
         if draft.text == nil && attachment == nil {
             throw APIError.server(status: 400, message: "A message needs text or a photo.")
         }
@@ -308,6 +312,29 @@ actor MockAPIClient: APIClient {
         conversationStore[conversationID] = nil
         messageStore[conversationID] = nil
     }
+
+    // MARK: End-to-end encryption
+
+    // The mock backend is a server with `E2E_MODE=off`: the app keeps the
+    // plaintext path, so the Debug scheme, previews and UI tests need no
+    // keys or Keychain. Real crypto is covered by `E2EEngineTests` with two
+    // in-memory devices, and by the Local scheme against `server/`.
+
+    func e2eConfig() async throws -> E2EConfig {
+        try await pause()
+        return .off
+    }
+
+    private static var e2eDisabled: APIError {
+        .e2e(code: E2EErrorCode.disabled, message: "End-to-end encryption isn't switched on for this server yet.")
+    }
+
+    func registerKeys(_ registration: KeyRegistration) async throws -> KeyStatus { throw Self.e2eDisabled }
+    func keyStatus() async throws -> KeyStatus { throw Self.e2eDisabled }
+    func uploadPreKeys(_ replenishment: PreKeyReplenishment) async throws -> KeyStatus { throw Self.e2eDisabled }
+    func rotateSignedPreKeys(_ rotation: SignedPreKeyRotation) async throws -> KeyStatus { throw Self.e2eDisabled }
+    func preKeyBundle(for profileID: Profile.ID) async throws -> PreKeyBundleResponse { throw Self.e2eDisabled }
+    func identityKey(for profileID: Profile.ID) async throws -> IdentityKeyResponse { throw Self.e2eDisabled }
 
     // MARK: Safety
 

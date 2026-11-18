@@ -181,6 +181,36 @@ struct HTTPAPIClient: APIClient {
         try await callVoid("DELETE", "conversations/\(conversationID)")
     }
 
+    // MARK: End-to-end encryption
+
+    func e2eConfig() async throws -> E2EConfig {
+        try await call("GET", "e2e/config")
+    }
+
+    func registerKeys(_ registration: KeyRegistration) async throws -> KeyStatus {
+        try await call("PUT", "keys", body: registration)
+    }
+
+    func keyStatus() async throws -> KeyStatus {
+        try await call("GET", "keys/status")
+    }
+
+    func uploadPreKeys(_ replenishment: PreKeyReplenishment) async throws -> KeyStatus {
+        try await call("POST", "keys/prekeys", body: replenishment)
+    }
+
+    func rotateSignedPreKeys(_ rotation: SignedPreKeyRotation) async throws -> KeyStatus {
+        try await call("PUT", "keys/signed", body: rotation)
+    }
+
+    func preKeyBundle(for profileID: Profile.ID) async throws -> PreKeyBundleResponse {
+        try await call("GET", "keys/bundle/\(profileID)")
+    }
+
+    func identityKey(for profileID: Profile.ID) async throws -> IdentityKeyResponse {
+        try await call("GET", "keys/identity/\(profileID)")
+    }
+
     // MARK: Safety
 
     func block(profileID: Profile.ID) async throws {
@@ -361,6 +391,11 @@ struct HTTPAPIClient: APIClient {
             return .content
         case ("POST", _) where path.hasPrefix("conversations/") && path.hasSuffix("/messages"):
             return .content
+        // E2E key registration and bundle fetches (`attest("message")`).
+        case ("PUT", "keys"):
+            return .content
+        case ("GET", _) where path.hasPrefix("keys/bundle/"):
+            return .content
         default:
             return nil
         }
@@ -425,12 +460,21 @@ struct HTTPAPIClient: APIClient {
             await hooks.requiresPlus()
             throw APIError.requiresPlus
         case 404:
+            // `keys_unavailable` / `e2e_disabled` decide between encrypting
+            // and plaintext; every other 404 is a plain "not found".
+            if let body = try? JSONDecoder.stexx().decode(ErrorBody.self, from: data),
+               let code = body.code, E2EErrorCode.all.contains(code) {
+                throw APIError.e2e(code: code, message: body.message)
+            }
             throw APIError.notFound
         case 429:
             throw APIError.rateLimited(retryAfter: Self.retryAfter(http.value(forHTTPHeaderField: "Retry-After")))
         default:
             let body = try? JSONDecoder.stexx().decode(ErrorBody.self, from: data)
             if http.statusCode == 403, body?.code == "attestation_key_unknown" { throw AttestationKeyRejected.rejected }
+            if let code = body?.code, E2EErrorCode.all.contains(code) {
+                throw APIError.e2e(code: code, message: body?.message)
+            }
             // 403 anti-spam codes (new_account_limit, links_not_allowed, duplicate_message, device_account_limit,
             // disposable_email, ...) carry a message written for people; it is shown as is.
             throw APIError.server(status: http.statusCode, message: body?.message)

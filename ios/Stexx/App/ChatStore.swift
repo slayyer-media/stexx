@@ -251,7 +251,8 @@ final class ChatStore {
         case .tapReceived(let tap):
             latestTap = tap
 
-        case .unknown:
+        case .identityChanged, .keysLow, .unknown:
+            // Encryption events are handled by `E2EStatus`.
             break
         }
     }
