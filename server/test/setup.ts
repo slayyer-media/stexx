@@ -30,6 +30,11 @@ process.env.APPLE_ENVIRONMENT = "Sandbox";
 process.env.ATTESTATION_MODE = "off";
 delete process.env.APPLE_TEAM_ID;
 delete process.env.DEVICECHECK_KEY_ID;
+// Photo checks: no real model in tests (photo-checks.test.ts injects fakes); defaults for everything else.
+process.env.PHOTO_CLASSIFIER = "off";
+for (const k of ["PHOTO_NSFW_MODEL", "PHOTO_NSFW_THRESHOLD", "PHOTO_NSFW_LABELS", "PHOTO_HIDE_UNCHECKED", "PHOTO_DUPLICATE_MAX_DISTANCE", "PHOTO_HASH_BLOCKLIST"]) {
+  delete process.env[k];
+}
 process.env.EMAIL_PEPPER ??= "test-pepper-test-pepper-test-pepper-0000";
 
 await migrate(testUrl, { quiet: true });

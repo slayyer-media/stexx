@@ -224,9 +224,9 @@ describe("serialize & visibility", () => {
       last_active_at: new Date(now.getTime() - 60_000), cell_lat: 37.0, cell_lon: -122.0, is_favorite: true,
     };
     const photos = [
-      { id: "ph_b", owner_id: "p_other", storage_key: "b".repeat(32) + ".jpg", position: 1, is_explicit: false },
-      { id: "ph_x", owner_id: "p_other", storage_key: "c".repeat(32) + ".jpg", position: 0, is_explicit: true },
-      { id: "ph_z", owner_id: "p_someone", storage_key: "d".repeat(32) + ".jpg", position: 0, is_explicit: false },
+      { id: "ph_b", owner_id: "p_other", storage_key: "b".repeat(32) + ".jpg", position: 1, is_explicit: false, is_checked: true },
+      { id: "ph_x", owner_id: "p_other", storage_key: "c".repeat(32) + ".jpg", position: 0, is_explicit: true, is_checked: true },
+      { id: "ph_z", owner_id: "p_someone", storage_key: "d".repeat(32) + ".jpg", position: 0, is_explicit: false, is_checked: true },
     ];
     const ctx = { viewerId: "p_me", viewerCell: { latitude: 37.001, longitude: -122.0 }, now };
     const p = profileJson(row, photos, ctx);

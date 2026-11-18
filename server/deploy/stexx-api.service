@@ -21,6 +21,8 @@ Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=8787
 Environment=MEDIA_DIR=/srv/stexx/media
+# NSFW model for the profile photo checks, fetched by deploy.sh (scripts/fetch-photo-model.sh). Read-only.
+Environment=PHOTO_NSFW_MODEL=/srv/stexx/models/nudenet-320n.onnx
 ExecStartPre=/bin/sh -c 'if grep -Eq "^[[:space:]]*(export[[:space:]]+)?(NODE_ENV|HOST|PORT|MEDIA_DIR)[[:space:]]*=" /etc/stexx/stexx.env; then echo "stexx.env must not set NODE_ENV, HOST, PORT or MEDIA_DIR (they would override the unit)" >&2; exit 1; fi'
 ExecStart=/usr/local/bin/bun src/index.ts
 Restart=on-failure
@@ -34,7 +36,8 @@ StandardError=journal
 # Media files are created 0640 stexx:stexx; Caddy reads them through the `stexx` group.
 UMask=0027
 
-# ---- Resource limits (adjust to the VPS; at most 2 sharp decodes run at once, each capped at 25 MP) ----
+# ---- Resource limits (adjust to the VPS; at most 2 sharp decodes run at once, each capped at 25 MP; the NSFW
+# model adds ~50 MB and runs one inference at a time on PHOTO_NSFW_THREADS cores) ----
 LimitNOFILE=65536
 TasksMax=512
 MemoryHigh=1G

@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
+import { parseBlocklist, type BlocklistEntry } from "./lib/photocheck/blocklist-format.ts";
+import { DEFAULT_EXPLICIT_LABELS, NUDENET_LABELS } from "./lib/photocheck/labels.ts";
 
 function readKeyFile(path: string): string {
   try {
@@ -89,6 +91,24 @@ const envSchema = z.object({
   REPORT_EVIDENCE_RETENTION_DAYS: z.coerce.number().min(1).max(365).default(30),
   REPORT_EVIDENCE_MAX_DAYS: z.coerce.number().min(1).max(3650).default(180),
 
+  // ---- Photo checks (docs/security.md "Photo checks") ----
+  /** auto: use the NSFW model if its file is present (default; "off" in tests) · off: never classify. */
+  PHOTO_CLASSIFIER: z.enum(["auto", "off"]).optional(),
+  /** NudeNet 320n ONNX file. Fetch it with scripts/fetch-photo-model.sh. */
+  PHOTO_NSFW_MODEL: z.string().optional(),
+  /** ONNX Runtime intra-op threads for one inference (inferences run one at a time). */
+  PHOTO_NSFW_THREADS: z.coerce.number().int().min(1).max(16).default(1),
+  /** A photo is explicit when any explicit label scores at least this. */
+  PHOTO_NSFW_THRESHOLD: z.coerce.number().min(0.2).max(1).default(0.5),
+  /** Comma list of NudeNet labels that count as explicit. */
+  PHOTO_NSFW_LABELS: z.string().optional(),
+  /** Hide photos the classifier hasn't checked yet from other people (fail closed). Default off (fail open). */
+  PHOTO_HIDE_UNCHECKED: flag.default(false),
+  /** Max pHash Hamming distance (of 64 bits) that counts as the same photo across accounts. -1 turns it off. */
+  PHOTO_DUPLICATE_MAX_DISTANCE: z.coerce.number().int().min(-1).max(32).default(6),
+  /** Optional file of known stock/scraped photo hashes: one 16-hex pHash per line, optional label after it. */
+  PHOTO_HASH_BLOCKLIST: z.string().optional(),
+
   STEXX_DEV_AUTH: flag,
   STEXX_DEV_DEFAULT_LOCATION: z.string().optional(),
   STEXX_DEV_WELCOME: flag,
@@ -124,12 +144,27 @@ export interface Config {
   trustProxy: boolean;
   antiSpam: AntiSpamConfig;
   moderation: ModerationConfig;
+  photoChecks: PhotoChecksConfig;
   /** Dev-only auth shortcuts (/auth/register returns a Session, /v1/dev/* mounted). Never true in production. */
   devAuth: boolean;
   /** Dev-only: new users get this cell so the grid isn't empty. null when unset or in production. */
   devDefaultLocation: { latitude: number; longitude: number } | null;
   devWelcome: boolean;
   devBots: boolean;
+}
+
+export interface PhotoChecksConfig {
+  classifier: "auto" | "off";
+  modelPath: string;
+  threads: number;
+  threshold: number;
+  explicitLabels: string[];
+  hideUnchecked: boolean;
+  /** -1 = duplicate detection off. */
+  duplicateMaxDistance: number;
+  blocklistPath: string | null;
+  /** Parsed at load, so a malformed file fails the boot (and deploy's boot check). */
+  blocklist: BlocklistEntry[];
 }
 
 export type AttestationMode = "off" | "dev" | "enforce";
@@ -182,6 +217,9 @@ export interface ModerationConfig {
 
 export const DEFAULT_APP_ATTEST_ROOT_CA = new URL("../certs/app-attest/Apple_App_Attestation_Root_CA.pem", import.meta.url)
   .pathname;
+
+/** Default model location: server/models/ (git-ignored). Production points PHOTO_NSFW_MODEL at /srv/stexx/models. */
+export const DEFAULT_NSFW_MODEL_PATH = new URL("../models/nudenet-320n.onnx", import.meta.url).pathname;
 
 export class ConfigError extends Error {
   override name = "ConfigError";
@@ -267,6 +305,32 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     if (k.startsWith("RATE_LIMIT_") && v) rateLimitOverrides[k] = v;
   }
 
+  // ---- Photo checks ----
+  const explicitLabels = (e.PHOTO_NSFW_LABELS ?? DEFAULT_EXPLICIT_LABELS.join(","))
+    .split(",")
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+  for (const label of explicitLabels) {
+    if (!(NUDENET_LABELS as readonly string[]).includes(label)) {
+      throw new ConfigError(`PHOTO_NSFW_LABELS: unknown label ${label}`);
+    }
+  }
+  if (explicitLabels.length === 0) throw new ConfigError("PHOTO_NSFW_LABELS: list at least one label");
+  let blocklist: BlocklistEntry[] = [];
+  if (e.PHOTO_HASH_BLOCKLIST) {
+    let text: string;
+    try {
+      text = readFileSync(e.PHOTO_HASH_BLOCKLIST, "utf8");
+    } catch {
+      throw new ConfigError(`PHOTO_HASH_BLOCKLIST: cannot read ${e.PHOTO_HASH_BLOCKLIST}`);
+    }
+    try {
+      blocklist = parseBlocklist(text);
+    } catch (err) {
+      throw new ConfigError(`PHOTO_HASH_BLOCKLIST: ${(err as Error).message}`);
+    }
+  }
+
   let devDefaultLocation: Config["devDefaultLocation"] = null;
   if (!isProduction && e.STEXX_DEV_DEFAULT_LOCATION) {
     const loc = latLon.safeParse(e.STEXX_DEV_DEFAULT_LOCATION);
@@ -334,6 +398,17 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       },
       evidenceRetentionDays: e.REPORT_EVIDENCE_RETENTION_DAYS,
       evidenceMaxDays: e.REPORT_EVIDENCE_MAX_DAYS,
+    },
+    photoChecks: {
+      classifier: e.PHOTO_CLASSIFIER ?? (e.NODE_ENV === "test" ? "off" : "auto"),
+      modelPath: e.PHOTO_NSFW_MODEL || DEFAULT_NSFW_MODEL_PATH,
+      threads: e.PHOTO_NSFW_THREADS,
+      threshold: e.PHOTO_NSFW_THRESHOLD,
+      explicitLabels,
+      hideUnchecked: e.PHOTO_HIDE_UNCHECKED,
+      duplicateMaxDistance: e.PHOTO_DUPLICATE_MAX_DISTANCE,
+      blocklistPath: e.PHOTO_HASH_BLOCKLIST || null,
+      blocklist,
     },
     devAuth: !isProduction && e.STEXX_DEV_AUTH,
     devDefaultLocation,

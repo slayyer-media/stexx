@@ -1,6 +1,7 @@
 import { sql, type Sql } from "../db/sql.ts";
 import { bucketedDistanceBetween, type Cell } from "./distance.ts";
 import { mediaUrl } from "./media.ts";
+import { visibleToOthers } from "./photocheck/policy.ts";
 import { isoDate, MINUTE } from "./time.ts";
 import { col, moderationVisible, notBlocked, val } from "./visibility.ts";
 
@@ -101,7 +102,12 @@ export interface PhotoRow {
   storage_key: string;
   position: number;
   is_explicit: boolean;
+  /** The NSFW classifier has labelled it (nsfw_checked_at IS NOT NULL). */
+  is_checked: boolean;
 }
+
+/** Select list producing a PhotoRow from `photos`. */
+export const photoColumns = sql`id, owner_id, storage_key, position, is_explicit, (nsfw_checked_at IS NOT NULL) AS is_checked`;
 
 export interface MessageRow {
   id: string;
@@ -151,7 +157,7 @@ export interface ViewerContext {
 
 /**
  * Build a Profile as seen by `ctx.viewerId`.
- * - Others: explicit photos removed; distance null if hideDistance or either cell unknown, else bucketed;
+ * - Others: only photos visibleToOthers() (never explicit; not unchecked either with PHOTO_HIDE_UNCHECKED); distance null if hideDistance or either cell unknown, else bucketed;
  *   isOnline = showOnlineStatus && active within 5 min; lastActiveAt null if !showOnlineStatus.
  * - Self: all photos, distance null, real lastActiveAt, isFavorite false.
  * `photos` may contain other users' photos; only this profile's are used (sorted by position).
@@ -160,7 +166,7 @@ export function profileJson(row: ProfileRow, photos: readonly PhotoRow[], ctx: V
   const now = (ctx.now ?? new Date()).getTime();
   const isSelf = row.id === ctx.viewerId;
   const own = photos
-    .filter((p) => p.owner_id === row.id && (isSelf || !p.is_explicit))
+    .filter((p) => p.owner_id === row.id && (isSelf || visibleToOthers(p)))
     .sort((a, b) => a.position - b.position)
     .map(photoJson);
   const recentlyActive = now - row.last_active_at.getTime() < ONLINE_WINDOW_MS;
@@ -254,7 +260,7 @@ export async function viewerCell(viewerId: string, db: Sql = sql): Promise<Cell 
 export async function photosFor(ownerIds: readonly string[], db: Sql = sql): Promise<PhotoRow[]> {
   if (ownerIds.length === 0) return [];
   return db<PhotoRow[]>`
-    SELECT id, owner_id, storage_key, position, is_explicit FROM photos
+    SELECT ${photoColumns} FROM photos
      WHERE owner_id = ANY(${ownerIds as string[]}) ORDER BY owner_id, position`;
 }
 

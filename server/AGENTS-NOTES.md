@@ -151,6 +151,15 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Actions (one tx + `moderation_actions` audit row each): `hideAccount`, `unhideAccount`, `dismissReports`,
   `actionReports`, `banAccount`, `unbanAccount`; read: `reviewQueue`, `accountReview`, `auditLog`. CLI:
   `src/moderation/cli.ts` (`scripts/moderate.ts`). Tests: `overrideAutoHideForTests`.
+### photocheck/ (profile photo checks, see docs/security.md §5; migration 106)
+- `checkPhoto(jpeg) → {phash, nsfw}` never throws (null parts = unchecked). `checkColumns(check)` → INSERT values.
+  `flagPhotoMatches(tx, {id, ownerId, phash})` → rows in `photo_flags` (duplicates on other accounts, blocklist).
+  `runPhotoChecks({batch?, ownerIds?})` background retry/backfill (jobs, every minute).
+- Rule: `explicitVerdict(labels)`; `visibleToOthers(photoRow)` is applied by `profileJson`. Select photos with
+  `photoColumns` (serialize.ts) so `PhotoRow.is_checked` is present.
+- Classifier: NudeNet 320n via onnxruntime-node, loaded lazily (`photoClassifier()` → null if off/missing).
+  Tests: `setPhotoClassifierForTests(fake|null)`, `setPhotoPolicyForTests({...})`, `setHashBlocklistForTests`.
+  Tests run with `PHOTO_CLASSIFIER=off`; `photo-checks.test.ts` also runs the real model if `models/` has it.
 
 ### media.ts
 - `sanitizeImage(bytes) → Buffer` (jpeg/png/webp/heif-if-supported → 400 `invalid_image` otherwise; 40 MP cap,

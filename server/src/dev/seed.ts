@@ -278,8 +278,10 @@ export async function seedDevData(opts: SeedOptions = {}): Promise<SeedResult> {
           await tx`INSERT INTO travel_locations (user_id, cell_lat, cell_lon) VALUES (${id}, ${p.traveling.latitude}, ${p.traveling.longitude})`;
         }
         for (const [pos, k] of keys.entries()) {
-          await tx`INSERT INTO photos (id, owner_id, storage_key, position, is_explicit)
-                   VALUES (${newId("photo")}, ${id}, ${k.key}, ${pos}, ${k.explicit})`;
+          // The "explicit" placeholder is labelled by hand (marked checked), so the classifier never relabels it.
+          await tx`INSERT INTO photos (id, owner_id, storage_key, position, is_explicit, nsfw_checked_at, nsfw_model)
+                   VALUES (${newId("photo")}, ${id}, ${k.key}, ${pos}, ${k.explicit},
+                           ${k.explicit ? new Date() : null}, ${k.explicit ? "manual" : null})`;
         }
         await tx`INSERT INTO dev_bots (user_id) VALUES (${id})`;
       });
