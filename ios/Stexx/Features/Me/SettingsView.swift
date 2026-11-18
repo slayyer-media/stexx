@@ -41,7 +41,11 @@ struct SettingsView: View {
                     BlockedProfilesView()
                 }
                 Link(destination: URL(string: "https://stexx.gay/safety")!) {
-                    Label("Safety tips", systemImage: "heart.text.square")
+                    Label {
+                        Text("Safety tips")
+                    } icon: {
+                        Image(systemName: "heart.text.square").foregroundStyle(Theme.violetBright)
+                    }
                 }
             } header: {
                 Text("Safety")
@@ -55,7 +59,12 @@ struct SettingsView: View {
                 PlusRow("Who viewed you", systemImage: "eyes") { isShowingViewers = true }
                 PlusRow("Boosts", systemImage: "bolt.fill") { Task { await boost() } }
             } header: {
-                Text(verbatim: "Stexx+")
+                HStack(spacing: Theme.Spacing.s) {
+                    Text(verbatim: "Stexx+")
+                    if appState.hasPlus {
+                        XXBadge("Active")
+                    }
+                }
             }
 
             Section("Account") {
@@ -69,7 +78,11 @@ struct SettingsView: View {
 
             Section {
                 Link(destination: URL(string: "https://github.com/stexxapp/stexx")!) {
-                    Label("Source code on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+                    Label {
+                        Text("Source code on GitHub")
+                    } icon: {
+                        Image(systemName: "chevron.left.forwardslash.chevron.right").foregroundStyle(Theme.violetBright)
+                    }
                 }
                 Link(destination: URL(string: "https://www.gnu.org/licenses/agpl-3.0.html")!) {
                     LabeledContent("License", value: "AGPL-3.0")
@@ -79,13 +92,16 @@ struct SettingsView: View {
                 Text("About")
             } footer: {
                 VStack(spacing: Theme.Spacing.s) {
-                    Wordmark(size: 22)
+                    StexxMark(size: 36)
+                    Wordmark(size: 26)
                     Text("No ads. Just stexx.")
+                        .font(.footnote.weight(.semibold))
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, Theme.Spacing.xl)
             }
         }
+        .headerProminence(.increased)
         .tint(Theme.violet)
         .stexxBackground(intensity: 0.5)
         .navigationTitle("Settings")
