@@ -1,0 +1,273 @@
+import Foundation
+
+/// In-memory backend used until the real server exists, and for previews and
+/// tests. Behaves like the API contract in `docs/api.md`, including small
+/// artificial latency so loading states are visible.
+actor MockAPIClient: APIClient {
+    static let shared = MockAPIClient()
+
+    private var me: Profile
+    private var profiles: [Profile.ID: Profile]
+    private var conversationStore: [Conversation.ID: Conversation]
+    private var messageStore: [Conversation.ID: [Message]]
+    private var blocked: Set<Profile.ID> = []
+    private var privacy = PrivacySettings()
+    private let latency: Duration
+    private var nextID = 1
+
+    init(latency: Duration = .milliseconds(250)) {
+        let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
+        var seededConversations: [Conversation.ID: Conversation] = [:]
+        var seededMessages: [Conversation.ID: [Message]] = [:]
+        let now = Date.now
+
+        for (participantID, thread) in MockData.seedThreads {
+            guard let participant = profilesByID[participantID] else { continue }
+            let conversationID = "c-\(participantID)"
+            let threadMessages = thread.enumerated().map { index, entry in
+                Message(
+                    id: "\(conversationID)-m\(index)",
+                    conversationID: conversationID,
+                    senderID: entry.0 ? MockData.myID : participantID,
+                    text: entry.1,
+                    attachment: nil,
+                    sentAt: now.addingTimeInterval(-entry.2 * 60),
+                    status: entry.0 ? .read : .delivered,
+                    expiresAt: nil,
+                    clientID: nil
+                )
+            }
+            // Messages they sent after my last reply count as unread.
+            let unread = thread.reversed().prefix { !$0.0 }.count
+            seededMessages[conversationID] = threadMessages
+            seededConversations[conversationID] = Conversation(
+                id: conversationID,
+                participant: participant,
+                lastMessage: threadMessages.last,
+                unreadCount: unread,
+                updatedAt: threadMessages.last?.sentAt ?? now
+            )
+        }
+
+        self.latency = latency
+        self.me = MockData.me
+        self.profiles = profilesByID
+        self.conversationStore = seededConversations
+        self.messageStore = seededMessages
+    }
+
+    // MARK: Auth & account
+
+    func register(_ request: RegistrationRequest) async throws -> Session {
+        try await pause()
+        me.displayName = request.displayName
+        return MockData.session
+    }
+
+    func deleteAccount() async throws {
+        try await pause()
+        me = MockData.me
+        conversationStore.removeAll()
+        messageStore.removeAll()
+        blocked.removeAll()
+    }
+
+    // MARK: Me
+
+    func fetchMe() async throws -> Profile {
+        try await pause()
+        return me
+    }
+
+    func updateMe(_ update: ProfileUpdate) async throws -> Profile {
+        try await pause()
+        me.displayName = update.displayName
+        me.age = update.age
+        me.pronouns = update.pronouns
+        me.headline = update.headline
+        me.about = update.about
+        me.heightCm = update.heightCm
+        me.position = update.position
+        me.lookingFor = update.lookingFor
+        me.tags = update.tags
+        return me
+    }
+
+    func uploadPhoto(jpegData: Data) async throws -> Photo {
+        try await pause()
+        // Keep the image on disk so AsyncImage can load it like a remote URL.
+        let id = makeID("photo")
+        let url = URL.temporaryDirectory.appending(path: "\(id).jpg")
+        try jpegData.write(to: url, options: .completeFileProtection)
+        let photo = Photo(id: id, url: url)
+        me.photos.append(photo)
+        return photo
+    }
+
+    func updatePrivacy(_ settings: PrivacySettings) async throws -> PrivacySettings {
+        try await pause()
+        privacy = settings
+        return privacy
+    }
+
+    func updateLocation(_ location: FuzzedLocation) async throws {
+        try await pause()
+    }
+
+    // MARK: Discovery
+
+    func nearby(_ query: NearbyQuery) async throws -> Page<Profile> {
+        try await pause()
+        var results = profiles.values
+            .filter { !blocked.contains($0.id) }
+            .sorted { ($0.distanceMeters ?? .infinity) < ($1.distanceMeters ?? .infinity) }
+
+        if query.onlineOnly { results = results.filter(\.isOnline) }
+        if query.favoritesOnly { results = results.filter(\.isFavorite) }
+        if !query.lookingFor.isEmpty {
+            results = results.filter { !query.lookingFor.isDisjoint(with: $0.lookingFor) }
+        }
+        if let minAge = query.minAge { results = results.filter { ($0.age ?? .max) >= minAge } }
+        if let maxAge = query.maxAge { results = results.filter { ($0.age ?? .min) <= maxAge } }
+        if let maxDistance = query.maxDistanceMeters {
+            results = results.filter { ($0.distanceMeters ?? .infinity) <= maxDistance }
+        }
+        if !query.positions.isEmpty {
+            results = results.filter { profile in profile.position.map { query.positions.contains($0) } ?? false }
+        }
+        if !query.tags.isEmpty {
+            let wanted = Set(query.tags.map { $0.lowercased() })
+            results = results.filter { !wanted.isDisjoint(with: $0.tags.map { $0.lowercased() }) }
+        }
+
+        let start = query.cursor.flatMap(Int.init) ?? 0
+        let end = min(results.count, start + query.limit)
+        let page = start < end ? Array(results[start..<end]) : []
+        return Page(items: page, nextCursor: end < results.count ? String(end) : nil)
+    }
+
+    func profile(id: Profile.ID) async throws -> Profile {
+        try await pause()
+        guard let profile = profiles[id], !blocked.contains(id) else { throw APIError.notFound }
+        return profile
+    }
+
+    func setFavorite(_ isFavorite: Bool, profileID: Profile.ID) async throws {
+        try await pause()
+        profiles[profileID]?.isFavorite = isFavorite
+    }
+
+    func sendTap(to profileID: Profile.ID) async throws {
+        try await pause()
+    }
+
+    func viewers() async throws -> [Profile] {
+        try await pause()
+        return Array(profiles.values.filter(\.isOnline).prefix(4))
+    }
+
+    // MARK: Chat
+
+    func conversations() async throws -> [Conversation] {
+        try await pause()
+        return conversationStore.values
+            .filter { !blocked.contains($0.participant.id) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func openConversation(with profileID: Profile.ID) async throws -> Conversation {
+        try await pause()
+        if let existing = conversationStore.values.first(where: { $0.participant.id == profileID }) {
+            return existing
+        }
+        guard let participant = profiles[profileID], !blocked.contains(profileID) else { throw APIError.notFound }
+        let conversation = Conversation(
+            id: "c-\(profileID)",
+            participant: participant,
+            lastMessage: nil,
+            unreadCount: 0,
+            updatedAt: .now
+        )
+        conversationStore[conversation.id] = conversation
+        messageStore[conversation.id] = []
+        return conversation
+    }
+
+    func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message> {
+        try await pause()
+        guard let all = messageStore[conversationID] else { throw APIError.notFound }
+        let upper = before.flatMap { id in all.firstIndex { $0.id == id } } ?? all.count
+        let lower = max(0, upper - 50)
+        return Page(items: Array(all[lower..<upper]), nextCursor: lower > 0 ? all[lower].id : nil)
+    }
+
+    func send(_ draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message {
+        try await pause()
+        guard var conversation = conversationStore[conversationID] else { throw APIError.notFound }
+        if blocked.contains(conversation.participant.id) { throw APIError.notFound }
+
+        // Idempotency: resending the same draft returns the original message.
+        if let existing = messageStore[conversationID]?.first(where: { $0.clientID == draft.clientID }) {
+            return existing
+        }
+        let message = Message(
+            id: makeID("m"),
+            conversationID: conversationID,
+            senderID: MockData.myID,
+            text: draft.text,
+            attachment: nil,
+            sentAt: .now,
+            status: .sent,
+            expiresAt: nil,
+            clientID: draft.clientID
+        )
+        messageStore[conversationID, default: []].append(message)
+        conversation.lastMessage = message
+        conversation.updatedAt = message.sentAt
+        conversationStore[conversationID] = conversation
+        return message
+    }
+
+    func markRead(conversationID: Conversation.ID) async throws {
+        conversationStore[conversationID]?.unreadCount = 0
+    }
+
+    func deleteConversation(_ conversationID: Conversation.ID) async throws {
+        try await pause()
+        conversationStore[conversationID] = nil
+        messageStore[conversationID] = nil
+    }
+
+    // MARK: Safety
+
+    func block(profileID: Profile.ID) async throws {
+        try await pause()
+        blocked.insert(profileID)
+    }
+
+    func unblock(profileID: Profile.ID) async throws {
+        try await pause()
+        blocked.remove(profileID)
+    }
+
+    func blockedProfiles() async throws -> [Profile] {
+        try await pause()
+        return blocked.compactMap { profiles[$0] }.sorted { $0.displayName < $1.displayName }
+    }
+
+    func report(_ report: ReportRequest) async throws {
+        try await pause()
+        if report.alsoBlock { blocked.insert(report.profileID) }
+    }
+
+    // MARK: Helpers
+
+    private func pause() async throws {
+        try await Task.sleep(for: latency)
+    }
+
+    private func makeID(_ prefix: String) -> String {
+        defer { nextID += 1 }
+        return "\(prefix)-\(nextID)-\(UUID().uuidString.prefix(8))"
+    }
+}
