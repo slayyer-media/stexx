@@ -19,6 +19,12 @@ struct FilterSheet: View {
                 Section {
                     Toggle("Age range", isOn: $limitsAge)
                     if limitsAge {
+                        Text(verbatim: "\(Int(ageRange.lowerBound))–\(Int(ageRange.upperBound))")
+                            .font(.stexxName)
+                            .tracking(Theme.Tracking.tight)
+                            .foregroundStyle(Theme.violetBright)
+                            .monospacedDigit()
+                            .accessibilityLabel(Text("Ages \(Int(ageRange.lowerBound)) to \(Int(ageRange.upperBound))"))
                         LabeledContent("From") {
                             Stepper("\(Int(ageRange.lowerBound))", value: lowerAge, in: 18...Double(Int(ageRange.upperBound)))
                         }
@@ -33,7 +39,10 @@ struct FilterSheet: View {
                     if limitsDistance {
                         VStack(alignment: .leading) {
                             Text(StexxFormat.distance(maxDistanceKm * 1000))
-                                .font(.headline)
+                                .font(.stexxName)
+                                .tracking(Theme.Tracking.tight)
+                                .foregroundStyle(Theme.violetBright)
+                                .monospacedDigit()
                             Slider(value: $maxDistanceKm, in: 1...100, step: 1)
                         }
                     }
@@ -87,6 +96,11 @@ struct FilterSheet: View {
                 }
             }
             .stexxBackground(intensity: 0.6)
+            .tint(Theme.violet)
+            .sensoryFeedback(.selection, trigger: draft.positions)
+            .sensoryFeedback(.selection, trigger: draft.lookingFor)
+            .sensoryFeedback(.selection, trigger: limitsAge)
+            .sensoryFeedback(.selection, trigger: limitsDistance)
             .navigationTitle("Filters")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
