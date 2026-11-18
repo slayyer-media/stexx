@@ -1,0 +1,39 @@
+[Unit]
+Description=Stexx encrypted database backup (pg_dump | age | rclone -> B2)
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=stexxbackup
+Group=stexxbackup
+ExecStart=/usr/local/sbin/stexx-backup
+SyslogIdentifier=stexx-backup
+TimeoutStartSec=30min
+StateDirectory=stexx-backup
+Environment=HOME=/var/lib/stexx-backup
+Environment=RCLONE_CONFIG=/etc/stexx/rclone.conf
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+UMask=0077
+# Needs /run/postgresql (unix socket, peer auth) and outbound HTTPS to B2.

@@ -1,0 +1,23 @@
+# Local development only. Production uses native Postgres 18 on the VPS (see deploy/).
+services:
+  postgres:
+    image: postgres:18
+    container_name: stexx_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: stexx
+      POSTGRES_PASSWORD: stexx
+      POSTGRES_DB: stexx
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - stexx_pgdata:/var/lib/postgresql
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stexx -d stexx"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  stexx_pgdata:

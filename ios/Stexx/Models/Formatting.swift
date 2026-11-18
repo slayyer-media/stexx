@@ -2,17 +2,25 @@ import Foundation
 
 enum StexxFormat {
     /// Coarse, locale-aware distance like "300 m", "1.2 km" or "0.7 mi".
-    /// Values are rounded to 100 m so the UI never implies more precision
-    /// than the server provides.
-    static func distance(_ meters: Double) -> String {
-        let rounded = max(100, (meters / 100).rounded() * 100)
-        return Measurement(value: rounded, unit: UnitLength.meters).formatted(
-            .measurement(
-                width: .abbreviated,
-                usage: .road,
-                numberFormatStyle: FloatingPointFormatStyle<Double>.number.precision(.fractionLength(0...1))
-            )
-        )
+    /// Never implies more precision than the server's buckets: metric rounds
+    /// to 100 m (then 0.1 km), imperial uses miles to one decimal. (Formatting
+    /// with `usage: .road` turned a 500 m bucket into "1,640.4 ft".)
+    static func distance(_ meters: Double, locale: Locale = .current) -> String {
+        let number = FloatingPointFormatStyle<Double>.number.locale(locale)
+        let style: (Int) -> Measurement<UnitLength>.FormatStyle = { digits in
+            .measurement(width: .abbreviated, usage: .asProvided, numberFormatStyle: number.precision(.fractionLength(0...digits)))
+                .locale(locale)
+        }
+        if locale.measurementSystem == .metric {
+            let rounded = max(100, (meters / 100).rounded() * 100)
+            if rounded < 1000 {
+                return Measurement(value: rounded, unit: UnitLength.meters).formatted(style(0))
+            }
+            return Measurement(value: rounded / 1000, unit: UnitLength.kilometers).formatted(style(1))
+        }
+        let exact = meters / 1609.344
+        let miles = exact < 10 ? max(0.1, (exact * 10).rounded() / 10) : exact.rounded()
+        return Measurement(value: miles, unit: UnitLength.miles).formatted(style(miles < 10 ? 1 : 0))
     }
 
     static func height(cm: Int) -> String {

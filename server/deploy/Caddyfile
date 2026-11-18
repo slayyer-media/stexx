@@ -1,0 +1,93 @@
+# Stexx: site blocks for api.stexx.gay and media.stexx.gay.
+#
+# Install as /etc/caddy/sites/stexx.caddy (deploy.sh --sync-config does this and validates before reload).
+# The global options (Cloudflare trusted proxies, log filtering) live in Caddyfile.main, which is the
+# whole /etc/caddy/Caddyfile on a dedicated box. On a box shared with another app, merge those global
+# options into the existing main Caddyfile instead (Caddy allows only one global options block).
+#
+# Both hostnames are proxied through Cloudflare (orange cloud) with SSL mode Full (strict).
+# Origin certificates: Caddy's automatic ACME works through the proxy (HTTP-01). If you prefer
+# Cloudflare Origin CA certificates, replace the automatic cert with:  tls /etc/caddy/certs/stexx.pem /etc/caddy/certs/stexx.key
+#
+# PRIVACY: no `log` directive appears in any site block, so Caddy writes NO access logs at all (no IPs,
+# no paths). Caddyfile.main additionally keeps request details out of Caddy's runtime error logs.
+
+(security_headers) {
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}
+
+# ---------------------------------------------------------------------------------------------
+# API: everything under /v1 plus /healthz, proxied to the Bun process on loopback.
+# ---------------------------------------------------------------------------------------------
+api.stexx.gay {
+	import security_headers
+
+	# Defense in depth: the dev media route and dev routes must never be reachable in production
+	# (the app does not mount them either).
+	@never path /media /media/* /v1/dev /v1/dev/*
+	respond @never 404
+
+	# Photos are capped at 10 MB by the app; leave a little headroom for multipart-free uploads.
+	request_body {
+		max_size 11MB
+	}
+
+	reverse_proxy 127.0.0.1:8787 {
+		# Caddy only believes CF-Connecting-IP when the peer is a Cloudflare address (see
+		# trusted_proxies in Caddyfile.main); otherwise {client_ip} is the raw peer. Either way a client
+		# cannot spoof the value the app uses (transiently, hashed) for rate limiting.
+		header_up CF-Connecting-IP {client_ip}
+		header_up -X-Real-IP
+		header_up -True-Client-IP
+
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 60s
+		}
+		# WebSocket (/v1/ws) upgrades pass through automatically. Cloudflare drops idle sockets after
+		# ~100 s, so clients should ping at least every 30 s.
+	}
+}
+
+# ---------------------------------------------------------------------------------------------
+# Media: static, read-only, unguessable names only (<32 hex>.jpg). No directory listing, no dotfiles,
+# no other extensions, GET/HEAD only.
+# ---------------------------------------------------------------------------------------------
+media.stexx.gay {
+	import security_headers
+
+	root * /srv/stexx/media
+
+	@jpg {
+		method GET HEAD
+		path_regexp ^/[0-9a-f]{32}\.jpg$
+	}
+
+	handle @jpg {
+		header {
+			Content-Type "image/jpeg"
+			# `private`: Cloudflare must NOT cache these. A shared cache would keep serving a photo
+			# after the app deleted it (expiring messages, view-once, account deletion). Devices may
+			# cache for a year because the name is a random 128-bit value that is never reused.
+			Cache-Control "private, max-age=31536000, immutable"
+			Content-Security-Policy "default-src 'none'; sandbox"
+			Cross-Origin-Resource-Policy "cross-origin"
+			# Do not leak upload times through validators.
+			-Last-Modified
+			-ETag
+		}
+		file_server {
+			hide .*
+		}
+	}
+
+	# Anything else (listing attempts, other extensions, other methods, traversal) is a flat 404.
+	handle {
+		respond 404
+	}
+}

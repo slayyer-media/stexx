@@ -48,6 +48,14 @@ Build settings in `project.yml` are exposed through `Info.plist`:
 | `STEXX_API_BASE_URL` | `https://api.stexx.gay` | Backend base URL (`/v1` is appended) |
 | `STEXX_USE_MOCK_API` | `YES` | `YES` uses `MockAPIClient`; `NO` uses `HTTPAPIClient` |
 
+Build configurations:
+
+| Configuration | Backend | Notes |
+| --- | --- | --- |
+| `Debug` (scheme **Stexx**) | Mock | No server needed |
+| `Local` (scheme **Stexx Local**) | `http://127.0.0.1:8787` | Run `../server` in dev mode. ATS allows plain HTTP to local hosts only in this configuration. Purchases use `StoreKit/Stexx.storekit`; see [`STOREKIT-LOCAL.md`](STOREKIT-LOCAL.md). |
+| `Release` | As configured | ATS is not relaxed |
+
 The API contract lives in [`../docs/api.md`](../docs/api.md).
 
 ## Layout
@@ -100,11 +108,10 @@ ios/
 
 ## Not done yet
 
-- Real passkey and email-link auth (`AuthenticationServices`, associated
-  domain `webcredentials:stexx.gay`)
-- Core Location wiring (the fuzzer and `PUT /me/location` are ready)
-- StoreKit 2 purchase for Stexx+ (product `gay.stexx.app.plus.monthly`)
-- Realtime chat over WebSocket, push notifications, photo messages
-- Token refresh and retry in `HTTPAPIClient`
+- Real passkey auth (`AuthenticationServices`, associated domain
+  `webcredentials:stexx.gay`); email links are handled in the API layer and
+  via `onOpenURL`, but there's no "sign in" screen yet
+- Travel mode UI (`APIClient.setTravelLocation` is ready)
+- Push notifications
 - Discreet alternate app icons, localization
 - Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)

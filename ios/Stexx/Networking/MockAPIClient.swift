@@ -7,6 +7,8 @@ actor MockAPIClient: APIClient {
     static let shared = MockAPIClient()
 
     private var me: Profile
+    /// Private chat uploads (`uploadAttachment`), consumed by `send`.
+    private var attachments: [Photo.ID: URL] = [:]
     private var profiles: [Profile.ID: Profile]
     private var conversationStore: [Conversation.ID: Conversation]
     private var messageStore: [Conversation.ID: [Message]]
@@ -14,8 +16,10 @@ actor MockAPIClient: APIClient {
     private var privacy = PrivacySettings()
     private let latency: Duration
     private var nextID = 1
+    private var plusExpiresAt: Date?
+    private var travelLocation: FuzzedLocation?
 
-    init(latency: Duration = .milliseconds(250)) {
+    init(latency: Duration = .milliseconds(250), plusActive: Bool = false) {
         let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
         var seededConversations: [Conversation.ID: Conversation] = [:]
         var seededMessages: [Conversation.ID: [Message]] = [:]
@@ -54,6 +58,7 @@ actor MockAPIClient: APIClient {
         self.profiles = profilesByID
         self.conversationStore = seededConversations
         self.messageStore = seededMessages
+        self.plusExpiresAt = plusActive ? now.addingTimeInterval(30 * 24 * 3600) : nil
     }
 
     // MARK: Auth & account
@@ -64,12 +69,32 @@ actor MockAPIClient: APIClient {
         return MockData.session
     }
 
+    func requestEmailLink(email: String) async throws {
+        try await pause()
+    }
+
+    func verifyEmailLink(token: String) async throws -> Session {
+        try await pause()
+        return MockData.session
+    }
+
+    func refreshSession(refreshToken: String) async throws -> Session {
+        try await pause()
+        return MockData.session
+    }
+
+    func logout(_ session: Session) async throws {
+        try await pause()
+    }
+
     func deleteAccount() async throws {
         try await pause()
         me = MockData.me
         conversationStore.removeAll()
         messageStore.removeAll()
         blocked.removeAll()
+        plusExpiresAt = nil
+        travelLocation = nil
     }
 
     // MARK: Me
@@ -104,6 +129,32 @@ actor MockAPIClient: APIClient {
         return photo
     }
 
+    func uploadAttachment(jpegData: Data) async throws -> Photo {
+        try await pause()
+        // Private: written to disk for display but never added to the profile.
+        let id = makeID("attachment")
+        let url = URL.temporaryDirectory.appending(path: "\(id).jpg")
+        try jpegData.write(to: url, options: .completeFileProtection)
+        attachments[id] = url
+        return Photo(id: id, url: url)
+    }
+
+    func deletePhoto(id: Photo.ID) async throws {
+        try await pause()
+        guard me.photos.contains(where: { $0.id == id }) else { throw APIError.notFound }
+        me.photos.removeAll { $0.id == id }
+    }
+
+    func reorderPhotos(_ photoIDs: [Photo.ID]) async throws -> [Photo] {
+        try await pause()
+        let byID = Dictionary(uniqueKeysWithValues: me.photos.map { ($0.id, $0) })
+        guard Set(photoIDs) == Set(byID.keys), photoIDs.count == byID.count else {
+            throw APIError.server(status: 400, message: "photoIDs must list every photo once.")
+        }
+        me.photos = photoIDs.compactMap { byID[$0] }
+        return me.photos
+    }
+
     func updatePrivacy(_ settings: PrivacySettings) async throws -> PrivacySettings {
         try await pause()
         privacy = settings
@@ -112,6 +163,17 @@ actor MockAPIClient: APIClient {
 
     func updateLocation(_ location: FuzzedLocation) async throws {
         try await pause()
+    }
+
+    func exportData() async throws -> Data {
+        try await pause()
+        struct Archive: Encodable {
+            let profile: Profile
+            let privacy: PrivacySettings
+            let messages: [Message]
+        }
+        let mine = messageStore.values.flatMap { $0 }.filter { $0.senderID == MockData.myID }
+        return try JSONEncoder.stexx().encode(Archive(profile: me, privacy: privacy, messages: mine))
     }
 
     // MARK: Discovery
@@ -210,12 +272,19 @@ actor MockAPIClient: APIClient {
         if let existing = messageStore[conversationID]?.first(where: { $0.clientID == draft.clientID }) {
             return existing
         }
+        // Like the server, an attachment is a copy of an uploaded photo.
+        let attachment = draft.attachmentPhotoID.map { photoID in
+            Message.Attachment(kind: .photo, url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url)
+        }
+        if draft.text == nil && attachment == nil {
+            throw APIError.server(status: 400, message: "A message needs text or a photo.")
+        }
         let message = Message(
             id: makeID("m"),
             conversationID: conversationID,
             senderID: MockData.myID,
             text: draft.text,
-            attachment: nil,
+            attachment: attachment,
             sentAt: .now,
             status: .sent,
             expiresAt: nil,
@@ -258,6 +327,44 @@ actor MockAPIClient: APIClient {
     func report(_ report: ReportRequest) async throws {
         try await pause()
         if report.alsoBlock { blocked.insert(report.profileID) }
+    }
+
+    // MARK: Stexx+
+
+    func subscriptionStatus() async throws -> SubscriptionStatus {
+        try await pause()
+        return currentPlusStatus
+    }
+
+    func submitAppleTransaction(signedTransaction: String) async throws -> SubscriptionStatus {
+        try await pause()
+        // The mock trusts any transaction; the real server verifies the JWS.
+        plusExpiresAt = Date.now.addingTimeInterval(30 * 24 * 3600)
+        return currentPlusStatus
+    }
+
+    func setTravelLocation(_ location: FuzzedLocation?) async throws {
+        try await pause()
+        guard currentPlusStatus.isActive else { throw APIError.requiresPlus }
+        travelLocation = location
+    }
+
+    func startBoost() async throws -> Boost {
+        try await pause()
+        guard currentPlusStatus.isActive else { throw APIError.requiresPlus }
+        return Boost(endsAt: Date.now.addingTimeInterval(3600))
+    }
+
+    #if DEBUG
+    func debugGrantPlus() async throws {
+        try await pause()
+        plusExpiresAt = Date.now.addingTimeInterval(30 * 24 * 3600)
+    }
+    #endif
+
+    private var currentPlusStatus: SubscriptionStatus {
+        guard let plusExpiresAt, plusExpiresAt > .now else { return .inactive }
+        return SubscriptionStatus(isActive: true, expiresAt: plusExpiresAt)
     }
 
     // MARK: Helpers

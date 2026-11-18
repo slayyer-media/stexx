@@ -50,6 +50,10 @@ struct MessageDraft: Codable, Hashable, Sendable {
     var attachmentPhotoID: Photo.ID?
     /// Seconds after reading until the message expires; `nil` keeps it.
     var expiresAfterSeconds: Int?
+    /// Photo messages only. `false` sends the photo as a normal, keepable
+    /// photo; `nil` (omitted on the wire) lets the server apply the sender's
+    /// "expiring photos by default" setting.
+    var isViewOnce: Bool? = nil
 }
 
 extension Message {

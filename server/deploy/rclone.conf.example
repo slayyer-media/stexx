@@ -1,0 +1,10 @@
+# /etc/stexx/rclone.conf  (root:stexxbackup 0640)
+# Backblaze B2 application key restricted to the backup bucket with capabilities:
+#   listBuckets, listFiles, writeFiles, deleteFiles       (NO readFiles: a stolen server key cannot download old backups)
+# Bucket: private, default encryption on, NO Object Lock, lifecycle rule:
+#   "Keep only the last version of the file" (daysFromHidingToDeleting = 1), as a backstop to the hard-deletes in backup.sh.
+[b2]
+type = b2
+account = <applicationKeyId>
+key = <applicationKey>
+hard_delete = true

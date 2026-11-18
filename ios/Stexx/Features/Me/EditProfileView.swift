@@ -17,9 +17,12 @@ struct EditProfileView: View {
 
     private let maxPhotos = 6
     private let maxTags = 10
+    /// What's actually on the server (uploads happen on pick).
+    @State private var photoSync: ProfilePhotoSync
 
     init(profile: Profile) {
         _draft = State(initialValue: profile)
+        _photoSync = State(initialValue: ProfilePhotoSync(photos: profile.photos))
     }
 
     private var isValid: Bool {
@@ -132,6 +135,11 @@ struct EditProfileView: View {
             guard !items.isEmpty else { return }
             Task { await upload(items) }
         }
+        .onDisappear {
+            // Left without saving: remove photos uploaded during this edit.
+            let photoSync = photoSync, api = api
+            Task { await photoSync.discardUnsavedUploads(using: api) }
+        }
     }
 
     // MARK: Photos
@@ -206,11 +214,19 @@ struct EditProfileView: View {
                       let jpeg = ImageSanitizer.strippedJPEG(from: data)
                 else { continue }
                 let photo = try await api.uploadPhoto(jpegData: jpeg)
+                photoSync.didUpload(photo)
                 draft.photos.append(photo)
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    /// Applies photo removals and reordering on the server (uploads already
+    /// happened when they were picked). Safe to retry. Returns the server's
+    /// photo order.
+    private func syncPhotos() async throws -> [Photo] {
+        try await photoSync.apply(draft.photos, using: api)
     }
 
     // MARK: Helpers
@@ -251,8 +267,7 @@ struct EditProfileView: View {
         draft.displayName = draft.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             var updated = try await api.updateMe(ProfileUpdate(draft))
-            // Photo order/removals are local-only in this mock-first version.
-            updated.photos = draft.photos
+            updated.photos = try await syncPhotos()
             appState.me = updated
             dismiss()
         } catch {

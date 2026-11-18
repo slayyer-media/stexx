@@ -157,6 +157,7 @@ Non-2xx responses carry:
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
+| POST | `/me/attachments` | `image/jpeg` body → `Photo` (201) | Private upload for a **chat** photo: sanitized like a profile photo but never on the profile, not counted in the 6 photos, no clean-up delete needed. Pass its `id` as `attachmentPhotoID` (consumed by the send). Unsent uploads are deleted after 1 h; at most 10 pending (409 `attachment_limit`); 30 attachments/h (429). |
 | PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito` (incognito → 402 without Stexx+) |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
@@ -179,13 +180,18 @@ Non-2xx responses carry:
 | GET | `/conversations` | → `[Conversation]` | Most recent first. |
 | POST | `/conversations` | `{ participantID }` → `Conversation` | Returns the existing conversation if there is one. |
 | GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100). Oldest-first within the page; `nextCursor` is the ID to pass as `before`. |
-| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, attachmentPhotoID?, expiresAfterSeconds? }` |
+| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
 | POST | `/conversations/{id}/read` | → 204 | Ignored for read receipts if the reader disabled them. |
 | DELETE | `/conversations/{id}` | → 204 | Deletes for the caller only. |
 
-Realtime (planned): `wss://api.stexx.gay/v1/ws` with the bearer token,
+Realtime: `wss://api.stexx.gay/v1/ws` with the bearer token (header, or a
+first frame `{ "type": "auth", "token": "…" }` within 5 s; never the query string),
 pushing `message.created`, `message.read`, `conversation.updated`, `tap.received`
-events using the same JSON models. APNs pushes carry no message content,
+events using the same JSON models. Each frame is `{ "type": "…", "data": … }`:
+`message.created` → `Message`, `conversation.updated` → `Conversation`,
+`message.read` → `{ conversationID, readerID, messageIDs, readAt }`,
+`tap.received` → `{ from: Profile, sentAt }`. Control frames (`ready`, `pong`,
+`error`) carry no `data`; clients ignore unknown types. APNs pushes carry no message content,
 only a conversation ID, and the app fetches the rest.
 
 ### Safety (always free)

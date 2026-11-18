@@ -8,6 +8,8 @@ struct SettingsView: View {
     @State private var isConfirmingDelete = false
     @State private var isDeleting = false
     @State private var errorMessage: String?
+    @State private var isShowingViewers = false
+    @State private var boostEndsAt: Date?
 
     private var version: String {
         let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
@@ -50,8 +52,8 @@ struct SettingsView: View {
             Section {
                 PlusToggle("Incognito", isOn: $bindable.privacy.incognito)
                 PlusRow("Travel mode", systemImage: "airplane")
-                PlusRow("Who viewed you", systemImage: "eyes")
-                PlusRow("Boosts", systemImage: "bolt.fill")
+                PlusRow("Who viewed you", systemImage: "eyes") { isShowingViewers = true }
+                PlusRow("Boosts", systemImage: "bolt.fill") { Task { await boost() } }
             } header: {
                 Text(verbatim: "Stexx+")
             }
@@ -89,6 +91,12 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .tabBar)
+        .navigationDestination(isPresented: $isShowingViewers) { ViewersView() }
+        .alert("Boosted", isPresented: Binding(get: { boostEndsAt != nil }, set: { if !$0 { boostEndsAt = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("You're shown first nearby until \((boostEndsAt ?? .now).formatted(date: .omitted, time: .shortened)).")
+        }
         .confirmationDialog("Sign out of Stexx?", isPresented: $isConfirmingSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { appState.signOut() }
         }
@@ -96,6 +104,16 @@ struct SettingsView: View {
             Button("Delete everything", role: .destructive) { Task { await deleteAccount() } }
         } message: {
             Text("Your profile, photos, messages and location history are permanently deleted from our servers. This can't be undone.")
+        }
+    }
+
+    private func boost() async {
+        do {
+            boostEndsAt = try await api.startBoost().endsAt
+        } catch APIError.requiresPlus {
+            appState.handleRequiresPlus()
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -115,17 +133,20 @@ struct SettingsView: View {
 private struct PlusRow: View {
     let title: LocalizedStringKey
     let systemImage: String
+    /// Runs when the user has Stexx+ (otherwise the paywall opens).
+    var action: (() -> Void)?
     @Environment(AppState.self) private var appState
 
-    init(_ title: LocalizedStringKey, systemImage: String) {
+    init(_ title: LocalizedStringKey, systemImage: String, action: (() -> Void)? = nil) {
         self.title = title
         self.systemImage = systemImage
+        self.action = action
     }
 
     var body: some View {
         Button {
-            appState.requirePlus()
-            // TODO: Navigate to the feature once implemented.
+            if appState.requirePlus() { action?() }
+            // TODO: Travel mode UI (API: `setTravelLocation`).
         } label: {
             HStack {
                 Label {

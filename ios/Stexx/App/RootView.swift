@@ -5,7 +5,9 @@ import SwiftUI
 struct RootView: View {
     @Environment(AppState.self) private var appState
     @Environment(ChatStore.self) private var chatStore
+    @Environment(AppServices.self) private var services
     @Environment(\.apiClient) private var api
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -20,11 +22,41 @@ struct RootView: View {
         .animation(.smooth(duration: 0.4), value: appState.isSignedIn)
         .onChange(of: appState.privacy) { _, newValue in
             appState.persistPrivacy()
+            guard appState.isSignedIn else { return }
             Task { _ = try? await api.updatePrivacy(newValue) }
         }
         .onChange(of: appState.isSignedIn) { _, isSignedIn in
             if !isSignedIn { chatStore.reset() }
         }
+        // Location and the realtime socket only run while signed in and in
+        // the foreground.
+        .onChange(of: SessionPhase(isSignedIn: appState.isSignedIn, isForeground: scenePhase == .active), initial: true) { old, new in
+            services.update(isSignedIn: new.isSignedIn, isForeground: new.isForeground)
+            if new.isForeground && !old.isForeground { services.didEnterForeground() }
+        }
+        .onOpenURL { url in
+            Task { await signIn(fromEmailLink: url) }
+        }
+    }
+
+    private struct SessionPhase: Equatable {
+        var isSignedIn: Bool
+        var isForeground: Bool
+    }
+
+    /// Email sign-in links (`…/auth/email?token=…`, a universal link once the
+    /// associated domain is set up) exchange their token for a session.
+    private func signIn(fromEmailLink url: URL) async {
+        guard !appState.isSignedIn,
+              url.path().contains("auth/email"),
+              let token = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                  .queryItems?.first(where: { $0.name == "token" })?.value,
+              !token.isEmpty
+        else { return }
+        guard let session = try? await api.verifyEmailLink(token: token) else { return }
+        // The link proves the email, not age: the 18+ gate still applies.
+        appState.signIn(session)
+        appState.me = try? await api.fetchMe()
     }
 }
 
