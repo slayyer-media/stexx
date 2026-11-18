@@ -88,10 +88,23 @@ enum APIError: LocalizedError, Equatable, Sendable {
         case .unauthorized: String(localized: "Your session expired. Please sign in again.")
         case .notFound: String(localized: "That profile or conversation no longer exists.")
         case .requiresPlus: String(localized: "This feature is part of Stexx+.")
-        case .rateLimited: String(localized: "Slow down a little and try again in a moment.")
+        case .rateLimited(let retryAfter): Self.rateLimitedMessage(retryAfter: retryAfter)
         case .server(_, let message): message ?? String(localized: "Something went wrong on our side.")
         case .invalidResponse: String(localized: "Unexpected response from the server.")
         }
+    }
+
+    /// A friendly 429 message that says roughly how long to wait.
+    static func rateLimitedMessage(retryAfter: TimeInterval?) -> String {
+        guard let retryAfter, retryAfter >= 60 else {
+            return String(localized: "Slow down a little and try again in a moment.")
+        }
+        if retryAfter < 3600 {
+            let minutes = Int((retryAfter / 60).rounded(.up))
+            return String(localized: "You're doing that a lot. Try again in about \(minutes) min.")
+        }
+        let hours = Int((retryAfter / 3600).rounded(.up))
+        return String(localized: "You've reached the limit for now. Try again in about \(hours) h.")
     }
 }
 
@@ -135,7 +148,8 @@ struct APIConfiguration: Sendable {
         return HTTPAPIClient(
             configuration: self,
             sessions: SessionCoordinator(store: sessionStore, hooks: hooks),
-            hooks: hooks
+            hooks: hooks,
+            attestation: AttestationService(mode: AttestationService.mode(), baseURL: baseURL, apiVersion: apiVersion)
         )
     }
 }

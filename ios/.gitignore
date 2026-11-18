@@ -10,3 +10,4 @@ xcuserdata/
 *.xcscmblueprint
 .swiftpm/
 .DS_Store
+Stexx/Stexx.entitlements

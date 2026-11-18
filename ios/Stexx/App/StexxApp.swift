@@ -28,7 +28,12 @@ struct StexxApp: App {
             sessions = nil
         } else {
             let coordinator = SessionCoordinator(store: sessionStore, hooks: hooks)
-            api = HTTPAPIClient(configuration: configuration, sessions: coordinator, hooks: hooks)
+            let attestation = AttestationService(
+                mode: AttestationService.mode(),
+                baseURL: configuration.baseURL,
+                apiVersion: configuration.apiVersion
+            )
+            api = HTTPAPIClient(configuration: configuration, sessions: coordinator, hooks: hooks, attestation: attestation)
             sessions = coordinator
         }
         appState.revokeSession = { session in

@@ -17,6 +17,8 @@ struct ChatThreadView: View {
     @State private var draft = ""
     @State private var isLoading = true
     @State private var errorMessage: String?
+    /// Why the last send was refused (rate limit or new-account limit), shown above the composer.
+    @State private var sendNotice: String?
     @State private var expiresPhotos = true
     @State private var isConfirmingBlock = false
     @State private var isReporting = false
@@ -158,17 +160,24 @@ struct ChatThreadView: View {
     // MARK: Composer
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: Theme.Spacing.s) {
-            attachmentMenu
-            messageField
-            if canSend {
-                sendButton
+        VStack(spacing: 0) {
+            if let sendNotice {
+                SendNoticeRow(text: sendNotice) { self.sendNotice = nil }
                     .transition(.opacity)
             }
+            HStack(alignment: .bottom, spacing: Theme.Spacing.s) {
+                attachmentMenu
+                messageField
+                if canSend {
+                    sendButton
+                        .transition(.opacity)
+                }
+            }
+            .padding(.horizontal, Theme.Spacing.m)
+            .padding(.vertical, Theme.Spacing.s)
         }
-        .padding(.horizontal, Theme.Spacing.m)
-        .padding(.vertical, Theme.Spacing.s)
         .background { composerBar }
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: sendNotice)
         .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: canSend)
         .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: isComposerFocused)
         .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: draft.isEmpty)
@@ -410,6 +419,7 @@ struct ChatThreadView: View {
                 if let index = messages.firstIndex(where: { $0.id == pendingID }) {
                     messages[index].status = .failed
                 }
+                sendNotice = Self.notice(for: error)
             }
         }
     }
@@ -428,11 +438,26 @@ struct ChatThreadView: View {
                     messages[index] = sent
                 }
                 chatStore.didSend(sent, in: conversation)
+                sendNotice = nil
             } catch {
                 if let index = messages.firstIndex(where: { $0.id == pendingID }) {
                     messages[index].status = .failed
                 }
+                sendNotice = Self.notice(for: error)
             }
+        }
+    }
+
+    /// The server's explanation for a refused send (429 or a 403 anti-spam
+    /// limit), or nil for plain failures, which the bubble already shows.
+    static func notice(for error: any Error) -> String? {
+        switch error as? APIError {
+        case .rateLimited?:
+            return error.localizedDescription
+        case .server(let status, let message?)? where status == 403 || status == 400:
+            return message
+        default:
+            return nil
         }
     }
 
@@ -629,4 +654,38 @@ fileprivate extension Message {
         ChatThreadView(route: ChatRoute(participant: MockData.profiles[0], conversationID: "c-p01"))
     }
     .previewEnvironment()
+}
+
+/// One quiet line above the composer explaining why a message wasn't sent
+/// (new-account and rate limits). Dismissible; cleared by the next send.
+private struct SendNoticeRow: View {
+    let text: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.s) {
+            Image(systemName: "hand.raised")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Theme.ice)
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.stexxSub)
+                .foregroundStyle(Theme.frost)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.steel)
+                    .frame(width: 28, height: 28)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(.leading, Theme.Spacing.l)
+        .padding(.trailing, Theme.Spacing.s)
+        .padding(.top, Theme.Spacing.s)
+        .accessibilityElement(children: .combine)
+    }
 }
