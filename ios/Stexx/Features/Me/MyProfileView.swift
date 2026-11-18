@@ -9,54 +9,59 @@ struct MyProfileView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
 
-    @State private var scroll = MeScrollTracker()
-
     var body: some View {
         @Bindable var bindable = appState
 
         NavigationStack {
             ScrollView {
-                VStack(spacing: Theme.Spacing.l) {
+                VStack(spacing: Theme.Spacing.xxl) {
                     header
-                    plusCard
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: Theme.Spacing.m) {
-                            MeCardTitle("Quick privacy", systemImage: "lock.shield.fill")
-                            Toggle("Hide my distance", isOn: $bindable.privacy.hideDistance)
-                            Toggle("Show when I'm online", isOn: $bindable.privacy.showOnlineStatus)
-                            PlusToggle("Incognito", isOn: $bindable.privacy.incognito)
-                        }
-                        .tint(Theme.violet)
+                    plusRow
+                    VStack(spacing: 0) {
+                        SectionLabel("Quick privacy")
+                            .padding(.bottom, Theme.Spacing.s)
+                        MeRow { Toggle("Hide my distance", isOn: $bindable.privacy.hideDistance) }
+                        HairlineDivider()
+                        MeRow { Toggle("Show when I'm online", isOn: $bindable.privacy.showOnlineStatus) }
+                        HairlineDivider()
+                        MeRow { PlusToggle("Incognito", isOn: $bindable.privacy.incognito) }
                     }
-                    GlassCard(padding: Theme.Spacing.s) {
-                        VStack(spacing: 0) {
-                            linkRow("Settings", systemImage: "gearshape", route: .settings)
-                            Divider().overlay(Theme.hairline)
-                            linkRow("Blocked", systemImage: "hand.raised", route: .blocked)
-                            Divider().overlay(Theme.hairline)
-                            Link(destination: URL(string: "https://github.com/stexxapp/stexx")!) {
-                                rowLabel("Source code", systemImage: "chevron.left.forwardslash.chevron.right", trailing: "arrow.up.right")
-                            }
+                    .font(.stexxBody)
+                    .foregroundStyle(Theme.frost)
+                    .tint(Theme.ice)
+                    VStack(spacing: 0) {
+                        SectionLabel("More")
+                            .padding(.bottom, Theme.Spacing.s)
+                        linkRow("Settings", systemImage: "gearshape", route: .settings)
+                        HairlineDivider(leadingInset: MeRowMetrics.iconInset)
+                        linkRow("Blocked", systemImage: "hand.raised", route: .blocked)
+                        HairlineDivider(leadingInset: MeRowMetrics.iconInset)
+                        Link(destination: URL(string: "https://github.com/stexxapp/stexx")!) {
+                            rowLabel("Source code", systemImage: "chevron.left.forwardslash.chevron.right", trailing: "arrow.up.right")
                         }
+                        .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, Theme.Spacing.l)
+                .padding(.horizontal, Theme.Spacing.screen)
                 .padding(.bottom, Theme.Spacing.xxl)
             }
-            .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                geometry.contentOffset.y + geometry.contentInsets.top
-            } action: { _, offset in
-                scroll.offset = offset
-            }
-            .scrollContentBackground(.hidden)
-            .background { MeGlow(scroll: scroll) }
+            .stexxBackground()
             .navigationTitle("You")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text(verbatim: "you")
+                        .font(.stexxHeadline.weight(.heavy))
+                        .tracking(Theme.Tracking.tight)
+                        .foregroundStyle(Theme.frost)
+                        .accessibilityAddTraits(.isHeader)
+                }
+                .sharedBackgroundVisibility(.hidden)
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink(value: Route.settings) {
                         Label("Settings", systemImage: "gearshape")
                     }
+                    .tint(Theme.steel)
                 }
             }
             .navigationDestination(for: Route.self) { route in
@@ -78,91 +83,82 @@ struct MyProfileView: View {
     @ViewBuilder
     private var header: some View {
         let me = appState.me ?? MockData.me
-        VStack(spacing: Theme.Spacing.m) {
+        let photoShape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        VStack(spacing: Theme.Spacing.l) {
             ProfilePhotoView(profile: me)
                 .frame(width: 136, height: 136)
-                .glowFrame(cornerRadius: 68, glow: 1.6)
+                .clipShape(photoShape)
+                .hairlineBorder(photoShape)
+                .rimLight(photoShape)
                 .overlay(alignment: .bottomTrailing) {
                     if appState.privacy.showOnlineStatus {
-                        OnlineGlow(size: 16)
-                            .padding(3)
-                            .background(Theme.background, in: .circle)
-                            .offset(x: -6, y: -6)
+                        OnlineDot()
+                            .padding(Theme.Spacing.s)
                     }
                 }
+                .cellCorners(outset: 6)
+                .padding(.top, Theme.Spacing.xl)
                 .padding(.bottom, Theme.Spacing.xs)
-            VStack(spacing: 6) {
+            VStack(spacing: Theme.Spacing.s) {
                 Text(me.nameAndAge)
-                    .font(.stexxHero)
-                    .tracking(Theme.Tracking.display)
-                    .foregroundStyle(Theme.textPrimary)
+                    .stexxTitleStyle(.display)
                     .multilineTextAlignment(.center)
                     .accessibilityAddTraits(.isHeader)
                 if appState.hasPlus {
-                    XXBadge(verbatim: "STEXX+")
+                    PlusBadge()
                 }
                 if let headline = me.headline {
                     Text(headline)
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.textSecondary)
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.steel)
                         .multilineTextAlignment(.center)
                 }
             }
             NavigationLink(value: Route.edit) {
                 Label("Edit profile", systemImage: "pencil")
-                    .font(.subheadline.weight(.bold))
-                    .padding(.horizontal, 6)
             }
-            .buttonStyle(.glassProminent)
-            .tint(Theme.violet)
+            .buttonStyle(.stexxSecondary)
+            .fixedSize()
         }
-        .padding(.top, Theme.Spacing.l)
+        .frame(maxWidth: .infinity)
     }
 
-    private var plusCard: some View {
+    private var plusRow: some View {
         Button {
             appState.isPaywallPresented = true
         } label: {
-            GlassCard(tint: Theme.violet.opacity(0.26)) {
+            VStack(spacing: 0) {
+                HairlineDivider()
                 HStack(spacing: Theme.Spacing.m) {
-                    StexxMark(size: 42)
+                    StexxMark(size: 28, glows: false)
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: Theme.Spacing.s) {
                             Text(appState.hasPlus ? "You have Stexx+" : "Get Stexx+")
-                                .font(.title3.weight(.heavy))
-                                .tracking(Theme.Tracking.tight)
-                                .foregroundStyle(Theme.textPrimary)
+                                .font(.stexxHeadline)
+                                .foregroundStyle(Theme.frost)
                             if appState.hasPlus {
-                                XXBadge("Active")
+                                Text("Active")
+                                    .stexxLabelStyle(.micro, color: Theme.ice)
                             }
                         }
                         Text(appState.hasPlus
                              ? "Thanks for keeping Stexx ad-free."
                              : "Incognito, travel mode, who viewed you & more. $10/mo.")
-                            .font(.footnote)
-                            .foregroundStyle(Theme.textSecondary)
+                            .font(.stexxSub)
+                            .foregroundStyle(Theme.steel)
                             .multilineTextAlignment(.leading)
                     }
                     Spacer(minLength: 0)
                     Image(systemName: "chevron.right")
-                        .font(.footnote.weight(.bold))
-                        .foregroundStyle(Theme.violetBright)
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Theme.slate)
                 }
+                .padding(.vertical, Theme.Spacing.l)
+                HairlineDivider()
             }
-            .overlay {
-                RoundedRectangle(cornerRadius: Theme.Radius.card)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [Theme.violetBright.opacity(0.7), Theme.edgeGlow.opacity(0.15), Theme.violet.opacity(0.5)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
-                    )
-            }
-            .shadow(color: Theme.edgeGlow.opacity(0.3), radius: 18, y: 6)
+            .contentShape(.rect)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.pressable)
         .accessibilityHint("Opens Stexx+")
     }
 
@@ -174,63 +170,38 @@ struct MyProfileView: View {
     }
 
     private func rowLabel(_ title: LocalizedStringKey, systemImage: String, trailing: String) -> some View {
-        HStack(spacing: Theme.Spacing.m) {
-            Image(systemName: systemImage)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.violetBright)
-                .frame(width: 32, height: 32)
-                .background(Theme.violet.opacity(0.18), in: .circle)
-            Text(title)
-                .font(.body.weight(.semibold))
-                .foregroundStyle(Theme.textPrimary)
-            Spacer()
-            Image(systemName: trailing)
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(Theme.textTertiary)
+        MeRow {
+            HStack(spacing: Theme.Spacing.m) {
+                Image(systemName: systemImage)
+                    .font(.body)
+                    .foregroundStyle(Theme.steel)
+                    .frame(width: MeRowMetrics.iconWidth)
+                Text(title)
+                    .font(.stexxBody)
+                    .foregroundStyle(Theme.frost)
+                Spacer()
+                Image(systemName: trailing)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Theme.slate)
+            }
         }
-        .padding(.horizontal, Theme.Spacing.m)
-        .padding(.vertical, 10)
         .contentShape(.rect)
     }
 }
 
-/// Heavy card title with a violet glyph.
-private struct MeCardTitle: View {
-    let title: LocalizedStringKey
-    let systemImage: String
-
-    init(_ title: LocalizedStringKey, systemImage: String) {
-        self.title = title
-        self.systemImage = systemImage
-    }
-
-    var body: some View {
-        Label {
-            Text(title)
-                .font(.headline.weight(.heavy))
-                .tracking(Theme.Tracking.tight)
-                .foregroundStyle(Theme.textPrimary)
-        } icon: {
-            Image(systemName: systemImage)
-                .foregroundStyle(Theme.violetBright)
-        }
-        .accessibilityAddTraits(.isHeader)
-    }
+private enum MeRowMetrics {
+    static let iconWidth: CGFloat = 24
+    static let iconInset: CGFloat = iconWidth + Theme.Spacing.m
 }
 
-/// The glow behind the tab, nudged by scrolling. Reads the offset itself so
-/// scrolling doesn't re-render the whole screen.
-private struct MeGlow: View {
-    let scroll: MeScrollTracker
+/// One row of a hairline-divided list on the plain background.
+private struct MeRow<Content: View>: View {
+    @ViewBuilder var content: Content
 
     var body: some View {
-        GlowBackground(intensity: 1, scrollOffset: scroll.offset)
+        content
+            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
     }
-}
-
-@MainActor @Observable
-private final class MeScrollTracker {
-    var offset: CGFloat = 0
 }
 
 /// A toggle for a Stexx+ feature: works normally with Stexx+, otherwise

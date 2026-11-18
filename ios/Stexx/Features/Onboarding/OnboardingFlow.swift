@@ -36,38 +36,38 @@ struct WelcomeView: View {
         VStack(spacing: 0) {
             Spacer(minLength: Theme.Spacing.xl)
 
-            VStack(spacing: Theme.Spacing.l) {
-                StexxLogoTile(size: 128)
-                    .scaleEffect(hasAppeared ? 1 : 0.85)
-                Wordmark(size: 56)
-                Text("No ads. Just stexx.")
-                    .font(.title3.weight(.medium))
-                    .foregroundStyle(Theme.textSecondary)
+            VStack(spacing: Theme.Spacing.xl) {
+                StexxLogoTile(size: 112)
+                    .scaleEffect(hasAppeared || reduceMotion ? 1 : 0.96)
+                VStack(spacing: Theme.Spacing.m) {
+                    Wordmark(size: 56)
+                    Tagline()
+                }
             }
             .opacity(hasAppeared ? 1 : 0)
 
             Spacer(minLength: Theme.Spacing.xl)
 
-            GlassCard {
-                VStack(alignment: .leading, spacing: Theme.Spacing.l) {
-                    PromiseRow(
-                        systemImage: "theatermasks",
-                        title: "Anonymous by default",
-                        detail: "No real name, no phone number, no contacts upload."
-                    )
-                    PromiseRow(
-                        systemImage: "location.slash",
-                        title: "Approximate distance only",
-                        detail: "Your location is rounded on your phone before it's sent."
-                    )
-                    PromiseRow(
-                        systemImage: "chevron.left.forwardslash.chevron.right",
-                        title: "Open source, AGPL-3.0",
-                        detail: "No ads, no trackers, no data sales. Read the code."
-                    )
-                }
+            VStack(alignment: .leading, spacing: 0) {
+                PromiseRow(
+                    systemImage: "theatermasks",
+                    title: "Anonymous by default",
+                    detail: "No real name, no phone number, no contacts upload."
+                )
+                HairlineDivider(leadingInset: PromiseRow.textInset)
+                PromiseRow(
+                    systemImage: "location.slash",
+                    title: "Approximate distance only",
+                    detail: "Your location is rounded on your phone before it's sent."
+                )
+                HairlineDivider(leadingInset: PromiseRow.textInset)
+                PromiseRow(
+                    systemImage: "chevron.left.forwardslash.chevron.right",
+                    title: "Open source, AGPL-3.0",
+                    detail: "No ads, no trackers, no data sales. Read the code."
+                )
             }
-            .offset(y: hasAppeared ? 0 : 24)
+            .offset(y: hasAppeared || reduceMotion ? 0 : 8)
             .opacity(hasAppeared ? 1 : 0)
 
             VStack(spacing: Theme.Spacing.m) {
@@ -77,18 +77,18 @@ struct WelcomeView: View {
                 .stexxPrimaryButton()
 
                 Text("Stexx is for adults 18+ only.")
-                    .font(.footnote)
-                    .foregroundStyle(Theme.textTertiary)
+                    .stexxLabelStyle(.micro, color: Theme.slate)
+                    .multilineTextAlignment(.center)
             }
             .padding(.top, Theme.Spacing.xl)
         }
         .padding(.horizontal, Theme.Spacing.xl)
         .padding(.bottom, Theme.Spacing.l)
-        .background { GlowBackground(intensity: 1.25) }
+        .background { GlowBackground() }
         .toolbarVisibility(.hidden, for: .navigationBar)
         .onAppear {
             guard !hasAppeared else { return }
-            withAnimation(reduceMotion ? nil : .spring(duration: 0.9, bounce: 0.25)) {
+            withAnimation(reduceMotion ? Motion.fade : .easeOut(duration: 0.28)) {
                 hasAppeared = true
             }
         }
@@ -96,26 +96,31 @@ struct WelcomeView: View {
 }
 
 private struct PromiseRow: View {
+    static let iconWidth: CGFloat = 24
+    static let textInset: CGFloat = iconWidth + Theme.Spacing.m
+
     let systemImage: String
     let title: LocalizedStringKey
     let detail: LocalizedStringKey
 
     var body: some View {
-        HStack(alignment: .top, spacing: Theme.Spacing.m) {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.m) {
             Image(systemName: systemImage)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(Theme.violetBright)
-                .frame(width: 28)
+                .font(.body)
+                .foregroundStyle(Theme.steel)
+                .frame(width: Self.iconWidth)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.stexxHeadline)
-                    .foregroundStyle(Theme.textPrimary)
+                    .foregroundStyle(Theme.frost)
                 Text(detail)
-                    .font(.subheadline)
-                    .foregroundStyle(Theme.textSecondary)
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            Spacer(minLength: 0)
         }
+        .padding(.vertical, Theme.Spacing.m)
         .accessibilityElement(children: .combine)
     }
 }

@@ -33,7 +33,7 @@ struct EditProfileView: View {
         Form {
             photosSection
 
-            Section("Basics") {
+            Section {
                 TextField("Nickname", text: $draft.displayName)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -45,19 +45,23 @@ struct EditProfileView: View {
                 }
                 TextField("Pronouns", text: optionalText(\.pronouns))
                     .textInputAutocapitalization(.never)
+            } header: {
+                SectionLabel("Basics")
             }
+            .editRows()
 
             Section {
                 TextField("Headline", text: optionalText(\.headline))
                 TextField("About you", text: optionalText(\.about), axis: .vertical)
                     .lineLimit(4...10)
             } header: {
-                Text("About")
+                SectionLabel("About")
             } footer: {
-                Text("Don't include your full name, workplace, or anything that could identify you if you don't want to.")
+                EditFooter("Don't include your full name, workplace, or anything that could identify you if you don't want to.")
             }
+            .editRows()
 
-            Section("Stats") {
+            Section {
                 Picker("Height", selection: $draft.heightCm) {
                     Text("Not shown").tag(Int?.none)
                     ForEach(140...220, id: \.self) { cm in
@@ -70,20 +74,25 @@ struct EditProfileView: View {
                         Text(position.title).tag(Position?.some(position))
                     }
                 }
+            } header: {
+                SectionLabel("Stats")
             }
+            .editRows()
 
-            Section("Looking for") {
+            Section {
                 ForEach(LookingFor.allCases) { item in
                     Toggle(isOn: lookingForBinding(item)) {
                         Label {
                             Text(item.title)
                         } icon: {
-                            Image(systemName: item.systemImage).foregroundStyle(Theme.violetBright)
+                            Image(systemName: item.systemImage).foregroundStyle(Theme.steel)
                         }
                     }
                 }
+            } header: {
+                SectionLabel("Looking for")
             }
-            .tint(Theme.violet)
+            .editRows()
 
             Section {
                 if !draft.tags.isEmpty {
@@ -106,24 +115,37 @@ struct EditProfileView: View {
                         .submitLabel(.done)
                 }
             } header: {
-                Text("Tags")
+                SectionLabel("Tags")
             } footer: {
-                Text("Up to \(maxTags). Nerd out.")
+                EditFooter("Up to \(maxTags). Nerd out.")
             }
+            .editRows()
 
             if let errorMessage {
                 Section {
-                    Text(errorMessage).foregroundStyle(Theme.danger)
+                    Text(errorMessage)
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.danger)
                 }
+                .editRows()
             }
         }
-        .headerProminence(.increased)
-        .tint(Theme.violet)
+        .listSectionSpacing(Theme.Spacing.xl)
+        .foregroundStyle(Theme.frost)
+        .tint(Theme.ice)
         .stexxBackground(intensity: 0.5)
         .navigationTitle("Edit profile")
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .tabBar)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(verbatim: "edit profile")
+                    .font(.stexxHeadline.weight(.heavy))
+                    .tracking(Theme.Tracking.tight)
+                    .foregroundStyle(Theme.frost)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            .sharedBackgroundVisibility(.hidden)
             ToolbarItem(placement: .confirmationAction) {
                 if isSaving {
                     ProgressView()
@@ -153,10 +175,21 @@ struct EditProfileView: View {
                     ForEach(Array(draft.photos.enumerated()), id: \.element.id) { index, photo in
                         ProfilePhotoView(profile: draft, photoIndex: index)
                             .frame(width: 96, height: 124)
-                            .glowFrame(cornerRadius: 14, glow: index == 0 ? 0.6 : 0.25)
+                            .clipShape(photoTileShape)
+                            .hairlineBorder(photoTileShape)
+                            .overlay {
+                                if index == 0 {
+                                    // The main photo is the screen's one rim-lit surface.
+                                    Color.clear.rimLight(photoTileShape)
+                                }
+                            }
                             .overlay(alignment: .bottomLeading) {
                                 if index == 0 {
-                                    XXBadge("Main")
+                                    Text("Main")
+                                        .stexxLabelStyle(.micro, color: Theme.frost)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 3)
+                                        .blackGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous))
                                         .padding(6)
                                 }
                             }
@@ -166,10 +199,12 @@ struct EditProfileView: View {
                                 } label: {
                                     Image(systemName: "xmark")
                                         .font(.caption2.weight(.bold))
+                                        .foregroundStyle(Theme.frost)
                                         .frame(width: 22, height: 22)
+                                        .blackGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous))
+                                        .contentShape(.rect)
                                 }
-                                .buttonStyle(.glass)
-                                .buttonBorderShape(.circle)
+                                .buttonStyle(.pressable)
                                 .padding(4)
                                 .accessibilityLabel("Remove photo")
                             }
@@ -185,16 +220,21 @@ struct EditProfileView: View {
                                     ProgressView()
                                 } else {
                                     Image(systemName: "plus")
-                                        .font(.title2.weight(.semibold))
-                                    Text("Add").font(.caption.weight(.semibold))
+                                        .font(.title3.weight(.regular))
+                                        .foregroundStyle(Theme.steel)
+                                    Text("Add")
+                                        .font(.stexxMicro)
+                                        .textCase(.uppercase)
+                                        .tracking(Theme.Tracking.micro)
+                                        .foregroundStyle(Theme.steel)
                                 }
                             }
-                            .foregroundStyle(Theme.violetBright)
+                            .tint(Theme.steel)
                             .frame(width: 96, height: 124)
-                            .background(Theme.surface, in: .rect(cornerRadius: 14))
+                            .background(Theme.ink1, in: RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 14)
-                                    .strokeBorder(Theme.violet.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
+                                RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous)
+                                    .strokeBorder(Theme.lineStrong, style: StrokeStyle(lineWidth: 0.5, dash: [4, 4]))
                             )
                         }
                         .disabled(isUploading)
@@ -205,10 +245,15 @@ struct EditProfileView: View {
             }
             .scrollIndicators(.hidden)
         } header: {
-            Text("Photos")
+            SectionLabel("Photos")
         } footer: {
-            Text("Location and camera data are stripped from photos on your phone before upload. Explicit photos belong in chat, not on your profile.")
+            EditFooter("Location and camera data are stripped from photos on your phone before upload. Explicit photos belong in chat, not on your profile.")
         }
+        .editRows()
+    }
+
+    private var photoTileShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: Theme.Radius.sm, style: .continuous)
     }
 
     private func upload(_ items: [PhotosPickerItem]) async {
@@ -282,6 +327,30 @@ struct EditProfileView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+}
+
+/// Rows sit on the plain background, divided by 0.5pt hairlines (no cards).
+private extension View {
+    func editRows() -> some View {
+        self
+            .listRowBackground(Color.clear)
+            .listRowSeparatorTint(Theme.line)
+    }
+}
+
+/// Section footer copy in slate.
+private struct EditFooter: View {
+    let text: LocalizedStringKey
+
+    init(_ text: LocalizedStringKey) {
+        self.text = text
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.footnote)
+            .foregroundStyle(Theme.slate)
     }
 }
 

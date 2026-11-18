@@ -59,31 +59,19 @@ struct PaywallView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: Theme.Spacing.xl) {
+            VStack(spacing: Theme.Spacing.xxl) {
                 hero
-                    .padding(.top, Theme.Spacing.xxl)
+                    .padding(.top, Theme.Spacing.xxxl)
                 features
-                GlassCard(tint: Theme.online.opacity(0.08)) {
-                    HStack(alignment: .top, spacing: Theme.Spacing.m) {
-                        Image(systemName: "checkmark.shield.fill")
-                            .font(.title3)
-                            .foregroundStyle(Theme.online)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Safety is always free")
-                                .font(.headline.weight(.heavy))
-                                .tracking(Theme.Tracking.tight)
-                            Text("Blocking, reporting, hiding your distance and expiring photos never cost a thing.")
-                                .font(.footnote)
-                                .foregroundStyle(Theme.textSecondary)
-                        }
-                    }
+                if !appState.hasPlus {
+                    plan
                 }
-                .accessibilityElement(children: .combine)
+                safetyNote
             }
-            .padding(.horizontal, Theme.Spacing.l)
-            .padding(.bottom, Theme.Spacing.l)
+            .padding(.horizontal, Theme.Spacing.screen)
+            .padding(.bottom, Theme.Spacing.xl)
         }
-        .stexxBackground(intensity: 1.2)
+        .stexxBackground()
         .safeAreaInset(edge: .bottom) { purchaseBar }
         .overlay(alignment: .topTrailing) {
             GlassIconButton("Close", systemImage: "xmark") { dismiss() }
@@ -106,31 +94,27 @@ struct PaywallView: View {
     // MARK: Hero
 
     private var hero: some View {
-        VStack(spacing: Theme.Spacing.m) {
-            PaywallLogo()
-                .padding(.bottom, Theme.Spacing.s)
+        VStack(spacing: Theme.Spacing.l) {
+            StexxLogoTile(size: 96)
+                .accessibilityHidden(true)
+                .padding(.bottom, Theme.Spacing.m)
 
             HStack(alignment: .firstTextBaseline, spacing: 0) {
                 Wordmark(size: 52)
                 Text(verbatim: "+")
                     .font(.stexxDisplay(52))
-                    .foregroundStyle(Theme.violetBright)
-                    .shadow(color: Theme.edgeGlow.opacity(0.7), radius: 10)
+                    .foregroundStyle(Theme.frost)
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(Text(verbatim: "Stexx+"))
             .accessibilityAddTraits(.isHeader)
 
-            Text("Extras for you.\nServers for everyone.")
-                .font(.system(.title, weight: .black))
-                .tracking(Theme.Tracking.tight)
-                .foregroundStyle(Theme.textPrimary)
-                .multilineTextAlignment(.center)
+            Tagline()
 
-            HStack(spacing: Theme.Spacing.s) {
-                XXBadge("No ads, ever")
-                XXBadge("Cancel anytime")
-            }
+            Text("Extras for you.\nServers for everyone.")
+                .font(.stexxSub)
+                .foregroundStyle(Theme.steel)
+                .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
     }
@@ -138,48 +122,93 @@ struct PaywallView: View {
     // MARK: Features
 
     private var features: some View {
-        GlassCard(tint: Theme.violet.opacity(0.10), padding: Theme.Spacing.l) {
-            VStack(alignment: .leading, spacing: Theme.Spacing.m) {
-                Text("What you get")
-                    .font(.headline.weight(.heavy))
-                    .tracking(Theme.Tracking.tight)
-                    .foregroundStyle(Theme.textPrimary)
-                    .accessibilityAddTraits(.isHeader)
+        GlassCard(padding: 0, rimLit: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                SectionLabel("What you get")
+                    .padding(.horizontal, Theme.Spacing.l)
+                    .padding(.top, Theme.Spacing.l)
+                    .padding(.bottom, Theme.Spacing.s)
                 ForEach(Array(PlusFeature.allCases.enumerated()), id: \.element) { index, feature in
+                    if index > 0 {
+                        HairlineDivider(leadingInset: Theme.Spacing.l + FeatureRow.iconWidth + Theme.Spacing.m)
+                    }
                     FeatureRow(feature: feature)
+                        .padding(.horizontal, Theme.Spacing.l)
                         .opacity(hasAppeared ? 1 : 0)
-                        .offset(x: hasAppeared || reduceMotion ? 0 : 18)
+                        .offset(y: hasAppeared || reduceMotion ? 0 : 6)
                         .animation(
                             reduceMotion
-                                ? .easeOut(duration: 0.2)
-                                : Motion.cardSpring.delay(0.12 + Double(index) * 0.05),
+                                ? Motion.fade
+                                : Motion.standard.delay(0.08 + Double(index) * 0.04),
                             value: hasAppeared
                         )
                 }
             }
+            .padding(.bottom, Theme.Spacing.s)
         }
-        .overlay {
-            RoundedRectangle(cornerRadius: Theme.Radius.card)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [Theme.violetBright.opacity(0.55), Theme.edgeGlow.opacity(0.08), Theme.violet.opacity(0.35)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
-                .allowsHitTesting(false)
+    }
+
+    // MARK: Plan
+
+    /// The single monthly plan, shown as a flat, selected row.
+    private var plan: some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+            SectionLabel("Plan")
+            HStack(spacing: Theme.Spacing.m) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.body)
+                    .foregroundStyle(Theme.ice)
+                Text("Monthly")
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
+                Spacer(minLength: Theme.Spacing.s)
+                Text(verbatim: purchases.displayPrice)
+                    .stexxLabelStyle(color: Theme.frost)
+            }
+            .padding(.horizontal, Theme.Spacing.l)
+            .frame(minHeight: 52)
+            .background(shape.fill(Theme.ink2))
+            .overlay(shape.strokeBorder(Theme.frost.opacity(0.6), lineWidth: 0.5))
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isSelected)
         }
+    }
+
+    // MARK: Safety
+
+    private var safetyNote: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HairlineDivider()
+            HStack(alignment: .top, spacing: Theme.Spacing.m) {
+                Image(systemName: "checkmark.shield")
+                    .font(.body)
+                    .foregroundStyle(Theme.steel)
+                    .frame(width: FeatureRow.iconWidth)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Safety is always free")
+                        .font(.stexxHeadline)
+                        .foregroundStyle(Theme.frost)
+                    Text("Blocking, reporting, hiding your distance and expiring photos never cost a thing.")
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.steel)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.vertical, Theme.Spacing.l)
+            HairlineDivider()
+        }
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: Purchase
 
     private var purchaseBar: some View {
-        VStack(spacing: Theme.Spacing.s) {
+        VStack(spacing: Theme.Spacing.m) {
             if appState.hasPlus {
                 Label("You have Stexx+. Thank you!", systemImage: "heart.fill")
-                    .font(.headline.weight(.heavy))
-                    .foregroundStyle(Theme.violetBright)
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
                     .padding(.vertical, Theme.Spacing.m)
             } else {
                 Button {
@@ -189,33 +218,20 @@ struct PaywallView: View {
                     HStack(spacing: Theme.Spacing.s) {
                         if purchases.isPurchasing {
                             ProgressView()
-                                .tint(.white)
+                                .tint(Theme.ink)
                         }
                         Text("Get Stexx+ for \(purchases.displayPrice)/month")
                     }
-                    .font(.headline.weight(.heavy))
                     .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.glassProminent)
-                .tint(Theme.violet)
-                .controlSize(.extraLarge)
-                .background {
-                    // Soft violet light pooling under the button.
-                    Capsule()
-                        .fill(Theme.edgeGlow)
-                        .blur(radius: 18)
-                        .opacity(0.45)
-                        .padding(.horizontal, Theme.Spacing.xl)
-                        .offset(y: 8)
-                        .allowsHitTesting(false)
-                }
+                .stexxPrimaryButton()
                 .disabled(purchases.isPurchasing || purchases.isRestoring)
 
                 Button("Restore purchases") {
                     Task { await purchases.restore() }
                 }
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(Theme.textSecondary)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(Theme.steel)
                 .disabled(purchases.isPurchasing || purchases.isRestoring)
 
                 #if DEBUG
@@ -223,96 +239,51 @@ struct PaywallView: View {
                     Task { await purchases.debugGrantPlus() }
                 }
                 .font(.footnote)
-                .foregroundStyle(Theme.textTertiary)
+                .foregroundStyle(Theme.slate)
                 #endif
 
                 Text("Cancel anytime in Settings. Billed monthly through the App Store.")
                     .font(.caption)
-                    .foregroundStyle(Theme.textTertiary)
+                    .foregroundStyle(Theme.slate)
                     .multilineTextAlignment(.center)
             }
         }
-        .padding(.horizontal, Theme.Spacing.xl)
+        .padding(.horizontal, Theme.Spacing.screen)
         .padding(.top, Theme.Spacing.l)
         .padding(.bottom, Theme.Spacing.s)
-        // The bar sits in a safe-area inset over the scroll view; without a
-        // backdrop, scrolled cards showed through behind the buttons.
+        // The bar sits in a safe-area inset over the scroll view: black
+        // frosted glass keeps scrolled content from showing through.
         .background {
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.background.opacity(0), location: 0),
-                    .init(color: Theme.background, location: 0.2),
-                    .init(color: Theme.background, location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .ignoresSafeArea(edges: .bottom)
+            Color.clear
+                .blackGlass(in: Rectangle())
+                .ignoresSafeArea(edges: .bottom)
         }
-    }
-}
-
-/// The glass logo tile on a softly breathing violet glow (static under
-/// Reduce Motion).
-private struct PaywallLogo: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isBreathing = false
-
-    var body: some View {
-        StexxLogoTile(size: 128)
-            .background {
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [Theme.edgeGlow.opacity(0.6), Theme.violet.opacity(0.18), Theme.violet.opacity(0)],
-                            center: .center,
-                            startRadius: 8,
-                            endRadius: 130
-                        )
-                    )
-                    .frame(width: 270, height: 270)
-                    .scaleEffect(isBreathing ? 1.08 : 0.94)
-                    .opacity(isBreathing ? 1 : 0.75)
-                    .allowsHitTesting(false)
-            }
-            .onAppear {
-                guard !reduceMotion else { return }
-                withAnimation(.easeInOut(duration: 2.8).repeatForever(autoreverses: true)) {
-                    isBreathing = true
-                }
-            }
-            .accessibilityHidden(true)
     }
 }
 
 private struct FeatureRow: View {
+    static let iconWidth: CGFloat = 24
+
     let feature: PlusFeature
 
-    @ScaledMetric(relativeTo: .body) private var glyphSize: CGFloat = 40
-
     var body: some View {
-        HStack(spacing: Theme.Spacing.m) {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.m) {
             Image(systemName: feature.systemImage)
-                .font(.body.weight(.bold))
-                .foregroundStyle(.white)
-                .frame(width: glyphSize, height: glyphSize)
-                .background(Theme.accentGradient, in: .rect(cornerRadius: glyphSize * 0.3))
-                .overlay(
-                    RoundedRectangle(cornerRadius: glyphSize * 0.3)
-                        .strokeBorder(Color.white.opacity(0.25), lineWidth: 0.5)
-                )
-                .shadow(color: Theme.edgeGlow.opacity(0.5), radius: 8)
+                .font(.body)
+                .foregroundStyle(Theme.steel)
+                .frame(width: Self.iconWidth)
             VStack(alignment: .leading, spacing: 2) {
                 Text(feature.title)
-                    .font(.headline.weight(.heavy))
-                    .tracking(Theme.Tracking.tight)
-                    .foregroundStyle(Theme.textPrimary)
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
                 Text(feature.detail)
-                    .font(.footnote)
-                    .foregroundStyle(Theme.textSecondary)
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }
+        .padding(.vertical, Theme.Spacing.m)
         .accessibilityElement(children: .combine)
     }
 }

@@ -30,17 +30,19 @@ struct SignUpView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.xl) {
                 VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-                    Text("Make it yours")
-                        .font(.stexxLargeTitle)
+                    Text("make it yours")
+                        .stexxTitleStyle()
+                        .accessibilityAddTraits(.isHeader)
                     Text("Pick a nickname. You can change it anytime, and nobody needs your real name.")
-                        .foregroundStyle(Theme.textSecondary)
+                        .font(.stexxBody)
+                        .foregroundStyle(Theme.steel)
                 }
 
-                GlassCard {
-                    VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-                        SectionLabel("Nickname")
+                VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                    SectionLabel("Nickname")
+                    SignUpField(isFocused: focusedField == .name) {
                         TextField("e.g. QuantumOtter", text: $displayName)
-                            .font(.title3.weight(.semibold))
+                            .font(.stexxHeadline)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .textContentType(.nickname)
@@ -59,20 +61,21 @@ struct SignUpView: View {
 
                     Text("Recommended. Uses Face ID or Touch ID. Nothing to remember, nothing to leak.")
                         .font(.footnote)
-                        .foregroundStyle(Theme.textTertiary)
+                        .foregroundStyle(Theme.slate)
                         .multilineTextAlignment(.center)
                 }
 
-                HStack {
-                    Rectangle().fill(Theme.hairline).frame(height: 0.5)
-                    Text("or").font(.footnote).foregroundStyle(Theme.textTertiary)
-                    Rectangle().fill(Theme.hairline).frame(height: 0.5)
+                HStack(spacing: Theme.Spacing.m) {
+                    HairlineDivider()
+                    Text("or").stexxLabelStyle(.micro, color: Theme.slate)
+                    HairlineDivider()
                 }
 
-                GlassCard {
-                    VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-                        SectionLabel("Email for sign-in links")
+                VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                    SectionLabel("Email for sign-in links")
+                    SignUpField(isFocused: focusedField == .email) {
                         TextField("you@example.com", text: $email)
+                            .font(.stexxBody)
                             .keyboardType(.emailAddress)
                             .textContentType(.emailAddress)
                             .textInputAutocapitalization(.never)
@@ -80,10 +83,10 @@ struct SignUpView: View {
                             .focused($focusedField, equals: .email)
                             .submitLabel(.go)
                             .onSubmit(signUpWithEmail)
-                        Text("Never shown on your profile. Use a throwaway or alias if you like.")
-                            .font(.footnote)
-                            .foregroundStyle(Theme.textTertiary)
                     }
+                    Text("Never shown on your profile. Use a throwaway or alias if you like.")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.slate)
                 }
 
                 Button(action: signUpWithEmail) {
@@ -94,13 +97,13 @@ struct SignUpView: View {
 
                 if let errorMessage {
                     Text(errorMessage)
-                        .font(.footnote)
+                        .font(.stexxSub)
                         .foregroundStyle(Theme.danger)
                 }
 
                 Text("By continuing you agree to our Terms and Community Guidelines.")
                     .font(.caption)
-                    .foregroundStyle(Theme.textTertiary)
+                    .foregroundStyle(Theme.slate)
                     .frame(maxWidth: .infinity)
                     .multilineTextAlignment(.center)
             }
@@ -115,7 +118,8 @@ struct SignUpView: View {
                 ProgressView()
                     .controlSize(.large)
                     .padding(Theme.Spacing.xl)
-                    .glassEffect(.regular, in: .rect(cornerRadius: Theme.Radius.card))
+                    .tint(Theme.frost)
+                    .blackGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
             }
         }
     }
@@ -153,6 +157,24 @@ struct SignUpView: View {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+}
+
+/// A flat ink1 field with a 0.5pt line, lineStrong while focused.
+private struct SignUpField<Content: View>: View {
+    var isFocused: Bool
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        content
+            .foregroundStyle(Theme.frost)
+            .tint(Theme.ice)
+            .padding(.horizontal, Theme.Spacing.l)
+            .frame(minHeight: 52)
+            .background(shape.fill(Theme.ink1))
+            .hairlineBorder(shape, strong: isFocused)
+            .animation(Motion.quick, value: isFocused)
     }
 }
 

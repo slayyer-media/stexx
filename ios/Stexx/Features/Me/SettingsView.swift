@@ -27,12 +27,14 @@ struct SettingsView: View {
                 Toggle("Send read receipts", isOn: $bindable.privacy.sendReadReceipts)
                 LabeledContent("Location precision") {
                     Text("About \(StexxFormat.distance(LocationFuzzer.defaultCellMeters))")
+                        .stexxLabelStyle()
                 }
             } header: {
-                Text("Privacy")
+                SectionLabel("Privacy")
             } footer: {
-                Text("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map.")
+                SettingsFooter("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map.")
             }
+            .settingsRows()
 
             Section {
                 Toggle("Expiring photos by default", isOn: $bindable.privacy.expiringPhotosByDefault)
@@ -44,14 +46,15 @@ struct SettingsView: View {
                     Label {
                         Text("Safety tips")
                     } icon: {
-                        Image(systemName: "heart.text.square").foregroundStyle(Theme.violetBright)
+                        Image(systemName: "heart.text.square").foregroundStyle(Theme.steel)
                     }
                 }
             } header: {
-                Text("Safety")
+                SectionLabel("Safety")
             } footer: {
-                Text("Blocking, reporting, hiding your distance and expiring photos are free, forever.")
+                SettingsFooter("Blocking, reporting, hiding your distance and expiring photos are free, forever.")
             }
+            .settingsRows()
 
             Section {
                 PlusToggle("Incognito", isOn: $bindable.privacy.incognito)
@@ -60,28 +63,37 @@ struct SettingsView: View {
                 PlusRow("Boosts", systemImage: "bolt.fill") { Task { await boost() } }
             } header: {
                 HStack(spacing: Theme.Spacing.s) {
-                    Text(verbatim: "Stexx+")
+                    SectionLabel(verbatim: "Stexx+")
+                        .fixedSize()
                     if appState.hasPlus {
-                        XXBadge("Active")
+                        Text("Active")
+                            .stexxLabelStyle(.micro, color: Theme.ice)
                     }
+                    Spacer(minLength: 0)
                 }
             }
+            .settingsRows()
 
-            Section("Account") {
+            Section {
                 Button("Sign out") { isConfirmingSignOut = true }
                 Button("Delete account", role: .destructive) { isConfirmingDelete = true }
                     .disabled(isDeleting)
                 if let errorMessage {
-                    Text(errorMessage).foregroundStyle(Theme.danger)
+                    Text(errorMessage)
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.danger)
                 }
+            } header: {
+                SectionLabel("Account")
             }
+            .settingsRows()
 
             Section {
                 Link(destination: URL(string: "https://github.com/stexxapp/stexx")!) {
                     Label {
                         Text("Source code on GitHub")
                     } icon: {
-                        Image(systemName: "chevron.left.forwardslash.chevron.right").foregroundStyle(Theme.violetBright)
+                        Image(systemName: "chevron.left.forwardslash.chevron.right").foregroundStyle(Theme.steel)
                     }
                 }
                 Link(destination: URL(string: "https://www.gnu.org/licenses/agpl-3.0.html")!) {
@@ -89,23 +101,33 @@ struct SettingsView: View {
                 }
                 LabeledContent("Version", value: version)
             } header: {
-                Text("About")
+                SectionLabel("About")
             } footer: {
-                VStack(spacing: Theme.Spacing.s) {
-                    StexxMark(size: 36)
-                    Wordmark(size: 26)
-                    Text("No ads. Just stexx.")
-                        .font(.footnote.weight(.semibold))
+                VStack(spacing: Theme.Spacing.m) {
+                    Wordmark(size: 26, glows: false)
+                    Tagline()
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.top, Theme.Spacing.xl)
+                .padding(.top, Theme.Spacing.xxl)
             }
+            .settingsRows()
         }
-        .headerProminence(.increased)
-        .tint(Theme.violet)
+        .listSectionSpacing(Theme.Spacing.xl)
+        .foregroundStyle(Theme.frost)
+        .tint(Theme.ice)
         .stexxBackground(intensity: 0.5)
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(verbatim: "settings")
+                    .font(.stexxHeadline.weight(.heavy))
+                    .tracking(Theme.Tracking.tight)
+                    .foregroundStyle(Theme.frost)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            .sharedBackgroundVisibility(.hidden)
+        }
         .toolbarVisibility(.hidden, for: .tabBar)
         .navigationDestination(isPresented: $isShowingViewers) { ViewersView() }
         .alert("Boosted", isPresented: Binding(get: { boostEndsAt != nil }, set: { if !$0 { boostEndsAt = nil } })) {
@@ -166,14 +188,38 @@ private struct PlusRow: View {
         } label: {
             HStack {
                 Label {
-                    Text(title).foregroundStyle(Theme.textPrimary)
+                    Text(title).foregroundStyle(Theme.frost)
                 } icon: {
-                    Image(systemName: systemImage).foregroundStyle(Theme.violetBright)
+                    Image(systemName: systemImage).foregroundStyle(Theme.steel)
                 }
                 Spacer()
                 if !appState.hasPlus { PlusBadge() }
             }
         }
+    }
+}
+
+/// Rows sit on the plain background, divided by 0.5pt hairlines (no cards).
+private extension View {
+    func settingsRows() -> some View {
+        self
+            .listRowBackground(Color.clear)
+            .listRowSeparatorTint(Theme.line)
+    }
+}
+
+/// Section footer copy in slate.
+private struct SettingsFooter: View {
+    let text: LocalizedStringKey
+
+    init(_ text: LocalizedStringKey) {
+        self.text = text
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.footnote)
+            .foregroundStyle(Theme.slate)
     }
 }
 
