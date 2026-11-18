@@ -84,7 +84,7 @@ struct SignUpView: View {
                             .submitLabel(.go)
                             .onSubmit(signUpWithEmail)
                     }
-                    Text("Never shown on your profile. Use a throwaway or alias if you like.")
+                    Text("Never shown on your profile. An alias like Hide My Email works; temporary inboxes don't.")
                         .font(.footnote)
                         .foregroundStyle(Theme.slate)
                 }

@@ -8,6 +8,16 @@ import { badRequest } from "../errors.ts";
 
 const LIST_URL = new URL("./disposable-domains.txt", import.meta.url);
 
+/**
+ * Privacy alias services are NOT disposable: an alias forwards to a real, lasting inbox, and anonymous users
+ * should be able to use one. Never blocked even if a future list update adds them.
+ */
+export const ALIAS_PROVIDERS = new Set([
+  "privaterelay.appleid.com", "icloud.com", "duck.com", "mozmail.com", "relay.firefox.com", "simplelogin.com",
+  "simplelogin.fr", "slmail.me", "aleeas.com", "8alias.com", "8shield.net", "anonaddy.com", "anonaddy.me", "addy.io",
+  "passmail.net", "passmail.com", "proton.me", "protonmail.com", "pm.me", "tuta.io", "tutanota.com", "33mail.com",
+]);
+
 let domains: Set<string> | null = null;
 function load(): Set<string> {
   domains ??= new Set(
@@ -27,7 +37,9 @@ export function isDisposableEmail(address: string): boolean {
   const list = load();
   const labels = domain.split(".");
   for (let i = 0; i < labels.length - 1; i++) {
-    if (list.has(labels.slice(i).join("."))) return true;
+    const candidate = labels.slice(i).join(".");
+    if (ALIAS_PROVIDERS.has(candidate)) return false;
+    if (list.has(candidate)) return true;
   }
   return false;
 }

@@ -124,7 +124,9 @@ describe("disposable email", () => {
     expect(isDisposableEmail("x@mailinator.com")).toBe(true);
     expect(isDisposableEmail("x@sub.mailinator.com")).toBe(true);
     expect(isDisposableEmail("X@MAILINATOR.COM.")).toBe(true);
-    for (const ok of ["gmail.com", "proton.me", "icloud.com", "outlook.com", "example.com"]) {
+    // Privacy aliases forward to a real inbox and stay allowed (anonymous users rely on them).
+    for (const ok of ["gmail.com", "proton.me", "icloud.com", "outlook.com", "example.com", "privaterelay.appleid.com",
+      "duck.com", "abc.slmail.me", "mozmail.com"]) {
       expect(isDisposableEmail(`someone@${ok}`)).toBe(false);
     }
   });
