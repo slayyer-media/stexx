@@ -134,7 +134,9 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   Tests: `resetAbuseLimits()` (switches to a fresh key namespace, never deletes), `setAbuseLimitForTests`,
   `setLimiterStoreForTests(new MemorySlidingWindowStore())`. Honours `setRateLimitsDisabled`.
 - `email.ts`: `assertNotDisposable(email)` → 400 `disposable_email`. `trust.ts`: `assertMessageAllowed(...)` →
-  403 `links_not_allowed` / `new_account_limit` / `duplicate_message`; `overrideTrustForTests`.
+  403 `new_account_limit` (metadata), then `contentPolicy().assertAllowed` (content.ts: `links_not_allowed`,
+  `duplicate_message`; text rules that move into the app with E2EE, swap via `setContentPolicy`);
+  `overrideTrustForTests`.
 - Tests run with `ATTESTATION_MODE=off`; `test/attest-helpers.ts` builds real assertions from
   `test/fixtures/app-attest/fixtures.json` (synthetic root, regenerate with `generate.ts`).
 

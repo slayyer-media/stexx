@@ -7,6 +7,10 @@
  *   - can't send the same text (16+ chars, case and spacing ignored) to more than
  *     TRUST_RAMP_DUPLICATE_RECIPIENTS people in 24 h, 403 `duplicate_message`.
  *
+ * The two TEXT rules (links, identical text) live behind `ContentPolicy` in content.ts so they can move into
+ * the app when chats become end-to-end encrypted; the first-contact cap here only uses metadata (who wrote in
+ * which conversation, when) and stays on the server.
+ *
  * Restricted = (younger than TRUST_RAMP_HOURS AND fewer than TRUST_RAMP_GRADUATE_REPLIES people have replied)
  *           OR (it has an open report against it AND is younger than 7 days).
  * So the limits lift with age, lift early once real people reply, and come back if new accounts get reported.
@@ -15,6 +19,7 @@
 import { config } from "../../config.ts";
 import { sql, type Sql } from "../../db/sql.ts";
 import { ApiError } from "../errors.ts";
+import { contentPolicy } from "./content.ts";
 import { DAY } from "../time.ts";
 
 export interface TrustSettings {
@@ -25,9 +30,6 @@ export interface TrustSettings {
   graduateReplies: number;
 }
 const REPORTED_RESTRICTION_MS = 7 * DAY;
-/** Shorter texts ("hey", "what's up?") are too common to treat as copy-paste spam. */
-export const DUPLICATE_MIN_LENGTH = 16;
-
 let overrides: Partial<TrustSettings> = {};
 export function trustSettings(): TrustSettings {
   return { ...config.antiSpam.trustRamp, ...overrides };
@@ -44,23 +46,8 @@ export function overrideTrustForTests(next: Partial<TrustSettings>): () => void 
 
 const policy = (code: string, message: string) => new ApiError(403, code, message);
 
-// Links: a scheme, "www.", or a bare domain with a common TLD (incl. messenger/payment short links).
-const TLDS =
-  "com|net|org|io|co|me|app|gg|ly|link|xyz|site|online|info|biz|us|uk|ca|de|ru|cn|tv|cc|to|be|ai|so|sh|club|live|shop|store|top|vip|fun|page|bio|lol|wtf|gay|dating|chat|social|fans|onlyfans|cash|pay|money";
-const LINK_RE = new RegExp(
-  String.raw`(?:\b[a-z][a-z0-9+.-]{1,15}:\/\/\S)|(?:\bwww\.\S)|(?:\b[a-z0-9-]{1,63}\s*(?:\.|\(dot\)|\[dot\])\s*(?:${TLDS})\b(?:\/\S*)?)`,
-  "i",
-);
-
-/** True if `text` contains something that looks like a link. */
-export function containsLink(text: string): boolean {
-  return LINK_RE.test(text.normalize("NFKC"));
-}
-
-/** Case- and whitespace-insensitive form used for duplicate detection (mirrors the SQL below). */
-export function normalizeForDuplicate(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, " ").trim();
-}
+// Re-exported for callers and tests that predate content.ts.
+export { containsLink, DUPLICATE_MIN_LENGTH, normalizeForDuplicate } from "./content.ts";
 
 export interface TrustState {
   restricted: boolean;
@@ -100,11 +87,7 @@ export async function assertMessageAllowed(
   const state = await trustState(opts.senderId, db);
   if (!state.restricted) return;
 
-  if (opts.text && containsLink(opts.text)) {
-    throw policy("links_not_allowed", "New accounts can't send links yet. Try again in a day or so.");
-  }
-
-  // First contact: the other person hasn't written in this conversation.
+  // Metadata rule (stays on the server with E2EE). First contact: the other person hasn't written in this conversation.
   const [conv] = await db<{ they_wrote: boolean; i_wrote_recently: boolean }[]>`
     SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ${opts.conversationId}
                                            AND sender_id = ${opts.otherId}) AS they_wrote,
@@ -126,16 +109,9 @@ export async function assertMessageAllowed(
     }
   }
 
-  if (opts.text && normalizeForDuplicate(opts.text).length >= DUPLICATE_MIN_LENGTH) {
-    const [d] = await db<{ n: number }[]>`
-      SELECT count(DISTINCT conversation_id)::int AS n
-        FROM messages
-       WHERE sender_id = ${opts.senderId} AND sent_at > now() - interval '24 hours'
-         AND conversation_id <> ${opts.conversationId}
-         AND text IS NOT NULL
-         AND btrim(regexp_replace(lower(text), '\\s+', ' ', 'g')) = ${normalizeForDuplicate(opts.text)}`;
-    if ((d?.n ?? 0) >= s.duplicateRecipients) {
-      throw policy("duplicate_message", "You've sent this exact message to several people already. Try something personal.");
-    }
-  }
+  // Text rules (links, identical text to many people): server-side today, in the app once chats are E2EE.
+  await contentPolicy().assertAllowed(
+    { senderId: opts.senderId, conversationId: opts.conversationId, text: opts.text },
+    { db, duplicateRecipients: s.duplicateRecipients },
+  );
 }

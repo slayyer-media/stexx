@@ -1,5 +1,6 @@
 /** New-account limits (lib/abuse/trust.ts) on POST /conversations/:id/messages. */
 import { afterEach, describe, expect, test } from "bun:test";
+import { contentPolicy, encryptedContentPolicy, plaintextContentPolicy, setContentPolicy, type ContentPolicy } from "../src/lib/abuse/content.ts";
 import { containsLink, overrideTrustForTests, trustState } from "../src/lib/abuse/trust.ts";
 import { as, createUser, expectError, expectJson, sql, uniq, type TestUser } from "./helpers.ts";
 
@@ -103,5 +104,33 @@ describe("trust ramp", () => {
     restores.push(overrideTrustForTests({ enabled: false }));
     const newbie = await createUser();
     await expectJson(await send(newbie, await open(newbie, await createUser()), "www.example.com"));
+  });
+});
+
+describe("content policy (moves into the app with end-to-end encryption)", () => {
+  test("plaintext is the default", () => {
+    expect(contentPolicy()).toBe(plaintextContentPolicy);
+  });
+
+  test("with the encrypted policy the server skips text rules but keeps the metadata cap", async () => {
+    restores.push(setContentPolicy(encryptedContentPolicy));
+    restores.push(overrideTrustForTests({ firstMessagesPerDay: 1 }));
+    const newbie = await createUser();
+    const [a, b] = await Promise.all([createUser(), createUser()]);
+    await expectJson(await send(newbie, await open(newbie, a), "check www.example.com"));
+    await expectError(await send(newbie, await open(newbie, b), "hello there"), 403, "new_account_limit");
+  });
+
+  test("only restricted senders reach the policy, with the message and settings", async () => {
+    const seen: string[] = [];
+    const spy: ContentPolicy = { name: "spy", async assertAllowed(m, ctx) { seen.push(`${m.text}|${ctx.duplicateRecipients}`); } };
+    restores.push(setContentPolicy(spy));
+    const newbie = await createUser();
+    const veteran = await createUser();
+    await age(veteran, 48);
+    const other = await createUser();
+    await expectJson(await send(newbie, await open(newbie, other), "from newbie"));
+    await expectJson(await send(veteran, await open(veteran, other), "from veteran"));
+    expect(seen).toEqual(["from newbie|3"]);
   });
 });

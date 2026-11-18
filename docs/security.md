@@ -92,6 +92,20 @@ An account is **restricted** while it is younger than `TRUST_RAMP_HOURS` (24) an
 | `new_account_limit` | At most `TRUST_RAMP_FIRST_MESSAGES_PER_DAY` (10) conversations started in 24h that nobody has replied to yet. |
 | `duplicate_message` | The same text (case, spacing and punctuation ignored, 16+ characters) to more than `TRUST_RAMP_DUPLICATE_RECIPIENTS` (3) people in 24h. |
 
+### With end-to-end encrypted chats
+
+Chats are planned to become end-to-end encrypted with the Signal Protocol (libsignal), in a separate PR. The rules above are split so that change doesn't undo them:
+
+| Rule | Needs | Where it runs after E2EE |
+| --- | --- | --- |
+| Rate limits (section 3) | counts per IP, device, account | server, unchanged |
+| `new_account_limit` (first contacts nobody replied to) | who wrote in which conversation, when | server, unchanged |
+| Trust state (age, repliers, open reports) | account metadata | server, unchanged |
+| `links_not_allowed` | message text | **the app**, before encrypting |
+| `duplicate_message` (same text to many people) | message text | **the app**, before encrypting |
+
+The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. Today the server uses `plaintextContentPolicy`; when messages become ciphertext it switches to `encryptedContentPolicy` (a no-op) and the app runs the same rules locally. `containsLink` and `normalizeForDuplicate` are the reference to port. The server learns whether the sender is restricted from its own metadata, so it can tell the app which rules apply. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server.
+
 The app shows the server's message above the composer (see screenshots in the PR) and keeps the failed bubble so the user can edit or retry. Set `TRUST_RAMP_ENABLED=0` to turn the ramp off.
 
 ## Error codes the app handles
