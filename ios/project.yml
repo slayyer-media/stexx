@@ -1,0 +1,79 @@
+# XcodeGen spec for the Stexx iOS app.
+# Generate the Xcode project with:  xcodegen generate
+name: Stexx
+
+options:
+  bundleIdPrefix: gay.stexx
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "26.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    CODE_SIGN_STYLE: Automatic
+    # Set your own team locally (Xcode > Signing & Capabilities); never commit it.
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  Stexx:
+    type: application
+    platform: iOS
+    sources:
+      - path: Stexx
+    settings:
+      base:
+        PRODUCT_NAME: Stexx
+        PRODUCT_BUNDLE_IDENTIFIER: gay.stexx.app
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        STEXX_API_BASE_URL: https://api.stexx.gay
+      configs:
+        Debug:
+          STEXX_USE_MOCK_API: "YES"
+        Release:
+          # Flip to NO once the backend is live.
+          STEXX_USE_MOCK_API: "YES"
+    info:
+      path: Stexx/Info.plist
+      properties:
+        CFBundleDisplayName: stexx
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ITSAppUsesNonExemptEncryption: false
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIUserInterfaceStyle: Dark
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSLocationWhenInUseUsageDescription: >-
+          Stexx uses your approximate location to show people nearby.
+          Your coordinates are rounded on your device before they are sent,
+          and your exact location is never stored.
+        StexxAPIBaseURL: $(STEXX_API_BASE_URL)
+        StexxUseMockAPI: $(STEXX_USE_MOCK_API)
+    scheme:
+      testTargets:
+        - StexxTests
+      gatherCoverageData: true
+
+  StexxTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: StexxTests
+    dependencies:
+      - target: Stexx
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: gay.stexx.app.tests
+        GENERATE_INFOPLIST_FILE: YES
