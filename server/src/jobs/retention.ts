@@ -163,6 +163,38 @@ export async function purgeExpiredAuth(now: Date = new Date()): Promise<AuthPurg
   return { sessions, challenges, linkTokens };
 }
 
+/** Idle App Attest devices kept this long without an account on them (banned devices are kept). */
+export const IDLE_DEVICE_RETENTION_MS = 90 * DAY;
+
+export interface DevicePurgeResult {
+  devices: number;
+  attestChallenges: number;
+}
+
+/**
+ * Anti-spam housekeeping: App Attest devices nobody has an account on and that haven't been seen for 90 days
+ * (bans and devices with accounts are kept), and expired attestation challenges.
+ */
+export async function purgeIdleDevices(now: Date = new Date()): Promise<DevicePurgeResult> {
+  const cutoff = new Date(now.getTime() - IDLE_DEVICE_RETENTION_MS);
+  const devices = await inBatches(async () => {
+    const r = await sql`
+      DELETE FROM devices WHERE id IN (
+        SELECT d.id FROM devices d
+         WHERE d.banned_at IS NULL AND d.last_seen_on < ${cutoff}::date
+           AND NOT EXISTS (SELECT 1 FROM device_accounts da WHERE da.device_id = d.id)
+         LIMIT ${BATCH})`;
+    return r.count;
+  });
+  const attestChallenges = await inBatches(async () => {
+    const r = await sql`
+      DELETE FROM attest_challenges WHERE challenge IN (
+        SELECT challenge FROM attest_challenges WHERE expires_at <= ${now} LIMIT ${BATCH})`;
+    return r.count;
+  });
+  return { devices, attestChallenges };
+}
+
 /** Clear finished boosts so the column only holds live ones. */
 export async function clearEndedBoosts(now: Date = new Date()): Promise<number> {
   return inBatches(async () => {
@@ -255,5 +287,6 @@ export async function runSlowJobs(now: Date = new Date()) {
   const profileViews = await purgeProfileViews(now);
   const auth = await purgeExpiredAuth(now);
   const boosts = await clearEndedBoosts(now);
-  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts };
+  const devices = await purgeIdleDevices(now);
+  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts, devices };
 }

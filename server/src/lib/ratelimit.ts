@@ -61,6 +61,11 @@ export function setRateLimitsDisabled(value: boolean) {
   disabled = value;
 }
 
+/** True while tests have disabled limits (lib/abuse/limits.ts honours it too). */
+export function rateLimitsDisabled(): boolean {
+  return disabled;
+}
+
 /** Clear all buckets (tests). */
 export function resetRateLimits() {
   buckets.clear();
@@ -125,6 +130,19 @@ const IP_SALT = randomBytes(32);
  * first X-Forwarded-For hop) are trusted only when the TCP peer is loopback (Caddy) and TRUST_PROXY is on.
  */
 export function clientKey(c: Context): string {
+  return hashClientPart(clientIp(c));
+}
+
+/** Salted hash of any client-derived string (same salt as clientKey). */
+export function hashClientPart(value: string): string {
+  return createHash("sha256").update(IP_SALT).update(value).digest("base64url").slice(0, 22);
+}
+
+/**
+ * The client IP as seen through the trusted proxy. Use ONLY to derive salted rate-limit keys
+ * (clientKey / networkKey); never store or log it.
+ */
+export function clientIp(c: Context): string {
   let peer: string | undefined;
   try {
     peer = getConnInfo(c).remote.address;
@@ -137,7 +155,7 @@ export function clientKey(c: Context): string {
     const fwd = c.req.header("CF-Connecting-IP") ?? c.req.header("X-Forwarded-For")?.split(",")[0];
     if (fwd?.trim()) ip = fwd.trim();
   }
-  return createHash("sha256").update(IP_SALT).update(ip).digest("base64url").slice(0, 22);
+  return ip;
 }
 
 /**

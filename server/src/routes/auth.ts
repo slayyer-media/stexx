@@ -22,6 +22,17 @@ import { logInfo } from "../lib/logger.ts";
 import { sendSignInLink } from "../lib/mailer.ts";
 import { clientKey, consume, rateLimit } from "../lib/ratelimit.ts";
 import { closeRevokedConnections } from "../lib/realtime.ts";
+import {
+  afterSignup,
+  assertLoginAllowed,
+  assertSignupAllowed,
+  attest,
+  deviceOf,
+  recordSignup,
+  type SignupCheck,
+} from "../lib/abuse/attestation.ts";
+import { assertNotDisposable } from "../lib/abuse/email.ts";
+import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import { MINUTE, inMs } from "../lib/time.ts";
 import { displayNameSchema, parseJson } from "../lib/validation.ts";
 import type { AppEnv } from "../types.ts";
@@ -183,7 +194,7 @@ async function consumeChallenge(challenge: string, kind: "register" | "login"): 
 
 // ---- POST /auth/register ---------------------------------------------------
 
-authRoutes.post("/auth/register", rateLimit("auth"), async (c) => {
+authRoutes.post("/auth/register", rateLimit("auth"), attest("signup"), async (c) => {
   const body = await parseJson(c, registerSchema);
 
   if (!config.devAuth) {
@@ -195,16 +206,22 @@ authRoutes.post("/auth/register", rateLimit("auth"), async (c) => {
   }
 
   // DEV ONLY (config.devAuth is never true in production).
+  const device = deviceOf(c);
   let hmac: Buffer | null = null;
   if (body.method === "email") {
     if (!body.email) throw badRequest("email: required for email sign-up.");
+    assertNotDisposable(body.email);
     hmac = emailHmac(body.email);
   }
+  hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
+  const check = await assertSignupAllowed(device);
   try {
     const session = await sql.begin(async (tx) => {
       const id = await insertUser(tx, { displayName: body.displayName, emailHmac: hmac });
+      await recordSignup(device, id, tx);
       return createSession(id, tx);
     });
+    await afterSignup(device, check);
     await afterNewUser(session.userID);
     return c.json(session, 200);
   } catch (err) {
@@ -235,7 +252,7 @@ authRoutes.post("/auth/passkey/register/options", rateLimit("auth"), async (c) =
   return c.json(options, 200);
 });
 
-authRoutes.post("/auth/passkey/register/finish", rateLimit("auth"), async (c) => {
+authRoutes.post("/auth/passkey/register/finish", rateLimit("auth"), attest("signup"), async (c) => {
   const { confirmedAdult, ...credential } = await parseJson(c, registrationBodySchema);
   const challenge = challengeOf(credential.response.clientDataJSON);
 
@@ -264,15 +281,20 @@ authRoutes.post("/auth/passkey/register/finish", rateLimit("auth"), async (c) =>
   }
   const cred = verified.registrationInfo.credential;
 
+  const device = deviceOf(c);
+  hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
+  const check = await assertSignupAllowed(device);
   try {
     const session = await sql.begin(async (tx) => {
       const userId = await insertUser(tx, { displayName: pending.display_name!, emailHmac: null });
+      await recordSignup(device, userId, tx);
       await tx`
         INSERT INTO passkey_credentials (id, user_id, public_key, counter, transports, webauthn_user_id)
         VALUES (${cred.id}, ${userId}, ${Buffer.from(cred.publicKey)}, ${cred.counter},
                 ${(cred.transports ?? []) as string[]}, ${pending.webauthn_user_id!})`;
       return createSession(userId, tx);
     });
+    await afterSignup(device, check);
     await afterNewUser(session.userID);
     return c.json(session, 200);
   } catch (err) {
@@ -294,7 +316,9 @@ authRoutes.post("/auth/passkey/login/options", rateLimit("auth"), async (c) => {
   return c.json(options, 200);
 });
 
-authRoutes.post("/auth/passkey/login/finish", rateLimit("auth"), async (c) => {
+authRoutes.post("/auth/passkey/login/finish", rateLimit("auth"), attest("login"), async (c) => {
+  const device = deviceOf(c);
+  hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
   const credential = await parseJson(c, authenticationBodySchema);
   const challenge = challengeOf(credential.response.clientDataJSON);
 
@@ -324,6 +348,7 @@ authRoutes.post("/auth/passkey/login/finish", rateLimit("auth"), async (c) => {
     throw unauthorized("Could not verify the passkey.", "invalid_credential");
   }
   if (!verified.verified) throw unauthorized("Could not verify the passkey.", "invalid_credential");
+  await assertLoginAllowed(device);
 
   const session = await sql.begin(async (tx) => {
     await tx`UPDATE passkey_credentials SET counter = ${verified.authenticationInfo.newCounter}, last_used_at = now()
@@ -335,9 +360,11 @@ authRoutes.post("/auth/passkey/login/finish", rateLimit("auth"), async (c) => {
 
 // ---- Email magic link ------------------------------------------------------
 
-authRoutes.post("/auth/email/link", rateLimit("auth"), async (c) => {
+authRoutes.post("/auth/email/link", rateLimit("auth"), attest("login"), async (c) => {
   const body = await parseJson(c, emailLinkSchema);
   const address = normalizeEmail(body.email);
+  assertNotDisposable(address);
+  hitAbuseLimits("login", subjectOf(c, { deviceId: deviceOf(c).deviceId }));
   const hmac = emailHmac(address);
   // Per (address, client) limit (3 / 15 min), plus a looser per-address cap across all clients. Keying the tight
   // limit on the client too means a third party cannot exhaust the owner's allowance (a lockout). Same for known
@@ -366,11 +393,15 @@ authRoutes.post("/auth/email/link", rateLimit("auth"), async (c) => {
 
 class NeedsRegistration extends Error {}
 
-authRoutes.post("/auth/email/verify", rateLimit("auth"), async (c) => {
+authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async (c) => {
+  const device = deviceOf(c);
+  hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
   const { token } = await parseJson(c, emailVerifySchema);
+  await assertLoginAllowed(device); // banned devices (DeviceCheck bit1) can neither sign in nor sign up
   const invalid = () => badRequest("This sign-in link is invalid or has expired.", "invalid_link");
 
   let createdUserId: string | null = null;
+  let signupCheck: SignupCheck | null = null;
   try {
     const session = await sql.begin(async (tx) => {
       // Single use: only one concurrent verify can flip used_at.
@@ -385,6 +416,9 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), async (c) => {
       if (!userId) {
         // First sign-in for this address: needs the pending registration that travelled with the link.
         if (!link.display_name || link.confirmed_adult !== true) throw new NeedsRegistration();
+        // Throwing here rolls the transaction back, so a refused sign-up doesn't burn the link.
+        hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
+        signupCheck = await assertSignupAllowed(device, tx);
         const id = newId("user");
         const [created] = await tx<{ id: string }[]>`
           INSERT INTO users (id, display_name, confirmed_adult, email_hmac)
@@ -393,6 +427,7 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), async (c) => {
         if (created) {
           userId = created.id;
           createdUserId = created.id;
+          await recordSignup(device, created.id, tx);
           if (config.devDefaultLocation) {
             const cell = snapToCell(config.devDefaultLocation.latitude, config.devDefaultLocation.longitude);
             await tx`INSERT INTO locations (user_id, cell_lat, cell_lon) VALUES (${userId}, ${cell.latitude}, ${cell.longitude})`;
@@ -404,7 +439,10 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), async (c) => {
       }
       return createSession(userId, tx);
     });
-    if (createdUserId) await afterNewUser(createdUserId);
+    if (createdUserId) {
+      if (signupCheck) await afterSignup(device, signupCheck);
+      await afterNewUser(createdUserId);
+    }
     return c.json(session, 200);
   } catch (err) {
     if (err instanceof NeedsRegistration) {

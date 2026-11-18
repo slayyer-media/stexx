@@ -26,6 +26,10 @@ delete process.env.STEXX_DEV_DEFAULT_LOCATION;
 delete process.env.APPLE_ROOT_CA_DIR;
 delete process.env.APPLE_APP_APPLE_ID;
 process.env.APPLE_ENVIRONMENT = "Sandbox";
+// Device attestation off by default in tests (test/attestation.test.ts switches it on per test); trust ramp on.
+process.env.ATTESTATION_MODE = "off";
+delete process.env.APPLE_TEAM_ID;
+delete process.env.DEVICECHECK_KEY_ID;
 process.env.EMAIL_PEPPER ??= "test-pepper-test-pepper-test-pepper-0000";
 
 await migrate(testUrl, { quiet: true });

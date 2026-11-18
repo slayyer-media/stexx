@@ -7,6 +7,7 @@ import { ApiError, onError, onNotFound, tooManyRequests } from "./lib/errors.ts"
 import { requestLogger } from "./lib/logger.ts";
 import { isStorageKey, mediaPath, MAX_UPLOAD_BYTES } from "./lib/media.ts";
 import { clientKey, consume, peekLimit } from "./lib/ratelimit.ts";
+import { attestRoutes } from "./routes/attest.ts";
 import { authRoutes } from "./routes/auth.ts";
 import { chatRoutes } from "./routes/chat.ts";
 import { discoveryRoutes } from "./routes/discovery.ts";
@@ -105,6 +106,7 @@ export async function createApp(): Promise<Hono<AppEnv>> {
   v1.use("*", bodyLimits);
   v1.use("*", generalLimit);
   v1.route("/", authRoutes);
+  v1.route("/", attestRoutes);
   v1.route("/", meRoutes);
   v1.route("/", discoveryRoutes);
   v1.route("/", chatRoutes);

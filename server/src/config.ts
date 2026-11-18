@@ -1,4 +1,13 @@
+import { readFileSync } from "node:fs";
 import { z } from "zod";
+
+function readKeyFile(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    throw new ConfigError(`DEVICECHECK_PRIVATE_KEY_PATH: cannot read ${path}`);
+  }
+}
 
 /** Placeholder pepper used only outside production. Production must set its own (and may not reuse this). */
 export const DEV_EMAIL_PEPPER = "dev-only-email-pepper-do-not-use-in-production-0000";
@@ -44,6 +53,31 @@ const envSchema = z.object({
 
   TRUST_PROXY: flag.default(true),
 
+  // ---- Anti-spam (docs/security.md) ----
+  /** off | dev | enforce. Default: dev outside production; in production enforce once APPLE_TEAM_ID is set. */
+  ATTESTATION_MODE: z.enum(["off", "dev", "enforce"]).optional(),
+  /** Apple Developer Team ID (10 chars). App Attest app ID = `${APPLE_TEAM_ID}.${APPLE_BUNDLE_ID}`. */
+  APPLE_TEAM_ID: z
+    .string()
+    .regex(/^[A-Z0-9]{10}$/, "expected a 10-character Apple Team ID")
+    .optional()
+    .or(z.literal("").transform(() => undefined)),
+  /** PEM of Apple's App Attestation Root CA (the repo ships it). */
+  APP_ATTEST_ROOT_CA: z.string().optional(),
+  /** Comma list of accepted App Attest environments. Default: production only in production, both elsewhere. */
+  APP_ATTEST_ENVIRONMENTS: z.string().optional(),
+  /** DeviceCheck server API key (Apple Developer > Keys, "DeviceCheck"). All three are needed to enable it. */
+  DEVICECHECK_KEY_ID: z.string().optional(),
+  DEVICECHECK_PRIVATE_KEY_PATH: z.string().optional(),
+  DEVICECHECK_PRIVATE_KEY: z.string().optional(),
+  DEVICECHECK_ENVIRONMENT: z.enum(["development", "production"]).optional(),
+  MAX_ACCOUNTS_PER_DEVICE: z.coerce.number().int().min(1).max(20).default(1),
+  TRUST_RAMP_ENABLED: flag.default(true),
+  TRUST_RAMP_HOURS: z.coerce.number().min(0).max(24 * 30).default(24),
+  TRUST_RAMP_FIRST_MESSAGES_PER_DAY: z.coerce.number().int().min(0).max(1000).default(10),
+  TRUST_RAMP_DUPLICATE_RECIPIENTS: z.coerce.number().int().min(1).max(1000).default(3),
+  TRUST_RAMP_GRADUATE_REPLIES: z.coerce.number().int().min(1).max(100).default(3),
+
   STEXX_DEV_AUTH: flag,
   STEXX_DEV_DEFAULT_LOCATION: z.string().optional(),
   STEXX_DEV_WELCOME: flag,
@@ -77,6 +111,7 @@ export interface Config {
     enabled: boolean;
   };
   trustProxy: boolean;
+  antiSpam: AntiSpamConfig;
   /** Dev-only auth shortcuts (/auth/register returns a Session, /v1/dev/* mounted). Never true in production. */
   devAuth: boolean;
   /** Dev-only: new users get this cell so the grid isn't empty. null when unset or in production. */
@@ -84,6 +119,38 @@ export interface Config {
   devWelcome: boolean;
   devBots: boolean;
 }
+
+export type AttestationMode = "off" | "dev" | "enforce";
+
+export interface AntiSpamConfig {
+  attestation: {
+    mode: AttestationMode;
+    /** `${teamId}.${bundleId}`, or null when APPLE_TEAM_ID is unset (real attestations are then refused). */
+    appId: string | null;
+    rootCaPath: string;
+    environments: ("development" | "production")[];
+  };
+  /** null unless DEVICECHECK_KEY_ID, APPLE_TEAM_ID and a private key are all set. */
+  deviceCheck: {
+    keyId: string;
+    teamId: string;
+    privateKeyPem: string;
+    environment: "development" | "production";
+  } | null;
+  maxAccountsPerDevice: number;
+  /** Raw RATE_LIMIT_* env values (parsed by lib/abuse/limits.ts). */
+  rateLimitOverrides: Record<string, string>;
+  trustRamp: {
+    enabled: boolean;
+    hours: number;
+    firstMessagesPerDay: number;
+    duplicateRecipients: number;
+    graduateReplies: number;
+  };
+}
+
+export const DEFAULT_APP_ATTEST_ROOT_CA = new URL("../certs/app-attest/Apple_App_Attestation_Root_CA.pem", import.meta.url)
+  .pathname;
 
 export class ConfigError extends Error {
   override name = "ConfigError";
@@ -136,6 +203,39 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     }
   }
 
+  // ---- Anti-spam ----
+  const appId = e.APPLE_TEAM_ID ? `${e.APPLE_TEAM_ID}.${e.APPLE_BUNDLE_ID}` : null;
+  const mode: AttestationMode = e.ATTESTATION_MODE ?? (isProduction ? (appId ? "enforce" : "off") : e.NODE_ENV === "test" ? "off" : "dev");
+  if (isProduction && mode === "dev") {
+    throw new ConfigError("ATTESTATION_MODE=dev is not allowed in production (it accepts the simulator bypass)");
+  }
+  if (mode === "enforce" && !appId) {
+    throw new ConfigError("ATTESTATION_MODE=enforce needs APPLE_TEAM_ID (the App Attest app ID is TEAMID.bundleId)");
+  }
+  const environments = (e.APP_ATTEST_ENVIRONMENTS ?? (isProduction ? "production" : "development,production"))
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const env of environments) {
+    if (env !== "development" && env !== "production") throw new ConfigError(`APP_ATTEST_ENVIRONMENTS: unknown ${env}`);
+  }
+  let deviceCheck: AntiSpamConfig["deviceCheck"] = null;
+  const dcKey =
+    e.DEVICECHECK_PRIVATE_KEY?.replace(/\\n/g, "\n") ||
+    (e.DEVICECHECK_PRIVATE_KEY_PATH ? readKeyFile(e.DEVICECHECK_PRIVATE_KEY_PATH) : undefined);
+  if (e.DEVICECHECK_KEY_ID && e.APPLE_TEAM_ID && dcKey) {
+    deviceCheck = {
+      keyId: e.DEVICECHECK_KEY_ID,
+      teamId: e.APPLE_TEAM_ID,
+      privateKeyPem: dcKey,
+      environment: e.DEVICECHECK_ENVIRONMENT ?? (isProduction ? "production" : "development"),
+    };
+  }
+  const rateLimitOverrides: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (k.startsWith("RATE_LIMIT_") && v) rateLimitOverrides[k] = v;
+  }
+
   let devDefaultLocation: Config["devDefaultLocation"] = null;
   if (!isProduction && e.STEXX_DEV_DEFAULT_LOCATION) {
     const loc = latLon.safeParse(e.STEXX_DEV_DEFAULT_LOCATION);
@@ -174,6 +274,24 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       enabled: appleEnabled,
     },
     trustProxy: e.TRUST_PROXY,
+    antiSpam: {
+      attestation: {
+        mode,
+        appId,
+        rootCaPath: e.APP_ATTEST_ROOT_CA ?? DEFAULT_APP_ATTEST_ROOT_CA,
+        environments: environments as ("development" | "production")[],
+      },
+      deviceCheck,
+      maxAccountsPerDevice: e.MAX_ACCOUNTS_PER_DEVICE,
+      rateLimitOverrides,
+      trustRamp: {
+        enabled: e.TRUST_RAMP_ENABLED,
+        hours: e.TRUST_RAMP_HOURS,
+        firstMessagesPerDay: e.TRUST_RAMP_FIRST_MESSAGES_PER_DAY,
+        duplicateRecipients: e.TRUST_RAMP_DUPLICATE_RECIPIENTS,
+        graduateReplies: e.TRUST_RAMP_GRADUATE_REPLIES,
+      },
+    },
     devAuth: !isProduction && e.STEXX_DEV_AUTH,
     devDefaultLocation,
     devWelcome: !isProduction && e.STEXX_DEV_WELCOME,

@@ -21,6 +21,8 @@ import {
 import { DAY, isoDate } from "../lib/time.ts";
 import { cleanText, idParam, locationSchema, lookingForSchema, multilineText, parseJson, positionSchema, privacySchema, tagsSchema } from "../lib/validation.ts";
 import { col, notBlocked, val, visibleToViewer } from "../lib/visibility.ts";
+import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
+import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import type { AppEnv } from "../types.ts";
 
 /**
@@ -125,7 +127,7 @@ meRoutes.patch("/me", async (c) => {
  * moderation history survives). DB triggers queue every photo/attachment file into media_trash in the same
  * transaction; we then unlink them. Anything that fails to unlink stays queued for the purge job.
  */
-meRoutes.delete("/me", async (c) => {
+meRoutes.delete("/me", attest("optional"), async (c) => {
   const me = c.get("userId");
   await sql.begin(async (tx) => {
     const [row] = await tx<{ email_hmac: Buffer | null }[]>`SELECT email_hmac FROM users WHERE id = ${me} FOR UPDATE`;
@@ -138,6 +140,8 @@ meRoutes.delete("/me", async (c) => {
   forgetTouch(me);
   closeUserConnections(me, 4401, "account_deleted");
   await drainMediaTrash();
+  // Frees this phone's DeviceCheck "has an account" bit once no account is left on it (never a ban bit).
+  await afterAccountDeleted(deviceOf(c));
   return c.body(null, 204);
 });
 
@@ -149,8 +153,9 @@ async function ownPhotos(userId: string): Promise<PhotoRow[]> {
 }
 
 /** Raw image body (jpeg, png, webp). Re-encoded server-side: orientation applied, ALL metadata stripped. */
-meRoutes.post("/me/photos", rateLimit("photoUploads"), async (c) => {
+meRoutes.post("/me/photos", rateLimit("photoUploads"), attest("photo"), async (c) => {
   const me = c.get("userId");
+  hitAbuseLimits("photo", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
   const type = (c.req.header("Content-Type") ?? "").toLowerCase();
   if (!type.startsWith("image/")) throw badRequest("Send the photo as an image body.", "invalid_image");
 
@@ -192,8 +197,9 @@ export const MAX_PENDING_ATTACHMENTS = 10;
  * `id` is passed as `attachmentPhotoID` to POST /conversations/:id/messages (which consumes it). Unsent uploads
  * are deleted after an hour.
  */
-meRoutes.post("/me/attachments", rateLimit("attachments"), async (c) => {
+meRoutes.post("/me/attachments", rateLimit("attachments"), attest("photo"), async (c) => {
   const me = c.get("userId");
+  hitAbuseLimits("photo", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
   const type = (c.req.header("Content-Type") ?? "").toLowerCase();
   if (!type.startsWith("image/")) throw badRequest("Send the photo as an image body.", "invalid_image");
 
