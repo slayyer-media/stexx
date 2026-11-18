@@ -1,8 +1,8 @@
 # Security and anti-spam
 
-Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md): how they work, how to configure them, and what they store.
+Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5): how they work, how to configure them, and what they store.
 
-All of the code lives in `server/src/lib/abuse/` (plus `server/src/routes/attest.ts`) and `ios/Stexx/Services/AttestationService.swift`. The schema is in `server/migrations/104_anti-spam.sql` and `105_abuse-counters.sql`.
+The anti-spam code lives in `server/src/lib/abuse/` (plus `server/src/routes/attest.ts`) and `ios/Stexx/Services/AttestationService.swift`; its schema is in `server/migrations/104_anti-spam.sql` and `105_abuse-counters.sql`. Reports and moderation are in `server/src/lib/moderation.ts`, `server/src/routes/safety.ts`, `server/src/moderation/cli.ts` and `server/migrations/107_report-autohide.sql`.
 
 ## Cost and footprint
 
@@ -103,6 +103,7 @@ Chats are planned to become end-to-end encrypted with the Signal Protocol (libsi
 | Trust state (age, repliers, open reports) | account metadata | server, unchanged |
 | `links_not_allowed` | message text | **the app**, before encrypting |
 | `duplicate_message` (same text to many people) | message text | **the app**, against its own recently sent messages; no content hashes go to the server |
+| Report evidence (section 5) | the reported messages | **the app** sends the plaintext of the messages the reporter ticks; the server checks only that message ids, thread and sender match |
 
 The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. Today the server uses `plaintextContentPolicy`; when messages become ciphertext it switches to `encryptedContentPolicy` (a no-op) and the app runs the same rules locally. `containsLink` and `normalizeForDuplicate` are the reference to port. The server learns whether the sender is restricted from its own metadata, so it can tell the app which rules apply. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server.
 
@@ -113,6 +114,78 @@ The app shows the server's message above the composer and keeps the failed bubbl
   <img src="images/security/chat-links-not-allowed.jpg" width="280" alt="Chat thread: a new account's link message marked not sent, with a notice above the composer">
 </p> Set `TRUST_RAMP_ENABLED=0` to turn the ramp off.
 
+## 5. Reports, auto-hide and moderation
+
+Reporting has to be fast for the person being harassed, and several independent reports should take an account out of circulation before a moderator gets to it, without letting one person (or one person with several accounts) knock someone offline.
+
+### Reporting in the app
+
+- **Two taps:** on a profile or in a chat, "•••" → **Report** opens the report sheet; "•••" → **Block** → confirm blocks. Safety actions are free.
+- The sheet's reasons are exactly the server's: `underage`, `harassment`, `spam`, `fakeProfile`, `threatsOrViolence`, `illegalContent`, `other`. "Also block" is on by default. After sending, the sheet confirms ("Report sent", the person won't know who reported them, and that they're blocked).
+- **Evidence from a chat:** "Include messages" lists the thread's last 30 messages; the reporter ticks up to 20. Only ticked messages are sent, as plaintext from the app, so this keeps working once chats are end-to-end encrypted. Photos aren't uploaded (the item says a photo was there). The server records whether each message id exists in that thread from the claimed sender (`verified`), which is all it will be able to check with E2EE.
+
+### Auto-hide rules
+
+Checked after every report, in the report's transaction, serialized per reported account (advisory lock). Only **open** reports filed in the last `REPORT_AUTOHIDE_WINDOW_DAYS` (14) **and after the account's last moderator review** count. Each reporter account counts once.
+
+| Rule | Hides when |
+| --- | --- |
+| `reports` | `REPORT_AUTOHIDE_THRESHOLD` (3) **independent trusted** reporters, any reasons |
+| `underage` | `REPORT_UNDERAGE_TRUSTED_THRESHOLD` (1) independent trusted reporter says `underage`, **or** `REPORT_UNDERAGE_ANY_THRESHOLD` (2) reporters say `underage` from different devices and connections, whatever their account age |
+
+- **Trusted reporter:** at least `REPORT_REPORTER_MIN_AGE_HOURS` old (default `TRUST_RAMP_HOURS`, 24) and not restricted by the trust ramp (section 4). Replies don't shorten this: sock-puppet accounts can reply to each other, but they can't age faster.
+- **Never counted:** reporters that are themselves hidden or banned, and anonymized reports (the reporter deleted their account).
+- **Independent:** reporters must not share a device (`device_accounts`, from section 2) or the connection they reported from (`reports.reporter_ip_hash`, the same keyed HMAC of the IP as the rate limits, never the address). Earlier reporters win: a later reporter on a device or IP already counted is skipped. People reporting from the same venue Wi-Fi therefore count once; that only makes auto-hide more conservative, and moderators still see every report.
+- **Why underage is faster:** a minor on the app is the worst case, so one established reporter is enough to hide the account immediately, and it goes to the top of the queue (priority `high`). The cost of a false report is a short hidden period until review, never a ban.
+
+### What a hidden account sees and can do
+
+| | Hidden (after reports or by a moderator) | Banned |
+| --- | --- | --- |
+| Nearby, viewers | gone for everyone | gone |
+| Profile, conversation list, favorite, tap target | 404 / missing, **except** for people who have written to them (their existing chats keep working) | gone everywhere, including existing chats (404) |
+| Start a chat, write first, tap | 403 `account_under_review` (may only reply where the other person has written) | can't sign in |
+| Sessions | unchanged | revoked; sign-in refused with 403 `account_banned`; every device it was created on is banned (section 2) |
+
+The hidden account is told it is under review (the 403 message, and `hiddenPendingReviewSince` in its data export) but never who reported it, how many people did, or why. Report responses are always 204, so reporters can't tell whether an account was hidden either.
+
+### Moderator review (CLI)
+
+No web admin and no third-party tool: moderation is a command on the server, run over SSH as the service user with the service's environment. Every write is one transaction and adds a row to `moderation_actions` (actor handle, action, account, report ids, note, details).
+
+```sh
+# on the VPS
+stexx-mod() {
+  sudo bash -c 'set -a; . /etc/stexx/stexx.env; set +a; export NODE_ENV=production HOST=127.0.0.1 PORT=8787 MEDIA_DIR=/srv/stexx/media
+    cd /srv/stexx/current && HOME=/nonexistent exec setpriv --reuid=stexx --regid=stexx --clear-groups /usr/local/bin/bun scripts/moderate.ts "$@"' _ "$@"
+}
+stexx-mod list                                   # queue: underage first, then hidden accounts, oldest report first
+stexx-mod show p_abc…                            # profile text, reports, shared messages, how each reporter was judged, history
+stexx-mod dismiss p_abc… --as mod-a --note "brigading"
+stexx-mod ban p_abc… --as mod-a --note "illegal content"
+```
+
+Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show` and `log` for machine-readable output.
+
+| Command | Effect |
+| --- | --- |
+| `list [--limit N]` | Accounts with open reports, plus hidden ones: underage first, then hidden, then oldest open report |
+| `show <profileID>` | Profile text (name, age, headline, about; never location), open and recent closed reports with details and shared messages, the auto-hide assessment per reporter, audit history. Never the chat thread itself |
+| `dismiss <profileID>` | Reports unfounded: close every open report as dismissed and unhide. `--report <id>` closes just that one and leaves the account as it is |
+| `action <profileID> [--unhide]` | Reports valid but handled without a ban (e.g. the person was asked to change a photo): close them as actioned; stays hidden unless `--unhide` |
+| `hide` / `unhide <profileID>` | Hide pending review / make visible. Open reports stay open, but only reports filed after a review count towards the next auto-hide |
+| `ban <profileID>` | See the table above. The account row is kept so its email hash and devices keep blocking a new sign-up |
+| `unban <profileID>` | Undo a ban: clears the ban, the hide and the server-side ban on its devices. A DeviceCheck ban bit already written at Apple stays set |
+| `log [<profileID>]` | Audit log |
+
+Write commands need `--as <handle>` (or `STEXX_MODERATOR`): letters, digits, `.`, `-`, `_`; use a handle, never a real name. `system` is reserved for automatic hides.
+
+### Retention
+
+- `report_evidence` rows, the report's free-text `details` and `reporter_ip_hash` are deleted by the slow retention job `REPORT_EVIDENCE_RETENTION_DAYS` (30) after a report is closed, 30 days after filing if the reported account was deleted, and in any case `REPORT_EVIDENCE_MAX_DAYS` (180) after filing.
+- The report row itself (reason, priority, status, dates) stays for history; account deletion anonymizes it (`SET NULL`) as before. `moderation_actions` is kept and anonymized the same way.
+- Evidence a reporter shared is part of their data export while it exists.
+
 ## Error codes the app handles
 
 | Status | Code | Shown as |
@@ -122,6 +195,8 @@ The app shows the server's message above the composer and keeps the failed bubbl
 | 403 | `device_banned`, `device_account_limit` | Server message on the sign-up screen |
 | 400 | `disposable_email` | "Please use a regular email address. Temporary inboxes aren't supported." |
 | 403 | `links_not_allowed`, `new_account_limit`, `duplicate_message` | Server message above the chat composer |
+| 403 | `account_under_review` | Server message where the chat or tap failed |
+| 403 | `account_banned` | Server message on the sign-in screen |
 | 429 | `rate_limited` | Friendly sentence built from `Retry-After` |
 
 ## Configuration
@@ -142,6 +217,14 @@ The app shows the server's message above the composer and keeps the failed bubbl
 | `TRUST_RAMP_DUPLICATE_RECIPIENTS` | `3` | |
 | `TRUST_RAMP_GRADUATE_REPLIES` | `3` | |
 | `RATE_LIMIT_*` | see table above | `<count>/<window>`, window like `30s`, `10m`, `1h`, `1d`. |
+| `REPORT_AUTOHIDE_ENABLED` | `1` | Set `0` to keep reports but never auto-hide. |
+| `REPORT_AUTOHIDE_THRESHOLD` | `3` | Independent trusted reporters that hide an account. |
+| `REPORT_AUTOHIDE_WINDOW_DAYS` | `14` | |
+| `REPORT_UNDERAGE_TRUSTED_THRESHOLD` | `1` | |
+| `REPORT_UNDERAGE_ANY_THRESHOLD` | `2` | |
+| `REPORT_REPORTER_MIN_AGE_HOURS` | `TRUST_RAMP_HOURS` | |
+| `REPORT_EVIDENCE_RETENTION_DAYS` | `30` | After the report is closed. |
+| `REPORT_EVIDENCE_MAX_DAYS` | `180` | Cap for reports that stay open. |
 
 iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev-bypass` in the Local configuration) and `STEXX_APP_ATTEST_ENVIRONMENT` (`development`; `production` in Release), which feeds the `com.apple.developer.devicecheck.appattest-environment` entitlement in the generated `Stexx/Stexx.entitlements`.
 
@@ -159,9 +242,12 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - `devices` holds a public key, a counter, the attestation environment, a ban timestamp and the last-seen **date** (not time). Idle devices with no accounts are purged after 90 days by the retention job, along with expired challenges.
 - Raw IPs are never stored. Rate-limit rows hold an HMAC of the IP or /24 network (key derived from `EMAIL_PEPPER`) and disappear within two windows.
 - The trust ramp reads message metadata the server already has (sender, conversation, time, text for the duplicate check); nothing new is collected.
+- Reports add two things: the messages a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Nothing in moderation stores or shows a location.
 
 ## Not done yet
 
-- Moderator tooling to ban an account's devices (`banDevicesOfUser` exists, nothing calls it).
+- Report evidence can't include photos yet (only that a photo was sent). With E2EE, the app would need to re-encrypt the chosen photo for moderators; that comes with the E2EE work.
+- No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Review turnaround depends on someone running `list`; there are no notifications for new high-priority reports yet.
+- The "Report" and "Block" menus were checked by hand; there are no UI tests for them.
 - Tests against a real-device attestation: the suite uses a synthetic root and devices generated by `server/test/fixtures/app-attest/generate.ts`. Do one manual sign-up on a physical iPhone against a staging server before enforcing.
 - The DeviceCheck "banned" bit is written on the device's next request with a token, not immediately at ban time.
