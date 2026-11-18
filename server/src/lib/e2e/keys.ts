@@ -17,7 +17,7 @@
  */
 import { config, type E2eMode } from "../../config.ts";
 import { sql, type Sql } from "../../db/sql.ts";
-import { ApiError, conflict } from "../errors.ts";
+import { ApiError, conflict, unauthorized } from "../errors.ts";
 import { logError } from "../logger.ts";
 import { isConnected, publish } from "../realtime.ts";
 import { isoDate } from "../time.ts";
@@ -139,6 +139,16 @@ async function lockKeys(tx: Sql, userId: string): Promise<void> {
   await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`e2e-keys:${userId}`}, 0))`;
 }
 
+/**
+ * Take the account's key lock and refuse a banned account. A request authenticated just before a ban could otherwise
+ * write keys after `deleteKeysOf` ran; both take the same lock, so whichever runs second sees the other's result.
+ */
+async function lockLiveAccount(tx: Sql, userId: string): Promise<void> {
+  await lockKeys(tx, userId);
+  const [u] = await tx<{ banned: boolean }[]>`SELECT banned_at IS NOT NULL AS banned FROM users WHERE id = ${userId}`;
+  if (!u || u.banned) throw unauthorized();
+}
+
 /** Each key in `keys` must be signed by `identityKey`; errors name `field[i]`. */
 async function checkSignatures(identityKey: Buffer, keys: SignedPreKeyInput[], field: string): Promise<void> {
   for (let i = 0; i < keys.length; i++) {
@@ -199,7 +209,7 @@ export async function registerKeys(
   await checkSignatures(input.identityKey, input.pqPreKeys, "pqPreKeys");
 
   const result = await sql.begin(async (tx) => {
-    await lockKeys(tx, userId);
+    await lockLiveAccount(tx, userId);
     const [prev] = await tx<{ identity_key: Buffer }[]>`
       SELECT identity_key FROM e2e_devices WHERE user_id = ${userId} AND device_id = ${DEVICE_ID} FOR UPDATE`;
     const identityChanged = !!prev && !prev.identity_key.equals(input.identityKey);
@@ -231,6 +241,7 @@ export async function registerKeys(
     await assertWithinLimits(tx, userId);
     return { identityChanged, status: await keyStatus(userId, tx) };
   });
+  lowSentAt.delete(userId);
   if (result.identityChanged) notifyIdentityChanged(userId, result.status.identityKeyChangedAt);
   return result;
 }
@@ -242,8 +253,8 @@ export async function addPreKeys(
 ): Promise<KeyStatusJson> {
   assertUniqueIds(input.preKeys, "preKeys");
   assertUniqueIds(input.pqPreKeys, "pqPreKeys");
-  return sql.begin(async (tx) => {
-    await lockKeys(tx, userId);
+  const status = await sql.begin(async (tx) => {
+    await lockLiveAccount(tx, userId);
     const [device] = await tx<{ identity_key: Buffer }[]>`
       SELECT identity_key FROM e2e_devices WHERE user_id = ${userId} AND device_id = ${DEVICE_ID}`;
     if (!device) throw notRegistered();
@@ -253,6 +264,8 @@ export async function addPreKeys(
     await assertWithinLimits(tx, userId);
     return await keyStatus(userId, tx);
   });
+  lowSentAt.delete(userId); // replenished: the next drop below the watermark is announced again
+  return status;
 }
 
 /** PUT /keys/signed: rotate the signed prekey and/or the PQ last-resort prekey (signed by the stored identity). */
@@ -261,7 +274,7 @@ export async function rotateKeys(
   input: { signedPreKey?: SignedPreKeyInput; pqLastResortPreKey?: SignedPreKeyInput },
 ): Promise<KeyStatusJson> {
   return sql.begin(async (tx) => {
-    await lockKeys(tx, userId);
+    await lockLiveAccount(tx, userId);
     const [device] = await tx<{ identity_key: Buffer }[]>`
       SELECT identity_key FROM e2e_devices WHERE user_id = ${userId} AND device_id = ${DEVICE_ID}`;
     if (!device) throw notRegistered();
@@ -420,8 +433,13 @@ function takeOne<T extends object>(tx: Sql, userId: string, kind: "ec" | "kyber"
 
 // ---- Deletion -----------------------------------------------------------------------------------
 
-/** Delete every key of an account (ban). Account deletion cascades on its own. Returns devices removed. */
+/**
+ * Delete every key of an account (ban). Pass the ban's transaction: the advisory lock is transaction-scoped.
+ * Account deletion cascades on its own. Returns devices removed.
+ */
 export async function deleteKeysOf(userId: string, db: Sql = sql): Promise<number> {
+  // Same lock as the key writes, so an upload racing the ban either lands first (and is deleted here) or sees the ban.
+  await lockKeys(db, userId);
   const rows = await db`DELETE FROM e2e_devices WHERE user_id = ${userId} RETURNING device_id`;
   return rows.length;
 }
@@ -450,19 +468,38 @@ function notifyIdentityChanged(userId: string, changedAt: string | null): void {
   })();
 }
 
-/** `keys.low` → the key owner, once, when a fetch takes their count just below a watermark. */
+/** At most one `keys.low` per owner in this window (fetches below the watermark keep triggering it until replenished). */
+export const KEYS_LOW_THROTTLE_MS = 10 * 60_000;
+const lowSentAt = new Map<string, number>();
+
+/**
+ * `keys.low` → the key owner when a fetch that took a key leaves them below a watermark. Fired on "below" rather than
+ * on an exact crossing, because concurrent fetches can step over the exact value; throttled per owner instead.
+ * Best effort (only to live sockets): the app also checks GET /keys/status on launch.
+ */
 function maybeNotifyLow(
   userId: string,
   remaining: { ec: number; kyber: number },
   took: { tookEc: boolean; tookKyber: boolean },
 ): void {
   const limits = preKeyLimits();
-  const crossedEc = took.tookEc && remaining.ec === limits.preKeyLowWatermark - 1;
-  const crossedKyber = took.tookKyber && remaining.kyber === limits.pqPreKeyLowWatermark - 1;
-  if (!crossedEc && !crossedKyber) return;
+  const lowEc = took.tookEc && remaining.ec < limits.preKeyLowWatermark;
+  const lowKyber = took.tookKyber && remaining.kyber < limits.pqPreKeyLowWatermark;
+  if (!lowEc && !lowKyber) return;
+  if (!isConnected(userId)) return;
+  const now = Date.now();
+  const last = lowSentAt.get(userId);
+  if (last !== undefined && now - last < KEYS_LOW_THROTTLE_MS) return;
+  if (lowSentAt.size > 10_000) lowSentAt.clear(); // bounded memory; worst case one extra event
+  lowSentAt.set(userId, now);
   try {
     publish(userId, { type: "keys.low", data: { preKeyCount: remaining.ec, pqPreKeyCount: remaining.kyber } });
   } catch (err) {
     logError("e2e.low_fanout", err);
   }
+}
+
+/** Tests only: forget the keys.low throttle. */
+export function resetKeysLowThrottleForTests(): void {
+  lowSentAt.clear();
 }

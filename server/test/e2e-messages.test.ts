@@ -213,6 +213,30 @@ describe("safety rules still apply to ciphertext", () => {
     }
   });
 
+  test("envelopes go through encryptedContentPolicy, plaintext through the current policy", async () => {
+    const { setContentPolicy } = await import("../src/lib/abuse/content.ts");
+    const seen: string[] = [];
+    const restorePolicy = setContentPolicy({
+      name: "spy",
+      async assertAllowed({ text }) {
+        seen.push(text ?? "<null>");
+      },
+    });
+    const restoreTrust = overrideTrustForTests({ firstMessagesPerDay: 50 });
+    try {
+      const me = await createUser(); // restricted, so the content policy runs
+      const other = await createUser();
+      const conv = await conversation(me, other);
+      await expectJson(await send(me, conv, { envelope: fakeEnvelope() }));
+      expect(seen).toEqual([]); // the current (plaintext) policy never saw the encrypted message
+      await expectJson(await send(me, conv, { text: "plain words" }));
+      expect(seen).toEqual(["plain words"]);
+    } finally {
+      restoreTrust();
+      restorePolicy();
+    }
+  });
+
   test("message rate limits count envelopes", async () => {
     const restore = setAbuseLimitForTests("messageAccount", { limit: 2, windowMs: HOUR });
     try {

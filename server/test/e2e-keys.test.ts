@@ -5,9 +5,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import * as S from "@signalapp/libsignal-client";
 import { forceBuiltinVerifierForTests } from "../src/lib/e2e/crypto.ts";
-import { setE2eModeForTests, setPreKeyLimitsForTests } from "../src/lib/e2e/keys.ts";
+import { resetKeysLowThrottleForTests, setE2eModeForTests, setPreKeyLimitsForTests } from "../src/lib/e2e/keys.ts";
 import { resetAbuseLimits, setAbuseLimitForTests } from "../src/lib/abuse/limits.ts";
-import { banAccount, hideAccount } from "../src/lib/moderation.ts";
+import { banAccount, hideAccount, unbanAccount } from "../src/lib/moderation.ts";
 import { addConnection, removeConnection } from "../src/lib/realtime.ts";
 import { HOUR } from "../src/lib/time.ts";
 import { as, createUser, expectError, expectJson, expectNoContent, sql, type TestUser } from "./helpers.ts";
@@ -158,6 +158,18 @@ describe("register, status, replenish, rotate", () => {
     expect(s.pqLastResortPreKeyID).toBe(status.pqLastResortPreKeyID);
     const s2 = await expectJson(await as(user).put("/v1/keys/signed", { json: { pqLastResortPreKey: lr } }));
     expect(s2.pqLastResortPreKeyID).toBe(lr.keyID);
+    // Rotation leaves the identity and the one-time prekeys alone...
+    expect(s2).toMatchObject({ identityKeyChangedAt: null, preKeyCount: status.preKeyCount, pqPreKeyCount: status.pqPreKeyCount });
+    // ...and bundles serve the new keys, which libsignal accepts (including the new last-resort key once the
+    // one-time Kyber keys are gone).
+    const fetchers = await Promise.all(Array.from({ length: status.pqPreKeyCount + 1 }, () => createUser()));
+    let last: any;
+    for (const f of fetchers) {
+      last = await expectJson(await bundleOf(f, user));
+      expect(last.devices[0].signedPreKey).toEqual(spk);
+      await new SignalDevice(f.id).processBundle(last);
+    }
+    expect(last.devices[0].pqPreKey).toEqual(lr);
     await expectError(await as(user).put("/v1/keys/signed", { json: {} }), 400);
     // Signed by some other identity → refused.
     const other = new SignalDevice(user.id);
@@ -327,7 +339,29 @@ describe("bundles", () => {
       await expectJson(await bundleOf(f2!, owner)); // 1 left: crossed
       await expectJson(await bundleOf(f3!, owner)); // 0 left: already announced
       const low = cap.events.filter((e) => e.type === "keys.low");
-      expect(low).toEqual([{ type: "keys.low", data: { preKeyCount: 1, pqPreKeyCount: 0 } }]);
+      expect(low).toEqual([{ type: "keys.low", data: { preKeyCount: 1, pqPreKeyCount: 0 } }]); // throttled after one
+    } finally {
+      removeConnection(cap.conn);
+      restore();
+    }
+  });
+
+  test("keys.low fires on any fetch that leaves the owner below the watermark (not only an exact crossing)", async () => {
+    const restore = setPreKeyLimitsForTests({ maxPreKeys: 20, maxPqPreKeys: 10 }); // watermarks 4 and 2
+    resetKeysLowThrottleForTests();
+    // Starts below both watermarks, as after concurrent fetches stepped over the exact values.
+    const { user: owner, device } = await registered({ preKeys: 2, pqPreKeys: 1 });
+    const cap = captureRealtime(owner.id);
+    addConnection(cap.conn);
+    try {
+      await expectJson(await bundleOf(await createUser(), owner));
+      expect(cap.events.filter((e) => e.type === "keys.low")).toEqual([
+        { type: "keys.low", data: { preKeyCount: 1, pqPreKeyCount: 0 } },
+      ]);
+      // Replenishing resets the throttle: the next drop is announced again.
+      await expectJson(await as(owner).post("/v1/keys/prekeys", { json: { preKeys: device.newPreKeys(1) } }));
+      await expectJson(await bundleOf(await createUser(), owner));
+      expect(cap.events.filter((e) => e.type === "keys.low")).toHaveLength(2);
     } finally {
       removeConnection(cap.conn);
       restore();
@@ -336,10 +370,22 @@ describe("bundles", () => {
 });
 
 describe("identity changes", () => {
-  test("re-registering the same identity keeps identityKeyChangedAt null and replaces one-time prekeys", async () => {
+  test("re-registering, rotating or replenishing with the same identity is silent", async () => {
     const { user, device } = await registered({ preKeys: 5, pqPreKeys: 2 });
-    const s = await expectJson(await as(user).put("/v1/keys", { json: device.registration({ preKeys: 2, pqPreKeys: 1 }) }));
-    expect(s).toMatchObject({ identityKeyChangedAt: null, preKeyCount: 2, pqPreKeyCount: 1 });
+    const partner = await createUser();
+    await say(partner, await conversation(partner, user));
+    const cap = captureRealtime(partner.id);
+    addConnection(cap.conn);
+    try {
+      const s = await expectJson(await as(user).put("/v1/keys", { json: device.registration({ preKeys: 2, pqPreKeys: 1 }) }));
+      expect(s).toMatchObject({ identityKeyChangedAt: null, preKeyCount: 2, pqPreKeyCount: 1 });
+      await expectJson(await as(user).put("/v1/keys/signed", { json: { signedPreKey: device.newSignedPreKey() } }));
+      await expectJson(await as(user).post("/v1/keys/prekeys", { json: { preKeys: device.newPreKeys(1) } }));
+      await Bun.sleep(150);
+      expect(cap.events.some((e) => e.type === "identity.changed")).toBe(false);
+    } finally {
+      removeConnection(cap.conn);
+    }
   });
 
   test("a new identity key is recorded, served with bundles/identity, and pushed to chat partners", async () => {
@@ -502,6 +548,33 @@ describe("deletion", () => {
     const [audit] = await sql<{ details: any }[]>`
       SELECT details FROM moderation_actions WHERE user_id = ${user.id} AND action = 'ban'`;
     expect(audit!.details.e2eKeysDeleted).toBe(1);
+  });
+
+  test("after a ban, an in-flight key upload can't put keys back; after an unban the app registers fresh keys", async () => {
+    const user = await createUser();
+    const device = new SignalDevice(user.id);
+    await banAccount({ actor: "mod-test", userId: user.id });
+    // The session is revoked by the ban; a request that authenticated just before it reaches the key store anyway.
+    const { registerKeys } = await import("../src/lib/e2e/keys.ts");
+    const reg = device.registration();
+    const decode = (k: { keyID: number; publicKey: string; signature?: string }) => ({
+      keyId: k.keyID,
+      publicKey: Buffer.from(k.publicKey, "base64"),
+      signature: Buffer.from(k.signature ?? "", "base64"),
+    });
+    await expect(
+      registerKeys(user.id, {
+        registrationId: reg.registrationID,
+        identityKey: Buffer.from(reg.identityKey, "base64"),
+        signedPreKey: decode(reg.signedPreKey),
+        pqLastResortPreKey: decode(reg.pqLastResortPreKey),
+        preKeys: reg.preKeys.map(decode),
+        pqPreKeys: reg.pqPreKeys.map(decode),
+      }),
+    ).rejects.toMatchObject({ status: 401 });
+    const [n] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM e2e_devices WHERE user_id = ${user.id}`;
+    expect(n!.n).toBe(0);
+    await unbanAccount({ actor: "mod-test", userId: user.id });
   });
 
   test("the data export lists the account's public key state", async () => {
