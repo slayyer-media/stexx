@@ -25,6 +25,7 @@ An open-source, ad-free, privacy-first gay dating and hookup app. A Grindr alter
 - Taps, favorites, and blocking that actually works
 - Dark, glassy, minimalist UI
 - Premium: more filters, incognito browsing, travel mode, and other extras (exact features TBD)
+- Anti-spam without giving up anonymity: device attestation, per-device limits, and new-account limits (see [`docs/roadmap.md`](docs/roadmap.md))
 
 ## Status
 
