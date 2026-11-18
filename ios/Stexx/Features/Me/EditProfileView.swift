@@ -117,6 +117,8 @@ struct EditProfileView: View {
                 }
             }
         }
+        .headerProminence(.increased)
+        .tint(Theme.violet)
         .stexxBackground(intensity: 0.5)
         .navigationTitle("Edit profile")
         .navigationBarTitleDisplayMode(.inline)
@@ -151,7 +153,13 @@ struct EditProfileView: View {
                     ForEach(Array(draft.photos.enumerated()), id: \.element.id) { index, photo in
                         ProfilePhotoView(profile: draft, photoIndex: index)
                             .frame(width: 96, height: 124)
-                            .clipShape(.rect(cornerRadius: 14))
+                            .glowFrame(cornerRadius: 14, glow: index == 0 ? 0.6 : 0.25)
+                            .overlay(alignment: .bottomLeading) {
+                                if index == 0 {
+                                    XXBadge("Main")
+                                        .padding(6)
+                                }
+                            }
                             .overlay(alignment: .topTrailing) {
                                 Button {
                                     draft.photos.removeAll { $0.id == photo.id }
@@ -192,7 +200,8 @@ struct EditProfileView: View {
                         .disabled(isUploading)
                     }
                 }
-                .padding(.vertical, 4)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 4)
             }
             .scrollIndicators(.hidden)
         } header: {
