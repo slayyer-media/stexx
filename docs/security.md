@@ -94,7 +94,7 @@ An account is **restricted** while it is younger than `TRUST_RAMP_HOURS` (24) an
 
 ### With end-to-end encrypted chats
 
-Chats are planned to become end-to-end encrypted with the Signal Protocol (libsignal), in a separate PR. The rules above are split so that change doesn't undo them:
+Chats are planned to become end-to-end encrypted with the Signal Protocol (libsignal); see "End-to-end encrypted chat" in [`roadmap.md`](roadmap.md). The rules above are split so that change doesn't undo them:
 
 | Rule | Needs | Where it runs after E2EE |
 | --- | --- | --- |
@@ -102,7 +102,7 @@ Chats are planned to become end-to-end encrypted with the Signal Protocol (libsi
 | `new_account_limit` (first contacts nobody replied to) | who wrote in which conversation, when | server, unchanged |
 | Trust state (age, repliers, open reports) | account metadata | server, unchanged |
 | `links_not_allowed` | message text | **the app**, before encrypting |
-| `duplicate_message` (same text to many people) | message text | **the app**, before encrypting |
+| `duplicate_message` (same text to many people) | message text | **the app**, against its own recently sent messages; no content hashes go to the server |
 
 The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. Today the server uses `plaintextContentPolicy`; when messages become ciphertext it switches to `encryptedContentPolicy` (a no-op) and the app runs the same rules locally. `containsLink` and `normalizeForDuplicate` are the reference to port. The server learns whether the sender is restricted from its own metadata, so it can tell the app which rules apply. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server.
 
