@@ -26,7 +26,7 @@ In dev (`STEXX_DEV_AUTH=1`) `/v1/auth/register` returns a session directly, new 
 and `POST /v1/dev/plus` grants 30 days of Stexx+. Production refuses to boot with any `STEXX_DEV_*` flag set and never ships `src/dev/`.
 Email sign-in links are printed to the terminal in dev (the link only, never the address).
 Without the photo model, uploads work as before and photos stay unchecked; with it, profile photos are labelled
-explicit or not at upload (see [Photo checks](../docs/security.md#5-photo-checks-profile-photos)).
+explicit or not at upload (see [Photo checks](../docs/security.md#6-photo-checks-profile-photos)).
 
 | Command | What it does |
 | --- | --- |

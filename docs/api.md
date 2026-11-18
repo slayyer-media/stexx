@@ -96,7 +96,7 @@ Non-2xx responses carry:
 - Profile photos on the public grid are never explicit; explicit photos are
   only sent in chat.
 - The server labels every uploaded profile photo with a nudity classifier
-  ([security.md](security.md#5-photo-checks-profile-photos)). A photo labelled
+  ([security.md](security.md#6-photo-checks-profile-photos)). A photo labelled
   explicit is still accepted (`201`) but comes back with `isExplicit: true` and
   is only ever shown to its owner: other people's views of the profile leave it
   out. The owner can still send it in a chat. Photos the classifier hasn't seen

@@ -12,7 +12,7 @@ Everything runs on the single VPS with what is already there: the Bun API and Po
 - The disposable-email list is a file bundled in the repo and loaded at boot; there are no lookups to an outside API.
 - App Attest is verified locally against Apple's root certificate (shipped in the repo). DeviceCheck calls go to Apple's free API, and only if a DeviceCheck key is configured: on signup, login and account deletion (the per-device bits), and on each protected request from the rare device that can't use App Attest (token validation).
 
-- The nudity classifier for profile photos is a 12 MB open-source model run in-process on the CPU (about 10 ms a photo); the file is downloaded once at deploy, pinned by checksum. See [section 5](#5-photo-checks-profile-photos).
+- The nudity classifier for profile photos is a 12 MB open-source model run in-process on the CPU (about 10 ms a photo); the file is downloaded once at deploy, pinned by checksum. See [section 6](#6-photo-checks-profile-photos).
 
 ## 1. Device attestation (App Attest, DeviceCheck fallback)
 
