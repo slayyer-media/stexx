@@ -287,7 +287,23 @@ struct ProfileDetailView: View {
             }
         }
         .padding(.horizontal, Theme.Spacing.l)
+        .padding(.top, Theme.Spacing.xl)
         .padding(.bottom, Theme.Spacing.s)
+        // Fade the scrolled cards out under the floating actions so text
+        // never shows through the glass buttons.
+        .background {
+            LinearGradient(
+                stops: [
+                    .init(color: Theme.background.opacity(0), location: 0),
+                    .init(color: Theme.background.opacity(0.85), location: 0.45),
+                    .init(color: Theme.background, location: 1),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea(edges: .bottom)
+            .allowsHitTesting(false)
+        }
     }
 
     private func toggleFavorite() async {

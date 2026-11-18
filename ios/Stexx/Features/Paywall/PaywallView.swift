@@ -241,7 +241,7 @@ struct PaywallView: View {
             LinearGradient(
                 stops: [
                     .init(color: Theme.background.opacity(0), location: 0),
-                    .init(color: Theme.background.opacity(0.92), location: 0.25),
+                    .init(color: Theme.background, location: 0.2),
                     .init(color: Theme.background, location: 1),
                 ],
                 startPoint: .top,
