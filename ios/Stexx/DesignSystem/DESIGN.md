@@ -84,8 +84,20 @@ Screen margin is 20 (`Theme.Spacing.screen`). Leave 24–32 between sections
 - **Black frosted glass** (`.blackGlass(in:)`): ultra-thin material under an
   ink @ 0.55 veil, with a 0.5pt edge running from `lineStrong` at the top to
   `line` at the bottom. The liquid-glass variant for interactive controls is
-  `.stexxGlass(in:)`. Use it for bars once content scrolls under them,
-  floating action bars, sheets, the composer, and chips over photos.
+  `.stexxGlass(in:)`. Use it for floating action bars, sheets, the composer,
+  and chips over photos.
+- **Tab header** (`TabHeaderBar`, applied with `.tabHeader { } trailing: { }`):
+  each tab root (Nearby, Chats, You) gets one compact row, about 46pt plus
+  the status bar, instead of a navigation bar and a big title. Leading is
+  the xx app mark (`StexxAppIconMark`, asset `StexxAppMark`, ~29pt,
+  unmodified), the middle is a flexible slot (a small lowercase heavy title
+  via `TabHeaderTitle`, or Nearby's inline quick-filter chips) and trailing
+  holds icon buttons or a mono count. Its background is black frosted glass
+  that is close to opaque (ultra-thin material under ink @ 0.85; solid ink
+  under Reduce Transparency), runs up under the status bar and ends in a
+  0.5pt `line` hairline, so scrolled content doesn't bleed through. The
+  system navigation bar is hidden on tab roots only; pushed screens keep
+  their normal bars and back buttons.
 - **Flat**: `ink1` with a 0.5pt `line` (`GlassCard`, rows), or plain whitespace
   with `HairlineDivider`.
 - **Rim light** (`.rimLight()`): a 0.75pt accent stroke at 0.9 opacity from
@@ -126,7 +138,8 @@ sparingly: `.selection` for tabs, favourites and filters, and a light
 | Accent: flare | violet `#7B5CFF` (`Theme.flare`) |
 | Motif | the 500 m cell |
 | Mark | the "xx" (`StexxMark`, asset `StexxMark`) |
-| Voice | lowercase heavy display titles: "nearby", "chats", "you" |
+| App mark | the app icon, a glassy XX on a dark squircle (`StexxAppIconMark`, asset `StexxAppMark`), at the leading edge of every tab header |
+| Voice | lowercase heavy titles: "chats", "you" |
 | Tagline | **No ads. Just stexx.** (`Tagline`) |
 
 **Direction: cold glass, violet rim light.** Violet appears only where light
@@ -140,13 +153,20 @@ catches glass.
 - **The cell** (`CellFrame` / `.cellCorners()`): Stexx snaps locations to a
   500 m grid cell, and the UI draws that cell. Four L-shaped corner ticks
   (6pt arms, 0.75pt, frost @ 0.35) sit 4pt outside a rectangle, or inset on
-  photos. The top-leading tick is lit `rim`. Use them on hero surfaces: the
-  profile hero, your photo, the logo tile, the paywall card and empty states.
-  Square-ish avatars (radius 6) and the 3-column Nearby grid with 2pt gutters
-  carry the same motif.
+  photos. The top-leading tick is lit `rim`. They apply to the logo tile,
+  your own photo, the profile hero and empty states only. Square-ish
+  avatars (radius 6) and the Nearby grid's 2pt gutters echo the cell
+  without drawing the ticks.
+- **Nearby grid**: uniform. Three equal columns of identical 3:4 tiles
+  (radius 4) on 2pt gutters, in the server's closest-first order. There is
+  no featured tile and no profile gets extra weight: every tile has the same
+  overlay (name, mono distance, static online dot, favourite star) and none
+  carries the rim light or cell corner ticks.
 - **× tick**: section labels read "× ABOUT", with the × in `rim` (`SectionLabel`).
 - **Coordinates**: distances are always mono caps ("0.5 KM").
 - **Wordmark** (`Wordmark`): lowercase "stexx", heavy, tracking −0.04em.
+  Used on the welcome screen, the paywall headline and the settings footer,
+  never in a bar (bars use the xx app mark).
   "ste" is frost and "xx" is flat `rim`, with an optional faint flare
   (rim @ 0.3, radius ≤ 6).
 - **Mark** (`StexxMark`): frost "XX" with a violet rim light on its

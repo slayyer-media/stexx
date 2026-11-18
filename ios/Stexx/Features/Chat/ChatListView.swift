@@ -13,7 +13,6 @@ struct ChatListView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var path = NavigationPath()
-    @State private var scroll = ChatListScrollTracker()
     /// Flips once the first conversations are on screen, so rows fade in
     /// on the first appearance only (not every time a lazy row is reused).
     @State private var hasRevealed = false
@@ -29,11 +28,6 @@ struct ChatListView: View {
 
         NavigationStack(path: $path) {
             List {
-                ChatListHeader(unread: unread, count: visible.count)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 4, leading: Theme.Spacing.screen, bottom: Theme.Spacing.l, trailing: Theme.Spacing.screen))
-
                 ForEach(Array(visible.enumerated()), id: \.element.id) { index, conversation in
                     Button {
                         openCount += 1
@@ -60,11 +54,6 @@ struct ChatListView: View {
                 }
             }
             .listStyle(.plain)
-            .onScrollGeometryChange(for: Bool.self) { geometry in
-                geometry.contentOffset.y + geometry.contentInsets.top > 44
-            } action: { _, isScrolled in
-                scroll.isPastHeader = isScrolled
-            }
             .overlay {
                 if chatStore.isLoading && visible.isEmpty {
                     ProgressView()
@@ -86,6 +75,11 @@ struct ChatListView: View {
                     }
                 }
             }
+            .tabHeader {
+                TabHeaderTitle(String(localized: "Chats"))
+            } trailing: {
+                ChatListCount(unread: unread, count: visible.count)
+            }
             .stexxBackground()
             .refreshable { await chatStore.load() }
             .task { await chatStore.loadIfNeeded() }
@@ -95,14 +89,6 @@ struct ChatListView: View {
             }
             .sensoryFeedback(.selection, trigger: openCount)
             .navigationTitle("Chats")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                // The big header lives in the list; the bar only shows a
-                // compact title once it has scrolled away.
-                ToolbarItem(placement: .principal) {
-                    ChatListCompactTitle(scroll: scroll)
-                }
-            }
             .navigationDestination(for: ChatRoute.self) { route in
                 ChatThreadView(route: route)
             }
@@ -115,51 +101,23 @@ struct ChatListView: View {
 
 // MARK: - Header
 
-private struct ChatListHeader: View {
+/// The mono count on the trailing side of the tab header.
+private struct ChatListCount: View {
     let unread: Int
     let count: Int
 
     var body: some View {
-        HStack(alignment: .lastTextBaseline) {
-            Text(verbatim: String(localized: "Chats").lowercased())
-                .stexxTitleStyle(.display)
-                .accessibilityLabel("Chats")
-                .accessibilityAddTraits(.isHeader)
-            Spacer(minLength: Theme.Spacing.s)
-            if unread > 0 {
-                Text("\(unread) new")
-                    .monospacedDigit()
-                    .stexxLabelStyle(.label, color: Theme.frost)
-            } else if count > 0 {
-                Text("All caught up")
-                    .stexxLabelStyle(.label, color: Theme.slate)
-            }
+        if unread > 0 {
+            Text("\(unread) new")
+                .monospacedDigit()
+                .stexxLabelStyle(.label, color: Theme.frost)
+                .lineLimit(1)
+        } else if count > 0 {
+            Text("All caught up")
+                .stexxLabelStyle(.label, color: Theme.slate)
+                .lineLimit(1)
         }
-        .padding(.top, Theme.Spacing.s)
     }
-}
-
-/// Inline title that fades in once the big header is scrolled off. Reads the
-/// scroll state itself so scrolling doesn't re-render the list.
-private struct ChatListCompactTitle: View {
-    let scroll: ChatListScrollTracker
-
-    var body: some View {
-        let isVisible = scroll.isPastHeader
-        Text(verbatim: String(localized: "Chats").lowercased())
-            .font(.stexxHeadline.weight(.heavy))
-            .tracking(Theme.Tracking.tight)
-            .foregroundStyle(Theme.frost)
-            .opacity(isVisible ? 1 : 0)
-            .animation(Motion.fade, value: isVisible)
-            .accessibilityLabel("Chats")
-            .accessibilityHidden(!isVisible)
-    }
-}
-
-@MainActor @Observable
-private final class ChatListScrollTracker {
-    var isPastHeader = false
 }
 
 // MARK: - Row

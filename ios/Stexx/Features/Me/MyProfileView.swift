@@ -45,25 +45,17 @@ struct MyProfileView: View {
                 .padding(.horizontal, Theme.Spacing.screen)
                 .padding(.bottom, Theme.Spacing.xxl)
             }
+            .tabHeader {
+                TabHeaderTitle(String(localized: "You"))
+            } trailing: {
+                NavigationLink(value: Route.settings) {
+                    TabHeaderIconLabel(title: "Settings", systemImage: "gearshape")
+                }
+                .buttonStyle(.pressable)
+                .padding(.trailing, -Theme.Spacing.s)
+            }
             .stexxBackground()
             .navigationTitle("You")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Text(verbatim: "you")
-                        .font(.stexxHeadline.weight(.heavy))
-                        .tracking(Theme.Tracking.tight)
-                        .foregroundStyle(Theme.frost)
-                        .accessibilityAddTraits(.isHeader)
-                }
-                .sharedBackgroundVisibility(.hidden)
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink(value: Route.settings) {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                    .tint(Theme.steel)
-                }
-            }
             .navigationDestination(for: Route.self) { route in
                 switch route {
                 case .edit:
