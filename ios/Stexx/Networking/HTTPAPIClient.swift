@@ -1,28 +1,65 @@
 import Foundation
 
-/// Live client for the Stexx REST API (`docs/api.md`). Thin by design: JSON
-/// over HTTPS with a bearer token. Token refresh, retries and the realtime
-/// WebSocket are still TODO.
+/// Live client for the Stexx REST API (`docs/api.md`): JSON over HTTP(S)
+/// with a bearer token.
+///
+/// - On 401 it refreshes the session once via `/auth/refresh` (single flight
+///   across concurrent requests, see `SessionCoordinator`), stores the
+///   rotated session and retries the original request once. If the refresh
+///   token is rejected the session is cleared and `hooks.sessionExpired` runs.
+/// - 402 maps to `APIError.requiresPlus` and runs `hooks.requiresPlus`.
+/// - 429 maps to `APIError.rateLimited(retryAfter:)` from `Retry-After`.
 struct HTTPAPIClient: APIClient {
     let configuration: APIConfiguration
-    var session: URLSession = .shared
-    /// Supplies the current access token, if any.
-    let accessToken: @Sendable () async -> String?
+    let session: URLSession
+    let sessions: SessionCoordinator
+    let hooks: APIClientHooks
 
     init(
         configuration: APIConfiguration,
-        session: URLSession = .shared,
-        accessToken: @escaping @Sendable () async -> String?
+        session: URLSession = .stexxAPI,
+        sessions: SessionCoordinator,
+        hooks: APIClientHooks = APIClientHooks()
     ) {
         self.configuration = configuration
         self.session = session
-        self.accessToken = accessToken
+        self.sessions = sessions
+        self.hooks = hooks
     }
 
     // MARK: Auth & account
 
     func register(_ request: RegistrationRequest) async throws -> Session {
-        try await call("POST", "auth/register", body: request, authenticated: false)
+        try await call("POST", "auth/register", body: request, auth: .none)
+    }
+
+    func requestEmailLink(email: String) async throws {
+        struct Body: Encodable { let email: String }
+        try await callVoid("POST", "auth/email/link", body: Body(email: email), auth: .none)
+    }
+
+    func verifyEmailLink(token: String) async throws -> Session {
+        struct Body: Encodable { let token: String }
+        return try await call("POST", "auth/email/verify", body: Body(token: token), auth: .none)
+    }
+
+    func refreshSession(refreshToken: String) async throws -> Session {
+        struct Body: Encodable { let refreshToken: String }
+        return try await call("POST", "auth/refresh", body: Body(refreshToken: refreshToken), auth: .none)
+    }
+
+    /// Revokes `session`'s token family. Runs after the local session is
+    /// already cleared, so it never touches the store: if the access token
+    /// has expired (likely after the app sat idle) it rotates with the
+    /// session's own refresh token and revokes the new pair instead.
+    func logout(_ session: Session) async throws {
+        do {
+            try await callVoid("POST", "auth/logout", auth: .explicit(session.accessToken))
+        } catch APIError.unauthorized {
+            guard let refreshToken = session.refreshToken else { throw APIError.unauthorized }
+            let fresh = try await refreshSession(refreshToken: refreshToken)
+            try await callVoid("POST", "auth/logout", auth: .explicit(fresh.accessToken))
+        }
     }
 
     func deleteAccount() async throws {
@@ -40,10 +77,22 @@ struct HTTPAPIClient: APIClient {
     }
 
     func uploadPhoto(jpegData: Data) async throws -> Photo {
-        var request = try await makeRequest("POST", "me/photos")
-        request.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jpegData
-        return try JSONDecoder.stexx().decode(Photo.self, from: try await perform(request))
+        let data = try await exchange("POST", "me/photos", body: .raw(jpegData, contentType: "image/jpeg"))
+        return try decode(Photo.self, from: data)
+    }
+
+    func uploadAttachment(jpegData: Data) async throws -> Photo {
+        let data = try await exchange("POST", "me/attachments", body: .raw(jpegData, contentType: "image/jpeg"))
+        return try decode(Photo.self, from: data)
+    }
+
+    func deletePhoto(id: Photo.ID) async throws {
+        try await callVoid("DELETE", "me/photos/\(id)")
+    }
+
+    func reorderPhotos(_ photoIDs: [Photo.ID]) async throws -> [Photo] {
+        struct Body: Encodable { let photoIDs: [Photo.ID] }
+        return try await call("PUT", "me/photos/order", body: Body(photoIDs: photoIDs))
     }
 
     func updatePrivacy(_ settings: PrivacySettings) async throws -> PrivacySettings {
@@ -52,6 +101,10 @@ struct HTTPAPIClient: APIClient {
 
     func updateLocation(_ location: FuzzedLocation) async throws {
         try await callVoid("PUT", "me/location", body: location)
+    }
+
+    func exportData() async throws -> Data {
+        try await exchange("GET", "me/export")
     }
 
     // MARK: Discovery
@@ -139,16 +192,78 @@ struct HTTPAPIClient: APIClient {
         try await callVoid("POST", "reports", body: report)
     }
 
+    // MARK: Stexx+
+
+    func subscriptionStatus() async throws -> SubscriptionStatus {
+        try await call("GET", "subscriptions/status")
+    }
+
+    func submitAppleTransaction(signedTransaction: String) async throws -> SubscriptionStatus {
+        try await call(
+            "POST",
+            "subscriptions/apple",
+            body: AppleTransactionSubmission(signedTransaction: signedTransaction)
+        )
+    }
+
+    func setTravelLocation(_ location: FuzzedLocation?) async throws {
+        /// Encodes the location, or a JSON `null` to turn travel mode off.
+        struct Body: Encodable {
+            let location: FuzzedLocation?
+            func encode(to encoder: any Encoder) throws {
+                var container = encoder.singleValueContainer()
+                if let location { try container.encode(location) } else { try container.encodeNil() }
+            }
+        }
+        try await callVoid("PUT", "me/travel", body: Body(location: location))
+    }
+
+    func startBoost() async throws -> Boost {
+        try await call("POST", "boosts")
+    }
+
+    #if DEBUG
+    func debugGrantPlus() async throws {
+        try await callVoid("POST", "dev/plus", body: [String: String]())
+    }
+    #endif
+
     // MARK: - Plumbing
+
+    enum Auth: Sendable {
+        /// Current session's access token; refresh and retry once on 401.
+        case session
+        /// This exact token; no refresh through the store (used for logout).
+        case explicit(String)
+        case none
+    }
+
+    enum Body: Sendable {
+        case json(Data)
+        case raw(Data, contentType: String)
+    }
 
     private func call<Response: Decodable>(
         _ method: String,
         _ path: String,
         query: [URLQueryItem] = [],
         body: (any Encodable)? = nil,
-        authenticated: Bool = true
+        auth: Auth = .session
     ) async throws -> Response {
-        let data = try await perform(makeRequest(method, path, query: query, body: body, authenticated: authenticated))
+        let data = try await exchange(method, path, query: query, body: body.map { try .json(JSONEncoder.stexx().encode($0)) }, auth: auth)
+        return try decode(Response.self, from: data)
+    }
+
+    private func callVoid(
+        _ method: String,
+        _ path: String,
+        body: (any Encodable)? = nil,
+        auth: Auth = .session
+    ) async throws {
+        _ = try await exchange(method, path, body: body.map { try .json(JSONEncoder.stexx().encode($0)) }, auth: auth)
+    }
+
+    private func decode<Response: Decodable>(_ type: Response.Type, from data: Data) throws -> Response {
         do {
             return try JSONDecoder.stexx().decode(Response.self, from: data)
         } catch {
@@ -156,39 +271,77 @@ struct HTTPAPIClient: APIClient {
         }
     }
 
-    private func callVoid(
+    /// Sends a request; on 401 with the session token, refreshes once and
+    /// retries once with the new token.
+    private func exchange(
         _ method: String,
         _ path: String,
-        body: (any Encodable)? = nil
-    ) async throws {
-        _ = try await perform(makeRequest(method, path, body: body))
+        query: [URLQueryItem] = [],
+        body: Body? = nil,
+        auth: Auth = .session
+    ) async throws -> Data {
+        switch auth {
+        case .none:
+            return try await perform(makeRequest(method, path, query: query, body: body, token: nil))
+        case .explicit(let token):
+            return try await perform(makeRequest(method, path, query: query, body: body, token: token))
+        case .session:
+            let current = await sessions.currentSession
+            do {
+                return try await perform(makeRequest(method, path, query: query, body: body, token: current?.accessToken))
+            } catch APIError.unauthorized {
+                let client = self
+                let fresh = try await sessions.refreshedSession(rejecting: current) { refreshToken in
+                    try await client.refreshSession(refreshToken: refreshToken)
+                }
+                return try await perform(makeRequest(method, path, query: query, body: body, token: fresh.accessToken))
+            }
+        }
     }
 
     private func makeRequest(
         _ method: String,
         _ path: String,
-        query: [URLQueryItem] = [],
-        body: (any Encodable)? = nil,
-        authenticated: Bool = true
-    ) async throws -> URLRequest {
-        var url = configuration.baseURL
-            .appending(path: configuration.apiVersion)
-            .appending(path: path)
-        if !query.isEmpty {
-            url.append(queryItems: query)
-        }
+        query: [URLQueryItem],
+        body: Body?,
+        token: String?
+    ) -> URLRequest {
+        let url = Self.url(
+            configuration.baseURL.appending(path: configuration.apiVersion).appending(path: path),
+            query: query
+        )
 
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if let body {
+        switch body {
+        case .json(let data):
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONEncoder.stexx().encode(body)
+            request.httpBody = data
+        case .raw(let data, let contentType):
+            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+            request.httpBody = data
+        case nil:
+            break
         }
-        if authenticated, let token = await accessToken() {
+        if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         return request
+    }
+
+    /// Appends `query` to `url`, percent-encoding `+` too: Foundation
+    /// leaves it literal, and form-style parsers (the server's) read a
+    /// literal `+` as a space, so a `C++` tag would arrive as `C  `.
+    static func url(_ url: URL, query: [URLQueryItem]) -> URL {
+        guard !query.isEmpty else { return url }
+        var url = url
+        url.append(queryItems: query)
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let encoded = components.percentEncodedQuery, encoded.contains("+")
+        else { return url }
+        components.percentEncodedQuery = encoded.replacingOccurrences(of: "+", with: "%2B")
+        return components.url ?? url
     }
 
     private func perform(_ request: URLRequest) async throws -> Data {
@@ -200,15 +353,28 @@ struct HTTPAPIClient: APIClient {
         case 401:
             throw APIError.unauthorized
         case 402:
+            await hooks.requiresPlus()
             throw APIError.requiresPlus
         case 404:
             throw APIError.notFound
         case 429:
-            throw APIError.rateLimited
+            throw APIError.rateLimited(retryAfter: Self.retryAfter(http.value(forHTTPHeaderField: "Retry-After")))
         default:
             let message = (try? JSONDecoder.stexx().decode(ErrorBody.self, from: data))?.message
             throw APIError.server(status: http.statusCode, message: message)
         }
+    }
+
+    /// `Retry-After` is either delta-seconds or an HTTP date.
+    static func retryAfter(_ header: String?, now: Date = .now) -> TimeInterval? {
+        guard let header = header?.trimmingCharacters(in: .whitespaces), !header.isEmpty else { return nil }
+        if let seconds = TimeInterval(header) { return max(0, seconds) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: header) else { return nil }
+        return max(0, date.timeIntervalSince(now))
     }
 
     private struct ErrorBody: Decodable {

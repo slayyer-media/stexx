@@ -1,3 +1,4 @@
+import StoreKit
 import SwiftUI
 
 /// Stexx+ features, in one place so the paywall, settings and docs agree.
@@ -40,16 +41,17 @@ enum PlusFeature: CaseIterable, Identifiable {
 enum PlusProduct {
     /// App Store product ID for the monthly subscription.
     static let monthlyID = "gay.stexx.app.plus.monthly"
-    /// Placeholder until StoreKit's localized `Product.displayPrice` is wired up.
-    static let placeholderPrice = "$10"
+    /// Shown until StoreKit's localized `Product.displayPrice` has loaded.
+    static let placeholderPrice = "$9.99"
 }
 
-/// Stexx+ paywall placeholder. Purchasing will use StoreKit 2 with server-side
-/// verification (`POST /v1/subscriptions/apple`).
+/// Stexx+ paywall. Purchases use StoreKit 2 with server-side verification
+/// (`POST /v1/subscriptions/apple`); see `PurchaseService`.
 struct PaywallView: View {
     @Environment(AppState.self) private var appState
+    @Environment(PurchaseService.self) private var purchases
+    @Environment(\.purchase) private var purchase
     @Environment(\.dismiss) private var dismiss
-    @State private var isShowingComingSoon = false
 
     var body: some View {
         ScrollView {
@@ -99,11 +101,15 @@ struct PaywallView: View {
             GlassIconButton("Close", systemImage: "xmark") { dismiss() }
                 .padding(Theme.Spacing.l)
         }
-        .alert("Coming soon", isPresented: $isShowingComingSoon) {
+        .alert("Stexx+", isPresented: Binding(
+            get: { purchases.errorMessage != nil },
+            set: { if !$0 { purchases.errorMessage = nil } }
+        )) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("Stexx+ isn't on sale yet. Star the repo to hear when it is.")
+            Text(purchases.errorMessage ?? "")
         }
+        .task { await purchases.loadProducts() }
     }
 
     private var purchaseBar: some View {
@@ -115,16 +121,23 @@ struct PaywallView: View {
                     .padding(.vertical, Theme.Spacing.m)
             } else {
                 Button {
-                    // TODO: StoreKit 2 purchase of PlusProduct.monthlyID.
-                    isShowingComingSoon = true
+                    Task { await purchases.purchase(using: purchase) }
                 } label: {
-                    WideLabel("Get Stexx+ for \(PlusProduct.placeholderPrice)/month")
+                    WideLabel("Get Stexx+ for \(purchases.displayPrice)/month")
                 }
                 .stexxPrimaryButton()
+                .disabled(purchases.isPurchasing || purchases.isRestoring)
+
+                Button("Restore purchases") {
+                    Task { await purchases.restore() }
+                }
+                .font(.footnote)
+                .foregroundStyle(Theme.textSecondary)
+                .disabled(purchases.isPurchasing || purchases.isRestoring)
 
                 #if DEBUG
                 Button("Simulate purchase (debug)") {
-                    appState.hasPlus = true
+                    Task { await purchases.debugGrantPlus() }
                 }
                 .font(.footnote)
                 .foregroundStyle(Theme.textTertiary)
@@ -137,7 +150,22 @@ struct PaywallView: View {
             }
         }
         .padding(.horizontal, Theme.Spacing.xl)
+        .padding(.top, Theme.Spacing.l)
         .padding(.bottom, Theme.Spacing.s)
+        // The bar sits in a safe-area inset over the scroll view; without a
+        // backdrop, scrolled cards showed through behind the buttons.
+        .background {
+            LinearGradient(
+                stops: [
+                    .init(color: Theme.background.opacity(0), location: 0),
+                    .init(color: Theme.background.opacity(0.92), location: 0.25),
+                    .init(color: Theme.background, location: 1),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea(edges: .bottom)
+        }
     }
 }
 

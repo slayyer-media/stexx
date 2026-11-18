@@ -30,6 +30,12 @@ An open-source, ad-free, privacy-first gay dating and hookup app. A Grindr alter
 
 Very early. The native iOS app (SwiftUI, iOS 26, Liquid Glass) is in [`ios/`](ios/) and runs against a mock backend; see [`ios/README.md`](ios/README.md) to build it. The planned server API is sketched in [`docs/api.md`](docs/api.md). Star the repo to follow along.
 
+## Backend
+
+The API server lives in [`server/`](server/) (Bun + TypeScript + Hono + Postgres 18). It implements [`docs/api.md`](docs/api.md) and enforces the privacy rules above in code and tests.
+Run it locally with `cd server && cp .env.example .env && bun install && bun run db:up && bun run db:migrate && bun run dev`; see [`server/README.md`](server/README.md) for the architecture,
+where each privacy guarantee is enforced, and the environment reference. Production is a single VPS behind Cloudflare, with no access logs and 30-day encrypted backups: see [`server/deploy/`](server/deploy/README.md).
+
 ## Contributing
 
 Developers, designers, and testers are all welcome. Open an issue with ideas, or say hi on X: [@stexxapp](https://x.com/stexxapp).

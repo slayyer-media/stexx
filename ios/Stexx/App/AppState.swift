@@ -10,8 +10,10 @@ final class AppState {
     private(set) var session: Session?
     var me: Profile? = nil
     var privacy: PrivacySettings
-    /// Stexx+ entitlement. Will come from StoreKit 2 transactions.
+    /// Stexx+ entitlement. Set from the server (`GET /subscriptions/status`,
+    /// 402 responses); StoreKit purchases only trigger a server re-check.
     var hasPlus = false
+    private(set) var plusExpiresAt: Date?
     /// Profiles blocked during this session; hidden everywhere immediately,
     /// even before the server round-trip finishes.
     private(set) var blockedIDs: Set<Profile.ID> = []
@@ -19,6 +21,8 @@ final class AppState {
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let sessionStore: any SessionStore
+    /// Revokes a session on the server when the user signs out. Set by the app.
+    @ObservationIgnored var revokeSession: ((Session) -> Void)?
 
     private enum Keys {
         static let ageConfirmed = "stexx.ageConfirmed"
@@ -51,19 +55,62 @@ final class AppState {
     }
 
     /// Clears the session. `wipeLocalData` also forgets onboarding and
-    /// settings, used after account deletion.
+    /// settings, used after account deletion. A plain sign-out also revokes
+    /// the session on the server.
     func signOut(wipeLocalData: Bool = false) {
-        sessionStore.clear()
-        session = nil
-        me = nil
-        hasPlus = false
-        blockedIDs = []
+        if !wipeLocalData, let session { revokeSession?(session) }
+        clearSession()
         if wipeLocalData {
             defaults.removeObject(forKey: Keys.ageConfirmed)
             defaults.removeObject(forKey: Keys.privacy)
             isAgeConfirmed = false
             privacy = PrivacySettings()
         }
+    }
+
+    /// The client rotated the tokens (already saved to the store).
+    func sessionDidRefresh(_ session: Session) {
+        guard self.session != nil else { return }
+        self.session = session
+    }
+
+    /// The server rejected the refresh token: back to onboarding, keeping
+    /// the 18+ flag and settings.
+    func sessionDidExpire() {
+        guard session != nil else { return }
+        clearSession()
+    }
+
+    private func clearSession() {
+        sessionStore.clear()
+        session = nil
+        me = nil
+        hasPlus = false
+        plusExpiresAt = nil
+        blockedIDs = []
+    }
+
+    // MARK: Stexx+
+
+    /// Applies the server's view of the entitlement.
+    func applySubscription(_ status: SubscriptionStatus) {
+        hasPlus = status.isActive
+        plusExpiresAt = status.isActive ? status.expiresAt : nil
+        if !status.isActive { dropPlusOnlySettings() }
+    }
+
+    /// The server answered 402 `requires_plus`: the entitlement is gone (or
+    /// never existed), so turn off Plus-only settings and show the paywall.
+    func handleRequiresPlus() {
+        hasPlus = false
+        plusExpiresAt = nil
+        dropPlusOnlySettings()
+        isPaywallPresented = true
+    }
+
+    private func dropPlusOnlySettings() {
+        // Re-sending incognito without Plus would just 402 again.
+        if privacy.incognito { privacy.incognito = false }
     }
 
     // MARK: Privacy

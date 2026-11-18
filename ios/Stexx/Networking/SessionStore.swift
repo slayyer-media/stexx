@@ -7,6 +7,24 @@ protocol SessionStore: Sendable {
     func load() -> Session?
     func save(_ session: Session) throws
     func clear()
+    /// Saves `session` (or clears the store for `nil`) only if the stored
+    /// session still belongs to `userID` and holds `refreshToken`, i.e.
+    /// nobody signed out, signed in as someone else or rotated the tokens
+    /// meanwhile. Returns whether the store changed.
+    func replace(userID: Profile.ID, refreshToken: String, with session: Session?) -> Bool
+}
+
+extension SessionStore {
+    /// Non-atomic fallback. `CachedSessionStore` and `InMemorySessionStore`
+    /// do the check and the write under one lock.
+    func replace(userID: Profile.ID, refreshToken: String, with session: Session?) -> Bool {
+        guard let current = load(), current.userID == userID, current.refreshToken == refreshToken else { return false }
+        guard let session else {
+            clear()
+            return true
+        }
+        return (try? save(session)) != nil
+    }
 }
 
 struct KeychainSessionStore: SessionStore {
@@ -53,6 +71,56 @@ struct KeychainSessionStore: SessionStore {
     }
 }
 
+/// The app's store: keeps the session in memory (the source of truth for
+/// this launch) and persists it to `backing` (the Keychain) best-effort.
+///
+/// A failed Keychain write (missing entitlement, locked device) therefore
+/// can't leave the app "signed in" with no readable token: requests keep
+/// working with the in-memory session, it just won't survive a relaunch.
+/// All reads and writes go through one lock, so `replace` is atomic with
+/// respect to sign-in and sign-out.
+final class CachedSessionStore: SessionStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private let backing: any SessionStore
+    private var session: Session?
+
+    init(backing: any SessionStore) {
+        self.backing = backing
+        self.session = backing.load()
+    }
+
+    func load() -> Session? {
+        lock.withLock { session }
+    }
+
+    /// Never fails for the in-memory copy; a persistence error is rethrown
+    /// after the session is already in use.
+    func save(_ session: Session) throws {
+        try lock.withLock {
+            self.session = session
+            try backing.save(session)
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            session = nil
+            backing.clear()
+        }
+    }
+
+    func replace(userID: Profile.ID, refreshToken: String, with session: Session?) -> Bool {
+        lock.withLock {
+            guard let current = self.session, current.userID == userID, current.refreshToken == refreshToken else {
+                return false
+            }
+            self.session = session
+            if let session { try? backing.save(session) } else { backing.clear() }
+            return true
+        }
+    }
+}
+
 /// For previews and tests.
 final class InMemorySessionStore: SessionStore, @unchecked Sendable {
     private let lock = NSLock()
@@ -72,5 +140,15 @@ final class InMemorySessionStore: SessionStore, @unchecked Sendable {
 
     func clear() {
         lock.withLock { session = nil }
+    }
+
+    func replace(userID: Profile.ID, refreshToken: String, with session: Session?) -> Bool {
+        lock.withLock {
+            guard let current = self.session, current.userID == userID, current.refreshToken == refreshToken else {
+                return false
+            }
+            self.session = session
+            return true
+        }
     }
 }

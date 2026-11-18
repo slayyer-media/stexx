@@ -1,0 +1,23 @@
+# /etc/fail2ban/jail.d/stexx.local
+# Only sshd is watched: Caddy writes no access logs and the API logs no client addresses, so there is
+# nothing to ban on at the HTTP layer (rate limiting lives in the app). fail2ban keeps the IPs of
+# *attackers who failed ssh auth* for the ban window; it holds no Stexx user data.
+[DEFAULT]
+backend = systemd
+banaction = ufw
+bantime = 1h
+findtime = 10m
+maxretry = 4
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+mode = aggressive
+
+[recidive]
+enabled = true
+backend = auto
+logpath = /var/log/fail2ban.log
+bantime = 7d
+findtime = 1d
+maxretry = 3

@@ -18,7 +18,8 @@ struct MockAPIClientTests {
         let distances = first.items.compactMap(\.distanceMeters)
         #expect(distances == distances.sorted())
 
-        query.cursor = try #require(first.nextCursor)
+        let cursor: String = try #require(first.nextCursor)
+        query.cursor = cursor
         let second = try await api.nearby(query)
         #expect(Set(first.items.map(\.id)).isDisjoint(with: second.items.map(\.id)))
     }
@@ -29,7 +30,7 @@ struct MockAPIClientTests {
         query.onlineOnly = true
         let page = try await makeClient().nearby(query)
         #expect(!page.items.isEmpty)
-        #expect(page.items.allSatisfy(\.isOnline))
+        #expect(page.items.allSatisfy { $0.isOnline })
     }
 
     @Test("Blocked members disappear from the grid and chats")

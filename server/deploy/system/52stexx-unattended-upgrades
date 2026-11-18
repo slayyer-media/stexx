@@ -1,0 +1,22 @@
+// /etc/apt/apt.conf.d/52stexx-unattended-upgrades  (loaded after Ubuntu's 50unattended-upgrades; later wins)
+// Security updates from Ubuntu plus PostgreSQL minor releases from PGDG, installed automatically.
+Unattended-Upgrade::Allowed-Origins {
+	"${distro_id}:${distro_codename}";
+	"${distro_id}:${distro_codename}-security";
+	"${distro_id}ESM:${distro_codename}-infra-security";
+	"${distro_id}ESM:${distro_codename}-apps-security";
+	// PostgreSQL minor/security releases (apt.postgresql.org). Major upgrades are never automatic.
+	"origin=apt.postgresql.org,codename=${distro_codename}-pgdg,label=PostgreSQL for Debian/Ubuntu repository";
+};
+Unattended-Upgrade::Package-Blacklist {
+	// Major-version packages are pinned by name; only point releases flow through.
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+// Kernel/libc updates need a reboot. All services are systemd units that come back on their own
+// (stexx-api, caddy, postgresql); expect about a minute of downtime at 04:30 UTC when it happens.
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+Unattended-Upgrade::Automatic-Reboot-Time "04:30";
+Unattended-Upgrade::SyslogEnable "true";

@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 /// A single conversation with a floating liquid-glass composer.
@@ -17,6 +18,8 @@ struct ChatThreadView: View {
     @State private var expiresPhotos = true
     @State private var isConfirmingBlock = false
     @State private var isReporting = false
+    @State private var isPickingPhoto = false
+    @State private var photoItem: PhotosPickerItem?
     @FocusState private var isComposerFocused: Bool
     @Namespace private var composerNamespace
 
@@ -103,6 +106,24 @@ struct ChatThreadView: View {
             }
         }
         .task { await load() }
+        .task(id: conversation?.id) {
+            // Realtime: new messages and read receipts while the thread is open.
+            guard let id = conversation?.id else { return }
+            for await update in chatStore.threadUpdates(for: id) {
+                if update == .resync {
+                    // The socket was down: refetch what was missed.
+                    try? await refreshMessages(in: id)
+                } else {
+                    ChatStore.merge(update, into: &messages, myID: appState.myID)
+                }
+            }
+        }
+        .photosPicker(isPresented: $isPickingPhoto, selection: $photoItem, matching: .images)
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            photoItem = nil
+            Task { await sendPhoto(item) }
+        }
     }
 
     // MARK: Composer
@@ -112,7 +133,7 @@ struct ChatThreadView: View {
             HStack(alignment: .bottom, spacing: Theme.Spacing.s) {
                 Menu {
                     Button {
-                        // TODO: PhotosPicker + upload; sent with expiresAfterSeconds when enabled.
+                        isPickingPhoto = true
                     } label: {
                         Label("Photo", systemImage: "photo")
                     }
@@ -190,12 +211,19 @@ struct ChatThreadView: View {
                 resolved = try await api.openConversation(with: participant.id)
             }
             conversation = resolved
-            messages = try await api.messages(in: resolved.id, before: nil).items
+            try await refreshMessages(in: resolved.id)
             await chatStore.markRead(resolved.id)
         } catch is CancellationError {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Fetches the latest page and reconciles it with what's shown, keeping
+    /// live events that arrived while the request was in flight.
+    private func refreshMessages(in conversationID: Conversation.ID) async throws {
+        let snapshot = try await api.messages(in: conversationID, before: nil).items
+        messages = ChatStore.reconcile(snapshot: snapshot, with: messages, myID: appState.myID)
     }
 
     private func send() {
@@ -216,14 +244,62 @@ struct ChatThreadView: View {
               let index = messages.firstIndex(where: { $0.id == message.id })
         else { return }
         messages[index].status = .sending
+        if message.attachment != nil {
+            deliverPhoto(nil, clientID: clientID, pendingID: message.id, in: conversation)
+            return
+        }
         deliver(MessageDraft(clientID: clientID, text: message.text), pendingID: message.id, in: conversation)
     }
+
+    /// Photo messages: metadata is stripped on device (`ImageSanitizer`),
+    /// then the photo is uploaded and sent as `attachmentPhotoID`.
+    private func sendPhoto(_ item: PhotosPickerItem) async {
+        guard let conversation,
+              let data = try? await item.loadTransferable(type: Data.self),
+              let jpeg = ImageSanitizer.strippedJPEG(from: data)
+        else { return }
+        var pending = Message.pending(
+            from: MessageDraft(clientID: UUID().uuidString),
+            conversationID: conversation.id,
+            senderID: appState.myID
+        )
+        pending.attachment = Message.Attachment(kind: .photo, url: nil)
+        messages.append(pending)
+        deliverPhoto(jpeg, clientID: pending.clientID ?? pending.id, pendingID: pending.id, in: conversation)
+    }
+
+    private func deliverPhoto(_ jpeg: Data?, clientID: String, pendingID: Message.ID, in conversation: Conversation) {
+        let expiresAfter = expiresPhotos ? Self.expiringPhotoSeconds : nil
+        Task {
+            do {
+                let sent = try await chatStore.sendPhoto(
+                    jpegData: jpeg,
+                    clientID: clientID,
+                    expiresAfterSeconds: expiresAfter,
+                    in: conversation
+                )
+                if let index = messages.firstIndex(where: { $0.id == pendingID }) {
+                    messages[index] = sent
+                }
+            } catch {
+                if let index = messages.firstIndex(where: { $0.id == pendingID }) {
+                    messages[index].status = .failed
+                }
+            }
+        }
+    }
+
+    /// How long an expiring photo stays after it's been read.
+    private static let expiringPhotoSeconds = 60
 
     private func deliver(_ messageDraft: MessageDraft, pendingID: Message.ID, in conversation: Conversation) {
         Task {
             do {
                 let sent = try await api.send(messageDraft, in: conversation.id)
                 if let index = messages.firstIndex(where: { $0.id == pendingID }) {
+                    messages[index] = sent
+                } else if let index = messages.firstIndex(where: { $0.id == sent.id }) {
+                    // The realtime echo arrived first and replaced the pending copy.
                     messages[index] = sent
                 }
                 chatStore.didSend(sent, in: conversation)
@@ -320,6 +396,16 @@ struct MessageBubble: View {
                     .font(.caption.weight(.semibold))
             }
             .foregroundStyle(Theme.textSecondary)
+            // View-once photos aren't fetched automatically: the first fetch
+            // counts as opening them.
+            if let url = attachment.url, !attachment.isViewOnce {
+                // Never through the shared URL cache: no copy on disk.
+                PrivateAsyncImage(url: url) { image in
+                    image.resizable().scaledToFill()
+                } placeholder: {
+                    Color.clear
+                }
+            }
         }
         .frame(width: 180, height: 220)
         .clipShape(.rect(cornerRadius: Theme.Radius.bubble))

@@ -1,0 +1,80 @@
+[Unit]
+Description=Stexx API (Bun + Hono)
+Documentation=https://github.com/stexx/stexx/blob/main/server/deploy/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+StartLimitIntervalSec=120
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=stexx
+Group=stexx
+# /srv/stexx/current is a symlink to releases/<stamp> (deploy.sh flips it). Code is owned by root and
+# read-only to the service; the only writable path is the media directory.
+WorkingDirectory=/srv/stexx/current
+# Secrets (DATABASE_URL, EMAIL_PEPPER, SMTP_URL, ...). root:root 0600; systemd reads it before dropping privileges.
+# NOTE: EnvironmentFile= values OVERRIDE Environment= below, so stexx.env must not set NODE_ENV, HOST, PORT or
+# MEDIA_DIR. ExecStartPre refuses to start if it does (deploy.sh and bootstrap.sh check the same thing).
+EnvironmentFile=/etc/stexx/stexx.env
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+Environment=MEDIA_DIR=/srv/stexx/media
+ExecStartPre=/bin/sh -c 'if grep -Eq "^[[:space:]]*(export[[:space:]]+)?(NODE_ENV|HOST|PORT|MEDIA_DIR)[[:space:]]*=" /etc/stexx/stexx.env; then echo "stexx.env must not set NODE_ENV, HOST, PORT or MEDIA_DIR (they would override the unit)" >&2; exit 1; fi'
+ExecStart=/usr/local/bin/bun src/index.ts
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+KillSignal=SIGTERM
+SyslogIdentifier=stexx-api
+# Application logs go to journald only (7-day retention, see system/journald-stexx.conf).
+StandardOutput=journal
+StandardError=journal
+# Media files are created 0640 stexx:stexx; Caddy reads them through the `stexx` group.
+UMask=0027
+
+# ---- Resource limits (adjust to the VPS; at most 2 sharp decodes run at once, each capped at 25 MP) ----
+LimitNOFILE=65536
+TasksMax=512
+MemoryHigh=1G
+MemoryMax=1536M
+
+# ---- Sandboxing (verify with: systemd-analyze security stexx-api) ----
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+# A denied syscall fails with EPERM instead of killing the process.
+SystemCallErrorNumber=EPERM
+# Only the media directory is writable. Everything else (code, /etc, /usr, /srv/stexx/backups) is read-only or hidden.
+ReadWritePaths=/srv/stexx/media
+# '-' prefix: a missing file is fine (backups may not be configured yet). Without it systemd fails the start
+# with 226/NAMESPACE whenever one of these files is absent.
+InaccessiblePaths=-/etc/stexx/rclone.conf -/etc/stexx/migrate.env -/etc/stexx/backup-recipients.txt
+# NOT set: MemoryDenyWriteExecute=. Bun (JavaScriptCore) and sharp (libvips) JIT-compile and need W+X mappings.
+# Optional: block all egress except loopback + SMTP by adding IPAddressDeny=any and IPAddressAllow= entries
+# for your SMTP relay (Postgres is on 127.0.0.1, so loopback must stay allowed).
+
+[Install]
+WantedBy=multi-user.target

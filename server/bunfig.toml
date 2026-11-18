@@ -1,0 +1,4 @@
+[test]
+# Points DATABASE_URL at stexx_test and applies migrations before any test file loads.
+preload = ["./test/setup.ts"]
+# Per-test timeout: bunfig has no key for it; see the "test" script (--timeout) and test/setup.ts.

@@ -2,6 +2,8 @@ import Foundation
 import Observation
 
 /// Conversation list shared by the Chats tab (and its badge) and threads.
+/// Realtime events (`RealtimeClient`) land here and are fanned out to open
+/// threads via `threadUpdates(for:)`.
 @MainActor
 @Observable
 final class ChatStore {
@@ -9,11 +11,33 @@ final class ChatStore {
     private(set) var isLoading = false
     private(set) var hasLoaded = false
     var errorMessage: String?
+    /// The most recent tap someone sent you (from `tap.received`).
+    private(set) var latestTap: RealtimeEvent.Tap?
+
+    /// Change to a thread pushed to its open view.
+    enum ThreadUpdate: Hashable, Sendable {
+        case created(Message)
+        case read(RealtimeEvent.ReadReceipt)
+        /// Live events may have been missed (the socket was down): refetch
+        /// the thread and reconcile it with `reconcile(snapshot:with:myID:)`.
+        case resync
+    }
 
     @ObservationIgnored private let api: any APIClient
+    @ObservationIgnored private var threadContinuations: [Conversation.ID: [UUID: AsyncStream<ThreadUpdate>.Continuation]] = [:]
+    /// Sanitized JPEGs of photo messages that haven't been sent yet, by
+    /// client ID, so a failed send can be retried.
+    @ObservationIgnored private var pendingPhotos: [String: Data] = [:]
+    /// Bumped by every `load()` and by `reset()`: only the newest load may
+    /// apply its result, and nothing started before a sign-out lands after it.
+    @ObservationIgnored private var loadGeneration = 0
+    /// Bumped by `reset()` (sign-out).
+    @ObservationIgnored private var epoch = 0
+    @ObservationIgnored private let defaults: UserDefaults
 
-    init(api: any APIClient) {
+    init(api: any APIClient, defaults: UserDefaults = .standard) {
         self.api = api
+        self.defaults = defaults
     }
 
     var unreadTotal: Int {
@@ -25,15 +49,45 @@ final class ChatStore {
         await load()
     }
 
+    /// Fetches the conversation list. Concurrent loads are fine: only the
+    /// most recently started one applies its result, and a load still in
+    /// flight when the user signs out (`reset()`) is discarded.
     func load() async {
+        loadGeneration += 1
+        let generation = loadGeneration
         isLoading = true
-        defer { isLoading = false }
+        defer { if generation == loadGeneration { isLoading = false } }
         do {
-            conversations = try await api.conversations()
+            let fetched = try await api.conversations()
+            guard generation == loadGeneration else { return }
+            conversations = fetched
             hasLoaded = true
             errorMessage = nil
+            markOpenThreadsRead()
         } catch {
+            guard generation == loadGeneration else { return }
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Catches up after the socket was down (reconnect, foreground): reloads
+    /// the list and tells open threads to refetch.
+    func resync() {
+        for conversationID in threadContinuations.keys {
+            broadcast(.resync, to: conversationID)
+        }
+        Task { await load() }
+    }
+
+    /// Open threads show everything, so the server's unread counts for them
+    /// are cleared (e.g. messages that arrived while the socket was down).
+    private func markOpenThreadsRead() {
+        for index in conversations.indices
+        where conversations[index].unreadCount > 0 && isThreadOpen(conversations[index].id) {
+            conversations[index].unreadCount = 0
+            let api = self.api
+            let id = conversations[index].id
+            Task { try? await api.markRead(conversationID: id) }
         }
     }
 
@@ -56,10 +110,12 @@ final class ChatStore {
 
     func delete(_ conversationID: Conversation.ID) async {
         let previous = conversations
+        let epoch = self.epoch
         conversations.removeAll { $0.id == conversationID }
         do {
             try await api.deleteConversation(conversationID)
         } catch {
+            guard epoch == self.epoch else { return }
             conversations = previous
             errorMessage = error.localizedDescription
         }
@@ -71,7 +127,198 @@ final class ChatStore {
     }
 
     func reset() {
+        loadGeneration += 1
+        epoch += 1
         conversations = []
         hasLoaded = false
+        isLoading = false
+        errorMessage = nil
+        latestTap = nil
+        pendingPhotos = [:]
+    }
+
+    // MARK: Photo messages
+
+    /// Sends a photo message: uploads the (already sanitized) JPEG as a
+    /// private chat attachment (`POST /me/attachments`, never on the public
+    /// profile), then sends it as `attachmentPhotoID`.
+    ///
+    /// `expiresAfterSeconds == nil` sends the photo explicitly as not
+    /// view-once (`isViewOnce: false`); otherwise the server would apply the
+    /// sender's "expiring photos by default" setting.
+    ///
+    /// Re-sending the same `clientID` after a failure is safe: the server
+    /// deduplicates by client ID, and an unsent upload expires on its own.
+    func sendPhoto(
+        jpegData: Data? = nil,
+        clientID: String,
+        text: String? = nil,
+        expiresAfterSeconds: Int?,
+        in conversation: Conversation
+    ) async throws -> Message {
+        if let jpegData { pendingPhotos[clientID] = jpegData }
+        guard let jpeg = pendingPhotos[clientID] else { throw APIError.invalidResponse }
+        let epoch = self.epoch
+
+        let attachment = try await api.uploadAttachment(jpegData: jpeg)
+        let draft = MessageDraft(
+            clientID: clientID,
+            text: text,
+            attachmentPhotoID: attachment.id,
+            expiresAfterSeconds: expiresAfterSeconds,
+            isViewOnce: expiresAfterSeconds == nil ? false : nil
+        )
+        let sent = try await api.send(draft, in: conversation.id)
+        guard epoch == self.epoch else { return sent }
+        pendingPhotos[clientID] = nil
+        didSend(sent, in: conversation)
+        return sent
+    }
+
+    func hasPendingPhoto(clientID: String) -> Bool {
+        pendingPhotos[clientID] != nil
+    }
+
+    // MARK: Realtime
+
+    /// Live updates for one open thread. While at least one stream is
+    /// subscribed the conversation counts as open: incoming messages are
+    /// marked read instead of raising the unread count.
+    func threadUpdates(for conversationID: Conversation.ID) -> AsyncStream<ThreadUpdate> {
+        let (stream, continuation) = AsyncStream.makeStream(of: ThreadUpdate.self, bufferingPolicy: .bufferingNewest(100))
+        let token = UUID()
+        threadContinuations[conversationID, default: [:]][token] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor in self?.endThreadSubscription(conversationID, token: token) }
+        }
+        return stream
+    }
+
+    private func endThreadSubscription(_ conversationID: Conversation.ID, token: UUID) {
+        threadContinuations[conversationID]?[token] = nil
+        if threadContinuations[conversationID]?.isEmpty == true {
+            threadContinuations[conversationID] = nil
+        }
+    }
+
+    func isThreadOpen(_ conversationID: Conversation.ID) -> Bool {
+        threadContinuations[conversationID]?.isEmpty == false
+    }
+
+    /// Applies a realtime event to the list and any open thread.
+    func apply(_ event: RealtimeEvent, myID: Profile.ID) {
+        switch event {
+        case .messageCreated(let message):
+            let isOpen = isThreadOpen(message.conversationID)
+            let isMine = message.senderID == myID
+            if let index = conversations.firstIndex(where: { $0.id == message.conversationID }) {
+                var conversation = conversations[index]
+                // Ignore replays of something we already have.
+                if conversation.lastMessage?.id != message.id {
+                    conversation.lastMessage = message
+                    conversation.updatedAt = max(conversation.updatedAt, message.sentAt)
+                    if !isMine && !isOpen { conversation.unreadCount += 1 }
+                }
+                conversations.remove(at: index)
+                conversations.insert(conversation, at: 0)
+            } else if hasLoaded {
+                // A new conversation: fetch it with its participant.
+                Task { await load() }
+            }
+            broadcast(.created(message), to: message.conversationID)
+            if isOpen && !isMine {
+                let api = self.api
+                Task { try? await api.markRead(conversationID: message.conversationID) }
+            }
+
+        case .messageRead(let receipt):
+            if let index = conversations.firstIndex(where: { $0.id == receipt.conversationID }),
+               var last = conversations[index].lastMessage,
+               last.senderID == myID,
+               Self.readReceipt(receipt, covers: last) {
+                last.status = .read
+                conversations[index].lastMessage = last
+            }
+            broadcast(.read(receipt), to: receipt.conversationID)
+
+        case .conversationUpdated(let conversation):
+            var updated = conversation
+            if isThreadOpen(conversation.id) { updated.unreadCount = 0 }
+            conversations.removeAll { $0.id == conversation.id }
+            let index = conversations.firstIndex { $0.updatedAt <= updated.updatedAt } ?? conversations.endIndex
+            conversations.insert(updated, at: index)
+
+        case .tapReceived(let tap):
+            latestTap = tap
+
+        case .unknown:
+            break
+        }
+    }
+
+    private func broadcast(_ update: ThreadUpdate, to conversationID: Conversation.ID) {
+        guard let continuations = threadContinuations[conversationID] else { return }
+        for continuation in continuations.values {
+            continuation.yield(update)
+        }
+    }
+
+    /// Merges a live update into a thread's messages (oldest first).
+    /// Replaces the optimistic copy of my own message by client ID.
+    static func merge(_ update: ThreadUpdate, into messages: inout [Message], myID: Profile.ID) {
+        switch update {
+        case .created(let message):
+            if let index = messages.firstIndex(where: {
+                $0.id == message.id || (message.clientID != nil && $0.clientID == message.clientID && $0.senderID == message.senderID)
+            }) {
+                // Keep a locally newer status (e.g. read) if the event is older.
+                if messages[index].status != .read || message.status == .read {
+                    messages[index] = message
+                }
+            } else {
+                let index = messages.lastIndex { $0.sentAt <= message.sentAt }.map { $0 + 1 } ?? 0
+                messages.insert(message, at: index)
+            }
+        case .read(let receipt):
+            for index in messages.indices where messages[index].senderID == myID {
+                if messages[index].status != .sending, messages[index].status != .failed,
+                   readReceipt(receipt, covers: messages[index]) {
+                    messages[index].status = .read
+                }
+            }
+        case .resync:
+            break
+        }
+    }
+
+    /// Combines a freshly fetched page of a thread (`snapshot`, oldest
+    /// first) with what the view already shows (`local`).
+    ///
+    /// Keeps local messages the snapshot doesn't have yet: optimistic ones
+    /// still sending or failed, and live events at least as new as the
+    /// snapshot's newest message (they arrived while the fetch was in
+    /// flight). Older local messages missing from the snapshot are gone on
+    /// the server (expired, deleted) and are dropped.
+    static func reconcile(snapshot: [Message], with local: [Message], myID: Profile.ID) -> [Message] {
+        var result = snapshot
+        let newest = snapshot.map(\.sentAt).max()
+        for message in local {
+            let isInSnapshot = snapshot.contains {
+                $0.id == message.id
+                    || (message.clientID != nil && $0.clientID == message.clientID && $0.senderID == message.senderID)
+            }
+            guard !isInSnapshot else { continue }
+            let isUnsent = message.status == .sending || message.status == .failed
+            let isNewer = newest.map { message.sentAt >= $0 } ?? true
+            guard isUnsent || isNewer else { continue }
+            merge(.created(message), into: &result, myID: myID)
+        }
+        return result
+    }
+
+    private static func readReceipt(_ receipt: RealtimeEvent.ReadReceipt, covers message: Message) -> Bool {
+        if let ids = receipt.messageIDs { return ids.contains(message.id) }
+        if let readAt = receipt.readAt { return message.sentAt <= readAt }
+        return true
     }
 }
