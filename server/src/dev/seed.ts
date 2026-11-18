@@ -1,5 +1,7 @@
 /**
- * Dev seed: ~40 profiles around San Francisco with generated (sharp, no downloads) photos.
+ * Dev seed: ~40 profiles around San Francisco. Profile photos come from src/dev/seed-photos/<index>-<n>.jpg:
+ * AI-generated portraits of people who don't exist (DreamShaper 8, CreativeML OpenRAIL-M, made locally with
+ * scripts/generate-seed-photos.py). Slots without a file, and "explicit" slots, get an abstract placeholder.
  *
  *   bun run db:seed            idempotent: only creates the profiles that don't exist yet
  *   bun run db:seed --reset    wipes every previously seeded profile (dev_bots) first, then reseeds
@@ -8,6 +10,7 @@
  * carry a deterministic email_hmac (HMAC of `seed-<i>@stexx.dev`), which is what makes re-runs idempotent.
  * Never imported by production code paths; the CLI entry refuses to run unless config.devAuth.
  */
+import { existsSync, readFileSync } from "node:fs";
 import sharp from "sharp";
 import { config } from "../config.ts";
 import { sql } from "../db/sql.ts";
@@ -103,6 +106,14 @@ const emailKey = (prefix: string, i: number) => `${prefix}-${i}@stexx.dev`;
 const hmacHex = (prefix: string, i: number) => emailHmac(emailKey(prefix, i)).toString("hex");
 
 // ---- Photos ------------------------------------------------------------------
+
+const SEED_PHOTO_DIR = new URL("./seed-photos/", import.meta.url);
+
+/** The committed AI portrait for this profile slot, if there is one. */
+export function seedPhotoFile(index: number, slot: number): Buffer | null {
+  const url = new URL(`${index}-${slot}.jpg`, SEED_PHOTO_DIR);
+  return existsSync(url) ? readFileSync(url) : null;
+}
 
 /** Gradient background + abstract head/shoulders silhouette (shapes only, so no font dependency). */
 export async function generatePhoto(seed: number, explicit = false): Promise<Buffer> {
@@ -240,7 +251,13 @@ export async function seedDevData(opts: SeedOptions = {}): Promise<SeedResult> {
     if (withPhotos) {
       for (let n = 0; n < p.photoCount; n++) {
         const explicit = p.explicitPhoto && n === p.photoCount - 1 && p.photoCount > 1;
-        keys.push({ key: await storeJpeg(await generatePhoto(i * 10 + n, explicit)), explicit });
+        const ai = explicit ? null : seedPhotoFile(i, n);
+        // Only the first slots have AI photos; skip the rest rather than mix in placeholders.
+        if (!ai && !explicit && n > 0 && seedPhotoFile(i, 0)) continue;
+        // Re-encode like any upload, so committed files can't carry metadata into the media store.
+        const jpeg = ai ? await sharp(ai).rotate().jpeg({ quality: 82, mozjpeg: true }).toBuffer()
+                        : await generatePhoto(i * 10 + n, explicit);
+        keys.push({ key: await storeJpeg(jpeg), explicit });
       }
     }
     const id = newId("user");
