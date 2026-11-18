@@ -161,6 +161,18 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   Tests: `setPhotoClassifierForTests(fake|null)`, `setPhotoPolicyForTests({...})`, `setHashBlocklistForTests`.
   Tests run with `PHOTO_CLASSIFIER=off`; `photo-checks.test.ts` also runs the real model if `models/` has it.
 
+### e2e/ (end-to-end encryption keys and envelopes; docs/security.md section 7, contract in docs/api.md)
+- `keys.ts`: `e2eMode()` (`E2E_MODE` off|optional|required; tests `setE2eModeForTests`), `assertE2eEnabled()` (404
+  `e2e_disabled`), `registerKeys`, `addPreKeys`, `rotateKeys`, `keyStatus(userId)`, `identityOf(userId)`,
+  `takeBundle(target, {consumeOneTime})` (SKIP LOCKED consumption), `deleteKeysOf(userId, tx)` (called on ban),
+  `preKeyLimits()` / `setPreKeyLimitsForTests`. Realtime: `identity.changed` to chat partners, `keys.low` to the owner.
+- `crypto.ts`: strict `decodeBase64`, `parseEcPublicKey` / `parseKemPublicKey` / `parseSignature`, `assertSignedBy`
+  (libsignal, lazily loaded; built-in XEdDSA fallback, `forceBuiltinVerifierForTests`). Never log key material.
+- `envelope.ts`: `envelopeSchema`, `decodeEnvelope` (≤ 32 KiB, 400 `invalid_envelope`), `envelopeJson`. Messages
+  carry `text` OR `envelope_type`/`envelope_body`; `assertMessageAllowed({..., encrypted})` picks `encryptedContentPolicy`.
+- Routes in `routes/keys.ts` (`/e2e/config`, `/keys*`). Tests: `test/e2e-helpers.ts` has a libsignal test client
+  (`SignalDevice`) that registers, builds bundles, encrypts and decrypts, and `captureRealtime(userId)`.
+
 ### media.ts
 - `sanitizeImage(bytes) → Buffer` (jpeg/png/webp/heif-if-supported → 400 `invalid_image` otherwise; 40 MP cap,
   rotate, strip metadata, ≤2048 px, JPEG q82 mozjpeg) · `storeJpeg(buf) → key` · `storeImage(bytes) → key`.
@@ -201,7 +213,8 @@ conversations (user_a < user_b, `COLLATE "C"`), conversation_members (cleared_be
 messages (attachment_kind/key/view_once/opened_at, delivered_at, read_at, read_receipt, expires_after_seconds,
 expires_at; UNIQUE(sender_id, client_id)), reports (SET NULL FKs, priority normal|high, status), subscriptions
 (PK original_transaction_id), dev_bots (dev seed markers). Migration 107: users.hidden_at/hidden_reason/banned_at/reviewed_at, reports.closed_at/
-reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL).
+reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL). Migration 109:
+e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), messages.envelope_type/envelope_body.
 
 ## Tests
 

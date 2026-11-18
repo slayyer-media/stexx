@@ -34,10 +34,10 @@ Done; see [`security.md`](security.md) for how each works and how to turn it on 
 
 Chat text and chat photos are end-to-end encrypted with the Signal Protocol, using Signal's official [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0, the same license as Stexx). The server relays ciphertext it can't read.
 
-- [ ] **Key management.** Each device has an identity key, a signed prekey, and one-time prekeys. The server stores and serves public prekey bundles only (Postgres, on the VPS).
+- [x] **Key management.** Each device has an identity key, a signed prekey, and one-time prekeys. The server stores and serves public prekey bundles only (Postgres, on the VPS). Done on the server: key upload with signature checks (libsignal), PQXDH bundles with Kyber prekeys, atomic one-time prekey consumption, limits against prekey draining, identity-change events, and an encrypted message envelope, behind `E2E_MODE` (off in production until the app ships); see [`security.md`](security.md#7-end-to-end-encrypted-chat). The iOS side is the next item.
 - [ ] **iOS client.** Use libsignal's Swift bindings for session setup (X3DH/PQXDH) and the Double Ratchet. Private keys stay in the Keychain on the device.
 - [ ] **Encrypted media.** Chat photos are encrypted on the device with a random key, uploaded as an opaque blob, and the key travels inside the encrypted message. Expiring media deletes both the blob and the key.
-- [ ] **Safety numbers.** An optional screen to compare keys with a match, and a warning when a match's key changes.
+- [ ] **Safety numbers.** An optional screen to compare keys with a match, and a warning when a match's key changes. The server already records key changes and tells chat partners (`identity.changed`); the screen and warning are iOS work.
 - [ ] **Multi-device.** Deferred. v1 is one device per account, which also fits the one-account-per-device anti-spam rule.
 
 ### Moderation with E2E
