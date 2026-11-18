@@ -10,6 +10,7 @@ export const ID_PREFIX = {
   session: "s",
   report: "r",
   challenge: "ch",
+  device: "dv",
 } as const;
 export type IdKind = keyof typeof ID_PREFIX;
 

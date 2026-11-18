@@ -9,22 +9,29 @@ import Foundation
 ///   token is rejected the session is cleared and `hooks.sessionExpired` runs.
 /// - 402 maps to `APIError.requiresPlus` and runs `hooks.requiresPlus`.
 /// - 429 maps to `APIError.rateLimited(retryAfter:)` from `Retry-After`.
+/// - Sign-up, sign-in, sending messages, photo uploads and account deletion
+///   carry device attestation headers from `attestation` (see
+///   `AttestationService`). A 403 `attestation_key_unknown` drops the key
+///   and retries once with a freshly attested one.
 struct HTTPAPIClient: APIClient {
     let configuration: APIConfiguration
     let session: URLSession
     let sessions: SessionCoordinator
     let hooks: APIClientHooks
+    let attestation: (any RequestAttesting)?
 
     init(
         configuration: APIConfiguration,
         session: URLSession = .stexxAPI,
         sessions: SessionCoordinator,
-        hooks: APIClientHooks = APIClientHooks()
+        hooks: APIClientHooks = APIClientHooks(),
+        attestation: (any RequestAttesting)? = nil
     ) {
         self.configuration = configuration
         self.session = session
         self.sessions = sessions
         self.hooks = hooks
+        self.attestation = attestation
     }
 
     // MARK: Auth & account
@@ -282,22 +289,84 @@ struct HTTPAPIClient: APIClient {
     ) async throws -> Data {
         switch auth {
         case .none:
-            return try await perform(makeRequest(method, path, query: query, body: body, token: nil))
+            return try await send(method, path, query: query, body: body, token: nil)
         case .explicit(let token):
-            return try await perform(makeRequest(method, path, query: query, body: body, token: token))
+            return try await send(method, path, query: query, body: body, token: token)
         case .session:
             let current = await sessions.currentSession
             do {
-                return try await perform(makeRequest(method, path, query: query, body: body, token: current?.accessToken))
+                return try await send(method, path, query: query, body: body, token: current?.accessToken)
             } catch APIError.unauthorized {
                 let client = self
                 let fresh = try await sessions.refreshedSession(rejecting: current) { refreshToken in
                     try await client.refreshSession(refreshToken: refreshToken)
                 }
-                return try await perform(makeRequest(method, path, query: query, body: body, token: fresh.accessToken))
+                return try await send(method, path, query: query, body: body, token: fresh.accessToken)
             }
         }
     }
+
+    /// Builds, attests (for protected routes) and performs one request. If
+    /// the server has forgotten our App Attest key, re-attests once.
+    private func send(
+        _ method: String,
+        _ path: String,
+        query: [URLQueryItem],
+        body: Body?,
+        token: String?
+    ) async throws -> Data {
+        let request = makeRequest(method, path, query: query, body: body, token: token)
+        guard let attestation, let kind = Self.attestedRoute(method, path) else {
+            return try await perform(request)
+        }
+        do {
+            return try await perform(attested(request, by: attestation, kind: kind))
+        } catch AttestationKeyRejected.rejected {
+            await attestation.resetKey()
+            do {
+                return try await perform(attested(request, by: attestation, kind: kind))
+            } catch AttestationKeyRejected.rejected {
+                throw APIError.server(status: 403, message: String(localized: "We couldn't verify this device. Please try again."))
+            }
+        }
+    }
+
+    private func attested(_ request: URLRequest, by attestation: any RequestAttesting, kind: AttestedRoute) async -> URLRequest {
+        var request = request
+        let headers = await attestation.headers(
+            method: request.httpMethod ?? "GET",
+            path: request.url?.path(percentEncoded: true) ?? "",
+            body: request.httpBody,
+            includeDeviceToken: kind == .account
+        )
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        return request
+    }
+
+    enum AttestedRoute: Equatable {
+        /// Sign-up, sign-in, account deletion: also sends a DeviceCheck token.
+        case account
+        /// Messages and photo uploads.
+        case content
+    }
+
+    /// Routes the server protects with device attestation (mirrors the
+    /// `attest(...)` middleware in `server/src/routes`).
+    static func attestedRoute(_ method: String, _ path: String) -> AttestedRoute? {
+        switch (method, path) {
+        case ("POST", "auth/register"), ("POST", "auth/email/link"), ("POST", "auth/email/verify"),
+             ("POST", "auth/passkey/register/finish"), ("POST", "auth/passkey/login/finish"), ("DELETE", "me"):
+            return .account
+        case ("POST", "me/photos"), ("POST", "me/attachments"):
+            return .content
+        case ("POST", _) where path.hasPrefix("conversations/") && path.hasSuffix("/messages"):
+            return .content
+        default:
+            return nil
+        }
+    }
+
+    private enum AttestationKeyRejected: Error { case rejected }
 
     private func makeRequest(
         _ method: String,
@@ -360,8 +429,11 @@ struct HTTPAPIClient: APIClient {
         case 429:
             throw APIError.rateLimited(retryAfter: Self.retryAfter(http.value(forHTTPHeaderField: "Retry-After")))
         default:
-            let message = (try? JSONDecoder.stexx().decode(ErrorBody.self, from: data))?.message
-            throw APIError.server(status: http.statusCode, message: message)
+            let body = try? JSONDecoder.stexx().decode(ErrorBody.self, from: data)
+            if http.statusCode == 403, body?.code == "attestation_key_unknown" { throw AttestationKeyRejected.rejected }
+            // 403 anti-spam codes (new_account_limit, links_not_allowed, duplicate_message, device_account_limit,
+            // disposable_email, ...) carry a message written for people; it is shown as is.
+            throw APIError.server(status: http.statusCode, message: body?.message)
         }
     }
 

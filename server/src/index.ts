@@ -17,7 +17,18 @@ const server = Bun.serve({
 });
 
 const stopJobs = startJobs();
-logInfo("listening", { host: config.host, port: server.port ?? config.port, env: config.env, devAuth: config.devAuth });
+logInfo("listening", {
+  host: config.host,
+  port: server.port ?? config.port,
+  env: config.env,
+  devAuth: config.devAuth,
+  attestation: config.antiSpam.attestation.mode,
+  deviceCheck: config.antiSpam.deviceCheck !== null,
+});
+if (config.isProduction && config.antiSpam.attestation.mode === "off") {
+  // Expected only until the Apple keys are set up (docs/security.md): sign-ups are not device-checked.
+  logInfo("attestation_disabled", { reason: "APPLE_TEAM_ID unset or ATTESTATION_MODE=off" });
+}
 
 async function shutdown() {
   stopJobs();

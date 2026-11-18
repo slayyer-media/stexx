@@ -9,6 +9,9 @@ import { logError } from "../lib/logger.ts";
 import { copyMedia, drainMediaTrash, unlinkMedia } from "../lib/media.ts";
 import { isConnected, publish } from "../lib/realtime.ts";
 import { consume, rateLimit } from "../lib/ratelimit.ts";
+import { attest, deviceOf } from "../lib/abuse/attestation.ts";
+import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { assertMessageAllowed } from "../lib/abuse/trust.ts";
 import { isoDate } from "../lib/time.ts";
 import {
   conversationJson,
@@ -337,7 +340,7 @@ const draftSchema = z.strictObject({
   isViewOnce: z.boolean().nullish(),
 });
 
-chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"), async (c) => {
+chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"), attest("message"), async (c) => {
   const me = currentUserId(c);
   const conversationId = idParam(c, "id", "conversation");
   const draft = await parseJson(c, draftSchema);
@@ -354,6 +357,11 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
     }
     return c.json(viewMessage(replay, me));
   }
+
+  // Anti-spam (after the idempotent replay, so retries of a sent message never count): volume windows per
+  // account/device/IP, then the new-account limits (lib/abuse/trust.ts).
+  await hitAbuseLimits("message", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
+  await assertMessageAllowed({ senderId: me, conversationId, otherId, text });
 
   // Attachment: either one of the sender's private chat uploads (POST /me/attachments), whose file is handed over
   // to the message, or one of their profile photos, which is COPIED so message and profile lifetimes are

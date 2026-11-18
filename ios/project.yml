@@ -44,11 +44,19 @@ targets:
         # ATS stays strict everywhere except the Local configuration (see
         # the "Allow local HTTP" build phase).
         STEXX_ATS_ALLOWS_LOCAL_NETWORKING: "NO"
+        # Device attestation (docs/security.md). attest = App Attest with a
+        # DeviceCheck fallback; dev-bypass = the header only a dev server
+        # (ATTESTATION_MODE=dev) accepts, for the simulator and Local builds.
+        STEXX_ATTESTATION_MODE: attest
+        # App Attest environment in the entitlement: development keys for
+        # Xcode builds, production for TestFlight / App Store.
+        STEXX_APP_ATTEST_ENVIRONMENT: development
       configs:
         Debug:
           STEXX_USE_MOCK_API: "YES"
         Local:
           STEXX_USE_MOCK_API: "NO"
+          STEXX_ATTESTATION_MODE: dev-bypass
           STEXX_API_BASE_URL: http://127.0.0.1:8787
           # Plain HTTP to 127.0.0.1 / localhost only (NSAllowsLocalNetworking).
           STEXX_ATS_ALLOWS_LOCAL_NETWORKING: "YES"
@@ -57,6 +65,13 @@ targets:
         Release:
           # Flip to NO once the backend is live.
           STEXX_USE_MOCK_API: "YES"
+          STEXX_APP_ATTEST_ENVIRONMENT: production
+    entitlements:
+      path: Stexx/Stexx.entitlements
+      properties:
+        # App Attest (DCAppAttestService). The App ID needs the App Attest
+        # capability in the Apple Developer account; automatic signing adds it.
+        com.apple.developer.devicecheck.appattest-environment: $(STEXX_APP_ATTEST_ENVIRONMENT)
     info:
       path: Stexx/Info.plist
       properties:
@@ -78,6 +93,7 @@ targets:
           and your exact location is never stored.
         StexxAPIBaseURL: $(STEXX_API_BASE_URL)
         StexxUseMockAPI: $(STEXX_USE_MOCK_API)
+        StexxAttestationMode: $(STEXX_ATTESTATION_MODE)
     postBuildScripts:
       # Adds NSAppTransportSecurity/NSAllowsLocalNetworking = true (a real
       # boolean) to the built Info.plist in the Local configuration only.
