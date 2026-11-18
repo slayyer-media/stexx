@@ -95,6 +95,13 @@ Non-2xx responses carry:
 - `lastActiveAt` is `null` when the user hides their online status.
 - Profile photos on the public grid are never explicit; explicit photos are
   only sent in chat.
+- The server labels every uploaded profile photo with a nudity classifier
+  ([security.md](security.md#5-photo-checks-profile-photos)). A photo labelled
+  explicit is still accepted (`201`) but comes back with `isExplicit: true` and
+  is only ever shown to its owner: other people's views of the profile leave it
+  out. The owner can still send it in a chat. Photos the classifier hasn't seen
+  yet (model not installed or busy) come back with `isExplicit: false` and are
+  re-checked in the background, so `isExplicit` can turn `true` later.
 
 ### Conversation
 
@@ -159,14 +166,14 @@ Non-2xx responses carry:
 | --- | --- | --- | --- |
 | GET | `/me` | → `Profile` | Own profile (includes hidden fields). |
 | PATCH | `/me` | `ProfileUpdate` → `Profile` | `displayName, age, pronouns, headline, about, heightCm, position, lookingFor, tags` |
-| POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. |
+| POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
 | POST | `/me/attachments` | `image/jpeg` body → `Photo` (201) | Private upload for a **chat** photo: sanitized like a profile photo but never on the profile, not counted in the 6 photos, no clean-up delete needed. Pass its `id` as `attachmentPhotoID` (consumed by the send). Unsent uploads are deleted after 1 h; at most 10 pending (409 `attachment_limit`); 30 attachments/h (429). |
 | PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito` (incognito → 402 without Stexx+) |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
-| GET | `/me/export` | → JSON archive | Data export (GDPR). |
+| GET | `/me/export` | → JSON archive | Data export (GDPR). Each photo includes `checks`: `perceptualHash`, `checkedAt`, `model`, `explicitScore`, `labels`. |
 
 ### Discovery
 
