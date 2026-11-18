@@ -109,6 +109,14 @@ const envSchema = z.object({
   /** Optional file of known stock/scraped photo hashes: one 16-hex pHash per line, optional label after it. */
   PHOTO_HASH_BLOCKLIST: z.string().optional(),
 
+  // End-to-end encrypted chat (src/lib/e2e/*, docs/security.md).
+  /** off | optional | required. Default: off in production, optional elsewhere. */
+  E2E_MODE: z.enum(["off", "optional", "required"]).optional(),
+  /** Most one-time EC prekeys stored per device (and per upload). */
+  E2E_MAX_PREKEYS: z.coerce.number().int().min(10).max(1000).default(100),
+  /** Most one-time Kyber prekeys stored per device (and per upload). ~1.6 KB each, so kept small on one VPS. */
+  E2E_MAX_PQ_PREKEYS: z.coerce.number().int().min(0).max(200).default(25),
+
   STEXX_DEV_AUTH: flag,
   STEXX_DEV_DEFAULT_LOCATION: z.string().optional(),
   STEXX_DEV_WELCOME: flag,
@@ -145,6 +153,7 @@ export interface Config {
   antiSpam: AntiSpamConfig;
   moderation: ModerationConfig;
   photoChecks: PhotoChecksConfig;
+  e2e: E2eConfig;
   /** Dev-only auth shortcuts (/auth/register returns a Session, /v1/dev/* mounted). Never true in production. */
   devAuth: boolean;
   /** Dev-only: new users get this cell so the grid isn't empty. null when unset or in production. */
@@ -194,6 +203,19 @@ export interface AntiSpamConfig {
     duplicateRecipients: number;
     graduateReplies: number;
   };
+}
+
+export type E2eMode = "off" | "optional" | "required";
+
+export interface E2eConfig {
+  /**
+   * off: key routes 404 `e2e_disabled`, envelopes refused, plaintext chat as before.
+   * optional: key routes live; a message may carry plaintext `text` or an encrypted `envelope` (migration period).
+   * required: text must travel in an envelope (plaintext `text` → 400 `encryption_required`).
+   */
+  mode: E2eMode;
+  maxPreKeys: number;
+  maxPqPreKeys: number;
 }
 
 export interface ModerationConfig {
@@ -409,6 +431,11 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       duplicateMaxDistance: e.PHOTO_DUPLICATE_MAX_DISTANCE,
       blocklistPath: e.PHOTO_HASH_BLOCKLIST || null,
       blocklist,
+    },
+    e2e: {
+      mode: e.E2E_MODE ?? (isProduction ? "off" : "optional"),
+      maxPreKeys: e.E2E_MAX_PREKEYS,
+      maxPqPreKeys: e.E2E_MAX_PQ_PREKEYS,
     },
     devAuth: !isProduction && e.STEXX_DEV_AUTH,
     devDefaultLocation,

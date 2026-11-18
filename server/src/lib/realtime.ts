@@ -14,6 +14,8 @@ import { isBlockedEitherWay } from "./visibility.ts";
  *   message.read          data: { conversationID, readerID, messageIDs, readAt } (only when the reader allows receipts)
  *   conversation.updated  data: Conversation                                  (viewer-specific)
  *   tap.received          data: { from: Profile, sentAt }
+ *   identity.changed      data: { userID, identityKeyChangedAt }  (a chat partner re-registered E2E keys, lib/e2e)
+ *   keys.low              data: { preKeyCount, pqPreKeyCount }     (to the key owner: replenish one-time prekeys)
  * Plus control frames without `data`: `ready` (after auth), `pong`, `error`. Clients ignore unknown types.
  *
  * Nothing here is persisted: if nobody is connected the event is simply dropped (clients refetch on connect/APNs).

@@ -12,6 +12,8 @@ import { consume, rateLimit } from "../lib/ratelimit.ts";
 import { attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import { assertMessageAllowed } from "../lib/abuse/trust.ts";
+import { decodeEnvelope, envelopeSchema } from "../lib/e2e/envelope.ts";
+import { e2eMode } from "../lib/e2e/keys.ts";
 import { assertMayMessage, assertMayStartContact } from "../lib/moderation.ts";
 import { isoDate } from "../lib/time.ts";
 import {
@@ -53,7 +55,8 @@ const DEFAULT_PAGE = 50;
 const MAX_PAGE = 100;
 
 /** Message select list (alias `m`). Matches MessageRow. */
-const MSG_COLS = sql`m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.attachment_kind, m.attachment_key,
+const MSG_COLS = sql`m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
+  m.attachment_kind, m.attachment_key,
   m.attachment_view_once, m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
 
 /** SQL: message `m` is visible to the member row `cm` (not cleared, not expired). */
@@ -340,6 +343,8 @@ const draftSchema = z.strictObject({
     .max(100, "must be at most 100 characters")
     .regex(/^[\x21-\x7e]+$/, "must be visible ASCII characters"),
   text: multilineText(4000).nullish(),
+  /** End-to-end encrypted content instead of `text` (lib/e2e/envelope.ts). Stored and relayed, never read. */
+  envelope: envelopeSchema.nullish(),
   attachmentPhotoID: z.string().max(100).nullish(),
   expiresAfterSeconds: z.number().int().min(1).max(2_592_000).nullish(),
   /** Optional override; default is the sender's "expiring photos by default" privacy setting. */
@@ -351,7 +356,18 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   const conversationId = idParam(c, "id", "conversation");
   const draft = await parseJson(c, draftSchema);
   const text = draft.text ? draft.text : null;
-  if (!text && !draft.attachmentPhotoID) throw badRequest("A message needs text or a photo.");
+  // E2E (E2E_MODE): `envelope` carries the text encrypted; plaintext `text` is refused once encryption is required.
+  // Photos are still server-side files until encrypted media lands, so photo-only messages stay allowed.
+  const mode = e2eMode();
+  if (draft.envelope && mode === "off") {
+    throw badRequest("End-to-end encryption isn't switched on for this server yet.", "e2e_disabled");
+  }
+  if (draft.envelope && text) throw badRequest("A message has either text or an encrypted envelope, not both.");
+  if (text && mode === "required") {
+    throw badRequest("Messages must be end-to-end encrypted. Update the app to keep chatting.", "encryption_required");
+  }
+  const envelope = draft.envelope ? decodeEnvelope(draft.envelope) : null;
+  if (!text && !envelope && !draft.attachmentPhotoID) throw badRequest("A message needs text or a photo.");
 
   const { otherId } = await requireConversation(me, conversationId);
 
@@ -369,7 +385,7 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   await hitAbuseLimits("message", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
   // Hidden pending review: may only write where the other person has written.
   await assertMayMessage(me, conversationId, otherId);
-  await assertMessageAllowed({ senderId: me, conversationId, otherId, text });
+  await assertMessageAllowed({ senderId: me, conversationId, otherId, text, encrypted: envelope !== null });
 
   // Attachment: either one of the sender's private chat uploads (POST /me/attachments), whose file is handed over
   // to the message, or one of their profile photos, which is COPIED so message and profile lifetimes are
@@ -411,9 +427,11 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   try {
     row = await sql.begin(async (tx) => {
       const [inserted] = await tx<MessageRow[]>`
-        INSERT INTO messages AS m (id, conversation_id, sender_id, client_id, text, attachment_kind, attachment_key,
-                                   attachment_view_once, delivered_at, expires_after_seconds)
+        INSERT INTO messages AS m (id, conversation_id, sender_id, client_id, text, envelope_type, envelope_body,
+                                   attachment_kind, attachment_key, attachment_view_once, delivered_at,
+                                   expires_after_seconds)
         VALUES (${newId("message")}, ${conversationId}, ${me}, ${draft.clientID}, ${text},
+                ${envelope?.type ?? null}, ${envelope?.body ?? null},
                 ${attachmentKey ? "photo" : null}, ${attachmentKey}, ${viewOnce},
                 ${recipientOnline ? sql`now()` : null}, ${draft.expiresAfterSeconds ?? null})
         ON CONFLICT (sender_id, client_id) DO NOTHING

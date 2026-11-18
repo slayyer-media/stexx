@@ -124,6 +124,7 @@ Non-2xx responses carry:
   "conversationID": "c_19",
   "senderID": "p_7f3a",
   "text": "Museum this weekend?",
+  "envelope": null,
   "attachment": { "kind": "photo", "url": "https://media.stexx.gay/…", "isViewOnce": false },
   "sentAt": "2026-11-17T20:30:00Z",
   "status": "delivered",
@@ -136,6 +137,9 @@ Non-2xx responses carry:
   `failed` are client-only).
 - `clientID` is the idempotency key from the sender. Re-sending the same
   `clientID` must return the original message, not a duplicate.
+- `envelope` is an end-to-end encrypted message (see
+  [End-to-end encryption](#end-to-end-encryption)): `{ "type": "prekey" | "signal", "body": "<base64>" }`.
+  When it is set, `text` is `null`. A message has `text` or `envelope`, never both.
 
 ### Session
 
@@ -192,7 +196,7 @@ Non-2xx responses carry:
 | GET | `/conversations` | → `[Conversation]` | Most recent first. |
 | POST | `/conversations` | `{ participantID }` → `Conversation` | Returns the existing conversation if there is one. |
 | GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100). Oldest-first within the page; `nextCursor` is the ID to pass as `before`. |
-| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
+| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
 | POST | `/conversations/{id}/read` | → 204 | Ignored for read receipts if the reader disabled them. |
 | DELETE | `/conversations/{id}` | → 204 | Deletes for the caller only. |
 
@@ -202,9 +206,219 @@ pushing `message.created`, `message.read`, `conversation.updated`, `tap.received
 events using the same JSON models. Each frame is `{ "type": "…", "data": … }`:
 `message.created` → `Message`, `conversation.updated` → `Conversation`,
 `message.read` → `{ conversationID, readerID, messageIDs, readAt }`,
-`tap.received` → `{ from: Profile, sentAt }`. Control frames (`ready`, `pong`,
+`tap.received` → `{ from: Profile, sentAt }`, and for end-to-end encryption
+`identity.changed` → `{ userID, identityKeyChangedAt }` and
+`keys.low` → `{ preKeyCount, pqPreKeyCount }`. Control frames (`ready`, `pong`,
 `error`) carry no `data`; clients ignore unknown types. APNs pushes carry no message content,
 only a conversation ID, and the app fetches the rest.
+
+### End-to-end encryption
+
+Chats are moving to the Signal Protocol, using Signal's
+[`libsignal`](https://github.com/signalapp/libsignal) on both ends (PQXDH and
+the Double Ratchet). The server stores and hands out **public** keys and relays
+ciphertext it can't read; private keys stay in the iOS Keychain. Design, abuse
+rules and the migration plan are in [`security.md`](security.md#7-end-to-end-encrypted-chat).
+v1 is **one device per account, device id `1`**.
+
+**Encoding.** Every key, signature and ciphertext is **standard base64 with
+padding** (RFC 4648 §4, `+/`, no whitespace, canonical) of libsignal's
+serialized form:
+
+| Field | libsignal | Bytes |
+| --- | --- | --- |
+| `identityKey`, EC `publicKey` | `PublicKey.serialize()` (`IdentityKey.serialize()`) | 33 (`0x05` + 32) |
+| Kyber `publicKey` | `KEMPublicKey.serialize()` | 1569 (`0x08` + 1568, Kyber1024) |
+| `signature` | `IdentityKeyPair.privateKey.sign(publicKey.serialize())` | 64 |
+| `envelope.body` | `CiphertextMessage.serialize()` | ≤ 32768 |
+
+`keyID`s are integers `0…16777215` (24 bit, like Signal's clients: start at a
+random value and wrap). `registrationID` is libsignal's
+`generateRegistrationId()` value, `1…16380`. Both signed-prekey and Kyber
+signatures are by the **identity key** over the serialized public key; the server
+verifies them (with libsignal) and refuses anything else.
+
+**Mode.** `E2E_MODE` on the server is `off`, `optional` or `required`
+(`GET /e2e/config` → `mode`). With `off`, every `/keys` route answers
+**404 `e2e_disabled`** and a message with an `envelope` gets
+**400 `e2e_disabled`**. With `optional`, plaintext `text` and `envelope` both
+work. With `required`, plaintext `text` gets **400 `encryption_required`**
+(photo-only messages still work until encrypted media lands).
+
+#### Endpoints
+
+| Method | Path | Body → Response | Notes |
+| --- | --- | --- | --- |
+| GET | `/e2e/config` | → `E2EConfig` | Always available (also when `off`). |
+| PUT | `/keys` | `KeyRegistration` → `KeyStatus` | Register or re-register this device: the **full** key state. Replaces every stored one-time prekey. Attested (`message`). 10 per account per day (429). |
+| GET | `/keys/status` | → `KeyStatus` | Own key state and remaining one-time prekey counts. |
+| POST | `/keys/prekeys` | `{ preKeys?, pqPreKeys? }` → `KeyStatus` | Add one-time prekeys (at least one non-empty array). Kyber keys must be signed by the stored identity key. |
+| PUT | `/keys/signed` | `{ signedPreKey?, pqLastResortPreKey? }` → `KeyStatus` | Rotate the signed prekey and/or the Kyber last-resort key (at least one). Signed by the stored identity key. |
+| GET | `/keys/bundle/{profileID}` | → `PreKeyBundle` | Start a session with someone. Consumes at most one one-time EC prekey and one one-time Kyber prekey. Attested (`message`). |
+| GET | `/keys/identity/{profileID}` | → `IdentityKey` | Someone's current identity key, for safety numbers and after `identity.changed`. Consumes nothing. |
+
+Every `/keys` route needs a session and shares a 30/min per-account bucket.
+Key uploads (`PUT /keys`, `POST /keys/prekeys`) accept bodies up to 512 KB;
+everything else stays at 64 KB.
+
+#### Models
+
+`E2EConfig`:
+
+```json
+{
+  "mode": "optional",
+  "deviceID": 1,
+  "maxPreKeys": 100,
+  "maxPqPreKeys": 25,
+  "preKeyLowWatermark": 20,
+  "pqPreKeyLowWatermark": 5,
+  "envelopeMaxBytes": 32768,
+  "contentRules": { "restricted": true, "noLinks": true, "duplicateRecipients": 3, "duplicateMinLength": 16 }
+}
+```
+
+`contentRules` are the trust-ramp text rules the **app** must enforce before
+encrypting, because the server can't read ciphertext
+([`security.md`](security.md#with-end-to-end-encrypted-chats)): while
+`restricted`, refuse links (`noLinks`, same rule as `containsLink` in
+`server/src/lib/abuse/content.ts`) and refuse sending the same text (case and
+spacing ignored, at least `duplicateMinLength` characters) to more than
+`duplicateRecipients` people in 24 h. Re-read it on launch and after a 403.
+
+`KeyRegistration` (PUT `/keys`):
+
+```json
+{
+  "registrationID": 4242,
+  "deviceID": 1,
+  "identityKey": "BTq…=",
+  "signedPreKey": { "keyID": 7, "publicKey": "BXc…=", "signature": "mN1…==" },
+  "pqLastResortPreKey": { "keyID": 8, "publicKey": "CNp…", "signature": "Hk2…==" },
+  "preKeys": [{ "keyID": 9, "publicKey": "BYa…=" }],
+  "pqPreKeys": [{ "keyID": 10, "publicKey": "COu…", "signature": "pX0…==" }]
+}
+```
+
+- `deviceID` is optional and must be `1`. `preKeys` and `pqPreKeys` are
+  optional (empty = none); at most `maxPreKeys` / `maxPqPreKeys` per upload and
+  stored (400 for a bigger upload, **409 `prekey_limit`** when adding would go
+  over). Key ids must be unique within an upload.
+- Re-uploading an id that is still stored replaces that key (idempotent retries).
+- A different `identityKey` than the one stored (a reinstall) is an **identity
+  change**: `identityKeyChangedAt` is set, and every chat partner gets
+  `identity.changed`.
+
+`KeyStatus`:
+
+```json
+{
+  "registered": true,
+  "deviceID": 1,
+  "registrationID": 4242,
+  "identityKey": "BTq…=",
+  "identityKeyChangedAt": null,
+  "preKeyCount": 87,
+  "pqPreKeyCount": 21,
+  "signedPreKeyID": 7,
+  "signedPreKeyUpdatedAt": "2026-11-17T20:30:00Z",
+  "pqLastResortPreKeyID": 8,
+  "pqLastResortPreKeyUpdatedAt": "2026-11-17T20:30:00Z"
+}
+```
+
+With no keys stored: `registered: false`, counts `0`, everything else `null`.
+**Replenish** (`POST /keys/prekeys`) when `preKeyCount < preKeyLowWatermark` or
+`pqPreKeyCount < pqPreKeyLowWatermark`: on launch, and on `keys.low` (sent to a
+connected app when a fetch leaves it below a watermark, at most every 10 minutes
+until it replenishes; best effort, so the launch check is the one to rely on).
+**Rotate** the signed prekey and the Kyber last-resort key about weekly
+(`signedPreKeyUpdatedAt`), keeping the previous private keys for a while, as
+libsignal recommends, so in-flight prekey messages still decrypt. If `registered`
+is `false` or `identityKey` doesn't match the Keychain (an account ban, or a
+restore on a new phone), upload everything again with `PUT /keys`.
+
+`PreKeyBundle` (GET `/keys/bundle/{profileID}`), fields named after libsignal's
+`PreKeyBundle(registrationId:deviceId:prekeyId:prekey:signedPrekeyId:signedPrekey:signedPrekeySignature:identity:kyberPrekeyId:kyberPrekey:kyberPrekeySignature:)`:
+
+```json
+{
+  "userID": "p_7f3a",
+  "identityKey": "BTq…=",
+  "identityKeyChangedAt": null,
+  "devices": [
+    {
+      "deviceID": 1,
+      "registrationID": 4242,
+      "signedPreKey": { "keyID": 7, "publicKey": "BXc…=", "signature": "mN1…==" },
+      "preKey": { "keyID": 9, "publicKey": "BYa…=" },
+      "pqPreKey": { "keyID": 10, "publicKey": "COu…", "signature": "pX0…==" }
+    }
+  ]
+}
+```
+
+- `devices` has exactly one entry in v1 (an array so multi-device can come later).
+- `preKey` may be `null` (none left, or the fetch was over budget); libsignal
+  accepts a bundle without a one-time EC prekey.
+- `pqPreKey` is always present: a one-time Kyber prekey, or the last-resort one
+  when none is left or the fetch is over budget.
+- Use the `ProtocolAddress(name: userID, deviceId: deviceID)`.
+
+`IdentityKey` (GET `/keys/identity/{profileID}`):
+`{ "userID": "p_7f3a", "identityKey": "BTq…=", "identityKeyChangedAt": "2026-11-17T20:30:00Z" }`.
+
+#### Who can fetch whose keys
+
+Bundles and identity keys are only served for someone you may message: not
+yourself, no block either way, not banned, and not hidden after reports unless
+you already share a conversation or have written to them. Otherwise
+**404 `not_found`** (same as their profile). If **you** are hidden pending
+review, only people who wrote to you: **403 `account_under_review`**. Someone
+who hasn't set up encryption yet: **404 `keys_unavailable`** (send plaintext
+while the mode is `optional`).
+
+Limits: bundle fetches **429 `rate_limited`** past 200 per account per day,
+300 per device per day, or 300 per IP per hour. Separately, each account hands out
+at most 50 one-time prekeys a day, and at most 3 a day to any single fetcher.
+Past those budgets a fetch still succeeds but gets `preKey: null` and the
+last-resort `pqPreKey`, so nobody can drain someone else's one-time prekeys.
+
+#### Sending encrypted messages
+
+```json
+{ "clientID": "7C1E…", "envelope": { "type": "prekey", "body": "MwiR…" } }
+```
+
+- `type` is `"prekey"` for a `PreKeySignalMessage`
+  (`CiphertextMessageType.preKey`, sent until the recipient has replied) and
+  `"signal"` for a `SignalMessage` (`.whisper`). The server checks only the
+  base64 and the size (≤ 32768 bytes decoded, **400 `invalid_envelope`**); it never
+  parses or decrypts `body`.
+- What goes inside is up to the app: encrypt a small UTF-8 JSON
+  (`{"text": "…"}`, room for the media key later), not raw text.
+- The envelope is addressed to the recipient's device only. The sender can't
+  decrypt its own copy: keep your sent plaintext locally, keyed by `clientID`.
+- A ratchet message decrypts **once**. Store the decrypted plaintext locally,
+  keyed by message `id`, and render from that store when the server sends the
+  same message again (`GET …/messages`, `conversation.updated`'s
+  `lastMessage`, `message.created`).
+- Everything else is unchanged: blocks (404), hidden accounts
+  (`account_under_review`), rate limits, `new_account_limit`, expiry, read
+  receipts, idempotent `clientID`. The text rules (`links_not_allowed`,
+  `duplicate_message`) aren't run on ciphertext: the app runs them
+  (`contentRules`).
+- `attachmentPhotoID` still works next to an `envelope` (the photo isn't
+  end-to-end encrypted yet).
+
+#### Identity changes
+
+When someone re-registers with a new identity key, each chat partner gets
+`identity.changed` `{ userID, identityKeyChangedAt }`. The app re-fetches
+`GET /keys/identity/{userID}`, compares it with the key it trusted, and shows
+the safety-number warning. libsignal also refuses the new identity
+(`untrustedIdentity`) until the app saves it, so a missed event can't silently
+switch keys.
 
 ### Safety (always free)
 

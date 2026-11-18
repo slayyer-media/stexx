@@ -68,12 +68,17 @@ const Attachment = z.strictObject({
   isViewOnce: z.boolean(),
 });
 
+// E2E envelope (docs/api.md "End-to-end encryption"). The Swift model doesn't decode it yet (iOS phase pending);
+// synthesized Decodable ignores unknown keys, so today's app keeps working.
+const Envelope = z.strictObject({ type: z.enum(["prekey", "signal"]), body: z.string().min(1) });
+
 // struct Message (status raw values: sending | sent | delivered | read | failed; the server only sends the middle three)
 const Message = z.strictObject({
   id: ID("m"),
   conversationID: ID("c"),
   senderID: ID("p"),
   text: swiftOptional(z.string()),
+  envelope: swiftOptional(Envelope),
   attachment: swiftOptional(Attachment),
   sentAt: SwiftDate,
   status: z.enum(["sent", "delivered", "read"]),

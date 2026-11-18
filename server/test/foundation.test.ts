@@ -252,6 +252,7 @@ describe("serialize & visibility", () => {
   test("messageJson status and read receipts", () => {
     const m = {
       id: "m_1", conversation_id: "c_1", sender_id: "p_a", client_id: "cid", text: "hi",
+      envelope_type: null, envelope_body: null,
       attachment_kind: "photo", attachment_key: null, attachment_view_once: true,
       sent_at: new Date("2026-11-17T20:30:00.250Z"), delivered_at: new Date(), read_at: new Date(), read_receipt: false,
       expires_at: null,

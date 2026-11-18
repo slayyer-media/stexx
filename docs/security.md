@@ -1,6 +1,6 @@
 # Security and anti-spam
 
-Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5) and profile photo checks (section 6): how they work, how to configure them, and what they store.
+Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5), profile photo checks (section 6) and the server side of end-to-end encrypted chat (section 7): how they work, how to configure them, and what they store.
 
 The anti-spam code lives in `server/src/lib/abuse/` (plus `server/src/routes/attest.ts`) and `ios/Stexx/Services/AttestationService.swift`; its schema is in `server/migrations/104_anti-spam.sql` and `105_abuse-counters.sql`. Reports and moderation are in `server/src/lib/moderation.ts`, `server/src/routes/safety.ts`, `server/src/moderation/cli.ts` and `server/migrations/107_report-autohide.sql`.
 
@@ -13,6 +13,7 @@ Everything runs on the single VPS with what is already there: the Bun API and Po
 - App Attest is verified locally against Apple's root certificate (shipped in the repo). DeviceCheck calls go to Apple's free API, and only if a DeviceCheck key is configured: on signup, login and account deletion (the per-device bits), and on each protected request from the rare device that can't use App Attest (token validation).
 
 - The nudity classifier for profile photos is a 12 MB open-source model run in-process on the CPU (about 10 ms a photo); the file is downloaded once at deploy, pinned by checksum. See [section 6](#6-photo-checks-profile-photos).
+- `@signalapp/libsignal-client` is a native module pulled at deploy (about 44 MB unpacked on Linux). Signature checks run in-process; a built-in verifier is used if the module fails to load. See [section 7](#7-end-to-end-encrypted-chat).
 
 ## 1. Device attestation (App Attest, DeviceCheck fallback)
 
@@ -43,7 +44,7 @@ Everything runs on the single VPS with what is already there: the Bun API and Po
 | --- | --- | --- |
 | signup | `POST /v1/auth/register` (dev), `POST /v1/auth/passkey/register/finish` | yes |
 | login | `POST /v1/auth/passkey/login/finish`, `POST /v1/auth/email/link`, `POST /v1/auth/email/verify` (which also runs the signup checks when it creates an account) | yes |
-| message | `POST /v1/conversations/:id/messages` | yes |
+| message | `POST /v1/conversations/:id/messages`, `PUT /v1/keys`, `GET /v1/keys/bundle/:id` | yes |
 | photo | `POST /v1/me/photos`, `POST /v1/me/attachments` | yes |
 | optional | `DELETE /v1/me` | used if present (to free the device's account slot) |
 
@@ -75,8 +76,10 @@ Sliding-window limits (the current window plus a weighted share of the previous 
 | login | 30 / 10m | – | 20 / 10m | – |
 | message | 600 / 10m | – | 1500 / 1d | 1000 / 1d |
 | photo | 120 / 1h | – | 60 / 1h | 60 / 1h |
+| key bundle fetch (section 7) | 300 / 1h | – | 300 / 1d | 200 / 1d |
+| key registration, `PUT /v1/keys` | – | – | – | 10 / 1d |
 
-Override any of them with `RATE_LIMIT_<ACTION>_<SCOPE>=<count>/<window>`, e.g. `RATE_LIMIT_SIGNUP_IP=5/1h`, `RATE_LIMIT_MESSAGE_ACCOUNT=500/1d`. These sit on top of the existing per-route token buckets in `lib/ratelimit.ts` (in memory, per minute). Because these windows run for hours and days, their counters live in Postgres (`abuse_counters`, migration 105): one small row per limit and subject, updated under a transaction-scoped advisory lock so concurrent requests can't overshoot, and kept across restarts and deploys. The retention job deletes rows once they can't affect a decision (at most two windows, so two days for the longest). `MemorySlidingWindowStore` implements the same interface for unit tests.
+Override any of them with `RATE_LIMIT_<ACTION>_<SCOPE>=<count>/<window>`, e.g. `RATE_LIMIT_SIGNUP_IP=5/1h`, `RATE_LIMIT_MESSAGE_ACCOUNT=500/1d` (key limits: `RATE_LIMIT_KEY_BUNDLE_ACCOUNT`, `…_DEVICE`, `…_IP`, `RATE_LIMIT_KEY_REGISTER_ACCOUNT`, and the prekey budgets `RATE_LIMIT_PREKEY_TARGET`, `RATE_LIMIT_PREKEY_PAIR`). These sit on top of the existing per-route token buckets in `lib/ratelimit.ts` (in memory, per minute). Because these windows run for hours and days, their counters live in Postgres (`abuse_counters`, migration 105): one small row per limit and subject, updated under a transaction-scoped advisory lock so concurrent requests can't overshoot, and kept across restarts and deploys. The retention job deletes rows once they can't affect a decision (at most two windows, so two days for the longest). `MemorySlidingWindowStore` implements the same interface for unit tests.
 
 Device and account keys are opaque ids. IP and network keys are HMACs with a key derived from `EMAIL_PEPPER` (which is never in the database or its backups), so a stored key can't be turned back into an address; raw IPs are never written anywhere.
 
@@ -105,7 +108,7 @@ Chats are planned to become end-to-end encrypted with the Signal Protocol (libsi
 | `duplicate_message` (same text to many people) | message text | **the app**, against its own recently sent messages; no content hashes go to the server |
 | Report evidence (section 5) | the reported messages | **the app** sends the plaintext of the messages the reporter ticks; the server checks only that message ids, thread and sender match |
 
-The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. Today the server uses `plaintextContentPolicy`; when messages become ciphertext it switches to `encryptedContentPolicy` (a no-op) and the app runs the same rules locally. `containsLink` and `normalizeForDuplicate` are the reference to port. The server learns whether the sender is restricted from its own metadata, so it can tell the app which rules apply. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server.
+The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. The choice is per message: plaintext `text` goes through the current policy (`plaintextContentPolicy`), and an encrypted envelope (section 7) goes through `encryptedContentPolicy` (a no-op), so both work side by side while `E2E_MODE=optional`. The app runs the same rules locally before encrypting; `containsLink` and `normalizeForDuplicate` are the reference to port. The server tells the app whether its account is restricted, and with which numbers, in `GET /v1/e2e/config` → `contentRules`. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server and count encrypted messages exactly like plaintext ones.
 
 The app shows the server's message above the composer and keeps the failed bubble so the user can edit or retry.
 
@@ -214,6 +217,60 @@ On the 61 seed photos (clothed and shirtless men) nothing reaches 0.5; the highe
 **Licenses.** NudeNet's repository, and the license file shipped in its wheel, are AGPL-3.0, the same license as Stexx. (The PyPI metadata says MIT; either way it is compatible.) ONNX Runtime is MIT.
 
 **Stored per photo:** the hash, the score of the explicit labels, the best score of each label NudeNet detected (no boxes), the model id and the time. No copy, crop or thumbnail of any image. The data export lists all of it under each photo's `checks`. Logs never contain scores, labels or ids from the checks, only operational events (`photo_checks.model_loaded`, `.model_missing`, errors) and job counts.
+
+## 7. End-to-end encrypted chat
+
+Chats use the Signal Protocol through Signal's own [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0): PQXDH to start a session, then the Double Ratchet. **Phase 1, this section, is the server:** it distributes public keys and relays ciphertext. The iOS client (libsignal's Swift bindings, keys in the Keychain), encrypted media and the safety-number screen come next ([`roadmap.md`](roadmap.md#end-to-end-encrypted-chat)). The wire contract is in [`api.md`](api.md#end-to-end-encryption).
+
+Code: `server/src/lib/e2e/` (`crypto.ts` key checks, `keys.ts` storage and bundles, `envelope.ts`), `server/src/routes/keys.ts`, the envelope path in `server/src/routes/chat.ts`; schema in `server/migrations/109_e2e-prekeys.sql`.
+
+### What the server stores
+
+| Table | Holds | Gone when |
+| --- | --- | --- |
+| `e2e_devices` | per account (device 1): registration id, identity **public** key, when it last changed, signed prekey + signature, Kyber last-resort prekey + signature | account deleted (cascade), account banned, replaced by `PUT /v1/keys` |
+| `e2e_one_time_prekeys` | one-time EC and Kyber **public** prekeys (Kyber ones signed) | handed out in a bundle (deleted in the same transaction), re-registration, account deleted or banned |
+| `messages.envelope_type`, `envelope_body` | the opaque ciphertext of an encrypted message (`prekey` or `signal`) | like any message: expiry, both people clearing the thread, account deletion |
+
+No private key ever reaches the server. Key material and ciphertext are never logged, and validation errors name the field, never the value. The data export lists the account's public key state and its messages' envelopes.
+
+### Key checks
+
+Every uploaded key is decoded from strict base64 and parsed: EC keys must be libsignal's 33-byte form, Kyber keys whatever libsignal's `KEMPublicKey` accepts (Kyber1024 today). The signed prekey, the last-resort Kyber key and every one-time Kyber key must carry a valid signature by the account's identity key (the uploaded one on `PUT /v1/keys`, the stored one on replenish and rotation). Anything else is 400 `invalid_key` / `invalid_signature`.
+
+The checks use libsignal's Node bindings (`@signalapp/libsignal-client`, prebuilt for macOS and for Linux x64/arm64 with glibc ≥ 2.34, so Ubuntu 24.04 is fine; no compiler or install script needed). They're loaded lazily; if the native module can't load on a host, the server logs `e2e.libsignal_unavailable` and falls back to a built-in XEdDSA verifier (node:crypto Ed25519 after the Montgomery→Edwards conversion, parity-tested against libsignal) plus size and type-byte checks for Kyber keys. The boot log line shows which one runs (`e2eVerifier`). These checks keep garbage out of the database; the apps verify every bundle again with libsignal before using it.
+
+### Bundles, consumption and exhaustion
+
+- **Atomic consumption.** A bundle fetch takes the oldest one-time EC prekey and the oldest one-time Kyber prekey with `DELETE … FOR UPDATE SKIP LOCKED` in one transaction, so concurrent fetchers never get the same key and never wait on each other. With none left, the bundle has no EC prekey and the Kyber **last-resort** key, which libsignal accepts (the session is still post-quantum; only the one-time part is missing).
+- **Exhaustion attacks.** Fetching is only needed to *start* a session, so it is limited per account, device and IP (429, table in section 3) and needs an attested app, like sending a message. On top, each account hands out at most `RATE_LIMIT_PREKEY_TARGET` (50/day) one-time prekeys, and at most `RATE_LIMIT_PREKEY_PAIR` (3/day) to any single fetcher. Over budget the fetch still succeeds, with the last-resort bundle and nothing consumed, so a swarm of accounts can't drain someone's prekeys and messaging never breaks. The key owner gets `keys.low` when a fetch leaves them below the watermark (a fifth of the cap; at most every 10 minutes) and replenishes; the app also checks on launch.
+- **Who may fetch.** Only someone the caller may message: not themselves, no block either way, not banned, not hidden after reports unless they already share a conversation or the caller wrote to them; a caller hidden pending review only gets keys of people who wrote to them. Otherwise 404 (403 `account_under_review` for the hidden caller), exactly like profiles and new chats.
+- **Storage bound.** One-time prekeys are capped per account: `E2E_MAX_PREKEYS` (100 EC, 33 bytes each) and `E2E_MAX_PQ_PREKEYS` (25 Kyber, 1.6 KB each, kept small on purpose), about 45 KB per account at most.
+
+### Identity changes (safety numbers)
+
+Key writes and the ban's key deletion take the same per-account lock, and writes refuse a banned account, so an upload racing a ban can't put keys back. Re-registering with a different identity key (a reinstall, or a new phone) records `identity_key_changed_at`, replaces every one-time prekey, and pushes `identity.changed` `{userID, identityKeyChangedAt}` to every chat partner without a block. Their app re-fetches the identity and shows a safety-number warning; libsignal itself refuses the new key until the app accepts it, so a missed event can't switch keys silently. Bundles and `GET /v1/keys/identity/:id` carry `identityKeyChangedAt` too. `PUT /v1/keys` is attested and limited to 10 per account per day, so a stolen session token alone can't swap the identity key on an enforcing server, and nobody can spam peers with warnings.
+
+### Envelopes and the moderation rules
+
+A message carries plaintext `text` **or** an `envelope` (`prekey` or `signal`, ≤ 32 KiB, base64), never both. The server stores and relays the envelope over REST and the websocket without parsing it. Everything that needs only metadata applies unchanged: blocks, hidden and banned accounts, the message rate limits, the new-account first-contact cap, idempotent `clientID`, expiry and read receipts. The text rules move to the app (section 4). Reports keep working because the reporter's app sends the plaintext of the messages it chose (section 5).
+
+### Rollout: `E2E_MODE`
+
+| Mode | Default | Behavior |
+| --- | --- | --- |
+| `off` | production | `/v1/keys*` → 404 `e2e_disabled`; an `envelope` → 400 `e2e_disabled`; plaintext chat exactly as before. `GET /v1/e2e/config` still answers. |
+| `optional` | development, tests | Keys live. Each message is plaintext or an envelope. The app encrypts when the recipient has keys and sends plaintext when the bundle fetch says `keys_unavailable`. |
+| `required` | – | Plaintext `text` → 400 `encryption_required`. Photo-only messages still work until encrypted media ships. |
+
+Migration plan:
+
+1. Deploy this with `E2E_MODE=off` (the default): migration 109 runs, nothing changes for users.
+2. Ship the iOS build with libsignal. It registers keys on launch and encrypts to recipients that have them.
+3. Switch the server to `optional`. Old builds keep sending plaintext; new builds encrypt whenever both sides have keys. Existing plaintext history stays as it is (it expires or is cleared as before).
+4. Once old builds are gone (minimum app version), switch to `required`. Then remove the plaintext text rules from the server.
+
+Rolling back from `optional` to `off` keeps stored envelopes readable by the apps (they're plain columns), but stops new key uploads and envelopes.
 ## Error codes the app handles
 
 | Status | Code | Shown as |
@@ -225,6 +282,11 @@ On the 61 seed photos (clothed and shirtless men) nothing reaches 0.5; the highe
 | 403 | `links_not_allowed`, `new_account_limit`, `duplicate_message` | Server message above the chat composer |
 | 403 | `account_under_review` | Server message where the chat or tap failed |
 | 403 | `account_banned` | Server message on the sign-in screen |
+| 400 | `invalid_key`, `invalid_signature`, `invalid_envelope` | Not shown: a client bug; log and re-generate keys |
+| 400 | `encryption_required` | "Update Stexx to keep chatting." |
+| 400 / 404 | `e2e_disabled` | Not shown: send plaintext (the server hasn't switched E2E on) |
+| 404 | `keys_unavailable` | Not shown: the recipient can't receive encrypted messages yet; send plaintext while the mode is `optional` |
+| 409 | `keys_not_registered`, `prekey_limit` | Not shown: re-register with `PUT /v1/keys` / upload fewer prekeys |
 | 429 | `rate_limited` | Friendly sentence built from `Retry-After` |
 
 ## Configuration
@@ -261,6 +323,9 @@ On the 61 seed photos (clothed and shirtless men) nothing reaches 0.5; the highe
 | `PHOTO_HIDE_UNCHECKED` | `0` | `1` hides unchecked photos from others (fail closed). |
 | `PHOTO_DUPLICATE_MAX_DISTANCE` | `6` | Hamming bits out of 64, 0–32; `-1` turns duplicate and blocklist flags off. |
 | `PHOTO_HASH_BLOCKLIST` | unset | Path to the stock/scraped hash list, read at boot. An unreadable or malformed file stops the boot (and fails deploy's boot check). |
+| `E2E_MODE` | `off` (production), `optional` (otherwise) | `off` / `optional` / `required`, see section 7. |
+| `E2E_MAX_PREKEYS` | `100` | One-time EC prekeys stored per account (and per upload), 10–1000. |
+| `E2E_MAX_PQ_PREKEYS` | `25` | One-time Kyber prekeys stored per account (and per upload), 0–200. |
 iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev-bypass` in the Local configuration) and `STEXX_APP_ATTEST_ENVIRONMENT` (`development`; `production` in Release), which feeds the `com.apple.developer.devicecheck.appattest-environment` entitlement in the generated `Stexx/Stexx.entitlements`.
 
 ## Turning it on for production (manual steps)
@@ -277,6 +342,7 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - `devices` holds a public key, a counter, the attestation environment, a ban timestamp and the last-seen **date** (not time). Idle devices with no accounts are purged after 90 days by the retention job, along with expired challenges.
 - Raw IPs are never stored. Rate-limit rows hold an HMAC of the IP or /24 network (key derived from `EMAIL_PEPPER`) and disappear within two windows.
 - The trust ramp reads message metadata the server already has (sender, conversation, time, text for the duplicate check); nothing new is collected.
+- End-to-end encryption adds public keys only (section 7), deleted with the account or on a ban, and ciphertext the server can't read. One-time prekeys are deleted the moment they are handed out.
 - Reports add two things: the messages a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Nothing in moderation stores or shows a location.
 - Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read.
 
@@ -290,3 +356,6 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Moderator tooling to ban an account's devices (`banDevicesOfUser` exists, nothing calls it).
 - Tests against a real-device attestation: the suite uses a synthetic root and devices generated by `server/test/fixtures/app-attest/generate.ts`. Do one manual sign-up on a physical iPhone against a staging server before enforcing.
 - The DeviceCheck "banned" bit is written on the device's next request with a token, not immediately at ban time.
+- End-to-end encryption is server-only so far: the iOS client, encrypted media, the safety-number screen and multi-device are still to come. `E2E_MODE` stays `off` in production until the app ships.
+- The libsignal native module was tested under Bun on macOS arm64 only; on the Linux VPS it is expected to load (glibc 2.39 ≥ 2.34), and if it doesn't, the built-in verifier takes over. Check the `e2eVerifier` boot log after the first deploy.
+- Ciphertext stays on the server as long as the message does, though the recipient can only decrypt it once. Deleting envelope bodies after delivery is a possible follow-up once the app keeps its own history.

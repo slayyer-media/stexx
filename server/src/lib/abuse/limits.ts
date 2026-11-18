@@ -36,6 +36,17 @@ export const DEFAULT_ABUSE_LIMITS = {
   photoAccount: "60/1h",
   photoDevice: "60/1h",
   photoIp: "120/1h",
+  // E2E prekey bundles (GET /keys/bundle/:id). Fetching is only needed to START a session, so these are generous
+  // for people and tight for scripts. Refused with 429 when exceeded.
+  keyBundleAccount: "200/1d",
+  keyBundleDevice: "300/1d",
+  keyBundleIp: "300/1h",
+  // One-time prekeys handed out per target account, and per (fetcher, target) pair. Over budget the fetch still
+  // succeeds but gets the last-resort bundle without consuming a one-time key, so nobody can drain someone's prekeys.
+  prekeyTarget: "50/1d",
+  prekeyPair: "3/1d",
+  // PUT /keys (full re-registration, which may change the identity key and warn every peer).
+  keyRegisterAccount: "10/1d",
 } as const;
 export type AbuseLimitName = keyof typeof DEFAULT_ABUSE_LIMITS;
 
@@ -265,13 +276,17 @@ export function networkOf(ip: string): string {
   return ip;
 }
 
-export type AbuseAction = "signup" | "login" | "message" | "photo";
+export type AbuseAction = "signup" | "login" | "message" | "photo" | "keyBundle" | "prekeyConsume" | "keyRegister";
 
 export interface AbuseSubject {
   ip?: string;
   network?: string;
   deviceId?: string | null;
   userId?: string | null;
+  /** The account whose keys are fetched (prekeyConsume). */
+  targetId?: string | null;
+  /** `${fetcherId}>${targetId}` (prekeyConsume). */
+  pair?: string | null;
 }
 
 const PLAN: Record<AbuseAction, [AbuseLimitName, keyof AbuseSubject][]> = {
@@ -279,6 +294,9 @@ const PLAN: Record<AbuseAction, [AbuseLimitName, keyof AbuseSubject][]> = {
   login: [["loginIp", "ip"], ["loginDevice", "deviceId"]],
   message: [["messageAccount", "userId"], ["messageDevice", "deviceId"], ["messageIp", "ip"]],
   photo: [["photoAccount", "userId"], ["photoDevice", "deviceId"], ["photoIp", "ip"]],
+  keyBundle: [["keyBundleAccount", "userId"], ["keyBundleDevice", "deviceId"], ["keyBundleIp", "ip"]],
+  prekeyConsume: [["prekeyPair", "pair"], ["prekeyTarget", "targetId"]],
+  keyRegister: [["keyRegisterAccount", "userId"]],
 };
 
 /**
@@ -287,15 +305,23 @@ const PLAN: Record<AbuseAction, [AbuseLimitName, keyof AbuseSubject][]> = {
  * other windows).
  */
 export async function hitAbuseLimits(action: AbuseAction, subject: AbuseSubject, now = Date.now()): Promise<void> {
-  if (rateLimitsDisabled()) return;
+  const waitMs = await tryAbuseLimits(action, subject, now);
+  if (waitMs > 0) throw tooManyRequests(waitMs / 1000);
+}
+
+/**
+ * Like hitAbuseLimits, but returns the wait in milliseconds (0 = allowed and counted) instead of throwing, for
+ * callers that degrade rather than refuse (prekey consumption falls back to the last-resort bundle).
+ */
+export async function tryAbuseLimits(action: AbuseAction, subject: AbuseSubject, now = Date.now()): Promise<number> {
+  if (rateLimitsDisabled()) return 0;
   const keys: LimiterEntry[] = [];
   for (const [name, field] of PLAN[action]) {
     const value = subject[field];
     if (!value) continue;
     keys.push([`${name}:${value}`, limits[name]]);
   }
-  const waitMs = await store.hit(keys, now);
-  if (waitMs > 0) throw tooManyRequests(waitMs / 1000);
+  return store.hit(keys, now);
 }
 
 /** The subject for a request: keyed hashes of the IP and network, the attested device (if any) and the signed-in user. */

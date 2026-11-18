@@ -1,5 +1,6 @@
 import { sql, type Sql } from "../db/sql.ts";
 import { bucketedDistanceBetween, type Cell } from "./distance.ts";
+import { envelopeJson, type EnvelopeJson } from "./e2e/envelope.ts";
 import { mediaUrl } from "./media.ts";
 import { visibleToOthers } from "./photocheck/policy.ts";
 import { isoDate, MINUTE } from "./time.ts";
@@ -45,6 +46,8 @@ export interface MessageJson {
   conversationID: string;
   senderID: string;
   text: string | null;
+  /** End-to-end encrypted content (libsignal ciphertext, opaque to the server); `text` is then null. */
+  envelope: EnvelopeJson | null;
   attachment: AttachmentJson | null;
   sentAt: string;
   status: "sent" | "delivered" | "read";
@@ -115,6 +118,8 @@ export interface MessageRow {
   sender_id: string;
   client_id: string;
   text: string | null;
+  envelope_type: string | null;
+  envelope_body: Buffer | null;
   attachment_kind: string | null;
   attachment_key: string | null;
   attachment_view_once: boolean;
@@ -206,6 +211,7 @@ export function messageJson(m: MessageRow, viewerId: string): MessageJson {
     conversationID: m.conversation_id,
     senderID: m.sender_id,
     text: m.text,
+    envelope: envelopeJson(m.envelope_type, m.envelope_body),
     attachment:
       m.attachment_kind === "photo"
         ? { kind: "photo", url: mediaUrl(m.attachment_key), isViewOnce: m.attachment_view_once }
