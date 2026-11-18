@@ -219,7 +219,8 @@ once chats are end-to-end encrypted:
 `fromReported` is true when the reported person sent it. Each item needs
 `text` (≤ 4000) or `hasPhoto: true`; photos themselves are not uploaded. The
 server records whether a message with that id, thread and sender exists, but
-can't check the text. Evidence is deleted 30 days after the report is closed.
+can't check the text. Evidence is deleted 30 days after the report is closed
+(180 days at most), and survives the reporter deleting their account until then.
 
 Several independent reports hide an account until a moderator reviews it
 (rules in [`security.md`](security.md#5-reports-auto-hide-and-moderation)).

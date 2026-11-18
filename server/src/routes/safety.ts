@@ -78,6 +78,16 @@ const evidenceItemSchema = z
 
 export const MAX_EVIDENCE_ITEMS = 20;
 
+/** IPv4 address as is; IPv6 reduced to its /64 (one household or device), lower-cased. */
+export function connectionOf(ip: string): string {
+  if (!ip.includes(":") || /^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(ip)) return ip.replace(/^::ffff:/i, "");
+  const [head = "", tail = ""] = ip.toLowerCase().split("::");
+  const h = head.split(":").filter(Boolean);
+  const t = tail.split(":").filter(Boolean);
+  const groups = [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":")}::/64`;
+}
+
 const reportSchema = z.strictObject({
   profileID: z.string().max(64),
   reason: reportReasonSchema,
@@ -100,8 +110,9 @@ safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
   if (evidence.length > 0 && body.conversationID == null) {
     throw badRequest("evidence: messages can only be attached to a report from a chat (conversationID).");
   }
-  // Keyed hash of the reporter's IP (never the address): lets auto-hide tell reports from one connection apart.
-  const ipHash = abuseKeyHash(clientIp(c));
+  // Keyed hash of the reporter's connection (never the address): lets auto-hide tell reports from one connection
+  // apart. IPv4: the address; IPv6: its /64, since one device rotates privacy addresses inside it.
+  const ipHash = abuseKeyHash(connectionOf(clientIp(c)));
 
   await sql.begin(async (tx) => {
     let conversationId: string | null = null;

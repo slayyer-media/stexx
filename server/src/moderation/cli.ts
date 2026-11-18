@@ -52,6 +52,19 @@ interface Parsed {
 
 const VALUE_FLAGS = new Set(["--as", "--note", "--report", "--limit"]);
 const BOOL_FLAGS = new Set(["--json", "--unhide", "--help"]);
+const WRITE_FLAGS = ["--as", "--note", "--json"];
+/** Flags each command accepts; anything else is refused so a mistyped command never acts on more than intended. */
+const ALLOWED: Record<string, string[]> = {
+  list: ["--limit", "--json"],
+  show: ["--json"],
+  log: ["--limit", "--json"],
+  dismiss: [...WRITE_FLAGS, "--report"],
+  action: [...WRITE_FLAGS, "--unhide"],
+  hide: WRITE_FLAGS,
+  unhide: WRITE_FLAGS,
+  ban: WRITE_FLAGS,
+  unban: WRITE_FLAGS,
+};
 
 function parse(argv: string[]): Parsed {
   const [command = "help", ...rest] = argv;
@@ -71,6 +84,14 @@ function parse(argv: string[]): Parsed {
     } else {
       positional.push(arg);
     }
+  }
+  const allowed = ALLOWED[command];
+  if (allowed) {
+    for (const f of flags.keys()) {
+      if (!allowed.includes(f)) throw new ModerationError(`${f} doesn't apply to "${command}".`);
+    }
+    const maxPositional = command === "list" ? 0 : 1;
+    if (positional.length > maxPositional) throw new ModerationError(`Unexpected argument ${positional[maxPositional]}.`);
   }
   return { command, positional, flags };
 }

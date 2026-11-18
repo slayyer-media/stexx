@@ -13,7 +13,7 @@
  * Rules, checked in this order:
  *   1. underage: >= REPORT_UNDERAGE_TRUSTED_THRESHOLD (1) independent trusted reporters said `underage`, OR
  *      >= REPORT_UNDERAGE_ANY_THRESHOLD (2) reporters said `underage` from different devices and connections, whatever
- *      their account age (still not hidden/banned).
+ *      their account age (still not hidden/banned; a new account must have been created on an attested device).
  *   2. reports:  >= REPORT_AUTOHIDE_THRESHOLD (3) independent trusted reporters, any reasons.
  * A hidden account (users.hidden_at) disappears from nearby and viewers, is shown as a profile/conversation only to
  * people who have written to it, can't open new conversations or tap, and can only message people who wrote to it
@@ -133,12 +133,16 @@ export function assessReporters(facts: readonly ReporterFacts[], s: AutoHideSett
   const independentTrusted = reporters.filter((r) => r.counted).length;
   const underageTrusted = reporters.filter((r) => r.counted && r.reasons.includes("underage")).length;
 
-  // Underage, any account age: distinct devices and connections among reporters who aren't hidden/banned.
+  // Underage, any account age: distinct devices and connections among reporters who aren't hidden/banned. A new
+  // account only counts here if it was created on an attested device (device_accounts), so this branch costs one real
+  // iPhone per fake reporter; trusted reporters count without one.
   const uDevices = new Set<string>();
   const uIps = new Set<string>();
   let underageAny = 0;
   for (const f of ordered) {
     if (f.moderated || !f.reasons.includes("underage")) continue;
+    const trusted = f.ageMs >= minAgeMs && !f.restricted;
+    if (!trusted && f.deviceIds.length === 0) continue;
     if (claimIfIndependent(f, uDevices, uIps)) underageAny += 1;
   }
 
@@ -150,7 +154,8 @@ export function assessReporters(facts: readonly ReporterFacts[], s: AutoHideSett
 
 // ---- Gathering facts ---------------------------------------------------------------------------------
 
-const MAX_REPORTS_ASSESSED = 500;
+/** Reporters (not reports) assessed per account, oldest first, so repeat reports from one account can't push others out. */
+const MAX_REPORTERS_ASSESSED = 500;
 
 /** Reporter facts for the open reports against `userId` that count towards auto-hide right now. */
 export async function reporterFacts(userId: string, db: Sql = sql, now = new Date()): Promise<ReporterFacts[]> {
@@ -158,46 +163,44 @@ export async function reporterFacts(userId: string, db: Sql = sql, now = new Dat
   const since = new Date(now.getTime() - s.windowDays * DAY);
   const rows = await db<
     {
-      id: string;
       reporter_id: string;
-      reason: ReportReason;
-      created_at: Date;
-      reporter_ip_hash: string | null;
+      first_at: Date;
+      report_ids: string[];
+      reasons: ReportReason[];
+      ip_hashes: string[];
       moderated: boolean;
     }[]
   >`
-    SELECT r.id, r.reporter_id, r.reason, r.created_at, r.reporter_ip_hash,
-           (ru.hidden_at IS NOT NULL OR ru.banned_at IS NOT NULL) AS moderated
+    SELECT r.reporter_id,
+           min(r.created_at) AS first_at,
+           array_agg(r.id ORDER BY r.created_at, r.id) AS report_ids,
+           array_agg(DISTINCT r.reason) AS reasons,
+           COALESCE(array_agg(DISTINCT r.reporter_ip_hash) FILTER (WHERE r.reporter_ip_hash IS NOT NULL), '{}') AS ip_hashes,
+           bool_or(ru.hidden_at IS NOT NULL OR ru.banned_at IS NOT NULL) AS moderated
       FROM reports r
       JOIN users ru ON ru.id = r.reporter_id
       JOIN users t ON t.id = r.reported_id
      WHERE r.reported_id = ${userId} AND r.status = 'open' AND r.reporter_id <> ${userId}
        AND r.created_at > ${since}
        AND r.created_at > COALESCE(t.reviewed_at, '-infinity'::timestamptz)
-     ORDER BY r.created_at, r.id
-     LIMIT ${MAX_REPORTS_ASSESSED}`;
+     GROUP BY r.reporter_id
+     ORDER BY first_at, r.reporter_id
+     LIMIT ${MAX_REPORTERS_ASSESSED}`;
   if (rows.length === 0) return [];
 
   const by = new Map<string, ReporterFacts>();
   for (const r of rows) {
-    let f = by.get(r.reporter_id);
-    if (!f) {
-      f = {
-        reporterId: r.reporter_id,
-        firstReportAt: new Date(r.created_at),
-        reasons: [],
-        reportIds: [],
-        moderated: r.moderated,
-        ageMs: 0,
-        restricted: false,
-        deviceIds: [],
-        ipHashes: [],
-      };
-      by.set(r.reporter_id, f);
-    }
-    f.reportIds.push(r.id);
-    if (!f.reasons.includes(r.reason)) f.reasons.push(r.reason);
-    if (r.reporter_ip_hash && !f.ipHashes.includes(r.reporter_ip_hash)) f.ipHashes.push(r.reporter_ip_hash);
+    by.set(r.reporter_id, {
+      reporterId: r.reporter_id,
+      firstReportAt: new Date(r.first_at),
+      reasons: r.reasons,
+      reportIds: r.report_ids,
+      moderated: r.moderated,
+      ageMs: 0,
+      restricted: false,
+      deviceIds: [],
+      ipHashes: r.ip_hashes,
+    });
   }
   const ids = [...by.keys()];
   const devices = await db<{ user_id: string; device_id: string }[]>`
@@ -461,7 +464,8 @@ export function banAccount(input: ActionInput): Promise<ActionResult> {
 }
 
 /**
- * Undo a ban (a mistake). Clears the account's ban and hide, and the server-side ban on its devices. A DeviceCheck
+ * Undo a ban (a mistake). Clears the account's ban and hide, and the server-side ban on its devices unless another
+ * banned account was created on the same device. A DeviceCheck
  * ban bit already written at Apple is not cleared (see docs/security.md).
  */
 export function unbanAccount(input: ActionInput): Promise<ActionResult> {
@@ -470,10 +474,14 @@ export function unbanAccount(input: ActionInput): Promise<ActionResult> {
     await tx`
       UPDATE users SET banned_at = NULL, hidden_at = NULL, hidden_reason = NULL, reviewed_at = now()
        WHERE id = ${input.userId}`;
+    // Lift device bans only where no other banned account was created on the same device.
     const devices = await tx`
-      UPDATE devices SET banned_at = NULL
-       WHERE banned_at IS NOT NULL AND id IN (SELECT device_id FROM device_accounts WHERE user_id = ${input.userId})
-       RETURNING id`;
+      UPDATE devices d SET banned_at = NULL
+       WHERE d.banned_at IS NOT NULL
+         AND d.id IN (SELECT device_id FROM device_accounts WHERE user_id = ${input.userId})
+         AND NOT EXISTS (SELECT 1 FROM device_accounts da JOIN users o ON o.id = da.user_id
+                          WHERE da.device_id = d.id AND da.user_id <> ${input.userId} AND o.banned_at IS NOT NULL)
+       RETURNING d.id`;
     return { details: { devicesUnbanned: devices.length } };
   });
 }

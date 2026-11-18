@@ -196,6 +196,8 @@ describe("assessReporters (independence rules)", () => {
     expect(assessReporters([fresh(), fresh()], s).rule).toBe("underage");
     expect(assessReporters([fresh({ ipHashes: ["ip_x"] }), fresh({ ipHashes: ["ip_x"] })], s).rule).toBeNull();
     expect(assessReporters([fresh(), fresh({ moderated: true })], s).rule).toBeNull();
+    // A new account with no attested device doesn't count towards the any-age rule.
+    expect(assessReporters([fresh(), fresh({ deviceIds: [] })], s).rule).toBeNull();
   });
 });
 
@@ -288,10 +290,43 @@ describe("auto-hide after independent reports", () => {
 
   test("underage from new accounts: one doesn't hide, two from different devices/connections do", async () => {
     const target = await user();
-    await expectNoContent(await report(await user(), target, { reason: "underage" }));
+    const [a, b] = [await user(), await user()];
+    await shareDevice(a);
+    await shareDevice(b);
+    await expectNoContent(await report(a, target, { reason: "underage" }));
     expect((await stateOf(target.id)).hidden_at).toBeNull();
-    await expectNoContent(await report(await user(), target, { reason: "underage" }));
+    await expectNoContent(await report(b, target, { reason: "underage" }));
     expect((await stateOf(target.id)).hidden_reason).toBe("underage");
+  });
+
+  test("underage from new accounts without an attested device doesn't count", async () => {
+    const target = await user();
+    for (let i = 0; i < 3; i++) await expectNoContent(await report(await user(), target, { reason: "underage" }));
+    expect((await stateOf(target.id)).hidden_at).toBeNull();
+  });
+
+  test("one reporter filing many times can't push other reporters out of the assessment", async () => {
+    const target = await user();
+    const spammer = await veteran();
+    for (let i = 0; i < 3; i++) await expectNoContent(await report(spammer, target, { ip: "10.9.9.9" }));
+    // Simulate a long flood (more rows than the old row cap) without hammering the rate limiter.
+    await sql`INSERT INTO reports (id, reporter_id, reported_id, reason, reporter_ip_hash)
+              SELECT 'r_' || substr(md5(random()::text || g::text), 1, 26), ${spammer.id}, ${target.id}, 'spam', 'flood'
+                FROM generate_series(1, 600) g`;
+    await expectNoContent(await report(await veteran(), target));
+    await expectNoContent(await report(await veteran(), target));
+    expect((await stateOf(target.id)).hidden_reason).toBe("reports");
+  });
+
+  test("IPv6 reporters in one /64 count once", async () => {
+    const target = await user();
+    for (const ip of ["2001:db8:1:2::a", "2001:db8:1:2:ffff::b", "2001:0db8:0001:0002:1:2:3:4"]) {
+      await expectNoContent(await report(await veteran(), target, { ip }));
+    }
+    expect((await stateOf(target.id)).hidden_at).toBeNull();
+    await expectNoContent(await report(await veteran(), target, { ip: "2001:db8:1:3::a" }));
+    await expectNoContent(await report(await veteran(), target, { ip: "203.0.113.9" }));
+    expect((await stateOf(target.id)).hidden_reason).toBe("reports");
   });
 
   test("concurrent reports hide exactly once", async () => {
@@ -548,6 +583,10 @@ describe("moderation CLI", () => {
     expect((await cli("hide", "not-an-id", "--as", "mod-a")).code).toBe(1);
     expect((await cli("frobnicate")).code).toBe(2);
     expect((await cli("list", "--bogus")).code).toBe(2);
+    // Flags that don't belong to a command are refused instead of ignored.
+    expect((await cli("action", target.id, "--report", newId("report"), "--as", "mod-a")).code).toBe(2);
+    expect((await cli("dismiss", target.id, "--unhide", "--as", "mod-a")).code).toBe(2);
+    expect((await cli("ban", target.id, "extra", "--as", "mod-a")).code).toBe(2);
     expect((await stateOf(target.id)).hidden_at).toBeNull();
     // STEXX_MODERATOR works instead of --as
     const lines: string[] = [];
@@ -641,6 +680,17 @@ describe("moderation CLI", () => {
     const session = await createSession(target.id);
     await expectJson(await as(session.accessToken).get("/v1/me"));
     await expectJson(await as(friend).get(`/v1/profiles/${target.id}`));
+  });
+
+  test("unban keeps a device banned while another banned account was created on it", async () => {
+    const a = await user();
+    const b = await user();
+    const device = await shareDevice(a, b);
+    await banAccount({ actor: "mod-d", userId: b.id });
+    await banAccount({ actor: "mod-d", userId: a.id });
+    await expect(cli("unban", a.id, "--as", "mod-d")).resolves.toMatchObject({ code: 0 });
+    const [d] = await sql<{ banned_at: Date | null }[]>`SELECT banned_at FROM devices WHERE id = ${device}`;
+    expect(d!.banned_at).not.toBeNull();
   });
 
   test("GET /blocks still lists a hidden account I blocked, but not a banned one", async () => {
