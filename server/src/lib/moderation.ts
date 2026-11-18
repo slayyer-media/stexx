@@ -1,0 +1,750 @@
+/**
+ * Reports, auto-hide and moderator review. See docs/security.md ("Reports, auto-hide and moderation").
+ *
+ * Auto-hide. After every report, the reported account is re-assessed (evaluateAutoHide, in the report's transaction,
+ * serialized per account by an advisory lock). Only OPEN reports filed inside the window (REPORT_AUTOHIDE_WINDOW_DAYS)
+ * and after the account's last moderator review (users.reviewed_at) count. Each reporter account counts once, and:
+ *   - a reporter that is itself hidden or banned never counts;
+ *   - a TRUSTED reporter is at least REPORT_REPORTER_MIN_AGE_HOURS old (default TRUST_RAMP_HOURS) and not currently
+ *     restricted by the trust ramp (lib/abuse/trust.ts);
+ *   - reporters are INDEPENDENT when they share neither a device (device_accounts, from the anti-spam work) nor the
+ *     connection they reported from (reports.reporter_ip_hash, a keyed hash of the IP). Earlier reporters win: a later
+ *     reporter on a device or IP already counted is skipped.
+ * Rules, checked in this order:
+ *   1. underage: >= REPORT_UNDERAGE_TRUSTED_THRESHOLD (1) independent trusted reporters said `underage`, OR
+ *      >= REPORT_UNDERAGE_ANY_THRESHOLD (2) reporters said `underage` from different devices and connections, whatever
+ *      their account age (still not hidden/banned).
+ *   2. reports:  >= REPORT_AUTOHIDE_THRESHOLD (3) independent trusted reporters, any reasons.
+ * A hidden account (users.hidden_at) disappears from nearby and viewers, is shown as a profile/conversation only to
+ * people who have written to it, can't open new conversations or tap, and can only message people who wrote to it
+ * (lib/visibility.ts moderationVisible/notModerated, assertMayStartContact, assertMayMessage). It is never told who
+ * reported it.
+ *
+ * Moderator actions (scripts/moderate.ts) each run in one transaction under the same lock and write an audit row to
+ * moderation_actions: hide, unhide, dismiss, action, ban, unban.
+ */
+import { config, type ModerationConfig } from "../config.ts";
+import { sql, type Sql } from "../db/sql.ts";
+import { banDevicesOfUser } from "./abuse/attestation.ts";
+import { trustState } from "./abuse/trust.ts";
+import { revokeAllSessions } from "./auth.ts";
+import { accountUnderReview, ApiError, notFound } from "./errors.ts";
+import { logInfo } from "./logger.ts";
+import { DAY, HOUR } from "./time.ts";
+
+export type ReportReason =
+  | "underage"
+  | "harassment"
+  | "spam"
+  | "fakeProfile"
+  | "threatsOrViolence"
+  | "illegalContent"
+  | "other";
+export type HideReason = "reports" | "underage" | "moderator";
+export type ModerationActionKind = "auto_hide" | "hide" | "unhide" | "dismiss" | "action" | "ban" | "unban";
+export const SYSTEM_ACTOR = "system";
+
+// ---- Settings ------------------------------------------------------------------------------------
+
+export type AutoHideSettings = ModerationConfig["autoHide"];
+let overrides: Partial<AutoHideSettings> = {};
+export function autoHideSettings(): AutoHideSettings {
+  return { ...config.moderation.autoHide, ...overrides };
+}
+/** Tests only. Returns a restore function. */
+export function overrideAutoHideForTests(next: Partial<AutoHideSettings>): () => void {
+  if (config.isProduction) throw new Error("not in production");
+  const prev = overrides;
+  overrides = { ...overrides, ...next };
+  return () => {
+    overrides = prev;
+  };
+}
+
+/** Serializes auto-hide evaluation and moderator actions for one account. Call inside a transaction. */
+async function lockAccount(db: Sql, userId: string): Promise<void> {
+  await db`SELECT pg_advisory_xact_lock(hashtextextended(${"stexx:moderation:" + userId}, 0))`;
+}
+
+// ---- Independence (pure) ----------------------------------------------------------------------------
+
+/** What we know about one reporter of one account, gathered from their open reports in the window. */
+export interface ReporterFacts {
+  reporterId: string;
+  firstReportAt: Date;
+  reasons: ReportReason[];
+  reportIds: string[];
+  /** The reporter's own account is hidden or banned. */
+  moderated: boolean;
+  ageMs: number;
+  /** Restricted by the trust ramp right now. */
+  restricted: boolean;
+  deviceIds: string[];
+  ipHashes: string[];
+}
+
+export type ExclusionReason = "reporter_hidden_or_banned" | "new_account" | "same_device_or_connection";
+
+export interface ReporterVerdict extends ReporterFacts {
+  trusted: boolean;
+  /** Counted towards the threshold: trusted and independent of every reporter counted before. */
+  counted: boolean;
+  excluded: ExclusionReason | null;
+}
+
+export interface Assessment {
+  reporters: ReporterVerdict[];
+  independentTrusted: number;
+  underageTrusted: number;
+  underageAny: number;
+  rule: Exclude<HideReason, "moderator"> | null;
+}
+
+/** Greedy de-duplication by device and connection: true if `f` shares neither with what was already accepted. */
+function claimIfIndependent(f: ReporterFacts, devices: Set<string>, ips: Set<string>): boolean {
+  if (f.deviceIds.some((d) => devices.has(d)) || f.ipHashes.some((h) => ips.has(h))) return false;
+  for (const d of f.deviceIds) devices.add(d);
+  for (const h of f.ipHashes) ips.add(h);
+  return true;
+}
+
+/** Applies the independence rules and thresholds. Pure, so the rules are unit-tested without a database. */
+export function assessReporters(facts: readonly ReporterFacts[], s: AutoHideSettings): Assessment {
+  const ordered = [...facts].sort(
+    (a, b) => a.firstReportAt.getTime() - b.firstReportAt.getTime() || a.reporterId.localeCompare(b.reporterId),
+  );
+  const minAgeMs = s.reporterMinAgeHours * HOUR;
+  const devices = new Set<string>();
+  const ips = new Set<string>();
+  const reporters: ReporterVerdict[] = [];
+  for (const f of ordered) {
+    if (f.moderated) {
+      reporters.push({ ...f, trusted: false, counted: false, excluded: "reporter_hidden_or_banned" });
+      continue;
+    }
+    const trusted = f.ageMs >= minAgeMs && !f.restricted;
+    if (!trusted) {
+      reporters.push({ ...f, trusted, counted: false, excluded: "new_account" });
+      continue;
+    }
+    const counted = claimIfIndependent(f, devices, ips);
+    reporters.push({ ...f, trusted, counted, excluded: counted ? null : "same_device_or_connection" });
+  }
+  const independentTrusted = reporters.filter((r) => r.counted).length;
+  const underageTrusted = reporters.filter((r) => r.counted && r.reasons.includes("underage")).length;
+
+  // Underage, any account age: distinct devices and connections among reporters who aren't hidden/banned.
+  const uDevices = new Set<string>();
+  const uIps = new Set<string>();
+  let underageAny = 0;
+  for (const f of ordered) {
+    if (f.moderated || !f.reasons.includes("underage")) continue;
+    if (claimIfIndependent(f, uDevices, uIps)) underageAny += 1;
+  }
+
+  let rule: Assessment["rule"] = null;
+  if (underageTrusted >= s.underageTrusted || underageAny >= s.underageAny) rule = "underage";
+  else if (independentTrusted >= s.threshold) rule = "reports";
+  return { reporters, independentTrusted, underageTrusted, underageAny, rule };
+}
+
+// ---- Gathering facts ---------------------------------------------------------------------------------
+
+const MAX_REPORTS_ASSESSED = 500;
+
+/** Reporter facts for the open reports against `userId` that count towards auto-hide right now. */
+export async function reporterFacts(userId: string, db: Sql = sql, now = new Date()): Promise<ReporterFacts[]> {
+  const s = autoHideSettings();
+  const since = new Date(now.getTime() - s.windowDays * DAY);
+  const rows = await db<
+    {
+      id: string;
+      reporter_id: string;
+      reason: ReportReason;
+      created_at: Date;
+      reporter_ip_hash: string | null;
+      moderated: boolean;
+    }[]
+  >`
+    SELECT r.id, r.reporter_id, r.reason, r.created_at, r.reporter_ip_hash,
+           (ru.hidden_at IS NOT NULL OR ru.banned_at IS NOT NULL) AS moderated
+      FROM reports r
+      JOIN users ru ON ru.id = r.reporter_id
+      JOIN users t ON t.id = r.reported_id
+     WHERE r.reported_id = ${userId} AND r.status = 'open' AND r.reporter_id <> ${userId}
+       AND r.created_at > ${since}
+       AND r.created_at > COALESCE(t.reviewed_at, '-infinity'::timestamptz)
+     ORDER BY r.created_at, r.id
+     LIMIT ${MAX_REPORTS_ASSESSED}`;
+  if (rows.length === 0) return [];
+
+  const by = new Map<string, ReporterFacts>();
+  for (const r of rows) {
+    let f = by.get(r.reporter_id);
+    if (!f) {
+      f = {
+        reporterId: r.reporter_id,
+        firstReportAt: new Date(r.created_at),
+        reasons: [],
+        reportIds: [],
+        moderated: r.moderated,
+        ageMs: 0,
+        restricted: false,
+        deviceIds: [],
+        ipHashes: [],
+      };
+      by.set(r.reporter_id, f);
+    }
+    f.reportIds.push(r.id);
+    if (!f.reasons.includes(r.reason)) f.reasons.push(r.reason);
+    if (r.reporter_ip_hash && !f.ipHashes.includes(r.reporter_ip_hash)) f.ipHashes.push(r.reporter_ip_hash);
+  }
+  const ids = [...by.keys()];
+  const devices = await db<{ user_id: string; device_id: string }[]>`
+    SELECT user_id, device_id FROM device_accounts WHERE user_id = ANY(${ids})`;
+  for (const d of devices) by.get(d.user_id)?.deviceIds.push(d.device_id);
+  for (const f of by.values()) {
+    const t = await trustState(f.reporterId, db, now);
+    f.ageMs = t.ageMs;
+    f.restricted = t.restricted;
+  }
+  return [...by.values()];
+}
+
+// ---- Audit ---------------------------------------------------------------------------------------------
+
+async function audit(
+  db: Sql,
+  entry: {
+    actor: string;
+    action: ModerationActionKind;
+    userId: string;
+    reportIds?: string[];
+    note?: string | null;
+    details?: Record<string, unknown>;
+  },
+): Promise<void> {
+  await db`
+    INSERT INTO moderation_actions (actor, action, user_id, report_ids, note, details)
+    VALUES (${entry.actor}, ${entry.action}, ${entry.userId}, ${entry.reportIds ?? []}, ${entry.note ?? null},
+            ${db.json((entry.details ?? {}) as never)})`;
+}
+
+// ---- Auto-hide ---------------------------------------------------------------------------------------------
+
+export interface AutoHideResult {
+  hidden: boolean;
+  rule: Assessment["rule"];
+}
+
+/**
+ * Re-assess `userId` after a report and hide the account when a rule fires. Run it inside the transaction that
+ * inserted the report (so a failure rolls both back). Never tells anyone who reported.
+ */
+export async function evaluateAutoHide(userId: string, db: Sql, now = new Date()): Promise<AutoHideResult> {
+  const s = autoHideSettings();
+  if (!s.enabled) return { hidden: false, rule: null };
+  await lockAccount(db, userId);
+  const [u] = await db<{ hidden_at: Date | null; banned_at: Date | null }[]>`
+    SELECT hidden_at, banned_at FROM users WHERE id = ${userId}`;
+  if (!u || u.hidden_at || u.banned_at) return { hidden: false, rule: null };
+
+  const assessment = assessReporters(await reporterFacts(userId, db, now), s);
+  if (!assessment.rule) return { hidden: false, rule: null };
+
+  await db`UPDATE users SET hidden_at = ${now}, hidden_reason = ${assessment.rule} WHERE id = ${userId}`;
+  await audit(db, {
+    actor: SYSTEM_ACTOR,
+    action: "auto_hide",
+    userId,
+    reportIds: assessment.reporters.flatMap((r) => r.reportIds),
+    details: {
+      rule: assessment.rule,
+      independentTrusted: assessment.independentTrusted,
+      underageTrusted: assessment.underageTrusted,
+      underageAny: assessment.underageAny,
+      reporters: assessment.reporters.length,
+      settings: s,
+    },
+  });
+  logInfo("moderation.auto_hide", { rule: assessment.rule, counted: assessment.independentTrusted });
+  return { hidden: true, rule: assessment.rule };
+}
+
+// ---- Gates for a hidden account's own actions --------------------------------------------------------------
+
+/** True when the account is hidden pending review (or banned). */
+export async function isUnderReview(userId: string, db: Sql = sql): Promise<boolean> {
+  const [row] = await db<{ held: boolean }[]>`
+    SELECT (hidden_at IS NOT NULL OR banned_at IS NOT NULL) AS held FROM users WHERE id = ${userId}`;
+  return row?.held ?? false;
+}
+
+/**
+ * A hidden account may only (re)open a conversation with someone who has already written to it. Throws 403
+ * `account_under_review` otherwise. No-op for everyone else.
+ */
+export async function assertMayStartContact(userId: string, otherId: string, db: Sql = sql): Promise<void> {
+  if (!(await isUnderReview(userId, db))) return;
+  const [row] = await db<{ ok: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1 FROM conversations c JOIN messages m ON m.conversation_id = c.id
+       WHERE m.sender_id = ${otherId}
+         AND ((c.user_a = ${userId} AND c.user_b = ${otherId}) OR (c.user_b = ${userId} AND c.user_a = ${otherId}))
+    ) AS ok`;
+  if (!row?.ok) throw accountUnderReview();
+}
+
+/** A hidden account may send only where the other person has written in this conversation. */
+export async function assertMayMessage(
+  userId: string,
+  conversationId: string,
+  otherId: string,
+  db: Sql = sql,
+): Promise<void> {
+  if (!(await isUnderReview(userId, db))) return;
+  const [row] = await db<{ ok: boolean }[]>`
+    SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ${conversationId} AND sender_id = ${otherId}) AS ok`;
+  if (!row?.ok) throw accountUnderReview();
+}
+
+/** Taps are first contact: a hidden account can't send them. */
+export async function assertMayTap(userId: string, db: Sql = sql): Promise<void> {
+  if (await isUnderReview(userId, db)) throw accountUnderReview();
+}
+
+// ---- Moderator actions -------------------------------------------------------------------------------------
+
+export class ModerationError extends Error {
+  override name = "ModerationError";
+}
+
+export interface ActionInput {
+  actor: string;
+  userId: string;
+  note?: string | null;
+}
+
+export interface ActionResult {
+  action: ModerationActionKind;
+  userId: string;
+  closedReports: string[];
+  state: AccountState;
+  details?: Record<string, unknown>;
+}
+
+export type AccountState = "visible" | "hidden" | "banned";
+
+const ACTOR_RE = /^[A-Za-z0-9._-]{1,64}$/;
+function checkActor(actor: string): void {
+  if (!ACTOR_RE.test(actor) || actor === SYSTEM_ACTOR) {
+    throw new ModerationError("Moderator handle must be 1-64 letters, digits, dot, dash or underscore (not 'system').");
+  }
+}
+function checkNote(note: string | null | undefined): void {
+  if (note && note.length > 2000) throw new ModerationError("Note is limited to 2000 characters.");
+}
+
+async function stateOf(db: Sql, userId: string): Promise<AccountState> {
+  const [u] = await db<{ hidden_at: Date | null; banned_at: Date | null }[]>`
+    SELECT hidden_at, banned_at FROM users WHERE id = ${userId}`;
+  if (!u) throw new ModerationError(`No account ${userId}.`);
+  return u.banned_at ? "banned" : u.hidden_at ? "hidden" : "visible";
+}
+
+/** Run a moderator action in one transaction, serialized with auto-hide for that account. */
+async function moderate(
+  input: ActionInput,
+  action: ModerationActionKind,
+  body: (tx: Sql, state: AccountState) => Promise<{ closedReports?: string[]; details?: Record<string, unknown> }>,
+): Promise<ActionResult> {
+  checkActor(input.actor);
+  checkNote(input.note);
+  return sql.begin(async (tx) => {
+    await lockAccount(tx, input.userId);
+    const before = await stateOf(tx, input.userId);
+    const out = await body(tx, before);
+    await audit(tx, {
+      actor: input.actor,
+      action,
+      userId: input.userId,
+      reportIds: out.closedReports ?? [],
+      note: input.note ?? null,
+      details: { before, ...(out.details ?? {}) },
+    });
+    const state = await stateOf(tx, input.userId);
+    return { action, userId: input.userId, closedReports: out.closedReports ?? [], state, details: out.details };
+  });
+}
+
+async function closeOpenReports(
+  tx: Sql,
+  userId: string,
+  status: "dismissed" | "actioned",
+  reportId?: string,
+): Promise<string[]> {
+  const rows = await tx<{ id: string }[]>`
+    UPDATE reports SET status = ${status}, closed_at = now()
+     WHERE reported_id = ${userId} AND status = 'open'
+       ${reportId ? tx`AND id = ${reportId}` : tx``}
+     RETURNING id`;
+  return rows.map((r) => r.id);
+}
+
+const clearHide = (tx: Sql, userId: string) =>
+  tx`UPDATE users SET hidden_at = NULL, hidden_reason = NULL, reviewed_at = now() WHERE id = ${userId}`;
+
+/** Hide an account pending review (e.g. on a credible single report). */
+export function hideAccount(input: ActionInput): Promise<ActionResult> {
+  return moderate(input, "hide", async (tx, state) => {
+    if (state === "banned") throw new ModerationError("Account is banned; nothing to hide.");
+    await tx`
+      UPDATE users SET hidden_at = COALESCE(hidden_at, now()), hidden_reason = COALESCE(hidden_reason, 'moderator')
+       WHERE id = ${input.userId}`;
+    return {};
+  });
+}
+
+/** Make a hidden account visible again. Open reports stay open, but only reports filed after this count again. */
+export function unhideAccount(input: ActionInput): Promise<ActionResult> {
+  return moderate(input, "unhide", async (tx, state) => {
+    if (state === "banned") throw new ModerationError("Account is banned; use unban.");
+    await clearHide(tx, input.userId);
+    return {};
+  });
+}
+
+/**
+ * The reports were unfounded. Without `reportId`: close every open report as dismissed and unhide the account.
+ * With `reportId`: dismiss just that report and leave the account as it is.
+ */
+export function dismissReports(input: ActionInput & { reportId?: string }): Promise<ActionResult> {
+  return moderate(input, "dismiss", async (tx, state) => {
+    const closedReports = await closeOpenReports(tx, input.userId, "dismissed", input.reportId);
+    if (input.reportId) {
+      if (closedReports.length === 0) throw new ModerationError(`No open report ${input.reportId} about this account.`);
+      return { closedReports };
+    }
+    if (state !== "banned") await clearHide(tx, input.userId);
+    return { closedReports };
+  });
+}
+
+/**
+ * The reports were valid and dealt with by a lesser measure than a ban (e.g. the account was asked to change a
+ * photo). Closes every open report as actioned. The account stays as it is unless `unhide`.
+ */
+export function actionReports(input: ActionInput & { unhide?: boolean }): Promise<ActionResult> {
+  return moderate(input, "action", async (tx, state) => {
+    const closedReports = await closeOpenReports(tx, input.userId, "actioned");
+    if (input.unhide && state !== "banned") await clearHide(tx, input.userId);
+    else await tx`UPDATE users SET reviewed_at = now() WHERE id = ${input.userId}`;
+    return { closedReports, details: { unhide: Boolean(input.unhide) } };
+  });
+}
+
+/**
+ * Ban: the account disappears from every surface (lib/visibility.ts), its sessions are revoked, sign-in is refused
+ * (403 account_banned), every device it was created on is banned (refused at sign-up and sign-in, and the
+ * DeviceCheck ban bit is written on that device's next request), and its open reports are closed as actioned.
+ * The row is kept so its email hash and devices keep blocking a new sign-up.
+ */
+export function banAccount(input: ActionInput): Promise<ActionResult> {
+  return moderate(input, "ban", async (tx, state) => {
+    if (state === "banned") throw new ModerationError("Account is already banned.");
+    await tx`UPDATE users SET banned_at = now(), reviewed_at = now() WHERE id = ${input.userId}`;
+    const closedReports = await closeOpenReports(tx, input.userId, "actioned");
+    await revokeAllSessions(input.userId, tx);
+    const devices = await banDevicesOfUser(input.userId, tx);
+    return { closedReports, details: { devicesBanned: devices } };
+  });
+}
+
+/**
+ * Undo a ban (a mistake). Clears the account's ban and hide, and the server-side ban on its devices. A DeviceCheck
+ * ban bit already written at Apple is not cleared (see docs/security.md).
+ */
+export function unbanAccount(input: ActionInput): Promise<ActionResult> {
+  return moderate(input, "unban", async (tx, state) => {
+    if (state !== "banned") throw new ModerationError("Account is not banned.");
+    await tx`
+      UPDATE users SET banned_at = NULL, hidden_at = NULL, hidden_reason = NULL, reviewed_at = now()
+       WHERE id = ${input.userId}`;
+    const devices = await tx`
+      UPDATE devices SET banned_at = NULL
+       WHERE banned_at IS NOT NULL AND id IN (SELECT device_id FROM device_accounts WHERE user_id = ${input.userId})
+       RETURNING id`;
+    return { details: { devicesUnbanned: devices.length } };
+  });
+}
+
+// ---- Review queue and account detail (read-only) ------------------------------------------------------------
+
+export interface QueueEntry {
+  userId: string;
+  displayName: string;
+  state: AccountState;
+  hiddenReason: HideReason | null;
+  hiddenAt: Date | null;
+  highPriority: boolean;
+  openReports: number;
+  reporters: number;
+  reasons: Record<string, number>;
+  oldestOpenAt: Date | null;
+  newestOpenAt: Date | null;
+}
+
+/**
+ * Accounts that need a decision: those with open reports, plus hidden (not banned) accounts. Order: any
+ * underage (high-priority) report first, then hidden accounts, then oldest open report first.
+ */
+export async function reviewQueue(opts: { limit?: number; db?: Sql } = {}): Promise<QueueEntry[]> {
+  const db = opts.db ?? sql;
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 1000);
+  const rows = await db<
+    {
+      id: string;
+      display_name: string;
+      hidden_at: Date | null;
+      hidden_reason: HideReason | null;
+      banned_at: Date | null;
+      high: boolean;
+      open_reports: number;
+      reporters: number;
+      reasons: string[];
+      oldest: Date | null;
+      newest: Date | null;
+    }[]
+  >`
+    SELECT u.id, u.display_name, u.hidden_at, u.hidden_reason, u.banned_at,
+           COALESCE(bool_or(r.priority = 'high'), false) AS high,
+           count(r.id)::int AS open_reports,
+           count(DISTINCT r.reporter_id)::int AS reporters,
+           COALESCE(array_agg(r.reason) FILTER (WHERE r.id IS NOT NULL), '{}') AS reasons,
+           min(r.created_at) AS oldest, max(r.created_at) AS newest
+      FROM users u
+      LEFT JOIN reports r ON r.reported_id = u.id AND r.status = 'open'
+     WHERE u.id IN (SELECT reported_id FROM reports WHERE status = 'open' AND reported_id IS NOT NULL)
+        OR (u.hidden_at IS NOT NULL AND u.banned_at IS NULL)
+     GROUP BY u.id
+     ORDER BY high DESC, (u.hidden_at IS NOT NULL AND u.banned_at IS NULL) DESC, oldest ASC NULLS LAST, u.id
+     LIMIT ${limit}`;
+  return rows.map((r) => {
+    const reasons: Record<string, number> = {};
+    for (const reason of r.reasons) reasons[reason] = (reasons[reason] ?? 0) + 1;
+    return {
+      userId: r.id,
+      displayName: r.display_name,
+      state: r.banned_at ? "banned" : r.hidden_at ? "hidden" : "visible",
+      hiddenReason: r.hidden_reason,
+      hiddenAt: r.hidden_at,
+      highPriority: r.high,
+      openReports: r.open_reports,
+      reporters: r.reporters,
+      reasons,
+      oldestOpenAt: r.oldest,
+      newestOpenAt: r.newest,
+    };
+  });
+}
+
+export interface EvidenceItem {
+  position: number;
+  messageId: string | null;
+  fromReported: boolean;
+  sentAt: Date | null;
+  text: string | null;
+  hasPhoto: boolean;
+  verified: boolean;
+}
+
+export interface ReportDetail {
+  id: string;
+  reporterId: string | null;
+  reason: ReportReason;
+  details: string | null;
+  priority: "normal" | "high";
+  status: "open" | "actioned" | "dismissed";
+  conversationId: string | null;
+  createdAt: Date;
+  closedAt: Date | null;
+  evidence: EvidenceItem[];
+}
+
+export interface AccountReview {
+  userId: string;
+  displayName: string;
+  age: number | null;
+  headline: string | null;
+  about: string | null;
+  createdAt: Date;
+  photoCount: number;
+  state: AccountState;
+  hiddenReason: HideReason | null;
+  hiddenAt: Date | null;
+  bannedAt: Date | null;
+  reviewedAt: Date | null;
+  devices: number;
+  reports: ReportDetail[];
+  assessment: Assessment;
+  history: { at: Date; actor: string; action: ModerationActionKind; note: string | null; reportIds: string[] }[];
+}
+
+/**
+ * Everything a moderator needs to decide: the profile text (no location, ever), the reports (open first, then the
+ * latest closed ones) with the evidence reporters chose to share, how auto-hide judged each reporter, and the audit
+ * history. Message threads are NOT shown: moderators see only what reporters shared.
+ */
+export async function accountReview(userId: string, db: Sql = sql, now = new Date()): Promise<AccountReview> {
+  const [u] = await db<
+    {
+      id: string;
+      display_name: string;
+      age: number | null;
+      headline: string | null;
+      about: string | null;
+      created_at: Date;
+      hidden_at: Date | null;
+      hidden_reason: HideReason | null;
+      banned_at: Date | null;
+      reviewed_at: Date | null;
+      photos: number;
+      devices: number;
+    }[]
+  >`
+    SELECT u.id, u.display_name, u.age, u.headline, u.about, u.created_at, u.hidden_at, u.hidden_reason,
+           u.banned_at, u.reviewed_at,
+           (SELECT count(*)::int FROM photos p WHERE p.owner_id = u.id) AS photos,
+           (SELECT count(*)::int FROM device_accounts da WHERE da.user_id = u.id) AS devices
+      FROM users u WHERE u.id = ${userId}`;
+  if (!u) throw new ModerationError(`No account ${userId}.`);
+
+  const reports = await db<
+    {
+      id: string;
+      reporter_id: string | null;
+      reason: ReportReason;
+      details: string | null;
+      priority: "normal" | "high";
+      status: "open" | "actioned" | "dismissed";
+      conversation_id: string | null;
+      created_at: Date;
+      closed_at: Date | null;
+    }[]
+  >`
+    (SELECT id, reporter_id, reason, details, priority, status, conversation_id, created_at, closed_at
+       FROM reports WHERE reported_id = ${userId} AND status = 'open'
+      ORDER BY created_at LIMIT 200)
+    UNION ALL
+    (SELECT id, reporter_id, reason, details, priority, status, conversation_id, created_at, closed_at
+       FROM reports WHERE reported_id = ${userId} AND status <> 'open'
+      ORDER BY closed_at DESC NULLS LAST LIMIT 20)`;
+  const evidence = reports.length
+    ? await db<(EvidenceItem & { report_id: string })[]>`
+        SELECT report_id, position, message_id AS "messageId", from_reported AS "fromReported", sent_at AS "sentAt",
+               text, has_photo AS "hasPhoto", verified
+          FROM report_evidence WHERE report_id = ANY(${reports.map((r) => r.id)})
+         ORDER BY report_id, position`
+    : [];
+  const evidenceBy = new Map<string, EvidenceItem[]>();
+  for (const e of evidence) {
+    const { report_id, ...item } = e;
+    const list = evidenceBy.get(report_id) ?? [];
+    list.push(item);
+    evidenceBy.set(report_id, list);
+  }
+
+  const history = await db<
+    { created_at: Date; actor: string; action: ModerationActionKind; note: string | null; report_ids: string[] }[]
+  >`
+    SELECT created_at, actor, action, note, report_ids FROM moderation_actions
+     WHERE user_id = ${userId} ORDER BY created_at DESC, id DESC LIMIT 50`;
+
+  return {
+    userId: u.id,
+    displayName: u.display_name,
+    age: u.age,
+    headline: u.headline,
+    about: u.about,
+    createdAt: u.created_at,
+    photoCount: u.photos,
+    state: u.banned_at ? "banned" : u.hidden_at ? "hidden" : "visible",
+    hiddenReason: u.hidden_reason,
+    hiddenAt: u.hidden_at,
+    bannedAt: u.banned_at,
+    reviewedAt: u.reviewed_at,
+    devices: u.devices,
+    reports: reports.map((r) => ({
+      id: r.id,
+      reporterId: r.reporter_id,
+      reason: r.reason,
+      details: r.details,
+      priority: r.priority,
+      status: r.status,
+      conversationId: r.conversation_id,
+      createdAt: r.created_at,
+      closedAt: r.closed_at,
+      evidence: evidenceBy.get(r.id) ?? [],
+    })),
+    assessment: assessReporters(await reporterFacts(userId, db, now), autoHideSettings()),
+    history: history.map((h) => ({
+      at: h.created_at,
+      actor: h.actor,
+      action: h.action,
+      note: h.note,
+      reportIds: h.report_ids,
+    })),
+  };
+}
+
+export interface AuditEntry {
+  id: string;
+  at: Date;
+  actor: string;
+  action: ModerationActionKind;
+  userId: string | null;
+  reportIds: string[];
+  note: string | null;
+  details: Record<string, unknown>;
+}
+
+/** Most recent audit entries, optionally for one account. */
+export async function auditLog(opts: { userId?: string; limit?: number; db?: Sql } = {}): Promise<AuditEntry[]> {
+  const db = opts.db ?? sql;
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 1000);
+  const rows = await db<
+    {
+      id: string;
+      created_at: Date;
+      actor: string;
+      action: ModerationActionKind;
+      user_id: string | null;
+      report_ids: string[];
+      note: string | null;
+      details: Record<string, unknown>;
+    }[]
+  >`
+    SELECT id, created_at, actor, action, user_id, report_ids, note, details FROM moderation_actions
+     WHERE ${opts.userId ? db`user_id = ${opts.userId}` : db`true`}
+     ORDER BY created_at DESC, id DESC LIMIT ${limit}`;
+  return rows.map((r) => ({
+    id: String(r.id),
+    at: r.created_at,
+    actor: r.actor,
+    action: r.action,
+    userId: r.user_id,
+    reportIds: r.report_ids,
+    note: r.note,
+    details: r.details,
+  }));
+}
+
+/** 404 for a target the reporter can't report (missing, self, or already banned). */
+export async function assertReportable(reporterId: string, targetId: string, db: Sql = sql): Promise<void> {
+  if (reporterId === targetId) throw notFound();
+  const [row] = await db<{ ok: boolean }[]>`
+    SELECT EXISTS (SELECT 1 FROM users WHERE id = ${targetId} AND banned_at IS NULL) AS ok`;
+  if (!row?.ok) throw notFound();
+}
+
+export { ApiError };

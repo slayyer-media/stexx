@@ -128,11 +128,19 @@ struct ChatThreadView: View {
             Text("This conversation will be removed and they won't be able to contact you.")
         }
         .sheet(isPresented: $isReporting) {
-            ReportSheet(profile: participant, conversationID: conversation?.id) { didBlock in
+            ReportSheet(profile: participant, conversationID: conversation?.id, messages: messages) { didBlock in
                 if didBlock { dismiss() }
             }
         }
-        .task { await load() }
+        .task {
+            await load()
+            #if DEBUG
+            // Screenshot-only: open the report sheet from a chat.
+            if let route = ScreenshotRoute.current, [.reportFromChat, .reportPicker, .reportSent].contains(route) {
+                isReporting = true
+            }
+            #endif
+        }
         .task(id: conversation?.id) {
             // Realtime: new messages and read receipts while the thread is open.
             guard let id = conversation?.id else { return }

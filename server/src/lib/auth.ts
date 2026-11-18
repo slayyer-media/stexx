@@ -3,7 +3,7 @@ import type { Context, MiddlewareHandler } from "hono";
 import { config } from "../config.ts";
 import { sql, type Sql } from "../db/sql.ts";
 import type { AppEnv } from "../types.ts";
-import { unauthorized } from "./errors.ts";
+import { accountBanned, unauthorized } from "./errors.ts";
 import { newId } from "./ids.ts";
 import { DAY, HOUR, MINUTE, inMs, isoDate } from "./time.ts";
 
@@ -63,6 +63,9 @@ export function bearerToken(header: string | undefined | null): string | null {
  * (e.g. together with the user row).
  */
 export async function createSession(userId: string, db: Sql = sql, familyId: string = newId("session")): Promise<SessionJson> {
+  // Single choke point for sign-in, sign-up and refresh: a banned account never gets a session.
+  const [u] = await db<{ banned: boolean }[]>`SELECT banned_at IS NOT NULL AS banned FROM users WHERE id = ${userId}`;
+  if (u?.banned) throw accountBanned();
   const accessToken = generateToken();
   const refreshToken = generateToken();
   const now = new Date();
@@ -139,9 +142,10 @@ export async function revokeAllSessions(userId: string, db: Sql = sql): Promise<
  */
 export async function authenticateAccessToken(token: string): Promise<{ userId: string; sessionId: string } | null> {
   const [row] = await sql<{ id: string; user_id: string; used_at: Date | null }[]>`
-    SELECT id, user_id, used_at FROM sessions
-     WHERE access_hash = ${hashToken(token)}
-       AND revoked_at IS NULL AND rotated_at IS NULL AND access_expires_at > now()`;
+    SELECT s.id, s.user_id, s.used_at FROM sessions s
+     WHERE s.access_hash = ${hashToken(token)}
+       AND s.revoked_at IS NULL AND s.rotated_at IS NULL AND s.access_expires_at > now()
+       AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = s.user_id AND u.banned_at IS NOT NULL)`;
   if (!row) return null;
   // One write per session lifetime: marks the session as in use (see REFRESH_REUSE_GRACE_MS).
   if (!row.used_at) await sql`UPDATE sessions SET used_at = now() WHERE id = ${row.id} AND used_at IS NULL`;

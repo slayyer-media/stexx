@@ -13,6 +13,8 @@ actor MockAPIClient: APIClient {
     private var conversationStore: [Conversation.ID: Conversation]
     private var messageStore: [Conversation.ID: [Message]]
     private var blocked: Set<Profile.ID> = []
+    /// The most recent report received, so tests can inspect what was sent.
+    private(set) var lastReport: ReportRequest?
     private var privacy = PrivacySettings()
     private let latency: Duration
     private var nextID = 1
@@ -326,6 +328,7 @@ actor MockAPIClient: APIClient {
 
     func report(_ report: ReportRequest) async throws {
         try await pause()
+        lastReport = report
         if report.alsoBlock { blocked.insert(report.profileID) }
     }
 

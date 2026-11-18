@@ -11,6 +11,17 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
+            #if DEBUG
+            if let route = ScreenshotRoute.current {
+                ScreenshotRouteView(route: route)
+            } else if appState.isSignedIn {
+                MainTabView()
+                    .transition(.opacity)
+            } else {
+                OnboardingFlow()
+                    .transition(.opacity)
+            }
+            #else
             if appState.isSignedIn {
                 MainTabView()
                     .transition(.opacity)
@@ -18,6 +29,7 @@ struct RootView: View {
                 OnboardingFlow()
                     .transition(.opacity)
             }
+            #endif
         }
         .animation(.smooth(duration: 0.4), value: appState.isSignedIn)
         .onChange(of: appState.privacy) { _, newValue in

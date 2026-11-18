@@ -12,6 +12,7 @@ import { consume, rateLimit } from "../lib/ratelimit.ts";
 import { attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import { assertMessageAllowed } from "../lib/abuse/trust.ts";
+import { assertMayMessage, assertMayStartContact } from "../lib/moderation.ts";
 import { isoDate } from "../lib/time.ts";
 import {
   conversationJson,
@@ -31,7 +32,8 @@ import type { AppEnv } from "../types.ts";
  * See server/AGENTS-NOTES.md for helpers and conventions.
  *
  * Rules implemented here (each has a test in test/chat.test.ts):
- *  - Blocks: any conversation with a blocked/blocking user is invisible and every route on it is 404.
+ *  - Blocks: any conversation with a blocked/blocking user is invisible and every route on it is 404. Same for a
+ *    banned user. An account hidden after reports can't open new threads or write first (403 account_under_review).
  *  - Send is idempotent on (sender, clientID): a replay returns the original message untouched.
  *  - attachmentPhotoID is one of the sender's pending chat uploads (POST /me/attachments; its file moves to the
  *    message) or one of their profile photos (COPIED to a message-owned file). Both count against `attachments`.
@@ -147,14 +149,16 @@ interface Membership {
   otherId: string;
 }
 
-/** 404 unless the caller is a participant and no block exists either way. */
+/** 404 unless the caller is a participant, no block exists either way, and the other person isn't banned. */
 async function requireConversation(userId: string, conversationId: string): Promise<Membership> {
   const [row] = await sql<{ other_id: string }[]>`
     SELECT CASE WHEN c.user_a = ${userId} THEN c.user_b ELSE c.user_a END AS other_id
       FROM conversations c
       JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = ${userId}
      WHERE c.id = ${conversationId}
-       AND ${notBlocked(col("c.user_a"), col("c.user_b"))}`;
+       AND ${notBlocked(col("c.user_a"), col("c.user_b"))}
+       AND NOT EXISTS (SELECT 1 FROM users bu WHERE bu.id IN (c.user_a, c.user_b) AND bu.id <> ${userId}
+                                               AND bu.banned_at IS NOT NULL)`;
   if (!row) throw notFound();
   return { otherId: row.other_id };
 }
@@ -247,6 +251,8 @@ chatRoutes.post("/conversations", requireAuth, async (c) => {
   const { participantID } = await parseJson(c, openSchema);
   if (!isId("user", participantID)) throw notFound();
   await assertVisibleUser(me, participantID);
+  // An account hidden after reports can only reopen threads with people who wrote to it.
+  await assertMayStartContact(me, participantID);
 
   const [a, b] = orderedPair(me, participantID);
   const conversationId = await sql.begin(async (tx) => {
@@ -361,6 +367,8 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   // Anti-spam (after the idempotent replay, so retries of a sent message never count): volume windows per
   // account/device/IP, then the new-account limits (lib/abuse/trust.ts).
   await hitAbuseLimits("message", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
+  // Hidden pending review: may only write where the other person has written.
+  await assertMayMessage(me, conversationId, otherId);
   await assertMessageAllowed({ senderId: me, conversationId, otherId, text });
 
   // Attachment: either one of the sender's private chat uploads (POST /me/attachments), whose file is handed over
