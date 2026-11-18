@@ -16,6 +16,8 @@ enum Theme {
     static let violet = Color(hex: 0x8B5CF6)
     /// Lighter violet for the wordmark "xx", highlights and icons.
     static let violetBright = Color(hex: 0xB89CFF)
+    /// Deeper violet for filled controls; white text on it stays above 4.5:1.
+    static let violetDeep = Color(hex: 0x7442E0)
     /// Deep violet used in the background glow.
     static let indigo = Color(hex: 0x3F2C80)
     /// Warm plum used in the background glow (the mauve in the icon).

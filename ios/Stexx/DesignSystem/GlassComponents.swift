@@ -3,6 +3,46 @@ import SwiftUI
 // Liquid Glass building blocks. Glass is reserved for the "control layer":
 // cards that float over the glow, buttons, chips and bars. Dense content
 // (photo grids, message bubbles) stays solid for legibility and performance.
+// Every glass surface here falls back to a solid fill under Reduce
+// Transparency (see `stexxGlass(in:tint:interactive:fallback:)`).
+
+extension View {
+    /// Liquid glass in `shape`, or a solid `fallback` fill with a hairline
+    /// edge when Reduce Transparency is on.
+    func stexxGlass<S: Shape>(
+        in shape: S,
+        tint: Color? = nil,
+        interactive: Bool = false,
+        fallback: Color = Theme.backgroundRaised
+    ) -> some View {
+        modifier(StexxGlassModifier(shape: shape, tint: tint, interactive: interactive, fallback: fallback))
+    }
+}
+
+private struct StexxGlassModifier<S: Shape>: ViewModifier {
+    let shape: S
+    let tint: Color?
+    let interactive: Bool
+    let fallback: Color
+
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if reduceTransparency {
+            content
+                .background {
+                    ZStack {
+                        shape.fill(fallback)
+                        if let tint { shape.fill(tint) }
+                    }
+                }
+                .overlay(shape.stroke(Color.white.opacity(0.16), lineWidth: 1).allowsHitTesting(false))
+        } else {
+            content.glassEffect(Glass.regular.tint(tint).interactive(interactive), in: shape)
+        }
+    }
+}
 
 /// A rounded liquid-glass container for grouped content.
 struct GlassCard<Content: View>: View {
@@ -27,7 +67,7 @@ struct GlassCard<Content: View>: View {
         content
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .glassEffect(.regular.tint(tint), in: .rect(cornerRadius: cornerRadius))
+            .stexxGlass(in: .rect(cornerRadius: cornerRadius), tint: tint)
     }
 }
 
@@ -104,6 +144,8 @@ struct GlassChip: View {
         self.action = action
     }
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
@@ -121,24 +163,35 @@ struct GlassChip: View {
             .foregroundStyle(isSelected ? Color.white : Theme.textSecondary)
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
+            .overlay {
+                // Violet edge glow on the selected chip. Lives inside the
+                // label so it moves with the interactive glass.
+                Capsule()
+                    .strokeBorder(Theme.violetBright.opacity(0.75), lineWidth: 1)
+                    .shadow(color: Theme.edgeGlow.opacity(0.85), radius: 6)
+                    .opacity(isSelected ? 1 : 0)
+                    .allowsHitTesting(false)
+            }
             .contentShape(.capsule)
         }
         .buttonStyle(.plain)
-        .glassEffect(
-            isSelected ? .regular.tint(Theme.violet.opacity(0.55)).interactive() : .regular.interactive(),
-            in: .capsule
+        .stexxGlass(
+            in: .capsule,
+            tint: isSelected ? Theme.violet.opacity(0.55) : nil,
+            interactive: true,
+            fallback: isSelected ? Theme.violetDeep : Theme.backgroundRaised
         )
+        .animation(Motion.animation(Motion.snappy, reduceMotion: reduceMotion), value: isSelected)
+        .sensoryFeedback(.selection, trigger: isSelected)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
 extension View {
-    /// Full-width violet liquid-glass call-to-action.
+    /// Full-width violet liquid-glass call-to-action with a soft violet
+    /// glow underneath (hidden while disabled).
     func stexxPrimaryButton() -> some View {
-        self
-            .buttonStyle(.glassProminent)
-            .tint(Theme.violet)
-            .controlSize(.large)
+        modifier(PrimaryButtonModifier())
     }
 
     /// Full-width neutral liquid-glass button.
@@ -146,6 +199,28 @@ extension View {
         self
             .buttonStyle(.glass)
             .controlSize(.large)
+    }
+}
+
+private struct PrimaryButtonModifier: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content
+            .buttonStyle(.glassProminent)
+            .tint(Theme.violetDeep)
+            .controlSize(.large)
+            .background {
+                // Static glow pooled under the button (rendered once).
+                Capsule()
+                    .fill(Theme.accentGradient)
+                    .blur(radius: 14)
+                    .opacity(isEnabled ? 0.55 : 0)
+                    .padding(.horizontal, 18)
+                    .offset(y: 6)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
     }
 }
 
@@ -194,6 +269,7 @@ struct WideLabel: View {
             }
             Button {} label: { WideLabel("Get started") }.stexxPrimaryButton()
             Button {} label: { WideLabel("Maybe later") }.stexxSecondaryButton()
+            Button {} label: { WideLabel("Disabled") }.stexxPrimaryButton().disabled(true)
         }
         .padding()
     }

@@ -76,16 +76,19 @@ struct MainTabView: View {
 
         TabView(selection: $selection) {
             Tab("Nearby", systemImage: "square.grid.3x3.fill", value: AppTab.nearby) {
-                NearbyView()
+                NearbyView().tint(Theme.violet)
             }
             Tab("Chats", systemImage: "bubble.left.and.bubble.right.fill", value: AppTab.chats) {
-                ChatListView()
+                ChatListView().tint(Theme.violet)
             }
             .badge(chatStore.unreadTotal)
             Tab("You", systemImage: "person.crop.circle.fill", value: AppTab.me) {
-                MyProfileView()
+                MyProfileView().tint(Theme.violet)
             }
         }
+        // Selected tab in the wordmark's "xx" violet; tab content keeps the
+        // app-wide violet tint.
+        .tint(Theme.violetBright)
         .tabBarMinimizeBehavior(.onScrollDown)
         .sheet(isPresented: $bindable.isPaywallPresented) {
             PaywallView()

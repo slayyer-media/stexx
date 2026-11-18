@@ -66,22 +66,20 @@ struct AvatarView: View {
             .overlay(Circle().strokeBorder(Theme.hairline, lineWidth: 0.5))
             .overlay(alignment: .bottomTrailing) {
                 if showsOnline && profile.isOnline {
-                    OnlineDot(size: max(10, size * 0.24))
+                    OnlineGlow(size: max(10, size * 0.24))
                 }
             }
     }
 }
 
-/// Green "online now" indicator with a dark ring so it reads on photos.
+/// Static green "online now" indicator: the lit core of `OnlineGlow`
+/// without the pulse. Prefer `OnlineGlow` where the status should feel live.
 struct OnlineDot: View {
     var size: CGFloat = 10
 
     var body: some View {
-        Circle()
-            .fill(Theme.online)
-            .frame(width: size, height: size)
-            .overlay(Circle().strokeBorder(Theme.background, lineWidth: size * 0.2))
-            .shadow(color: Theme.online.opacity(0.6), radius: size * 0.4)
+        OnlineGlowCore(size: size)
+            .accessibilityElement(children: .ignore)
             .accessibilityLabel("Online")
     }
 }
@@ -169,7 +167,7 @@ extension Collection {
             ForEach(MockData.profiles.prefix(3)) { profile in
                 ProfilePhotoView(profile: profile)
                     .frame(width: 110, height: 140)
-                    .clipShape(.rect(cornerRadius: Theme.Radius.tile))
+                    .glowFrame(cornerRadius: Theme.Radius.tile)
             }
         }
         HStack {
