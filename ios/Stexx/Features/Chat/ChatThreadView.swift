@@ -1,7 +1,7 @@
 import PhotosUI
 import SwiftUI
 
-/// A single conversation with a floating liquid-glass composer.
+/// A single conversation with a black-glass composer.
 struct ChatThreadView: View {
     let route: ChatRoute
 
@@ -10,6 +10,7 @@ struct ChatThreadView: View {
     @Environment(\.apiClient) private var api
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     @State private var conversation: Conversation?
     @State private var messages: [Message] = []
@@ -21,14 +22,13 @@ struct ChatThreadView: View {
     @State private var isReporting = false
     @State private var isPickingPhoto = false
     @State private var photoItem: PhotosPickerItem?
-    /// Messages that should "land" with a bounce when they first appear
+    /// Messages that should "land" (a short fade-up) when they first appear
     /// (sent or received while the thread is open), by `bubbleKey`. Anything
     /// loaded with the thread just appears.
     @State private var landingKeys: Set<String> = []
     /// Bumped on every send, for haptics.
     @State private var sendCount = 0
     @FocusState private var isComposerFocused: Bool
-    @Namespace private var composerNamespace
 
     private var participant: Profile { route.participant }
 
@@ -79,15 +79,15 @@ struct ChatThreadView: View {
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: messages.last?.bubbleKey) { _, lastKey in
                 guard let lastKey else { return }
-                withAnimation(reduceMotion ? .easeOut(duration: 0.15) : .smooth) {
+                withAnimation(Motion.animation(Motion.standard, reduceMotion: reduceMotion)) {
                     proxy.scrollTo(lastKey, anchor: .bottom)
                 }
             }
         }
         .overlay {
-            if isLoading { ProgressView() }
+            if isLoading { ProgressView().tint(Theme.steel) }
         }
-        .stexxBackground(intensity: 0.55)
+        .stexxBackground()
         .safeAreaInset(edge: .bottom) { composer }
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .tabBar)
@@ -95,15 +95,13 @@ struct ChatThreadView: View {
             ToolbarItem(placement: .principal) {
                 NavigationLink(value: participant) {
                     HStack(spacing: Theme.Spacing.s) {
-                        ThreadAvatar(profile: participant, size: 32, glow: 0.5)
-                        VStack(alignment: .leading, spacing: 0) {
+                        AvatarView(profile: participant, size: 30)
+                        VStack(alignment: .leading, spacing: 1) {
                             Text(participant.displayName)
-                                .font(.subheadline.weight(.heavy))
-                                .tracking(Theme.Tracking.tight)
-                                .foregroundStyle(Theme.textPrimary)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Theme.frost)
                             Text(StexxFormat.lastSeen(participant.lastActiveAt, isOnline: participant.isOnline))
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(participant.isOnline ? Theme.online : Theme.textTertiary)
+                                .stexxLabelStyle(.micro, color: participant.isOnline ? Theme.online : Theme.slate)
                         }
                     }
                 }
@@ -160,25 +158,41 @@ struct ChatThreadView: View {
     // MARK: Composer
 
     private var composer: some View {
-        GlassEffectContainer(spacing: Theme.Spacing.s) {
-            HStack(alignment: .bottom, spacing: Theme.Spacing.s) {
-                attachmentMenu
-                messageField
-                if canSend {
-                    sendButton
-                }
+        HStack(alignment: .bottom, spacing: Theme.Spacing.s) {
+            attachmentMenu
+            messageField
+            if canSend {
+                sendButton
+                    .transition(.opacity)
             }
         }
         .padding(.horizontal, Theme.Spacing.m)
         .padding(.vertical, Theme.Spacing.s)
-        .animation(Motion.animation(Motion.cardSpring, reduceMotion: reduceMotion), value: canSend)
-        .animation(Motion.animation(Motion.snappy, reduceMotion: reduceMotion), value: isComposerFocused)
-        .animation(Motion.animation(Motion.snappy, reduceMotion: reduceMotion), value: draft.isEmpty)
-        .sensoryFeedback(.impact(weight: .medium), trigger: sendCount)
+        .background { composerBar }
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: canSend)
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: isComposerFocused)
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: draft.isEmpty)
+        .sensoryFeedback(.impact(weight: .light), trigger: sendCount)
+    }
+
+    /// Black frosted glass under the composer, with a single hairline top
+    /// edge; flat ink1 under Reduce Transparency.
+    private var composerBar: some View {
+        ZStack {
+            if reduceTransparency {
+                Theme.ink1
+            } else {
+                Rectangle().fill(.ultraThinMaterial)
+                Theme.ink.opacity(0.55)
+            }
+        }
+        .overlay(alignment: .top) { HairlineDivider(strong: true) }
+        .ignoresSafeArea(edges: .bottom)
     }
 
     private var attachmentMenu: some View {
-        Menu {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return Menu {
             Button {
                 isPickingPhoto = true
             } label: {
@@ -189,44 +203,44 @@ struct ChatThreadView: View {
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(Theme.textPrimary)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(Theme.steel)
                 .frame(width: 44, height: 44)
-                .contentShape(.circle)
+                .background(Theme.ink1, in: shape)
+                .hairlineBorder(shape)
+                .contentShape(shape)
                 .overlay(alignment: .topTrailing) {
-                    // Small violet timer: photos sent now will expire.
+                    // Small timer: photos sent now will expire.
                     if expiresPhotos {
                         Image(systemName: "timer")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(3)
-                            .background(Theme.accentGradient, in: .circle)
-                            .offset(x: -1, y: 3)
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(Theme.ice)
+                            .offset(x: -5, y: 5)
                     }
                 }
         }
-        .glassEffect(.regular.interactive(), in: .circle)
-        .glassEffectID("attach", in: composerNamespace)
         .accessibilityLabel("Attachments")
         .accessibilityValue(expiresPhotos ? Text("Expiring photos on") : Text(verbatim: ""))
     }
 
     private var messageField: some View {
-        let shape = RoundedRectangle(cornerRadius: Theme.Radius.field)
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
         return HStack(alignment: .bottom, spacing: 4) {
             TextField("Message", text: $draft, axis: .vertical)
                 .lineLimit(1...5)
+                .font(.stexxBody)
+                .foregroundStyle(Theme.frost)
                 .focused($isComposerFocused)
-                .tint(Theme.violetBright)
-                .padding(.vertical, 12)
+                .tint(Theme.ice)
+                .padding(.vertical, 11)
 
             if draft.isEmpty {
                 Button {
                     isPickingPhoto = true
                 } label: {
                     Image(systemName: "photo.on.rectangle.angled")
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(Theme.violetBright)
+                        .font(.body)
+                        .foregroundStyle(Theme.steel)
                         .frame(width: 36, height: 44)
                         .contentShape(.rect)
                 }
@@ -236,67 +250,49 @@ struct ChatThreadView: View {
                 .accessibilityLabel("Send a photo")
             }
         }
-        .padding(.leading, Theme.Spacing.l)
-        .padding(.trailing, draft.isEmpty ? 6 : Theme.Spacing.l)
+        .padding(.leading, Theme.Spacing.m + 2)
+        .padding(.trailing, draft.isEmpty ? 6 : Theme.Spacing.m + 2)
         .frame(minHeight: 44)
-        .glassEffect(.regular.interactive(), in: shape)
-        .glassEffectID("field", in: composerNamespace)
-        // Violet focus glow: a soft halo behind the glass plus a crisp rim.
-        .background {
-            shape
-                .stroke(Theme.edgeGlow, lineWidth: 2)
-                .blur(radius: 7)
-                .opacity(isComposerFocused ? 0.85 : 0)
-        }
-        .overlay {
-            shape
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [Theme.violetBright.opacity(0.9), Theme.edgeGlow.opacity(0.35)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
-                .opacity(isComposerFocused ? 1 : 0)
-                .allowsHitTesting(false)
-        }
+        .background(Theme.ink2, in: shape)
+        .hairlineBorder(shape, strong: isComposerFocused)
+        // The composer is this screen's one lit surface, and only while focused.
+        .rimLight(shape, intensity: isComposerFocused ? 1 : 0)
     }
 
     private var sendButton: some View {
-        Button(action: send) {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return Button(action: send) {
             Image(systemName: "arrow.up")
-                .font(.system(size: 17, weight: .bold))
-                .foregroundStyle(.white)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Theme.ink)
                 .frame(width: 44, height: 44)
-                .contentShape(.circle)
+                .background(Theme.frost, in: shape)
+                .contentShape(shape)
         }
-        .buttonStyle(.plain)
-        .glassEffect(.regular.tint(Theme.violet).interactive(), in: .circle)
-        .glassEffectID("send", in: composerNamespace)
-        .shadow(color: Theme.edgeGlow.opacity(0.55), radius: 10)
+        // The send itself gives the light impact haptic.
+        .buttonStyle(PressableButtonStyle(haptics: false))
         .accessibilityLabel("Send")
     }
 
     private var emptyThread: some View {
         VStack(spacing: Theme.Spacing.m) {
-            ThreadAvatar(profile: participant, size: 96, glow: 1.4)
-                .padding(.bottom, Theme.Spacing.s)
+            AvatarView(profile: participant, size: 88)
+                .rimLight(cornerRadius: Theme.Radius.avatar)
+                .cellCorners()
+                .padding(.bottom, Theme.Spacing.l)
             Text("Say hi to \(participant.displayName)")
-                .font(.stexxName)
-                .tracking(Theme.Tracking.tight)
-                .foregroundStyle(Theme.textPrimary)
+                .stexxTitleStyle(.title)
                 .multilineTextAlignment(.center)
             Text("Be kind, be clear, have fun. You can block or report anytime from the ••• menu.")
-                .font(.footnote)
-                .foregroundStyle(Theme.textSecondary)
+                .font(.stexxSub)
+                .foregroundStyle(Theme.steel)
                 .multilineTextAlignment(.center)
             GlassChip("Wave", systemImage: "hand.wave.fill", isSelected: true) {
                 draft = String(localized: "Hi 👋")
                 isComposerFocused = true
             }
             .accessibilityRemoveTraits(.isSelected)
-            .padding(.top, Theme.Spacing.s)
+            .padding(.top, Theme.Spacing.m)
             .disabled(conversation == nil)
         }
         .padding(.top, 80)
@@ -450,9 +446,9 @@ struct ChatThreadView: View {
     }
 }
 
-/// A chat bubble. Own messages use the violet gradient with a soft glow;
-/// theirs sit on liquid glass (a solid surface under Reduce Transparency).
-/// Bubbles in a run from the same sender tuck their inner corners together.
+/// A chat bubble. Own messages are frost with ink text; theirs are flat
+/// ink1 with a 0.5pt line. Radius 14, with a 4pt tail corner on the last
+/// bubble of a run; bubbles in a run tuck their inner corners together.
 struct MessageBubble: View {
     let message: Message
     let isMine: Bool
@@ -462,19 +458,13 @@ struct MessageBubble: View {
     /// Whether a `.read` status is spelled out under this bubble.
     var showsReadReceipt = true
 
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-
     var body: some View {
         VStack(spacing: 4) {
             if showsTimestamp {
                 Text(StexxFormat.chatTimestamp(message.sentAt))
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Theme.textSecondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Theme.surface, in: .capsule)
+                    .stexxLabelStyle(.micro, color: Theme.slate)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, Theme.Spacing.s)
+                    .padding(.vertical, Theme.Spacing.m)
             }
 
             HStack(alignment: .bottom, spacing: 6) {
@@ -487,28 +477,27 @@ struct MessageBubble: View {
                     }
                     if let text = message.text {
                         Text(text)
-                            .font(.body)
-                            .foregroundStyle(.white)
+                            .font(.stexxBody)
+                            .foregroundStyle(isMine ? Theme.ink : Theme.frost)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
                             .background { bubbleBackground }
                             .opacity(message.status == .sending ? 0.7 : 1)
                     }
                     if isMine, let status = statusText {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 4) {
                             if message.status == .read {
                                 Image(systemName: "checkmark")
-                                    .fontWeight(.bold)
                                     .accessibilityHidden(true)
                             } else if message.status == .failed {
-                                Image(systemName: "exclamationmark.circle.fill")
+                                Image(systemName: "exclamationmark.circle")
                                     .accessibilityHidden(true)
                             }
                             Text(status)
                         }
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(statusColor)
-                        .padding(.trailing, 4)
+                        .stexxLabelStyle(.micro, color: statusColor)
+                        .padding(.trailing, 2)
+                        .padding(.top, 2)
                     }
                 }
 
@@ -520,9 +509,9 @@ struct MessageBubble: View {
 
     private var bubbleShape: UnevenRoundedRectangle {
         let big = Theme.Radius.bubble
-        let small: CGFloat = 6
-        let top = isFirstInGroup ? big : small
-        let bottom = isLastInGroup ? big : small
+        let joined: CGFloat = 6
+        let top = isFirstInGroup ? big : joined
+        let bottom = isLastInGroup ? Theme.Radius.bubbleTail : joined
         if isMine {
             return UnevenRoundedRectangle(
                 topLeadingRadius: big, bottomLeadingRadius: big,
@@ -542,16 +531,11 @@ struct MessageBubble: View {
     private var bubbleBackground: some View {
         let shape = bubbleShape
         if isMine {
-            shape
-                .fill(Theme.ownBubbleGradient)
-                .shadow(color: Theme.edgeGlow.opacity(isLastInGroup ? 0.4 : 0.22), radius: 10, y: 3)
-        } else if reduceTransparency {
-            shape
-                .fill(Theme.backgroundRaised)
-                .overlay(shape.stroke(Theme.hairline, lineWidth: 0.5))
+            shape.fill(Theme.frost)
         } else {
-            Color.clear
-                .glassEffect(.regular, in: shape)
+            shape
+                .fill(Theme.ink1)
+                .overlay(shape.stroke(Theme.line, lineWidth: 0.5))
         }
     }
 
@@ -567,21 +551,22 @@ struct MessageBubble: View {
     private var statusColor: Color {
         switch message.status {
         case .failed: Theme.danger
-        case .read: Theme.violetBright
-        default: Theme.textTertiary
+        case .read: Theme.steel
+        default: Theme.slate
         }
     }
 
     private func attachmentView(_ attachment: Message.Attachment) -> some View {
-        ZStack {
-            Theme.backgroundRaised
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
+        return ZStack {
+            Theme.ink1
             VStack(spacing: 6) {
                 Image(systemName: attachment.isViewOnce ? "eye.slash" : "photo")
-                    .font(.title2)
+                    .font(.title2.weight(.light))
                 Text(attachment.isViewOnce ? "View once" : "Photo")
-                    .font(.caption.weight(.semibold))
+                    .stexxLabelStyle(.micro, color: Theme.steel)
             }
-            .foregroundStyle(Theme.textSecondary)
+            .foregroundStyle(Theme.steel)
             // View-once photos aren't fetched automatically: the first fetch
             // counts as opening them.
             if let url = attachment.url, !attachment.isViewOnce {
@@ -594,16 +579,17 @@ struct MessageBubble: View {
             }
             if message.status == .sending {
                 ProgressView()
-                    .tint(.white)
+                    .tint(Theme.frost)
             }
         }
         .frame(width: 180, height: 220)
-        .glowFrame(cornerRadius: Theme.Radius.bubble, glow: isMine ? 0.7 : 0.3)
+        .clipShape(shape)
+        .hairlineBorder(shape)
     }
 }
 
-/// New bubbles land with a slight bounce from the sender's side; a plain
-/// fade under Reduce Motion. Bubbles that were already there just appear.
+/// New bubbles fade up a few points from the sender's side; a plain fade
+/// under Reduce Motion. No bounce. Bubbles that were already there just appear.
 private struct BubbleLanding: ViewModifier {
     let anchor: UnitPoint
     let reduceMotion: Bool
@@ -619,35 +605,15 @@ private struct BubbleLanding: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .scaleEffect(landed || reduceMotion ? 1 : 0.85, anchor: anchor)
-            .offset(y: landed || reduceMotion ? 0 : 14)
+            .scaleEffect(landed || reduceMotion ? 1 : 0.98, anchor: anchor)
+            .offset(y: landed || reduceMotion ? 0 : 6)
             .opacity(landed ? 1 : 0)
             .onAppear {
                 guard !landed else { return }
-                withAnimation(reduceMotion ? .easeOut(duration: 0.2) : Motion.bubbleLand) {
+                withAnimation(Motion.animation(Motion.quick, reduceMotion: reduceMotion)) {
                     landed = true
                 }
                 onLanded()
-            }
-    }
-}
-
-/// Round avatar with the glass rim, violet edge glow and online glow.
-private struct ThreadAvatar: View {
-    let profile: Profile
-    var size: CGFloat
-    var glow: Double
-
-    var body: some View {
-        ProfilePhotoView(profile: profile)
-            .frame(width: size, height: size)
-            .glowFrame(cornerRadius: size / 2, glow: glow)
-            .overlay(alignment: .bottomTrailing) {
-                if profile.isOnline {
-                    OnlineGlow(size: max(8, size * 0.2))
-                        .padding(1.5)
-                        .background(Theme.background, in: .circle)
-                }
             }
     }
 }
