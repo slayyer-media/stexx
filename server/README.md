@@ -1,7 +1,7 @@
 # Stexx API server
 
 Bun + TypeScript (strict) + Hono + Postgres 18. Implements [`docs/api.md`](../docs/api.md) for the iOS app in [`ios/`](../ios). No ORM, no analytics or
-telemetry SDKs, no third-party network calls at runtime (only optional SMTP). Production runs on a single VPS behind Cloudflare: see [`deploy/`](deploy/README.md).
+telemetry SDKs, no third-party network calls at runtime (only optional SMTP; the photo model is downloaded at deploy, not at runtime). Production runs on a single VPS behind Cloudflare: see [`deploy/`](deploy/README.md).
 
 ## Local development
 
@@ -15,6 +15,7 @@ bun run db:up                      # Postgres 18 in Docker on 127.0.0.1:55433 (d
 bun run db:migrate
 bun run db:migrate:test
 bun run db:seed                    # ~40 dev profiles around San Francisco (add --reset to wipe and re-seed)
+sh scripts/fetch-photo-model.sh    # optional: 12 MB NSFW model for the photo checks (into models/, git-ignored)
 bun run dev                        # http://127.0.0.1:8787/v1 (watch mode)
 bun run check                      # typecheck + tests
 ```
@@ -24,6 +25,8 @@ Point the iOS app at it with `STEXX_API_BASE_URL=http://127.0.0.1:8787` and `Ste
 In dev (`STEXX_DEV_AUTH=1`) `/v1/auth/register` returns a session directly, new users get a default location, a few seeded accounts say hello,
 and `POST /v1/dev/plus` grants 30 days of Stexx+. Production refuses to boot with any `STEXX_DEV_*` flag set and never ships `src/dev/`.
 Email sign-in links are printed to the terminal in dev (the link only, never the address).
+Without the photo model, uploads work as before and photos stay unchecked; with it, profile photos are labelled
+explicit or not at upload (see [Photo checks](../docs/security.md#6-photo-checks-profile-photos)).
 
 | Command | What it does |
 | --- | --- |
@@ -83,6 +86,7 @@ These are the product promises from `docs/api.md`. "Enforced" names the code tha
 | **Account deletion is real**: one transaction cascades every table, unlinks every file, revokes sessions, anonymizes reports you filed. Backups age out within 30 days | `routes/me.ts` (`DELETE /me`), FKs in migration 001, `deploy/backup.sh` (hard 30-day cap, `messages` rows never backed up) | `me.test.ts` ("DELETE /me"); backup retention is a script check, see `deploy/README.md` |
 | **No trackers, no sensitive logs.** The request logger emits method, route *pattern*, status, duration, nothing else. Caddy writes no access logs, Postgres logs no statements or values, journald keeps 7 days | `lib/logger.ts`, `deploy/Caddyfile*`, `deploy/postgres/90-stexx.conf`, `deploy/system/journald-stexx.conf` | `foundation.test.ts` (logger) |
 | **Uploads are sanitized**: EXIF/GPS stripped, re-encoded, size and pixel capped, HEIC/other formats rejected | `lib/media.ts` (`sanitizeImage`) | `foundation.test.ts` (media), `me.test.ts` (photos) |
+| **Explicit profile photos are never public**: labelled by a self-hosted classifier at upload, kept for the owner and chat, hidden from everyone else; only scores and a hash are stored | `lib/photocheck/*`, `routes/me.ts` (`POST /me/photos`), `lib/serialize.ts` (`profileJson`), migration 106 | `photo-checks.test.ts` |
 | **No email addresses at rest**, no IPs at rest, no user agents, no device IDs | `lib/auth.ts` (`emailHmac`), `lib/ratelimit.ts` (salted IP hash, in memory only, forwarded headers trusted from loopback only) | `foundation.test.ts`, `auth.test.ts` |
 | **Production can't run in dev mode** | `config.ts` (refuses dev flags, short/default pepper, http URLs, dev DB password), `deploy.sh` (never uploads `src/dev/`, validates config before switching) | `foundation.test.ts` (config), `plus.test.ts` (production never imports the dev module) |
 
@@ -121,6 +125,9 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `MAX_ACCOUNTS_PER_DEVICE` | `1` | |
 | `TRUST_RAMP_*`, `RATE_LIMIT_*` | see security.md | New-account limits and sliding-window rate limits. |
 | `REPORT_*` | see security.md | Auto-hide thresholds (`REPORT_AUTOHIDE_THRESHOLD` 3, window 14 days, underage 1 trusted / 2 any) and evidence retention (30 days after closing, 180 max). |
+| `PHOTO_CLASSIFIER`, `PHOTO_NSFW_MODEL`, `PHOTO_NSFW_THREADS`, `PHOTO_NSFW_THRESHOLD`, `PHOTO_NSFW_LABELS` | `auto`, `models/nudenet-320n.onnx`, `1`, `0.5`, genitals/anus/buttocks | Profile photo nudity classifier. Missing model: photos stay unchecked. See security.md. |
+| `PHOTO_HIDE_UNCHECKED` | `0` | `1` hides not-yet-classified photos from others (fail closed). |
+| `PHOTO_DUPLICATE_MAX_DISTANCE`, `PHOTO_HASH_BLOCKLIST` | `6`, unset | Cross-account duplicate and stock-photo flags (`photo_flags`). `-1` turns them off. |
 | `TRUST_PROXY` | `1` | Trust `CF-Connecting-IP` / `X-Forwarded-For` only from a loopback peer; used transiently for hashed rate-limit keys. |
 | `STEXX_DEV_AUTH` | off | `/auth/register` returns a session; mounts `/v1/dev/*`. **Production refuses to boot if set.** |
 | `STEXX_DEV_DEFAULT_LOCATION` | unset | `lat,lon`; new dev users get this (snapped) cell. Production refuses. |

@@ -3,6 +3,7 @@ import { config } from "./config.ts";
 import { sql } from "./db/sql.ts";
 import { startJobs } from "./jobs/index.ts";
 import { logInfo } from "./lib/logger.ts";
+import { photoClassifier } from "./lib/photocheck/classifier.ts";
 import { websocket } from "./routes/ws.ts";
 
 const app = await createApp();
@@ -24,7 +25,11 @@ logInfo("listening", {
   devAuth: config.devAuth,
   attestation: config.antiSpam.attestation.mode,
   deviceCheck: config.antiSpam.deviceCheck !== null,
+  photoClassifier: config.photoChecks.classifier,
+  photoBlocklist: config.photoChecks.blocklist.length,
 });
+// Load the NSFW model now (logs photo_checks.model_loaded or .model_missing) instead of on the first upload.
+void photoClassifier();
 if (config.isProduction && config.antiSpam.attestation.mode === "off") {
   // Expected only until the Apple keys are set up (docs/security.md): sign-ups are not device-checked.
   logInfo("attestation_disabled", { reason: "APPLE_TEAM_ID unset or ATTESTATION_MODE=off" });

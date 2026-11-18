@@ -1,6 +1,6 @@
 # Security and anti-spam
 
-Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5): how they work, how to configure them, and what they store.
+Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5) and profile photo checks (section 6): how they work, how to configure them, and what they store.
 
 The anti-spam code lives in `server/src/lib/abuse/` (plus `server/src/routes/attest.ts`) and `ios/Stexx/Services/AttestationService.swift`; its schema is in `server/migrations/104_anti-spam.sql` and `105_abuse-counters.sql`. Reports and moderation are in `server/src/lib/moderation.ts`, `server/src/routes/safety.ts`, `server/src/moderation/cli.ts` and `server/migrations/107_report-autohide.sql`.
 
@@ -12,7 +12,7 @@ Everything runs on the single VPS with what is already there: the Bun API and Po
 - The disposable-email list is a file bundled in the repo and loaded at boot; there are no lookups to an outside API.
 - App Attest is verified locally against Apple's root certificate (shipped in the repo). DeviceCheck calls go to Apple's free API, and only if a DeviceCheck key is configured: on signup, login and account deletion (the per-device bits), and on each protected request from the rare device that can't use App Attest (token validation).
 
-Photo moderation is not part of this work; it will come in a later change.
+- The nudity classifier for profile photos is a 12 MB open-source model run in-process on the CPU (about 10 ms a photo); the file is downloaded once at deploy, pinned by checksum. See [section 6](#6-photo-checks-profile-photos).
 
 ## 1. Device attestation (App Attest, DeviceCheck fallback)
 
@@ -187,6 +187,33 @@ Options that don't belong to a command are refused rather than ignored. Write co
 - Evidence a reporter shared is part of their data export while it exists.
 - If the reporter deletes their account, the report is anonymized but its evidence keeps the same clock, so a harassed person leaving the app doesn't erase the evidence against the harasser. If the reported account is deleted, the evidence goes 30 days after the report was filed.
 
+## 6. Photo checks (profile photos)
+
+Every **profile** photo is checked at upload. The rule is *label, don't reject*: nothing is refused, and the upload still returns `201`.
+
+**Nudity classifier.** [NudeNet](https://github.com/notAI-tech/NudeNet) v3.4's `320n` detector (YOLOv8n, ONNX, 12,150,158 bytes, SHA-256 `c15d8273…1f0f`) runs in the API process through `onnxruntime-node` on the CPU, one photo at a time. It returns a score per body-part label. A photo is **explicit** when any of the explicit labels scores at least `PHOTO_NSFW_THRESHOLD` (0.5):
+
+- Explicit by default: `MALE_GENITALIA_EXPOSED`, `FEMALE_GENITALIA_EXPOSED`, `ANUS_EXPOSED`, `BUTTOCKS_EXPOSED`.
+- Never explicit: shirtless chests, underwear (`…_COVERED`), faces, feet.
+- `FEMALE_BREAST_EXPOSED` is off by default: the model gives men's chests that label (0.44 on a clothed cyclist in the seed set). Add it with `PHOTO_NSFW_LABELS` if wanted.
+
+On the 61 seed photos (clothed and shirtless men) nothing reaches 0.5; the highest stray explicit score is 0.29.
+
+**What explicit means.** An explicit photo is kept and shown to its owner with `isExplicit: true`, and the app badges it "Hidden". It is never shown to anyone else: not on the grid, a profile, a chat header or a favourites list. This is the same rule the server already applied to `is_explicit`, now set by the classifier. The owner can still send that photo in a chat. Chat photos aren't checked here; they will be moderated on the device once chats are end-to-end encrypted (see "With end-to-end encrypted chats" above).
+
+**Duplicates.** Each photo gets a 64-bit perceptual hash (DCT pHash, the same algorithm as Python's `imagehash.phash`). If it is within `PHOTO_DUPLICATE_MAX_DISTANCE` bits (6 of 64) of a photo on **another** account, the new upload gets a row in `photo_flags` (`kind = 'duplicate'`) naming the older photo and account. Re-encoded and resized copies differ by 0–4 bits. Different photos, even of the same person, differ by 20 or more. Near-uniform images (solid colours, a black frame) aren't hashed, because they would all match each other.
+
+**Blocklist.** `PHOTO_HASH_BLOCKLIST` points at a file of known stock or scraped photos, one entry per line: `<16 hex pHash> [label]`, with `#` for comments. A match adds a `photo_flags` row with `kind = 'blocklist'` and the label. Hashes made with Python's `str(imagehash.phash(Image.open(path)))` work as is.
+
+**Moderation queue.** Nothing reads `photo_flags` automatically yet. A moderator runs `SELECT * FROM photo_flags WHERE status = 'open' ORDER BY created_at` and sets `status` to `actioned` or `dismissed`. Flags go with the flagged photo or account (cascade). If the matched account is deleted, its columns become NULL.
+
+**When the model is missing.** On dev machines, in CI and tests, or if the download failed, uploads work exactly as before. Photos are stored unchecked (`nsfw_checked_at` NULL) and stay visible. Every minute a background job retries unchecked photos (up to 5 attempts each) and backfills hashes for older photos. So dropping the model in place later fixes everything without a restart: the API retries loading a missing model every 5 minutes, and the job then works through the backlog. Set `PHOTO_HIDE_UNCHECKED=1` to fail closed instead: unchecked photos are then hidden from others until the classifier has seen them. Busy or slow inference (more than 8 queued, or 15 s) also leaves a photo unchecked for the job.
+
+**Install the model:** `server/scripts/fetch-photo-model.sh [dir]` downloads it from the GitHub release asset (falling back to the `nudenet` 3.4.2 wheel on PyPI) and refuses anything with the wrong SHA-256. `deploy.sh` runs it on every deploy into `/srv/stexx/models` (a no-op once the file is there), and the systemd unit sets `PHOTO_NSFW_MODEL`. The weights are never committed.
+
+**Licenses.** NudeNet's repository, and the license file shipped in its wheel, are AGPL-3.0, the same license as Stexx. (The PyPI metadata says MIT; either way it is compatible.) ONNX Runtime is MIT.
+
+**Stored per photo:** the hash, the score of the explicit labels, the best score of each label NudeNet detected (no boxes), the model id and the time. No copy, crop or thumbnail of any image. The data export lists all of it under each photo's `checks`. Logs never contain scores, labels or ids from the checks, only operational events (`photo_checks.model_loaded`, `.model_missing`, errors) and job counts.
 ## Error codes the app handles
 
 | Status | Code | Shown as |
@@ -226,7 +253,14 @@ Options that don't belong to a command are refused rather than ignored. Write co
 | `REPORT_REPORTER_MIN_AGE_HOURS` | `TRUST_RAMP_HOURS` | |
 | `REPORT_EVIDENCE_RETENTION_DAYS` | `30` | After the report is closed. |
 | `REPORT_EVIDENCE_MAX_DAYS` | `180` | Cap for reports that stay open. |
-
+| `PHOTO_CLASSIFIER` | `auto` (`off` in tests) | `auto` uses the model if its file exists; `off` never classifies. |
+| `PHOTO_NSFW_MODEL` | `server/models/nudenet-320n.onnx` | Production unit: `/srv/stexx/models/nudenet-320n.onnx`. |
+| `PHOTO_NSFW_THREADS` | `1` | CPU threads for one inference (1–16). |
+| `PHOTO_NSFW_THRESHOLD` | `0.5` | 0.2–1. |
+| `PHOTO_NSFW_LABELS` | genitals, anus, buttocks (exposed) | Comma list of NudeNet labels that count as explicit. |
+| `PHOTO_HIDE_UNCHECKED` | `0` | `1` hides unchecked photos from others (fail closed). |
+| `PHOTO_DUPLICATE_MAX_DISTANCE` | `6` | Hamming bits out of 64, 0–32; `-1` turns duplicate and blocklist flags off. |
+| `PHOTO_HASH_BLOCKLIST` | unset | Path to the stock/scraped hash list, read at boot. An unreadable or malformed file stops the boot (and fails deploy's boot check). |
 iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev-bypass` in the Local configuration) and `STEXX_APP_ATTEST_ENVIRONMENT` (`development`; `production` in Release), which feeds the `com.apple.developer.devicecheck.appattest-environment` entitlement in the generated `Stexx/Stexx.entitlements`.
 
 ## Turning it on for production (manual steps)
@@ -244,11 +278,15 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Raw IPs are never stored. Rate-limit rows hold an HMAC of the IP or /24 network (key derived from `EMAIL_PEPPER`) and disappear within two windows.
 - The trust ramp reads message metadata the server already has (sender, conversation, time, text for the duplicate check); nothing new is collected.
 - Reports add two things: the messages a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Nothing in moderation stores or shows a location.
+- Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read.
 
 ## Not done yet
 
 - Report evidence can't include photos yet (only that a photo was sent). With E2EE, the app would need to re-encrypt the chosen photo for moderators; that comes with the E2EE work.
 - No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Review turnaround depends on someone running `list`; there are no notifications for new high-priority reports yet.
 - The "Report" and "Block" menus were checked by hand; there are no UI tests for them.
+- A moderator screen for `photo_flags`, and a way for a person to contest an "explicit" label. Today a moderator fixes a wrong label with SQL: `UPDATE photos SET is_explicit = false, nsfw_model = 'manual' WHERE id = …`.
+- The classifier hasn't been measured on explicit photos in this repo: there are none to test with, so only its false-positive rate on the seed set was checked. Watch the scores of the first real uploads before trusting the threshold.
+- Moderator tooling to ban an account's devices (`banDevicesOfUser` exists, nothing calls it).
 - Tests against a real-device attestation: the suite uses a synthetic root and devices generated by `server/test/fixtures/app-attest/generate.ts`. Do one manual sign-up on a physical iPhone against a staging server before enforcing.
 - The DeviceCheck "banned" bit is written on the device's next request with a token, not immediately at ban time.

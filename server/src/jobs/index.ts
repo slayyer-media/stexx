@@ -1,4 +1,6 @@
 import { logError, logInfo } from "../lib/logger.ts";
+import { runPhotoChecks } from "../lib/photocheck/index.ts";
+import { MINUTE } from "../lib/time.ts";
 import {
   FAST_INTERVAL_MS,
   ORPHAN_INTERVAL_MS,
@@ -9,6 +11,8 @@ import {
 } from "./retention.ts";
 
 export * from "./retention.ts";
+
+export const PHOTO_CHECK_INTERVAL_MS = 1 * MINUTE;
 
 /** Flatten a job result (numbers, possibly nested) into counts for logging. */
 function flatten(value: unknown, prefix = "result", out: Record<string, number> = {}): Record<string, number> {
@@ -51,6 +55,8 @@ export function startJobs(): () => void {
   every("fast", FAST_INTERVAL_MS, () => runFastJobs(), 1_000);
   every("slow", SLOW_INTERVAL_MS, () => runSlowJobs(), 5_000);
   every("orphans", ORPHAN_INTERVAL_MS, () => sweepOrphanMedia(), 60_000);
+  // Retries unchecked photos (model missing/busy at upload) and backfills hashes of older photos.
+  every("photoChecks", PHOTO_CHECK_INTERVAL_MS, () => runPhotoChecks(), 20_000);
 
   return () => {
     stopped = true;

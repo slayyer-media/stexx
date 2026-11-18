@@ -146,6 +146,16 @@ Responses are `Cache-Control: private, max-age=31536000, immutable`: devices kee
 A public/shared cache would keep serving a photo after the server deleted it, which would break the "expiring content is actually deleted" promise.
 The directory is `2750 stexx:stexx` (setgid) and files are created `0640`; Caddy reads them through the `stexx` group (`bootstrap.sh` adds `caddy` to it).
 
+## Photo model
+
+Profile photo checks ([docs/security.md](../../docs/security.md#5-photo-checks-profile-photos)) use a 12 MB ONNX model in `/srv/stexx/models/nudenet-320n.onnx`.
+`deploy.sh` runs `scripts/fetch-photo-model.sh /srv/stexx/models` on every deploy: it downloads the pinned file (GitHub, then PyPI as a fallback),
+checks its SHA-256 and does nothing if it is already there. A failed download only warns; the API keeps running and photos stay unchecked until
+the file appears (`journalctl -u stexx-api | grep photo_checks` shows `model_loaded` or `model_missing`). The unit points `PHOTO_NSFW_MODEL` at it.
+`deploy.sh` also deletes the other platforms' ONNX Runtime binaries from each release (~250 MB saved per release).
+To install the model by hand: `sudo sh /srv/stexx/current/scripts/fetch-photo-model.sh /srv/stexx/models`, then wait up to 5 minutes (the API retries
+loading a missing model every 5 minutes) or restart. A malformed `PHOTO_HASH_BLOCKLIST` file fails the boot check before anything is switched.
+
 ## Updating things
 
 - **App:** `deploy.sh`. Releases are immutable; five are kept. Migrations must be additive, because a rollback does not undo them.

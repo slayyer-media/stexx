@@ -222,6 +222,21 @@ sync_to scripts/moderate.ts "$NEW/scripts/"
 
 log "Installing dependencies on the server (frozen lockfile, production only, no install scripts)"
 rrun "cd '$NEW' && sudo $BUN install --frozen-lockfile --production --ignore-scripts"
+# onnxruntime-node ships CPU binaries for every OS (~290 MB); keep only this server's (~46 MB for linux/x64).
+rscript <<EOF
+ort='$NEW/node_modules/onnxruntime-node/bin/napi-v6'
+if [ -d "\$ort" ]; then
+  arch=\$(uname -m); case "\$arch" in x86_64) arch=x64;; aarch64) arch=arm64;; esac
+  for d in "\$ort"/*/*; do [ "\$d" = "\$ort/linux/\$arch" ] || rm -rf "\$d"; done
+fi
+EOF
+
+log "Photo checks: NSFW model (pinned SHA-256, shared by all releases in $APP_ROOT/models)"
+sync_to scripts/fetch-photo-model.sh "$NEW/scripts/"
+# Not fatal: without the model, uploads still work and photos stay unchecked (the API logs photo_checks.model_missing).
+if ! rrun "sudo sh '$NEW/scripts/fetch-photo-model.sh' '$APP_ROOT/models'"; then
+  echo "  WARNING: could not fetch the photo model; profile photos will stay unchecked until it is installed" >&2
+fi
 # Code is root-owned and group-readable: the service can read it but never modify it.
 rrun "sudo chown -R root:stexx '$NEW' && sudo chmod -R u=rwX,g=rX,o= '$NEW'"
 

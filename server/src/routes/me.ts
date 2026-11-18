@@ -10,6 +10,7 @@ import { requirePlus } from "../lib/plus.ts";
 import { rateLimit } from "../lib/ratelimit.ts";
 import { closeUserConnections } from "../lib/realtime.ts";
 import {
+  photoColumns,
   photoJson,
   privacyJson,
   profileColumns,
@@ -23,6 +24,8 @@ import { cleanText, idParam, locationSchema, lookingForSchema, multilineText, pa
 import { col, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
 import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { checkColumns, checkPhoto, flagPhotoMatches, storedPhash } from "../lib/photocheck/index.ts";
+import { phashToHex } from "../lib/photocheck/phash.ts";
 import type { AppEnv } from "../types.ts";
 
 /**
@@ -149,7 +152,7 @@ meRoutes.delete("/me", attest("optional"), async (c) => {
 
 async function ownPhotos(userId: string): Promise<PhotoRow[]> {
   return sql<PhotoRow[]>`
-    SELECT id, owner_id, storage_key, position, is_explicit FROM photos WHERE owner_id = ${userId} ORDER BY position`;
+    SELECT ${photoColumns} FROM photos WHERE owner_id = ${userId} ORDER BY position`;
 }
 
 /** Raw image body (jpeg, png, webp). Re-encoded server-side: orientation applied, ALL metadata stripped. */
@@ -164,6 +167,9 @@ meRoutes.post("/me/photos", rateLimit("photoUploads"), attest("photo"), async (c
 
   const bytes = new Uint8Array(await c.req.arrayBuffer());
   const jpeg = await sanitizeImage(bytes);
+  // Label, don't reject: an explicit photo is stored (isExplicit: true) but never shown to others. If the
+  // classifier is unavailable the photo stays unchecked and the background job retries (lib/photocheck).
+  const check = await checkPhoto(jpeg);
   const key = await storeJpeg(jpeg);
 
   try {
@@ -172,10 +178,14 @@ meRoutes.post("/me/photos", rateLimit("photoUploads"), attest("photo"), async (c
       const [counted] = await tx<{ n: number }[]>`SELECT count(*)::int AS n FROM photos WHERE owner_id = ${me}`;
       const n = counted?.n ?? 0;
       if (n >= MAX_PHOTOS) throw conflict(`You can have at most ${MAX_PHOTOS} photos.`, "photo_limit");
+      const v = checkColumns(check);
       const [photo] = await tx<PhotoRow[]>`
-        INSERT INTO photos (id, owner_id, storage_key, position)
-        VALUES (${newId("photo")}, ${me}, ${key}, ${n})
-        RETURNING id, owner_id, storage_key, position, is_explicit`;
+        INSERT INTO photos (id, owner_id, storage_key, position, phash, is_explicit,
+                            nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels)
+        VALUES (${newId("photo")}, ${me}, ${key}, ${n}, ${v.phash}::bigint, ${v.is_explicit},
+                ${v.nsfw_checked_at}, ${v.nsfw_model}, ${v.nsfw_score}, ${v.nsfw_labels})
+        RETURNING ${photoColumns}`;
+      await flagPhotoMatches(tx, { id: photo!.id, ownerId: me, phash: check.phash });
       return photo!;
     });
     return c.json(photoJson(row), 201);
@@ -263,7 +273,7 @@ meRoutes.put("/me/photos/order", async (c) => {
       await tx`UPDATE photos SET position = ${position} WHERE id = ${id} AND owner_id = ${me}`;
     }
     return tx<PhotoRow[]>`
-      SELECT id, owner_id, storage_key, position, is_explicit FROM photos WHERE owner_id = ${me} ORDER BY position`;
+      SELECT ${photoColumns} FROM photos WHERE owner_id = ${me} ORDER BY position`;
   });
   return c.json(rows.map(photoJson));
 });
@@ -410,6 +420,16 @@ meRoutes.get("/me/export", async (c) => {
          WHERE c.user_a = ${me} OR c.user_b = ${me} ORDER BY c.created_at`,
     ]);
 
+  // What the photo checks stored about each photo (docs/security.md "Photo checks"). Moderation flags are not
+  // included, like reports filed against the account.
+  const checks = new Map(
+    (
+      await sql<
+        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null }[]
+      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels FROM photos WHERE owner_id = ${me}`
+    ).map((r) => [r.id, r]),
+  );
+
   const msgRows = convs.length
     ? await sql<
         {
@@ -486,7 +506,21 @@ meRoutes.get("/me/export", async (c) => {
       tags: user.tags,
     },
     privacy: privacyJson(user),
-    photos: photos.map((p) => ({ ...photoJson(p), position: p.position })),
+    photos: photos.map((p) => {
+      const ck = checks.get(p.id);
+      const hash = storedPhash(ck?.phash ?? null);
+      return {
+        ...photoJson(p),
+        position: p.position,
+        checks: {
+          perceptualHash: hash === null ? null : phashToHex(hash),
+          checkedAt: isoDate(ck?.nsfw_checked_at ?? null),
+          model: ck?.nsfw_model ?? null,
+          explicitScore: ck?.nsfw_score ?? null,
+          labels: ck?.nsfw_labels ?? null,
+        },
+      };
+    }),
     pendingChatUploads: uploads.map((u) => ({ id: u.id, url: mediaUrl(u.storage_key), createdAt: isoDate(u.created_at) })),
     location: {
       home: home[0] ? { latitude: home[0].cell_lat, longitude: home[0].cell_lon, updatedAt: isoDate(home[0].updated_at) } : null,

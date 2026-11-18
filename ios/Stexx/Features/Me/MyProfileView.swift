@@ -78,7 +78,8 @@ struct MyProfileView: View {
         let me = appState.me ?? MockData.me
         let photoShape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
         VStack(spacing: Theme.Spacing.l) {
-            ProfilePhotoView(profile: me)
+            // The photo others see first (an explicit one is hidden from them).
+            ProfilePhotoView(profile: me, photoIndex: me.photos.firstIndex { !$0.isExplicit } ?? 0)
                 .frame(width: 136, height: 136)
                 .clipShape(photoShape)
                 .hairlineBorder(photoShape)

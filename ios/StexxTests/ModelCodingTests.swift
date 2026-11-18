@@ -59,4 +59,16 @@ struct ModelCodingTests {
         query.positions = [.top]
         #expect(query.usesAdvancedFilters)
     }
+
+    @Test("Photos the server labelled explicit are left out of the public photos")
+    func publicPhotosSkipExplicit() throws {
+        let json = Data("""
+        [{ "id": "ph_1", "url": "https://media.stexx.gay/a.jpg", "isExplicit": true },
+         { "id": "ph_2", "url": "https://media.stexx.gay/b.jpg", "isExplicit": false }]
+        """.utf8)
+        var profile = MockData.me
+        profile.photos = try JSONDecoder.stexx().decode([Photo].self, from: json)
+        #expect(profile.photos.map(\.isExplicit) == [true, false])
+        #expect(profile.publicPhotos.map(\.id) == ["ph_2"])
+    }
 }
