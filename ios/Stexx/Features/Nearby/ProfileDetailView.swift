@@ -295,8 +295,8 @@ struct ProfileDetailView: View {
             LinearGradient(
                 stops: [
                     .init(color: Theme.background.opacity(0), location: 0),
-                    .init(color: Theme.background.opacity(0.85), location: 0.45),
-                    .init(color: Theme.background, location: 1),
+                    .init(color: Theme.background.opacity(0.92), location: 0.28),
+                    .init(color: Theme.background, location: 0.5),
                 ],
                 startPoint: .top,
                 endPoint: .bottom

@@ -487,9 +487,13 @@ private struct NearbyGridBlock: Identifiable {
         return blocks
     }
 
-    /// Online beats offline; then the more recent activity wins. Ties keep
-    /// the server order (closest first).
+    /// A profile with a photo beats a placeholder (the big tile should show
+    /// a face); then online beats offline; then the more recent activity
+    /// wins. Ties keep the server order (closest first).
     private static func isLessActive(_ a: Profile, _ b: Profile) -> Bool {
+        let aHasPhoto = a.primaryPhotoURL != nil
+        let bHasPhoto = b.primaryPhotoURL != nil
+        if aHasPhoto != bHasPhoto { return !aHasPhoto }
         if a.isOnline != b.isOnline { return !a.isOnline }
         return (a.lastActiveAt ?? .distantPast) < (b.lastActiveAt ?? .distantPast)
     }
