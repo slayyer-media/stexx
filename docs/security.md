@@ -106,7 +106,12 @@ Chats are planned to become end-to-end encrypted with the Signal Protocol (libsi
 
 The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. Today the server uses `plaintextContentPolicy`; when messages become ciphertext it switches to `encryptedContentPolicy` (a no-op) and the app runs the same rules locally. `containsLink` and `normalizeForDuplicate` are the reference to port. The server learns whether the sender is restricted from its own metadata, so it can tell the app which rules apply. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server.
 
-The app shows the server's message above the composer (see screenshots in the PR) and keeps the failed bubble so the user can edit or retry. Set `TRUST_RAMP_ENABLED=0` to turn the ramp off.
+The app shows the server's message above the composer and keeps the failed bubble so the user can edit or retry.
+
+<p>
+  <img src="images/security/signup-disposable-email.jpg" width="280" alt="Sign-up refusing a temporary inbox with a red explanation under the email field">
+  <img src="images/security/chat-links-not-allowed.jpg" width="280" alt="Chat thread: a new account's link message marked not sent, with a notice above the composer">
+</p> Set `TRUST_RAMP_ENABLED=0` to turn the ramp off.
 
 ## Error codes the app handles
 
