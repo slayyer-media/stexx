@@ -18,20 +18,24 @@ struct AgeGateView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: Theme.Spacing.xl) {
-                VStack(spacing: Theme.Spacing.s) {
+                VStack(spacing: Theme.Spacing.m) {
                     Image(systemName: "18.circle")
-                        .font(.system(size: 44, weight: .semibold))
-                        .foregroundStyle(Theme.violetBright)
-                    Text("Adults only")
-                        .font(.stexxLargeTitle)
+                        .font(.system(size: 40, weight: .light))
+                        .foregroundStyle(Theme.steel)
+                        .accessibilityHidden(true)
+                    Text("adults only")
+                        .stexxTitleStyle()
+                        .accessibilityAddTraits(.isHeader)
                     Text("Stexx is for people 18 and older. Your birth date isn't stored or shown to anyone.")
-                        .font(.body)
-                        .foregroundStyle(Theme.textSecondary)
+                        .font(.stexxBody)
+                        .foregroundStyle(Theme.steel)
                         .multilineTextAlignment(.center)
                 }
                 .padding(.top, Theme.Spacing.xl)
 
-                GlassCard {
+                VStack(spacing: Theme.Spacing.s) {
+                    SectionLabel("Birth date")
+                    HairlineDivider()
                     DatePicker(
                         "Birth date",
                         selection: $birthDate,
@@ -42,17 +46,18 @@ struct AgeGateView: View {
                     .labelsHidden()
                     .frame(maxWidth: .infinity)
                     .onChange(of: birthDate) { hasPickedDate = true }
+                    HairlineDivider()
                 }
 
                 if hasPickedDate && !isAdult {
                     Label("Sorry, you need to be 18 or older to use Stexx.", systemImage: "hand.raised.fill")
-                        .font(.subheadline.weight(.medium))
+                        .font(.stexxSub)
                         .foregroundStyle(Theme.warning)
                         .transition(.opacity)
                 }
             }
             .padding(.horizontal, Theme.Spacing.xl)
-            .animation(.smooth, value: isAdult)
+            .animation(Motion.standard, value: isAdult)
         }
         .safeAreaInset(edge: .bottom) {
             Button {

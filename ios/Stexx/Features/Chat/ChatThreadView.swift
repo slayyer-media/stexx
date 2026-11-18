@@ -1,7 +1,7 @@
 import PhotosUI
 import SwiftUI
 
-/// A single conversation with a floating liquid-glass composer.
+/// A single conversation with a black-glass composer.
 struct ChatThreadView: View {
     let route: ChatRoute
 
@@ -9,6 +9,8 @@ struct ChatThreadView: View {
     @Environment(ChatStore.self) private var chatStore
     @Environment(\.apiClient) private var api
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     @State private var conversation: Conversation?
     @State private var messages: [Message] = []
@@ -20,8 +22,13 @@ struct ChatThreadView: View {
     @State private var isReporting = false
     @State private var isPickingPhoto = false
     @State private var photoItem: PhotosPickerItem?
+    /// Messages that should "land" (a short fade-up) when they first appear
+    /// (sent or received while the thread is open), by `bubbleKey`. Anything
+    /// loaded with the thread just appears.
+    @State private var landingKeys: Set<String> = []
+    /// Bumped on every send, for haptics.
+    @State private var sendCount = 0
     @FocusState private var isComposerFocused: Bool
-    @Namespace private var composerNamespace
 
     private var participant: Profile { route.participant }
 
@@ -30,19 +37,36 @@ struct ChatThreadView: View {
     }
 
     var body: some View {
+        let myID = appState.myID
+        // "Read" shows once, under the newest of my messages that was read.
+        let lastReadIndex = messages.lastIndex { $0.senderID == myID && $0.status == .read }
+
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 6) {
+                LazyVStack(spacing: 0) {
                     if !isLoading && messages.isEmpty {
                         emptyThread
                     }
-                    ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
+                    ForEach(Array(messages.enumerated()), id: \.element.bubbleKey) { index, message in
+                        let key = message.bubbleKey
+                        let isMine = message.senderID == myID
+                        let continues = continuesGroup(at: index)
                         MessageBubble(
                             message: message,
-                            isMine: message.senderID == appState.myID,
-                            showsTimestamp: showsTimestamp(at: index)
+                            isMine: isMine,
+                            showsTimestamp: showsTimestamp(at: index),
+                            isFirstInGroup: !continues,
+                            isLastInGroup: isLastInGroup(at: index),
+                            showsReadReceipt: index == lastReadIndex
                         )
-                        .id(message.id)
+                        .id(key)
+                        .padding(.top, continues ? 2 : Theme.Spacing.s)
+                        .modifier(BubbleLanding(
+                            animatesIn: landingKeys.contains(key),
+                            anchor: isMine ? .bottomTrailing : .bottomLeading,
+                            reduceMotion: reduceMotion,
+                            onLanded: { landingKeys.remove(key) }
+                        ))
                         .onTapGesture {
                             if message.status == .failed { retry(message) }
                         }
@@ -53,15 +77,17 @@ struct ChatThreadView: View {
             }
             .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
-            .onChange(of: messages.last?.id) { _, lastID in
-                guard let lastID else { return }
-                withAnimation(.smooth) { proxy.scrollTo(lastID, anchor: .bottom) }
+            .onChange(of: messages.last?.bubbleKey) { _, lastKey in
+                guard let lastKey else { return }
+                withAnimation(Motion.animation(Motion.standard, reduceMotion: reduceMotion)) {
+                    proxy.scrollTo(lastKey, anchor: .bottom)
+                }
             }
         }
         .overlay {
-            if isLoading { ProgressView() }
+            if isLoading { ProgressView().tint(Theme.steel) }
         }
-        .stexxBackground(intensity: 0.55)
+        .stexxBackground()
         .safeAreaInset(edge: .bottom) { composer }
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(.hidden, for: .tabBar)
@@ -70,13 +96,12 @@ struct ChatThreadView: View {
                 NavigationLink(value: participant) {
                     HStack(spacing: Theme.Spacing.s) {
                         AvatarView(profile: participant, size: 30)
-                        VStack(alignment: .leading, spacing: 0) {
+                        VStack(alignment: .leading, spacing: 1) {
                             Text(participant.displayName)
                                 .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(Theme.textPrimary)
+                                .foregroundStyle(Theme.frost)
                             Text(StexxFormat.lastSeen(participant.lastActiveAt, isOnline: participant.isOnline))
-                                .font(.caption2)
-                                .foregroundStyle(participant.isOnline ? Theme.online : Theme.textTertiary)
+                                .stexxLabelStyle(.micro, color: participant.isOnline ? Theme.online : Theme.slate)
                         }
                     }
                 }
@@ -114,6 +139,10 @@ struct ChatThreadView: View {
                     // The socket was down: refetch what was missed.
                     try? await refreshMessages(in: id)
                 } else {
+                    if case .created(let message) = update,
+                       !messages.contains(where: { $0.id == message.id || $0.bubbleKey == message.bubbleKey }) {
+                        landingKeys.insert(message.bubbleKey)
+                    }
                     ChatStore.merge(update, into: &messages, myID: appState.myID)
                 }
             }
@@ -129,63 +158,142 @@ struct ChatThreadView: View {
     // MARK: Composer
 
     private var composer: some View {
-        GlassEffectContainer(spacing: Theme.Spacing.s) {
-            HStack(alignment: .bottom, spacing: Theme.Spacing.s) {
-                Menu {
-                    Button {
-                        isPickingPhoto = true
-                    } label: {
-                        Label("Photo", systemImage: "photo")
-                    }
-                    Toggle(isOn: $expiresPhotos) {
-                        Label("Expiring photos", systemImage: "timer")
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 17, weight: .semibold))
-                        .frame(width: 44, height: 44)
-                        .contentShape(.circle)
-                }
-                .glassEffect(.regular.interactive(), in: .circle)
-                .accessibilityLabel("Attachments")
-
-                TextField("Message", text: $draft, axis: .vertical)
-                    .lineLimit(1...5)
-                    .focused($isComposerFocused)
-                    .padding(.horizontal, Theme.Spacing.l)
-                    .padding(.vertical, 12)
-                    .frame(minHeight: 44)
-                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: Theme.Radius.field))
-
-                if canSend {
-                    Button(action: send) {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 44, height: 44)
-                            .contentShape(.circle)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.tint(Theme.violet).interactive(), in: .circle)
-                    .glassEffectID("send", in: composerNamespace)
-                    .accessibilityLabel("Send")
-                }
+        HStack(alignment: .bottom, spacing: Theme.Spacing.s) {
+            attachmentMenu
+            messageField
+            if canSend {
+                sendButton
+                    .transition(.opacity)
             }
         }
         .padding(.horizontal, Theme.Spacing.m)
         .padding(.vertical, Theme.Spacing.s)
-        .animation(.smooth(duration: 0.25), value: canSend)
+        .background { composerBar }
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: canSend)
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: isComposerFocused)
+        .animation(Motion.animation(Motion.quick, reduceMotion: reduceMotion), value: draft.isEmpty)
+        .sensoryFeedback(.impact(weight: .light), trigger: sendCount)
+    }
+
+    /// Black frosted glass under the composer, with a single hairline top
+    /// edge; flat ink1 under Reduce Transparency.
+    private var composerBar: some View {
+        ZStack {
+            if reduceTransparency {
+                Theme.ink1
+            } else {
+                Rectangle().fill(.ultraThinMaterial)
+                Theme.ink.opacity(0.55)
+            }
+        }
+        .overlay(alignment: .top) { HairlineDivider(strong: true) }
+        .ignoresSafeArea(edges: .bottom)
+    }
+
+    private var attachmentMenu: some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return Menu {
+            Button {
+                isPickingPhoto = true
+            } label: {
+                Label("Photo", systemImage: "photo")
+            }
+            Toggle(isOn: $expiresPhotos) {
+                Label("Expiring photos", systemImage: "timer")
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(Theme.steel)
+                .frame(width: 44, height: 44)
+                .background(Theme.ink1, in: shape)
+                .hairlineBorder(shape)
+                .contentShape(shape)
+                .overlay(alignment: .topTrailing) {
+                    // Small timer: photos sent now will expire.
+                    if expiresPhotos {
+                        Image(systemName: "timer")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(Theme.ice)
+                            .offset(x: -5, y: 5)
+                    }
+                }
+        }
+        .accessibilityLabel("Attachments")
+        .accessibilityValue(expiresPhotos ? Text("Expiring photos on") : Text(verbatim: ""))
+    }
+
+    private var messageField: some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return HStack(alignment: .bottom, spacing: 4) {
+            TextField("Message", text: $draft, axis: .vertical)
+                .lineLimit(1...5)
+                .font(.stexxBody)
+                .foregroundStyle(Theme.frost)
+                .focused($isComposerFocused)
+                .tint(Theme.ice)
+                .padding(.vertical, 11)
+
+            if draft.isEmpty {
+                Button {
+                    isPickingPhoto = true
+                } label: {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.body)
+                        .foregroundStyle(Theme.steel)
+                        .frame(width: 36, height: 44)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .disabled(conversation == nil)
+                .transition(.opacity)
+                .accessibilityLabel("Send a photo")
+            }
+        }
+        .padding(.leading, Theme.Spacing.m + 2)
+        .padding(.trailing, draft.isEmpty ? 6 : Theme.Spacing.m + 2)
+        .frame(minHeight: 44)
+        .background(Theme.ink2, in: shape)
+        .hairlineBorder(shape, strong: isComposerFocused)
+        // The composer is this screen's one lit surface, and only while focused.
+        .rimLight(shape, intensity: isComposerFocused ? 1 : 0)
+    }
+
+    private var sendButton: some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return Button(action: send) {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Theme.ink)
+                .frame(width: 44, height: 44)
+                .background(Theme.frost, in: shape)
+                .contentShape(shape)
+        }
+        // The send itself gives the light impact haptic.
+        .buttonStyle(PressableButtonStyle(haptics: false))
+        .accessibilityLabel("Send")
     }
 
     private var emptyThread: some View {
         VStack(spacing: Theme.Spacing.m) {
             AvatarView(profile: participant, size: 88)
+                .rimLight(cornerRadius: Theme.Radius.avatar)
+                .cellCorners()
+                .padding(.bottom, Theme.Spacing.l)
             Text("Say hi to \(participant.displayName)")
-                .font(.stexxHeadline)
-            Text("Be kind, be clear, have fun. You can block or report anytime from the ••• menu.")
-                .font(.footnote)
-                .foregroundStyle(Theme.textSecondary)
+                .stexxTitleStyle(.title)
                 .multilineTextAlignment(.center)
+            Text("Be kind, be clear, have fun. You can block or report anytime from the ••• menu.")
+                .font(.stexxSub)
+                .foregroundStyle(Theme.steel)
+                .multilineTextAlignment(.center)
+            GlassChip("Wave", systemImage: "hand.wave.fill", isSelected: true) {
+                draft = String(localized: "Hi 👋")
+                isComposerFocused = true
+            }
+            .accessibilityRemoveTraits(.isSelected)
+            .padding(.top, Theme.Spacing.m)
+            .disabled(conversation == nil)
         }
         .padding(.top, 80)
         .padding(.horizontal, Theme.Spacing.xl)
@@ -197,6 +305,19 @@ struct ChatThreadView: View {
     private func showsTimestamp(at index: Int) -> Bool {
         guard index > 0 else { return true }
         return messages[index].sentAt.timeIntervalSince(messages[index - 1].sentAt) > 15 * 60
+    }
+
+    /// Consecutive messages from the same sender, within a couple of
+    /// minutes and without a timestamp between them, form a group.
+    private func continuesGroup(at index: Int) -> Bool {
+        guard index > 0, !showsTimestamp(at: index) else { return false }
+        let previous = messages[index - 1], current = messages[index]
+        return previous.senderID == current.senderID
+            && current.sentAt.timeIntervalSince(previous.sentAt) < 2 * 60
+    }
+
+    private func isLastInGroup(at index: Int) -> Bool {
+        index == messages.count - 1 || !continuesGroup(at: index + 1)
     }
 
     private func load() async {
@@ -233,6 +354,8 @@ struct ChatThreadView: View {
 
         let messageDraft = MessageDraft(clientID: UUID().uuidString, text: text)
         let pending = Message.pending(from: messageDraft, conversationID: conversation.id, senderID: appState.myID)
+        landingKeys.insert(pending.bubbleKey)
+        sendCount += 1
         messages.append(pending)
         deliver(messageDraft, pendingID: pending.id, in: conversation)
     }
@@ -264,6 +387,8 @@ struct ChatThreadView: View {
             senderID: appState.myID
         )
         pending.attachment = Message.Attachment(kind: .photo, url: nil)
+        landingKeys.insert(pending.bubbleKey)
+        sendCount += 1
         messages.append(pending)
         deliverPhoto(jpeg, clientID: pending.clientID ?? pending.id, pendingID: pending.id, in: conversation)
     }
@@ -321,21 +446,25 @@ struct ChatThreadView: View {
     }
 }
 
-/// A chat bubble. Own messages use the violet gradient; theirs a dark solid
-/// surface (bubbles are content, so they aren't glass).
+/// A chat bubble. Own messages are frost with ink text; theirs are flat
+/// ink1 with a 0.5pt line. Radius 14, with a 4pt tail corner on the last
+/// bubble of a run; bubbles in a run tuck their inner corners together.
 struct MessageBubble: View {
     let message: Message
     let isMine: Bool
     var showsTimestamp = false
+    var isFirstInGroup = true
+    var isLastInGroup = true
+    /// Whether a `.read` status is spelled out under this bubble.
+    var showsReadReceipt = true
 
     var body: some View {
         VStack(spacing: 4) {
             if showsTimestamp {
                 Text(StexxFormat.chatTimestamp(message.sentAt))
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(Theme.textTertiary)
+                    .stexxLabelStyle(.micro, color: Theme.slate)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, Theme.Spacing.m)
             }
 
             HStack(alignment: .bottom, spacing: 6) {
@@ -344,26 +473,31 @@ struct MessageBubble: View {
                 VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
                     if let attachment = message.attachment {
                         attachmentView(attachment)
+                            .opacity(message.status == .sending ? 0.7 : 1)
                     }
                     if let text = message.text {
                         Text(text)
-                            .font(.body)
-                            .foregroundStyle(.white)
+                            .font(.stexxBody)
+                            .foregroundStyle(isMine ? Theme.ink : Theme.frost)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
-                            .background(bubbleStyle, in: .rect(cornerRadius: Theme.Radius.bubble))
-                            .overlay {
-                                if !isMine {
-                                    RoundedRectangle(cornerRadius: Theme.Radius.bubble)
-                                        .strokeBorder(Theme.hairline, lineWidth: 0.5)
-                                }
-                            }
+                            .background { bubbleBackground }
                             .opacity(message.status == .sending ? 0.7 : 1)
                     }
                     if isMine, let status = statusText {
-                        Text(status)
-                            .font(.caption2)
-                            .foregroundStyle(message.status == .failed ? Theme.danger : Theme.textTertiary)
+                        HStack(spacing: 4) {
+                            if message.status == .read {
+                                Image(systemName: "checkmark")
+                                    .accessibilityHidden(true)
+                            } else if message.status == .failed {
+                                Image(systemName: "exclamationmark.circle")
+                                    .accessibilityHidden(true)
+                            }
+                            Text(status)
+                        }
+                        .stexxLabelStyle(.micro, color: statusColor)
+                        .padding(.trailing, 2)
+                        .padding(.top, 2)
                     }
                 }
 
@@ -373,29 +507,66 @@ struct MessageBubble: View {
         .accessibilityElement(children: .combine)
     }
 
-    private var bubbleStyle: AnyShapeStyle {
-        isMine ? AnyShapeStyle(Theme.accentGradient) : AnyShapeStyle(Theme.backgroundRaised)
+    private var bubbleShape: UnevenRoundedRectangle {
+        let big = Theme.Radius.bubble
+        let joined: CGFloat = 6
+        let top = isFirstInGroup ? big : joined
+        let bottom = isLastInGroup ? Theme.Radius.bubbleTail : joined
+        if isMine {
+            return UnevenRoundedRectangle(
+                topLeadingRadius: big, bottomLeadingRadius: big,
+                bottomTrailingRadius: bottom, topTrailingRadius: top,
+                style: .continuous
+            )
+        } else {
+            return UnevenRoundedRectangle(
+                topLeadingRadius: top, bottomLeadingRadius: bottom,
+                bottomTrailingRadius: big, topTrailingRadius: big,
+                style: .continuous
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var bubbleBackground: some View {
+        let shape = bubbleShape
+        if isMine {
+            shape.fill(Theme.frost)
+        } else {
+            shape
+                .fill(Theme.ink1)
+                .overlay(shape.stroke(Theme.line, lineWidth: 0.5))
+        }
     }
 
     private var statusText: LocalizedStringKey? {
         switch message.status {
         case .sending: return "Sending…"
         case .failed: return "Not sent. Tap to retry."
-        case .read: return "Read"
+        case .read: return showsReadReceipt ? "Read" : nil
         case .sent, .delivered: return nil
         }
     }
 
+    private var statusColor: Color {
+        switch message.status {
+        case .failed: Theme.danger
+        case .read: Theme.steel
+        default: Theme.slate
+        }
+    }
+
     private func attachmentView(_ attachment: Message.Attachment) -> some View {
-        ZStack {
-            Theme.backgroundRaised
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
+        return ZStack {
+            Theme.ink1
             VStack(spacing: 6) {
                 Image(systemName: attachment.isViewOnce ? "eye.slash" : "photo")
-                    .font(.title2)
+                    .font(.title2.weight(.light))
                 Text(attachment.isViewOnce ? "View once" : "Photo")
-                    .font(.caption.weight(.semibold))
+                    .stexxLabelStyle(.micro, color: Theme.steel)
             }
-            .foregroundStyle(Theme.textSecondary)
+            .foregroundStyle(Theme.steel)
             // View-once photos aren't fetched automatically: the first fetch
             // counts as opening them.
             if let url = attachment.url, !attachment.isViewOnce {
@@ -406,10 +577,51 @@ struct MessageBubble: View {
                     Color.clear
                 }
             }
+            if message.status == .sending {
+                ProgressView()
+                    .tint(Theme.frost)
+            }
         }
         .frame(width: 180, height: 220)
-        .clipShape(.rect(cornerRadius: Theme.Radius.bubble))
+        .clipShape(shape)
+        .hairlineBorder(shape)
     }
+}
+
+/// New bubbles fade up a few points from the sender's side; a plain fade
+/// under Reduce Motion. No bounce. Bubbles that were already there just appear.
+private struct BubbleLanding: ViewModifier {
+    let anchor: UnitPoint
+    let reduceMotion: Bool
+    let onLanded: () -> Void
+    @State private var landed: Bool
+
+    init(animatesIn: Bool, anchor: UnitPoint, reduceMotion: Bool, onLanded: @escaping () -> Void) {
+        self.anchor = anchor
+        self.reduceMotion = reduceMotion
+        self.onLanded = onLanded
+        _landed = State(initialValue: !animatesIn)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(landed || reduceMotion ? 1 : 0.98, anchor: anchor)
+            .offset(y: landed || reduceMotion ? 0 : 6)
+            .opacity(landed ? 1 : 0)
+            .onAppear {
+                guard !landed else { return }
+                withAnimation(Motion.animation(Motion.quick, reduceMotion: reduceMotion)) {
+                    landed = true
+                }
+                onLanded()
+            }
+    }
+}
+
+fileprivate extension Message {
+    /// Stable identity across the optimistic → sent swap (the server's copy
+    /// gets a new `id` but keeps the client ID).
+    var bubbleKey: String { "\(senderID)|\(clientID ?? id)" }
 }
 
 #Preview {

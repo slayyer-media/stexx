@@ -50,15 +50,15 @@ struct ReportSheet: View {
                         } label: {
                             HStack {
                                 Label {
-                                    Text(item.title).foregroundStyle(Theme.textPrimary)
+                                    Text(item.title).foregroundStyle(Theme.frost)
                                 } icon: {
-                                    Image(systemName: item.systemImage).foregroundStyle(Theme.violetBright)
+                                    Image(systemName: item.systemImage).foregroundStyle(Theme.steel)
                                 }
                                 Spacer()
                                 if reason == item {
                                     Image(systemName: "checkmark")
                                         .font(.body.weight(.semibold))
-                                        .foregroundStyle(Theme.violetBright)
+                                        .foregroundStyle(Theme.ice)
                                 }
                             }
                             .contentShape(.rect)
@@ -67,25 +67,37 @@ struct ReportSheet: View {
                         .accessibilityAddTraits(reason == item ? .isSelected : [])
                     }
                 } header: {
-                    Text("What's going on?")
+                    SectionLabel("What's going on?")
                 }
+                .listRowBackground(Theme.ink1)
 
-                Section("Details (optional)") {
+                Section {
                     TextField("Anything that helps us understand", text: $details, axis: .vertical)
                         .lineLimit(3...6)
+                } header: {
+                    SectionLabel("Details (optional)")
                 }
+                .listRowBackground(Theme.ink1)
 
                 Section {
                     Toggle("Also block \(profile.displayName)", isOn: $alsoBlock)
                 } footer: {
                     Text("Reports are reviewed by people, not just algorithms. \(profile.displayName) won't know who reported them. If you're in danger, contact local emergency services.")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.slate)
                 }
+                .listRowBackground(Theme.ink1)
 
                 if let errorMessage {
-                    Text(errorMessage).foregroundStyle(Theme.danger)
+                    Text(errorMessage)
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.danger)
+                        .listRowBackground(Theme.ink1)
                 }
             }
-            .stexxBackground(intensity: 0.5)
+            .listRowSeparatorTint(Theme.line)
+            .tint(Theme.ice)
+            .stexxBackground(intensity: 0.4)
             .navigationTitle("Report \(profile.displayName)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -146,17 +158,24 @@ struct BlockedProfilesView: View {
                 HStack(spacing: Theme.Spacing.m) {
                     AvatarView(profile: profile, size: 40, showsOnline: false)
                     Text(profile.displayName)
+                        .font(.stexxHeadline)
+                        .foregroundStyle(Theme.frost)
+                        .lineLimit(1)
                     Spacer()
                     Button("Unblock") { Task { await unblock(profile) } }
-                        .buttonStyle(.glass)
-                        .controlSize(.small)
+                        .buttonStyle(SafetyUnblockButtonStyle())
                 }
-                .listRowBackground(Theme.surface)
+                .padding(.vertical, 4)
+                .listRowBackground(Color.clear)
+                .listRowSeparatorTint(Theme.line)
+                .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] + 52 }
             }
         }
+        .listStyle(.plain)
         .overlay {
             if isLoading {
                 ProgressView()
+                    .tint(Theme.steel)
             } else if blocked.isEmpty {
                 ContentUnavailableView(
                     "No one blocked",
@@ -165,7 +184,7 @@ struct BlockedProfilesView: View {
                 )
             }
         }
-        .stexxBackground(intensity: 0.5)
+        .stexxBackground(intensity: 0.4)
         .navigationTitle("Blocked")
         .task {
             blocked = (try? await api.blockedProfiles()) ?? []
@@ -179,6 +198,22 @@ struct BlockedProfilesView: View {
             appState.markUnblocked(profile.id)
             blocked.removeAll { $0.id == profile.id }
         } catch {}
+    }
+}
+
+/// Small secondary action in a row: mono caps frost on ink1, radius 4,
+/// hairline border; dims when pressed.
+private struct SafetyUnblockButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous)
+        configuration.label
+            .stexxLabelStyle(color: Theme.frost)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(shape.fill(configuration.isPressed ? Theme.ink2 : Theme.ink1))
+            .overlay(shape.strokeBorder(Theme.lineStrong, lineWidth: 0.5))
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .contentShape(shape)
     }
 }
 

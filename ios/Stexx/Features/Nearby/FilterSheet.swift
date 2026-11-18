@@ -19,6 +19,10 @@ struct FilterSheet: View {
                 Section {
                     Toggle("Age range", isOn: $limitsAge)
                     if limitsAge {
+                        Text(verbatim: "\(Int(ageRange.lowerBound))–\(Int(ageRange.upperBound))")
+                            .stexxTitleStyle(.title)
+                            .monospacedDigit()
+                            .accessibilityLabel(Text("Ages \(Int(ageRange.lowerBound)) to \(Int(ageRange.upperBound))"))
                         LabeledContent("From") {
                             Stepper("\(Int(ageRange.lowerBound))", value: lowerAge, in: 18...Double(Int(ageRange.upperBound)))
                         }
@@ -26,20 +30,27 @@ struct FilterSheet: View {
                             Stepper("\(Int(ageRange.upperBound))", value: upperAge, in: ageRange.lowerBound...99)
                         }
                     }
+                } header: {
+                    SectionLabel("Age")
                 }
+                .listRowBackground(Theme.ink1)
 
                 Section {
                     Toggle("Maximum distance", isOn: $limitsDistance)
                     if limitsDistance {
                         VStack(alignment: .leading) {
                             Text(StexxFormat.distance(maxDistanceKm * 1000))
-                                .font(.headline)
+                                .stexxTitleStyle(.title)
+                                .monospacedDigit()
                             Slider(value: $maxDistanceKm, in: 1...100, step: 1)
                         }
                     }
+                } header: {
+                    SectionLabel("Distance")
                 }
+                .listRowBackground(Theme.ink1)
 
-                Section("Position") {
+                Section {
                     FlowLayout {
                         ForEach(Position.allCases) { position in
                             GlassChip(Text(position.title), isSelected: draft.positions.contains(position)) {
@@ -48,9 +59,12 @@ struct FilterSheet: View {
                         }
                     }
                     .padding(.vertical, 4)
+                } header: {
+                    SectionLabel("Position")
                 }
+                .listRowBackground(Theme.ink1)
 
-                Section("Looking for") {
+                Section {
                     FlowLayout {
                         ForEach(LookingFor.allCases) { item in
                             GlassChip(
@@ -63,7 +77,10 @@ struct FilterSheet: View {
                         }
                     }
                     .padding(.vertical, 4)
+                } header: {
+                    SectionLabel("Looking for")
                 }
+                .listRowBackground(Theme.ink1)
 
                 Section {
                     TextField("Add a tag, e.g. Physics", text: $tagText)
@@ -83,10 +100,17 @@ struct FilterSheet: View {
                         .padding(.vertical, 4)
                     }
                 } header: {
-                    Text("Tags")
+                    SectionLabel("Tags")
                 }
+                .listRowBackground(Theme.ink1)
             }
-            .stexxBackground(intensity: 0.6)
+            .listRowSeparatorTint(Theme.line)
+            .stexxBackground(intensity: 0.4)
+            .tint(Theme.ice)
+            .sensoryFeedback(.selection, trigger: draft.positions)
+            .sensoryFeedback(.selection, trigger: draft.lookingFor)
+            .sensoryFeedback(.selection, trigger: limitsAge)
+            .sensoryFeedback(.selection, trigger: limitsDistance)
             .navigationTitle("Filters")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

@@ -52,50 +52,26 @@ struct PaywallView: View {
     @Environment(PurchaseService.self) private var purchases
     @Environment(\.purchase) private var purchase
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    @State private var hasAppeared = false
+    @State private var purchaseTaps = 0
 
     var body: some View {
         ScrollView {
-            VStack(spacing: Theme.Spacing.xl) {
-                VStack(spacing: Theme.Spacing.m) {
-                    StexxLogoTile(size: 96)
-                    HStack(spacing: 0) {
-                        Wordmark(size: 44)
-                        Text(verbatim: "+")
-                            .font(.stexxDisplay(44))
-                            .foregroundStyle(Theme.violetBright)
-                    }
-                    Text("Extras for you. Servers for everyone.\nNo ads, ever.")
-                        .font(.body)
-                        .foregroundStyle(Theme.textSecondary)
-                        .multilineTextAlignment(.center)
+            VStack(spacing: Theme.Spacing.xxl) {
+                hero
+                    .padding(.top, Theme.Spacing.xxxl)
+                features
+                if !appState.hasPlus {
+                    plan
                 }
-                .padding(.top, Theme.Spacing.xxl)
-
-                VStack(spacing: Theme.Spacing.s) {
-                    ForEach(PlusFeature.allCases) { feature in
-                        FeatureRow(feature: feature)
-                    }
-                }
-
-                GlassCard(tint: Theme.online.opacity(0.08)) {
-                    HStack(alignment: .top, spacing: Theme.Spacing.m) {
-                        Image(systemName: "checkmark.shield.fill")
-                            .font(.title3)
-                            .foregroundStyle(Theme.online)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Safety is always free")
-                                .font(.stexxHeadline)
-                            Text("Blocking, reporting, hiding your distance and expiring photos never cost a thing.")
-                                .font(.footnote)
-                                .foregroundStyle(Theme.textSecondary)
-                        }
-                    }
-                }
+                safetyNote
             }
-            .padding(.horizontal, Theme.Spacing.l)
-            .padding(.bottom, Theme.Spacing.l)
+            .padding(.horizontal, Theme.Spacing.screen)
+            .padding(.bottom, Theme.Spacing.xl)
         }
-        .stexxBackground(intensity: 1.2)
+        .stexxBackground()
         .safeAreaInset(edge: .bottom) { purchaseBar }
         .overlay(alignment: .topTrailing) {
             GlassIconButton("Close", systemImage: "xmark") { dismiss() }
@@ -110,20 +86,143 @@ struct PaywallView: View {
             Text(purchases.errorMessage ?? "")
         }
         .task { await purchases.loadProducts() }
+        .onAppear { hasAppeared = true }
+        .sensoryFeedback(.impact(weight: .medium), trigger: purchaseTaps)
+        .sensoryFeedback(.success, trigger: appState.hasPlus) { old, new in !old && new }
     }
 
+    // MARK: Hero
+
+    private var hero: some View {
+        VStack(spacing: Theme.Spacing.l) {
+            StexxLogoTile(size: 96)
+                .accessibilityHidden(true)
+                .padding(.bottom, Theme.Spacing.m)
+
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Wordmark(size: 52)
+                Text(verbatim: "+")
+                    .font(.stexxDisplay(52))
+                    .foregroundStyle(Theme.frost)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(verbatim: "Stexx+"))
+            .accessibilityAddTraits(.isHeader)
+
+            Tagline()
+
+            Text("Extras for you.\nServers for everyone.")
+                .font(.stexxSub)
+                .foregroundStyle(Theme.steel)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: Features
+
+    private var features: some View {
+        GlassCard(padding: 0, rimLit: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                SectionLabel("What you get")
+                    .padding(.horizontal, Theme.Spacing.l)
+                    .padding(.top, Theme.Spacing.l)
+                    .padding(.bottom, Theme.Spacing.s)
+                ForEach(Array(PlusFeature.allCases.enumerated()), id: \.element) { index, feature in
+                    if index > 0 {
+                        HairlineDivider(leadingInset: Theme.Spacing.l + FeatureRow.iconWidth + Theme.Spacing.m)
+                    }
+                    FeatureRow(feature: feature)
+                        .padding(.horizontal, Theme.Spacing.l)
+                        .opacity(hasAppeared ? 1 : 0)
+                        .offset(y: hasAppeared || reduceMotion ? 0 : 6)
+                        .animation(
+                            reduceMotion
+                                ? Motion.fade
+                                : Motion.standard.delay(0.08 + Double(index) * 0.04),
+                            value: hasAppeared
+                        )
+                }
+            }
+            .padding(.bottom, Theme.Spacing.s)
+        }
+    }
+
+    // MARK: Plan
+
+    /// The single monthly plan, shown as a flat, selected row.
+    private var plan: some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        return VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+            SectionLabel("Plan")
+            HStack(spacing: Theme.Spacing.m) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.body)
+                    .foregroundStyle(Theme.ice)
+                Text("Monthly")
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
+                Spacer(minLength: Theme.Spacing.s)
+                Text(verbatim: purchases.displayPrice)
+                    .stexxLabelStyle(color: Theme.frost)
+            }
+            .padding(.horizontal, Theme.Spacing.l)
+            .frame(minHeight: 52)
+            .background(shape.fill(Theme.ink2))
+            .overlay(shape.strokeBorder(Theme.frost.opacity(0.6), lineWidth: 0.5))
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isSelected)
+        }
+    }
+
+    // MARK: Safety
+
+    private var safetyNote: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HairlineDivider()
+            HStack(alignment: .top, spacing: Theme.Spacing.m) {
+                Image(systemName: "checkmark.shield")
+                    .font(.body)
+                    .foregroundStyle(Theme.steel)
+                    .frame(width: FeatureRow.iconWidth)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Safety is always free")
+                        .font(.stexxHeadline)
+                        .foregroundStyle(Theme.frost)
+                    Text("Blocking, reporting, hiding your distance and expiring photos never cost a thing.")
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.steel)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.vertical, Theme.Spacing.l)
+            HairlineDivider()
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    // MARK: Purchase
+
     private var purchaseBar: some View {
-        VStack(spacing: Theme.Spacing.s) {
+        VStack(spacing: Theme.Spacing.m) {
             if appState.hasPlus {
                 Label("You have Stexx+. Thank you!", systemImage: "heart.fill")
-                    .font(.headline)
-                    .foregroundStyle(Theme.violetBright)
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
                     .padding(.vertical, Theme.Spacing.m)
             } else {
                 Button {
+                    purchaseTaps += 1
                     Task { await purchases.purchase(using: purchase) }
                 } label: {
-                    WideLabel("Get Stexx+ for \(purchases.displayPrice)/month")
+                    HStack(spacing: Theme.Spacing.s) {
+                        if purchases.isPurchasing {
+                            ProgressView()
+                                .tint(Theme.ink)
+                        }
+                        Text("Get Stexx+ for \(purchases.displayPrice)/month")
+                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .stexxPrimaryButton()
                 .disabled(purchases.isPurchasing || purchases.isRestoring)
@@ -131,8 +230,8 @@ struct PaywallView: View {
                 Button("Restore purchases") {
                     Task { await purchases.restore() }
                 }
-                .font(.footnote)
-                .foregroundStyle(Theme.textSecondary)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(Theme.steel)
                 .disabled(purchases.isPurchasing || purchases.isRestoring)
 
                 #if DEBUG
@@ -140,57 +239,51 @@ struct PaywallView: View {
                     Task { await purchases.debugGrantPlus() }
                 }
                 .font(.footnote)
-                .foregroundStyle(Theme.textTertiary)
+                .foregroundStyle(Theme.slate)
                 #endif
 
                 Text("Cancel anytime in Settings. Billed monthly through the App Store.")
                     .font(.caption)
-                    .foregroundStyle(Theme.textTertiary)
+                    .foregroundStyle(Theme.slate)
                     .multilineTextAlignment(.center)
             }
         }
-        .padding(.horizontal, Theme.Spacing.xl)
+        .padding(.horizontal, Theme.Spacing.screen)
         .padding(.top, Theme.Spacing.l)
         .padding(.bottom, Theme.Spacing.s)
-        // The bar sits in a safe-area inset over the scroll view; without a
-        // backdrop, scrolled cards showed through behind the buttons.
+        // The bar sits in a safe-area inset over the scroll view: black
+        // frosted glass keeps scrolled content from showing through.
         .background {
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.background.opacity(0), location: 0),
-                    .init(color: Theme.background.opacity(0.92), location: 0.25),
-                    .init(color: Theme.background, location: 1),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .ignoresSafeArea(edges: .bottom)
+            Color.clear
+                .blackGlass(in: Rectangle())
+                .ignoresSafeArea(edges: .bottom)
         }
     }
 }
 
 private struct FeatureRow: View {
+    static let iconWidth: CGFloat = 24
+
     let feature: PlusFeature
 
     var body: some View {
-        HStack(spacing: Theme.Spacing.m) {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.m) {
             Image(systemName: feature.systemImage)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(Theme.violetBright)
-                .frame(width: 40, height: 40)
-                .background(Theme.violet.opacity(0.18), in: .circle)
+                .font(.body)
+                .foregroundStyle(Theme.steel)
+                .frame(width: Self.iconWidth)
             VStack(alignment: .leading, spacing: 2) {
                 Text(feature.title)
                     .font(.stexxHeadline)
-                    .foregroundStyle(Theme.textPrimary)
+                    .foregroundStyle(Theme.frost)
                 Text(feature.detail)
-                    .font(.footnote)
-                    .foregroundStyle(Theme.textSecondary)
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }
-        .padding(Theme.Spacing.m)
-        .glassEffect(.regular, in: .rect(cornerRadius: 20))
+        .padding(.vertical, Theme.Spacing.m)
         .accessibilityElement(children: .combine)
     }
 }

@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Shows a profile's primary photo, or a tasteful generated placeholder
-/// (violet-family gradient + silhouette) when there is none. The placeholder
-/// is deterministic per profile so the grid doesn't reshuffle on reload.
+/// Shows a profile's primary photo, or a generated placeholder (cool ink
+/// gradient + silhouette) when there is none. The placeholder is
+/// deterministic per profile so the grid doesn't reshuffle on reload.
 struct ProfilePhotoView: View {
     let profile: Profile
     var photoIndex = 0
@@ -27,17 +27,17 @@ struct ProfilePhotoView: View {
     }
 }
 
-/// Generated stand-in for a missing photo.
+/// Generated stand-in for a missing photo: cool steel/ink gradients only.
 struct PhotoPlaceholder: View {
     let seed: String
 
     private static let palettes: [(Color, Color)] = [
-        (Color(hex: 0x3F2C80), Color(hex: 0x16131F)),
-        (Color(hex: 0x6A3A7A), Color(hex: 0x1A1220)),
-        (Color(hex: 0x2E3A7A), Color(hex: 0x12131D)),
-        (Color(hex: 0x7A3A5C), Color(hex: 0x1C1118)),
-        (Color(hex: 0x4B2F6E), Color(hex: 0x0F0E14)),
-        (Color(hex: 0x30506E), Color(hex: 0x11151B)),
+        (Color(hex: 0x1B2430), Color(hex: 0x0A0C10)),
+        (Color(hex: 0x222A35), Color(hex: 0x0B0D11)),
+        (Color(hex: 0x1A2028), Color(hex: 0x08090C)),
+        (Color(hex: 0x262C36), Color(hex: 0x0D0F13)),
+        (Color(hex: 0x1E2733), Color(hex: 0x090B0E)),
+        (Color(hex: 0x2A2F38), Color(hex: 0x0E1014)),
     ]
 
     var body: some View {
@@ -47,63 +47,57 @@ struct PhotoPlaceholder: View {
             Image(systemName: "person.fill")
                 .resizable()
                 .scaledToFit()
-                .foregroundStyle(.white.opacity(0.14))
+                .foregroundStyle(Theme.frost.opacity(0.10))
                 .scaleEffect(0.62, anchor: .bottom)
         }
     }
 }
 
-/// Round avatar for lists and toolbars.
+/// Square-ish avatar (radius 6, part of the cell motif) with a 0.5pt line
+/// and an optional static online dot at the bottom-trailing corner.
 struct AvatarView: View {
     let profile: Profile
     var size: CGFloat = 52
     var showsOnline = true
+    var cornerRadius: CGFloat = Theme.Radius.avatar
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         ProfilePhotoView(profile: profile)
             .frame(width: size, height: size)
-            .clipShape(.circle)
-            .overlay(Circle().strokeBorder(Theme.hairline, lineWidth: 0.5))
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(Theme.line, lineWidth: 0.5))
             .overlay(alignment: .bottomTrailing) {
                 if showsOnline && profile.isOnline {
-                    OnlineDot(size: max(10, size * 0.24))
+                    OnlineDot().offset(x: 3, y: 3)
                 }
             }
     }
 }
 
-/// Green "online now" indicator with a dark ring so it reads on photos.
+/// "Online now": a static 6pt `online` dot with a 1.5pt ink ring so it reads
+/// on any photo. No pulse, no glow.
 struct OnlineDot: View {
-    var size: CGFloat = 10
+    var size: CGFloat = 6
 
     var body: some View {
         Circle()
             .fill(Theme.online)
             .frame(width: size, height: size)
-            .overlay(Circle().strokeBorder(Theme.background, lineWidth: size * 0.2))
-            .shadow(color: Theme.online.opacity(0.6), radius: size * 0.4)
+            .padding(1.5)
+            .background(Circle().fill(Theme.ink))
+            .accessibilityElement(children: .ignore)
             .accessibilityLabel("Online")
     }
 }
 
-/// Small static tag, e.g. interests on a profile.
-struct TagChip: View {
-    let text: String
-    var systemImage: String?
+/// Legacy adapter (v1 pulsing glow): now the static `OnlineDot`. `size` is
+/// ignored so every call site gets the 6pt dot.
+struct OnlineGlow: View {
+    var size: CGFloat = 6
 
     var body: some View {
-        HStack(spacing: 5) {
-            if let systemImage {
-                Image(systemName: systemImage).font(.caption2)
-            }
-            Text(text)
-        }
-        .font(.footnote.weight(.medium))
-        .foregroundStyle(Theme.textPrimary)
-        .padding(.horizontal, 11)
-        .padding(.vertical, 6)
-        .background(Theme.surface, in: .capsule)
-        .overlay(Capsule().strokeBorder(Theme.hairline, lineWidth: 0.5))
+        OnlineDot()
     }
 }
 
@@ -182,6 +176,6 @@ extension Collection {
         .padding()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(GlowBackground())
+    .stexxBackground()
     .preferredColorScheme(.dark)
 }

@@ -1,6 +1,11 @@
 import SwiftUI
 
-/// The grid of people nearby, closest first.
+/// The grid of people nearby, in the server's closest-first order.
+///
+/// A uniform grid: three equal columns of 3:4 tiles on 2pt gutters. Every
+/// profile gets the same tile; nobody is featured or given extra weight.
+/// The tab header's compact row holds the quick filters and the filters
+/// button, under the centered xx logo row.
 struct NearbyView: View {
     enum QuickFilter: Hashable, CaseIterable {
         case all, online, rightNow, favorites
@@ -26,6 +31,7 @@ struct NearbyView: View {
 
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var profiles: [Profile] = []
     @State private var nextCursor: String?
@@ -36,8 +42,9 @@ struct NearbyView: View {
     @State private var errorMessage: String?
     @State private var isShowingFilters = false
     @State private var loadedQuery: NearbyQuery?
+    @State private var path = NavigationPath()
 
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 3)
+    @Namespace private var zoomNamespace
 
     private var visibleProfiles: [Profile] {
         profiles.filter { !appState.blockedIDs.contains($0.id) }
@@ -57,35 +64,44 @@ struct NearbyView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                filterBar
-                    .padding(.bottom, Theme.Spacing.s)
+        let visible = visibleProfiles
+        let lastID = visible.last?.id
 
-                LazyVGrid(columns: columns, spacing: 4) {
-                    ForEach(visibleProfiles) { profile in
-                        NavigationLink(value: profile) {
-                            ProfileTile(profile: profile)
-                        }
-                        .buttonStyle(.plain)
-                        .onAppear {
-                            if profile.id == visibleProfiles.last?.id { Task { await loadMore() } }
-                        }
+        NavigationStack(path: $path) {
+            ScrollView {
+                LazyVGrid(columns: NearbyGridMetrics.gridColumns, spacing: NearbyGridMetrics.spacing) {
+                    ForEach(visible) { profile in
+                        tileLink(profile)
+                            .aspectRatio(NearbyGridMetrics.tileAspect, contentMode: .fit)
+                            .onAppear {
+                                if profile.id == lastID { Task { await loadMore() } }
+                            }
                     }
                 }
-                .padding(.horizontal, 4)
+                .padding(.horizontal, NearbyGridMetrics.spacing)
+                .padding(.top, NearbyGridMetrics.spacing)
+                .padding(.bottom, Theme.Spacing.xl)
 
                 if isLoading && profiles.isEmpty {
                     ProgressView()
+                        .controlSize(.regular)
+                        .tint(Theme.steel)
                         .padding(.top, 80)
                 }
             }
+            .collapsesTabHeaderLogo()
             .overlay {
-                if !isLoading && visibleProfiles.isEmpty {
+                if !isLoading && visible.isEmpty {
                     emptyState
                 }
             }
-            .stexxBackground(intensity: 0.8)
+            .tabHeader {
+                filterBar(onlineCount: visible.filter(\.isOnline).count)
+            } trailing: {
+                filtersButton
+            }
+            .sensoryFeedback(.selection, trigger: quickFilter)
+            .stexxBackground()
             .refreshable { await reload() }
             .task(id: query) {
                 // Runs on first appearance and whenever a filter changes;
@@ -94,34 +110,9 @@ struct NearbyView: View {
                 await reload()
             }
             .navigationTitle("Nearby")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Wordmark(size: 24)
-                }
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        appState.isPaywallPresented = true
-                    } label: {
-                        Label("Stexx+", systemImage: "sparkles")
-                    }
-                    .tint(Theme.violetBright)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        if appState.requirePlus() { isShowingFilters = true }
-                    } label: {
-                        Label(
-                            "Filters",
-                            systemImage: hasActiveAdvancedFilters
-                                ? "line.3.horizontal.decrease.circle.fill"
-                                : "line.3.horizontal.decrease"
-                        )
-                    }
-                }
-            }
             .navigationDestination(for: Profile.self) { profile in
                 ProfileDetailView(profile: profile)
+                    .modifier(NearbyZoomTransition(sourceID: profile.id, namespace: zoomNamespace))
             }
             .navigationDestination(for: ChatRoute.self) { route in
                 ChatThreadView(route: route)
@@ -130,27 +121,78 @@ struct NearbyView: View {
                 FilterSheet(query: $advanced)
             }
         }
+        // A light tick when a profile opens from the grid.
+        .sensoryFeedback(.impact(weight: .light), trigger: path.count) { old, new in
+            old == 0 && new == 1
+        }
     }
 
-    private var filterBar: some View {
+    // MARK: Header
+
+    /// Quick filters inline in the header row. The Online chip carries the
+    /// live online count ("ONLINE 18") when there is one.
+    private func filterBar(onlineCount: Int) -> some View {
         ScrollView(.horizontal) {
-            GlassEffectContainer(spacing: 8) {
-                HStack(spacing: 8) {
+            GlassEffectContainer(spacing: 6) {
+                HStack(spacing: 6) {
                     ForEach(QuickFilter.allCases, id: \.self) { filter in
-                        GlassChip(filter.title, systemImage: filter.systemImage, isSelected: quickFilter == filter) {
-                            quickFilter = filter
+                        GlassChip(chipTitle(filter, onlineCount: onlineCount), systemImage: filter.systemImage, isSelected: quickFilter == filter) {
+                            selectQuickFilter(filter)
                         }
                     }
                     GlassChip("More filters", isSelected: hasActiveAdvancedFilters, isLocked: !appState.hasPlus) {
-                        if appState.requirePlus() { isShowingFilters = true }
+                        openAdvancedFilters()
                     }
                 }
-                .padding(.horizontal, Theme.Spacing.l)
-                .padding(.vertical, 4)
+                .padding(.vertical, 2)
             }
         }
         .scrollIndicators(.hidden)
     }
+
+    private func selectQuickFilter(_ filter: QuickFilter) {
+        withAnimation(Motion.animation(Motion.quick, reduceMotion: reduceMotion)) {
+            quickFilter = filter
+        }
+    }
+
+    private func openAdvancedFilters() {
+        if appState.requirePlus() { isShowingFilters = true }
+    }
+
+    private func chipTitle(_ filter: QuickFilter, onlineCount: Int) -> Text {
+        if filter == .online, onlineCount > 0 {
+            return Text("Online \(onlineCount)").monospacedDigit()
+        }
+        return Text(filter.title)
+    }
+
+    private var filtersButton: some View {
+        Button {
+            openAdvancedFilters()
+        } label: {
+            TabHeaderIconLabel(
+                title: "Filters",
+                systemImage: "line.3.horizontal.decrease",
+                tint: hasActiveAdvancedFilters ? Theme.ice : Theme.steel
+            )
+        }
+        .buttonStyle(.pressable)
+        .padding(.trailing, -Theme.Spacing.s)
+        .accessibilityValue(hasActiveAdvancedFilters ? Text("On") : Text(verbatim: ""))
+    }
+
+    // MARK: Grid
+
+    private func tileLink(_ profile: Profile) -> some View {
+        NavigationLink(value: profile) {
+            ProfileTile(profile: profile)
+                .matchedTransitionSource(id: profile.id, in: zoomNamespace)
+        }
+        .buttonStyle(NearbyTilePressStyle())
+    }
+
+    // MARK: States
 
     @ViewBuilder
     private var emptyState: some View {
@@ -159,18 +201,33 @@ struct NearbyView: View {
                 Label("Couldn't load the grid", systemImage: "wifi.exclamationmark")
             } description: {
                 Text(errorMessage)
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
             } actions: {
                 Button("Try again") { Task { await reload() } }
                     .stexxSecondaryButton()
             }
         } else {
-            ContentUnavailableView(
-                "Nobody here yet",
-                systemImage: "sparkles",
-                description: Text("Try fewer filters, or check back in a bit.")
-            )
+            ContentUnavailableView {
+                Label {
+                    Text("Nobody here yet")
+                        .stexxTitleStyle(.title)
+                } icon: {
+                    StexxMark(size: 40, glows: false)
+                        .padding(Theme.Spacing.m)
+                        .cellCorners()
+                        .padding(.bottom, Theme.Spacing.s)
+                        .accessibilityHidden(true)
+                }
+            } description: {
+                Text("Try fewer filters, or check back in a bit.")
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
+            }
         }
     }
+
+    // MARK: Loading
 
     private func reload() async {
         isLoading = true
@@ -207,58 +264,129 @@ struct NearbyView: View {
     }
 }
 
-/// A photo tile in the grid: photo, name, distance and online status.
+// MARK: - Tile
+
+/// A photo tile in the grid: photo, name, mono distance, a static online
+/// dot and the favourite star. Every tile is identical: radius 4, no rim
+/// light, no cell corners.
 struct ProfileTile: View {
     let profile: Profile
 
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous)
+    }
+
     var body: some View {
         Color.clear
-            .aspectRatio(0.78, contentMode: .fit)
             .overlay { ProfilePhotoView(profile: profile) }
-            .overlay(alignment: .bottom) {
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 5) {
-                        if profile.isOnline {
-                            OnlineDot(size: 8)
-                        }
-                        Text(profile.displayName)
-                            .font(.footnote.weight(.semibold))
-                            .lineLimit(1)
-                    }
-                    if let distance = profile.distanceMeters {
-                        Text(StexxFormat.distance(distance))
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.7))
-                    }
-                }
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
-                .padding(.top, 24)
-                .padding(.bottom, 7)
-                .background(Theme.photoScrim)
-            }
-            .overlay(alignment: .topTrailing) {
-                if profile.isFavorite {
-                    Image(systemName: "star.fill")
-                        .font(.caption2)
-                        .foregroundStyle(Theme.warning)
-                        .padding(6)
-                        .shadow(radius: 3)
-                }
-            }
-            .clipShape(.rect(cornerRadius: 10))
-            .contentShape(.rect(cornerRadius: 10))
+            .overlay(alignment: .bottom) { caption }
+            .overlay(alignment: .topTrailing) { favoriteMark }
+            .clipShape(shape)
+            .contentShape(shape)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(accessibilityText)
             .accessibilityAddTraits(.isButton)
+    }
+
+    private var caption: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 5) {
+                if profile.isOnline {
+                    OnlineDot()
+                }
+                Text(profile.displayName)
+                    .font(.system(.footnote, weight: .semibold))
+                    .foregroundStyle(Theme.frost)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            if let distance = profile.distanceMeters {
+                Text(StexxFormat.distance(distance))
+                    .stexxLabelStyle(.micro, color: Theme.frost.opacity(0.7))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 7)
+        .padding(.top, 24)
+        .padding(.bottom, 7)
+        .background(Theme.photoScrim)
+    }
+
+    @ViewBuilder
+    private var favoriteMark: some View {
+        if profile.isFavorite {
+            Image(systemName: "star.fill")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Theme.frost)
+                .shadow(color: .black.opacity(0.45), radius: 2)
+                .padding(6)
+        }
     }
 
     private var accessibilityText: Text {
         var parts = [profile.nameAndAge]
         if profile.isOnline { parts.append(String(localized: "online")) }
         if let distance = profile.distanceMeters { parts.append(StexxFormat.distance(distance)) }
+        if profile.isFavorite { parts.append(String(localized: "favorite")) }
         return Text(parts.joined(separator: ", "))
+    }
+}
+
+// MARK: - Grid metrics
+
+private enum NearbyGridMetrics {
+    static let columns = 3
+    /// 2pt gutters on ink, so the gaps read as grid lines.
+    static let spacing: CGFloat = Theme.Spacing.gridGutter
+    /// Width / height of a tile (3:4).
+    static let tileAspect: CGFloat = 0.75
+    static let gridColumns = Array(
+        repeating: GridItem(.flexible(), spacing: spacing),
+        count: columns
+    )
+}
+
+// MARK: - Motion helpers
+
+/// Tiles sink slightly when pressed (no bounce); just dim under Reduce Motion.
+private struct NearbyTilePressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        NearbyTilePressBody(configuration: configuration)
+    }
+}
+
+private struct NearbyTilePressBody: View {
+    let configuration: ButtonStyleConfiguration
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.98 : 1)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .animation(
+                reduceMotion ? Motion.fade : (configuration.isPressed ? Motion.press : Motion.quick),
+                value: configuration.isPressed
+            )
+    }
+}
+
+/// The profile zooms out of its tile; plain push under Reduce Motion.
+private struct NearbyZoomTransition: ViewModifier {
+    let sourceID: Profile.ID
+    let namespace: Namespace.ID
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if reduceMotion {
+            content
+        } else {
+            content.navigationTransition(.zoom(sourceID: sourceID, in: namespace))
+        }
     }
 }
 
@@ -267,10 +395,14 @@ struct ProfileTile: View {
         .previewEnvironment()
 }
 
-#Preview("Tile") {
-    ProfileTile(profile: MockData.profiles[0])
-        .frame(width: 130)
-        .padding()
-        .background(GlowBackground())
-        .preferredColorScheme(.dark)
+#Preview("Tiles") {
+    HStack(alignment: .top, spacing: 2) {
+        ProfileTile(profile: MockData.profiles[0])
+            .frame(width: 115, height: 153)
+        ProfileTile(profile: MockData.profiles[1])
+            .frame(width: 115, height: 153)
+    }
+    .padding()
+    .background(Theme.ink)
+    .preferredColorScheme(.dark)
 }
