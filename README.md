@@ -28,7 +28,7 @@ An open-source, ad-free, privacy-first gay dating and hookup app. A Grindr alter
 
 ## Status
 
-Very early. We're figuring out the stack and design right now. Star the repo to follow along.
+Very early. The native iOS app (SwiftUI, iOS 26, Liquid Glass) is in [`ios/`](ios/) and runs against a mock backend; see [`ios/README.md`](ios/README.md) to build it. The planned server API is sketched in [`docs/api.md`](docs/api.md). Star the repo to follow along.
 
 ## Contributing
 
