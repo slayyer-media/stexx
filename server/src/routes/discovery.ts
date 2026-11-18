@@ -6,6 +6,7 @@ import { decodeCursor, encodeCursor } from "../lib/cursor.ts";
 import { badRequest, notFound } from "../lib/errors.ts";
 import { logError } from "../lib/logger.ts";
 import { isConnected, publishUnlessBlocked } from "../lib/realtime.ts";
+import { assertMayTap } from "../lib/moderation.ts";
 import { requirePlus } from "../lib/plus.ts";
 import { rateLimit } from "../lib/ratelimit.ts";
 import { ONLINE_WINDOW_MS, profileColumns, profilesFor, viewerCell, type ProfileRow } from "../lib/serialize.ts";
@@ -20,7 +21,7 @@ import {
   qMany,
   qOne,
 } from "../lib/validation.ts";
-import { assertVisibleUser, col, isIncognito, notBlocked, val, visibleToViewer } from "../lib/visibility.ts";
+import { assertVisibleUser, col, isIncognito, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
 import { DAY, isoDate } from "../lib/time.ts";
 import type { AppEnv } from "../types.ts";
 
@@ -135,6 +136,7 @@ discoveryRoutes.get("/nearby", requireAuth, async (c) => {
                      % ${lonRegions}::int + ${lonRegions}::int) % ${lonRegions}::int) IN (0, 1, ${lonRegions - 1}::int)))
          AND ${notBlocked(val(me), col("u.id"))}
          AND ${visibleToViewer(val(me), "u")}
+         AND ${notModerated("u")}
          AND (NOT ${q.onlineOnly} OR (u.show_online_status AND u.last_active_at > ${onlineCutoff}))
          AND (NOT ${q.favoritesOnly} OR EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = ${me} AND f.target_id = u.id))
          AND (${lookingFor.length === 0} OR u.looking_for && ${lookingFor}::text[])
@@ -198,6 +200,7 @@ discoveryRoutes.post("/profiles/:id/tap", requireAuth, rateLimit("taps"), async 
   const me = currentUserId(c);
   const id = idParam(c, "id", "user");
   await assertVisibleUser(me, id);
+  await assertMayTap(me);
 
   // One tap per (from,to) per 24 h; a repeat inside the window is an idempotent no-op.
   const created = await sql.begin(async (tx) => {

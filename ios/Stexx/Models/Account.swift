@@ -101,6 +101,53 @@ struct ReportRequest: Codable, Hashable, Sendable {
     var details: String?
     var conversationID: Conversation.ID?
     var alsoBlock: Bool
+    /// Messages the reporter chose to share with moderators. Only valid
+    /// together with `conversationID`.
+    var evidence: [ReportEvidence]?
+}
+
+/// One message the reporter chose to share. Chats are headed for end-to-end
+/// encryption, so the app sends the plaintext itself. Photos are not
+/// uploaded: a photo message is flagged with `hasPhoto`.
+struct ReportEvidence: Codable, Hashable, Sendable {
+    /// The server accepts at most this many items per report.
+    static let maxItems = 20
+    static let maxTextLength = 4000
+    static let maxIDLength = 64
+
+    var messageID: String?
+    var sentAt: Date?
+    /// `true` when the person being reported sent this message.
+    var fromReported: Bool
+    var text: String?
+    var hasPhoto: Bool?
+
+    /// Builds the evidence list from exactly the selected messages, oldest
+    /// first. Unselected messages are never included; messages with neither
+    /// text nor a photo are dropped. Keeps the newest `maxItems`.
+    static func from(
+        messages: [Message],
+        selectedIDs: Set<Message.ID>,
+        reportedID: Profile.ID
+    ) -> [ReportEvidence] {
+        let items: [ReportEvidence] = messages
+            .filter { selectedIDs.contains($0.id) }
+            .sorted { $0.sentAt < $1.sentAt }
+            .compactMap { message in
+                let trimmed = message.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let text = (trimmed?.isEmpty ?? true) ? nil : String(trimmed!.prefix(maxTextLength))
+                let hasPhoto = message.attachment?.kind == .photo
+                guard text != nil || hasPhoto else { return nil }
+                return ReportEvidence(
+                    messageID: String(message.id.prefix(maxIDLength)),
+                    sentAt: message.sentAt,
+                    fromReported: message.senderID == reportedID,
+                    text: text,
+                    hasPhoto: hasPhoto ? true : nil
+                )
+            }
+        return Array(items.suffix(maxItems))
+    }
 }
 
 /// A location that has already been coarsened on device.

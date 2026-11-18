@@ -208,6 +208,7 @@ echo "  new release:      $STAMP"
 log "Uploading code"
 rrun "sudo mkdir -p '$NEW'"
 # Explicit allowlist: only what runs. No tests, no docker files, no .env*, no node_modules, no src/dev.
+# (scripts/moderate.ts is added below.)
 # certs/ holds Apple's public root CA for StoreKit verification (APPLE_ROOT_CA_DIR=/srv/stexx/current/certs).
 for item in src migrations certs; do
   sync_to "$item" "$NEW/" --exclude='/src/dev/' --exclude='*.test.ts'
@@ -215,6 +216,9 @@ done
 for item in package.json bun.lock tsconfig.json bunfig.toml; do
   sync_to "$item" "$NEW/"
 done
+# The moderator CLI (bun scripts/moderate.ts); the rest of scripts/ is dev tooling and stays local.
+rrun "sudo mkdir -p '$NEW/scripts'"
+sync_to scripts/moderate.ts "$NEW/scripts/"
 
 log "Installing dependencies on the server (frozen lockfile, production only, no install scripts)"
 rrun "cd '$NEW' && sudo $BUN install --frozen-lockfile --production --ignore-scripts"

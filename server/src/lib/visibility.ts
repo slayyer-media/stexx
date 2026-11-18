@@ -43,6 +43,29 @@ export function visibleToViewer(viewer: Fragment, t: string): Fragment {
        AND ((cv.user_a = ${tid} AND cv.user_b = ${viewer}) OR (cv.user_b = ${tid} AND cv.user_a = ${viewer}))))`;
 }
 
+/**
+ * Moderation gate for LISTS of other users (nearby grid, viewers): TRUE unless the target row `t` is hidden pending
+ * review (auto-hidden after reports, or by a moderator) or banned. No exceptions: a hidden account disappears from
+ * discovery for everyone.
+ */
+export function notModerated(t: string): Fragment {
+  return sql`(${sql(t + ".hidden_at")} IS NULL AND ${sql(t + ".banned_at")} IS NULL)`;
+}
+
+/**
+ * Moderation gate for showing ONE other user (profile, conversation list, favorite, tap): TRUE when target row `t`
+ * may be shown to `viewer`. Banned: never. Hidden: only to people who have written to them (their existing
+ * conversations keep working for the people they were already talking to; someone who only received messages from
+ * them, e.g. spam, no longer sees them). Combine with notBlocked().
+ */
+export function moderationVisible(viewer: Fragment, t: string): Fragment {
+  const tid = sql(t + ".id");
+  return sql`(${sql(t + ".banned_at")} IS NULL AND (${sql(t + ".hidden_at")} IS NULL OR EXISTS (
+    SELECT 1 FROM conversations cv JOIN messages ms ON ms.conversation_id = cv.id
+     WHERE ms.sender_id = ${viewer}
+       AND ((cv.user_a = ${tid} AND cv.user_b = ${viewer}) OR (cv.user_b = ${tid} AND cv.user_a = ${viewer})))))`;
+}
+
 /** Whether a block exists in either direction between two users. */
 export async function isBlockedEitherWay(a: string, b: string, db: Sql = sql): Promise<boolean> {
   const [row] = await db<{ blocked: boolean }[]>`
@@ -54,8 +77,9 @@ export async function isBlockedEitherWay(a: string, b: string, db: Sql = sql): P
 }
 
 /**
- * 404 unless `targetId` is an existing user, is not the viewer (unless allowSelf), and no block exists
- * either way. Use for profiles/{id}, favorite, tap, open conversation, etc.
+ * 404 unless `targetId` is an existing user, is not the viewer (unless allowSelf), no block exists
+ * either way, and moderation doesn't hide them from the viewer (moderationVisible). Use for profiles/{id},
+ * favorite, tap, open conversation, etc.
  */
 export async function assertVisibleUser(
   viewerId: string,
@@ -66,7 +90,10 @@ export async function assertVisibleUser(
   const db = opts.db ?? sql;
   const [row] = await db<{ ok: boolean }[]>`
     SELECT EXISTS (
-      SELECT 1 FROM users u WHERE u.id = ${targetId} AND ${notBlocked(val(viewerId), col("u.id"))}
+      SELECT 1 FROM users u
+       WHERE u.id = ${targetId}
+         AND (u.id = ${viewerId}
+              OR (${notBlocked(val(viewerId), col("u.id"))} AND ${moderationVisible(val(viewerId), "u")}))
     ) AS ok`;
   if (!row?.ok) throw notFound();
 }

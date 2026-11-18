@@ -205,6 +205,43 @@ export async function purgeAbuseCounters(now: Date = new Date()): Promise<number
   });
 }
 
+export interface ReportPurgeResult {
+  /** report_evidence rows deleted. */
+  evidence: number;
+  /** Reports whose free-text details and reporter IP hash were cleared. */
+  scrubbed: number;
+}
+
+/**
+ * Report evidence is kept only while a moderator may need it (docs/security.md): the messages a reporter shared, the
+ * report's free-text details and the reporter's IP hash are deleted REPORT_EVIDENCE_RETENTION_DAYS (30) after the
+ * report is closed, or after it was filed when the reported account no longer exists, and in any case
+ * REPORT_EVIDENCE_MAX_DAYS (180) after it was filed. The report row itself (reason, status, dates) stays, anonymized
+ * by the SET NULL foreign keys when either account is deleted.
+ */
+export async function purgeReportEvidence(now: Date = new Date()): Promise<ReportPurgeResult> {
+  const closedCutoff = new Date(now.getTime() - config.moderation.evidenceRetentionDays * DAY);
+  const maxCutoff = new Date(now.getTime() - config.moderation.evidenceMaxDays * DAY);
+  const expired = sql`(r.closed_at <= ${closedCutoff}
+                       OR (r.reported_id IS NULL AND r.created_at <= ${closedCutoff})
+                       OR r.created_at <= ${maxCutoff})`;
+  const evidence = await inBatches(async () => {
+    const res = await sql`
+      DELETE FROM report_evidence WHERE (report_id, position) IN (
+        SELECT e.report_id, e.position FROM report_evidence e JOIN reports r ON r.id = e.report_id
+         WHERE ${expired} LIMIT ${BATCH})`;
+    return res.count;
+  });
+  const scrubbed = await inBatches(async () => {
+    const res = await sql`
+      UPDATE reports SET details = NULL, reporter_ip_hash = NULL WHERE id IN (
+        SELECT r.id FROM reports r
+         WHERE (r.details IS NOT NULL OR r.reporter_ip_hash IS NOT NULL) AND ${expired} LIMIT ${BATCH})`;
+    return res.count;
+  });
+  return { evidence, scrubbed };
+}
+
 /** Clear finished boosts so the column only holds live ones. */
 export async function clearEndedBoosts(now: Date = new Date()): Promise<number> {
   return inBatches(async () => {
@@ -289,7 +326,7 @@ export async function runFastJobs(now: Date = new Date()) {
   return { expired, viewOnce, trashed };
 }
 
-/** Every 10 min: the 14-day caps (unread expiring messages, unopened view-once photos), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows. */
+/** Every 10 min: the 14-day caps (unread expiring messages, unopened view-once photos), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows, old report evidence. */
 export async function runSlowJobs(now: Date = new Date()) {
   const unreadCapped = await purgeUnreadExpiringMessages(now);
   const unopenedViewOnce = await purgeUnopenedViewOnceAttachments(now);
@@ -299,5 +336,6 @@ export async function runSlowJobs(now: Date = new Date()) {
   const boosts = await clearEndedBoosts(now);
   const devices = await purgeIdleDevices(now);
   const abuseCounters = await purgeAbuseCounters(now);
-  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts, devices, abuseCounters };
+  const reports = await purgeReportEvidence(now);
+  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts, devices, abuseCounters, reports };
 }

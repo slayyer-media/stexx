@@ -41,7 +41,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - 204: `return c.body(null, 204)`.
 - Blocks: every query that surfaces another user must use `notBlocked(...)` / `assertVisibleUser(...)`.
   Blocked → 404, never 403.
-- Lists of other users (nearby, viewers) must also apply `visibleToViewer(...)` (incognito).
+- Lists of other users (nearby, viewers) must also apply `visibleToViewer(...)` (incognito) and `notModerated("u")`
+  (accounts hidden after reports / banned). `profilesFor` and `assertVisibleUser` already apply `moderationVisible`.
 - Location: always `snapToCell()` client coords before storing; never return coordinates.
 - Logging: the request logger already logs method/route-pattern/status/ms. Don't `console.log` request data.
   Use `logError(event, err)` / `logInfo(event, fields)` with no user content.
@@ -102,7 +103,10 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `notBlocked(a, b)` — SQL boolean, symmetric. `WHERE ${notBlocked(val(me), col("u.id"))}`.
 - `isIncognito("u")` — `(u.incognito AND u.plus_expires_at > now())`.
 - `visibleToViewer(val(me), "u")` — incognito gate for lists: hidden unless target sent the viewer a message.
-- `isBlockedEitherWay(a, b, db?)` · `assertVisibleUser(viewer, target, {allowSelf?, db?})` → 404 if missing/self/blocked.
+- `notModerated("u")` — list gate: not hidden, not banned. `moderationVisible(val(me), "u")` — single-profile gate: never
+  banned; hidden only visible to people who have written to them.
+- `isBlockedEitherWay(a, b, db?)` · `assertVisibleUser(viewer, target, {allowSelf?, db?})` → 404 if missing/self/blocked/
+  hidden-or-banned for the viewer.
 - `orderedPair(x, y) → [user_a, user_b]` (byte order; matches `COLLATE "C"` columns).
 
 ### distance.ts
@@ -139,6 +143,14 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   `overrideTrustForTests`.
 - Tests run with `ATTESTATION_MODE=off`; `test/attest-helpers.ts` builds real assertions from
   `test/fixtures/app-attest/fixtures.json` (synthetic root, regenerate with `generate.ts`).
+
+### moderation.ts (reports, auto-hide, moderator actions; docs/security.md section 5)
+- `evaluateAutoHide(userId, tx)` — call in the report transaction. Pure rules: `assessReporters(facts, settings)`.
+- Gates for a hidden account's own actions: `assertMayStartContact(me, other)`, `assertMayMessage(me, conv, other)`,
+  `assertMayTap(me)` → 403 `account_under_review`. `createSession` refuses banned accounts (403 `account_banned`).
+- Actions (one tx + `moderation_actions` audit row each): `hideAccount`, `unhideAccount`, `dismissReports`,
+  `actionReports`, `banAccount`, `unbanAccount`; read: `reviewQueue`, `accountReview`, `auditLog`. CLI:
+  `src/moderation/cli.ts` (`scripts/moderate.ts`). Tests: `overrideAutoHideForTests`.
 
 ### media.ts
 - `sanitizeImage(bytes) → Buffer` (jpeg/png/webp/heif-if-supported → 400 `invalid_image` otherwise; 40 MP cap,
@@ -179,7 +191,8 @@ pending fields, used_at), favorites, taps (internal bigint id), blocks, profile_
 conversations (user_a < user_b, `COLLATE "C"`), conversation_members (cleared_before, hidden, last_read_at, muted),
 messages (attachment_kind/key/view_once/opened_at, delivered_at, read_at, read_receipt, expires_after_seconds,
 expires_at; UNIQUE(sender_id, client_id)), reports (SET NULL FKs, priority normal|high, status), subscriptions
-(PK original_transaction_id), dev_bots (dev seed markers).
+(PK original_transaction_id), dev_bots (dev seed markers). Migration 107: users.hidden_at/hidden_reason/banned_at/reviewed_at, reports.closed_at/
+reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL).
 
 ## Tests
 

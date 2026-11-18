@@ -2,7 +2,7 @@ import { sql, type Sql } from "../db/sql.ts";
 import { bucketedDistanceBetween, type Cell } from "./distance.ts";
 import { mediaUrl } from "./media.ts";
 import { isoDate, MINUTE } from "./time.ts";
-import { col, notBlocked, val } from "./visibility.ts";
+import { col, moderationVisible, notBlocked, val } from "./visibility.ts";
 
 /**
  * Wire models (must match docs/api.md + ios/Stexx/Models exactly) and the ONLY functions that build them.
@@ -260,7 +260,8 @@ export async function photosFor(ownerIds: readonly string[], db: Sql = sql): Pro
 
 /**
  * Build Profiles for `ids` as seen by `viewerId`, in input order. Missing users are skipped, and
- * users blocked either way are skipped unless `includeBlocked` (only GET /blocks should pass it).
+ * users blocked either way are skipped unless `includeBlocked` (only GET /blocks should pass it). Users hidden by
+ * moderation are skipped unless the viewer has written to them; banned users are always skipped (moderationVisible).
  * Does NOT apply the incognito list gate (lists must filter with visibleToViewer in their own query).
  * Pass `rows` if you already selected `profileColumns(viewerId)` to avoid a second users query.
  */
@@ -278,7 +279,9 @@ export async function profilesFor(
       SELECT ${profileColumns(viewerId)}
         FROM users u LEFT JOIN effective_locations el ON el.user_id = u.id
        WHERE u.id = ANY(${ids as string[]})
-         AND (${includeBlocked} OR u.id = ${viewerId} OR ${notBlocked(val(viewerId), col("u.id"))})`);
+         AND (u.id = ${viewerId}
+              OR (${includeBlocked} AND u.banned_at IS NULL)
+              OR (${notBlocked(val(viewerId), col("u.id"))} AND ${moderationVisible(val(viewerId), "u")}))`);
   const [photos, cell] = await Promise.all([
     photosFor(rows.map((r) => r.id), db),
     opts.cell !== undefined ? Promise.resolve(opts.cell) : viewerCell(viewerId, db),

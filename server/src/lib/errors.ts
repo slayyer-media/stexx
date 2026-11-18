@@ -36,6 +36,16 @@ export const tooManyRequests = (retryAfterSeconds: number) =>
   new ApiError(429, "rate_limited", "Slow down a little and try again in a moment.", {
     "Retry-After": String(Math.max(1, Math.ceil(retryAfterSeconds))),
   });
+/** The caller's account is hidden pending moderator review (src/lib/moderation.ts). Never says who reported them. */
+export const accountUnderReview = () =>
+  new ApiError(
+    403,
+    "account_under_review",
+    "Your account is being reviewed by our moderators. Until then you can keep chatting with people who've written to you, but you can't start new chats.",
+  );
+/** Sign-in to an account a moderator banned. */
+export const accountBanned = () =>
+  new ApiError(403, "account_banned", "This account has been suspended for breaking the Stexx community rules.");
 export const serviceUnavailable = (code: string, message: string) => new ApiError(503, code, message);
 
 export function errorResponse(c: Context, status: ContentfulStatusCode, code: string, message: string) {

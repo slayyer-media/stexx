@@ -78,6 +78,17 @@ const envSchema = z.object({
   TRUST_RAMP_DUPLICATE_RECIPIENTS: z.coerce.number().int().min(1).max(1000).default(3),
   TRUST_RAMP_GRADUATE_REPLIES: z.coerce.number().int().min(1).max(100).default(3),
 
+  // Reports, auto-hide and moderation (src/lib/moderation.ts, docs/security.md).
+  REPORT_AUTOHIDE_ENABLED: flag.default(true),
+  REPORT_AUTOHIDE_THRESHOLD: z.coerce.number().int().min(1).max(100).default(3),
+  REPORT_AUTOHIDE_WINDOW_DAYS: z.coerce.number().min(1).max(365).default(14),
+  REPORT_UNDERAGE_TRUSTED_THRESHOLD: z.coerce.number().int().min(1).max(100).default(1),
+  REPORT_UNDERAGE_ANY_THRESHOLD: z.coerce.number().int().min(1).max(100).default(2),
+  /** Default: TRUST_RAMP_HOURS. */
+  REPORT_REPORTER_MIN_AGE_HOURS: z.coerce.number().min(0).max(24 * 365).optional(),
+  REPORT_EVIDENCE_RETENTION_DAYS: z.coerce.number().min(1).max(365).default(30),
+  REPORT_EVIDENCE_MAX_DAYS: z.coerce.number().min(1).max(3650).default(180),
+
   STEXX_DEV_AUTH: flag,
   STEXX_DEV_DEFAULT_LOCATION: z.string().optional(),
   STEXX_DEV_WELCOME: flag,
@@ -112,6 +123,7 @@ export interface Config {
   };
   trustProxy: boolean;
   antiSpam: AntiSpamConfig;
+  moderation: ModerationConfig;
   /** Dev-only auth shortcuts (/auth/register returns a Session, /v1/dev/* mounted). Never true in production. */
   devAuth: boolean;
   /** Dev-only: new users get this cell so the grid isn't empty. null when unset or in production. */
@@ -147,6 +159,25 @@ export interface AntiSpamConfig {
     duplicateRecipients: number;
     graduateReplies: number;
   };
+}
+
+export interface ModerationConfig {
+  autoHide: {
+    enabled: boolean;
+    /** Independent trusted reporters (any reason) within the window that hide an account. */
+    threshold: number;
+    windowDays: number;
+    /** Independent trusted reporters of `underage` that hide an account. */
+    underageTrusted: number;
+    /** Distinct reporters of `underage` (not hidden/banned, different device and connection; any account age). */
+    underageAny: number;
+    /** A reporter counts as trusted from this account age (and when the trust ramp doesn't restrict them). */
+    reporterMinAgeHours: number;
+  };
+  /** Evidence (and report details, IP hash) is deleted this many days after the report is closed. */
+  evidenceRetentionDays: number;
+  /** Hard cap for evidence on reports that stay open. */
+  evidenceMaxDays: number;
 }
 
 export const DEFAULT_APP_ATTEST_ROOT_CA = new URL("../certs/app-attest/Apple_App_Attestation_Root_CA.pem", import.meta.url)
@@ -291,6 +322,18 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
         duplicateRecipients: e.TRUST_RAMP_DUPLICATE_RECIPIENTS,
         graduateReplies: e.TRUST_RAMP_GRADUATE_REPLIES,
       },
+    },
+    moderation: {
+      autoHide: {
+        enabled: e.REPORT_AUTOHIDE_ENABLED,
+        threshold: e.REPORT_AUTOHIDE_THRESHOLD,
+        windowDays: e.REPORT_AUTOHIDE_WINDOW_DAYS,
+        underageTrusted: e.REPORT_UNDERAGE_TRUSTED_THRESHOLD,
+        underageAny: e.REPORT_UNDERAGE_ANY_THRESHOLD,
+        reporterMinAgeHours: e.REPORT_REPORTER_MIN_AGE_HOURS ?? e.TRUST_RAMP_HOURS,
+      },
+      evidenceRetentionDays: e.REPORT_EVIDENCE_RETENTION_DAYS,
+      evidenceMaxDays: e.REPORT_EVIDENCE_MAX_DAYS,
     },
     devAuth: !isProduction && e.STEXX_DEV_AUTH,
     devDefaultLocation,

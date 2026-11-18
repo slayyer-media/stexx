@@ -13,7 +13,11 @@ struct StexxApp: App {
         // so a failed Keychain write can't leave the app signed in without
         // a usable token.
         let sessionStore = CachedSessionStore(backing: KeychainSessionStore())
+        #if DEBUG
+        let appState = ScreenshotRoute.current == nil ? AppState(sessionStore: sessionStore) : AppState.preview()
+        #else
         let appState = AppState(sessionStore: sessionStore)
+        #endif
 
         // The live client reports rotated/expired sessions and 402s here.
         let hooks = APIClientHooks(

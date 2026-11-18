@@ -32,13 +32,17 @@ These aren't optional implementation details; they are product promises.
    for the other party, and messages are rejected with 404.
 4. **Incognito** (Stexx+) users don't appear in `nearby` or `viewers` for
    others, except people they've messaged.
-5. **Expiring content is actually deleted** (database rows and media objects)
+5. **Accounts hidden after reports** don't appear in `nearby` or `viewers`,
+   and `profiles/{id}` and `conversations` show them only to people who have
+   written to them. Banned accounts appear nowhere (404). A hidden account is
+   never told who reported it.
+6. **Expiring content is actually deleted** (database rows and media objects)
    at `expiresAt`, not just hidden.
-6. **Account deletion is real deletion**: profile, photos, messages, reports
+7. **Account deletion is real deletion**: profile, photos, messages, reports
    filed (anonymized), and location within 30 days, including backups.
-7. **No third-party trackers or ad SDKs**, server-side included. Logs must
+8. **No third-party trackers or ad SDKs**, server-side included. Logs must
    not contain locations or message bodies.
-8. Media is served from `media.stexx.gay` with unguessable URLs; uploaded
+9. Media is served from `media.stexx.gay` with unguessable URLs; uploaded
    images are re-encoded server-side as well to strip any metadata the
    client missed.
 
@@ -55,6 +59,7 @@ Non-2xx responses carry:
 | 400 | Validation error (`message` is shown to the user) |
 | 401 | Session expired → refresh or sign in again |
 | 402 | Requires Stexx+ (`code: "requires_plus"`) |
+| 403 | Refused by a safety rule; show `message` (e.g. `account_under_review`, `account_banned`, anti-spam codes in [`security.md`](security.md)) |
 | 404 | Not found, or hidden because of a block |
 | 409 | Conflict (e.g. nickname taken, if we ever enforce uniqueness) |
 | 429 | Rate limited; `Retry-After` header set |
@@ -201,7 +206,29 @@ only a conversation ID, and the app fetches the rest.
 | GET | `/blocks` | → `[Profile]` | |
 | PUT | `/blocks/{profileID}` | → 204 | Effective immediately for both sides. |
 | DELETE | `/blocks/{profileID}` | → 204 | |
-| POST | `/reports` | `ReportRequest` → 204 | `{ profileID, reason, details?, conversationID?, alsoBlock }`. Reasons: `underage, harassment, spam, fakeProfile, threatsOrViolence, illegalContent, other`. Underage reports are prioritized. Including `conversationID` lets moderators see that thread; nothing else is shared. |
+| POST | `/reports` | `ReportRequest` → 204 | `{ profileID, reason, details?, conversationID?, alsoBlock, evidence? }`. Reasons: `underage, harassment, spam, fakeProfile, threatsOrViolence, illegalContent, other`. Underage reports are prioritized. `conversationID` links the report to that thread (it must be one between the reporter and the reported user, else 404); moderators never see the thread itself, only `evidence`. Always 204, whatever happens to the reported account. 404 for yourself or an unknown/banned account. |
+
+`evidence` (optional, only with `conversationID`, at most 20 items) is the
+messages the reporter ticked, sent by the app as plaintext so it keeps working
+once chats are end-to-end encrypted:
+
+```json
+{ "messageID": "m_…", "sentAt": "2026-11-17T20:30:00Z", "fromReported": true, "text": "…", "hasPhoto": false }
+```
+
+`fromReported` is true when the reported person sent it. Each item needs
+`text` (≤ 4000) or `hasPhoto: true`; photos themselves are not uploaded. The
+server records whether a message with that id, thread and sender exists, but
+can't check the text. Evidence is deleted 30 days after the report is closed
+(180 days at most), and survives the reporter deleting their account until then.
+
+Several independent reports hide an account until a moderator reviews it
+(rules in [`security.md`](security.md#5-reports-auto-hide-and-moderation)).
+While hidden, the account's own requests to start a chat
+(`POST /conversations`), write first in a thread where the other person hasn't
+written, or tap get **403 `account_under_review`** with a message to show.
+A banned account's sessions stop working (401) and sign-in returns
+**403 `account_banned`**.
 
 ### Stexx+
 

@@ -20,7 +20,7 @@ import {
 } from "../lib/serialize.ts";
 import { DAY, isoDate } from "../lib/time.ts";
 import { cleanText, idParam, locationSchema, lookingForSchema, multilineText, parseJson, positionSchema, privacySchema, tagsSchema } from "../lib/validation.ts";
-import { col, notBlocked, val, visibleToViewer } from "../lib/visibility.ts";
+import { col, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
 import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import type { AppEnv } from "../types.ts";
@@ -344,6 +344,7 @@ meRoutes.get("/me/viewers", async (c) => {
        AND pv.viewed_at > ${new Date(Date.now() - VIEWERS_WINDOW_MS)}
        AND ${notBlocked(val(me), col("u.id"))}
        AND ${visibleToViewer(val(me), "u")}
+       AND ${notModerated("u")}
      ORDER BY pv.viewed_at DESC
      LIMIT ${VIEWERS_LIMIT}`;
   return c.json(await profilesFor(me, rows.map((r) => r.id), { rows }));
@@ -371,12 +372,13 @@ meRoutes.get("/me/export", async (c) => {
         boost_ends_at: Date | null;
         last_active_at: Date;
         created_at: Date;
+        hidden_at: Date | null;
       })[]
   >`
     SELECT id, display_name, age, pronouns, headline, about, height_cm, position, looking_for, tags,
            confirmed_adult, (email_hmac IS NOT NULL) AS has_email,
            hide_distance, show_online_status, send_read_receipts, expiring_photos_by_default,
-           blur_explicit_photos, incognito, plus_expires_at, boost_ends_at, last_active_at, created_at
+           blur_explicit_photos, incognito, plus_expires_at, boost_ends_at, last_active_at, created_at, hidden_at
       FROM users WHERE id = ${me}`;
   if (!user) throw notFound();
 
@@ -441,6 +443,19 @@ meRoutes.get("/me/export", async (c) => {
     byConv.set(m.conversation_id, list);
   }
 
+  type EvidenceRow = { report_id: string; message_id: string | null; from_reported: boolean; sent_at: Date | null; text: string | null; has_photo: boolean };
+  const evidenceRows: EvidenceRow[] = reports.length
+    ? await sql<EvidenceRow[]>`
+        SELECT report_id, message_id, from_reported, sent_at, text, has_photo FROM report_evidence
+         WHERE report_id = ANY(${reports.map((r) => r.id)}) ORDER BY report_id, position`
+    : [];
+  const evidenceBy = new Map<string, EvidenceRow[]>();
+  for (const e of evidenceRows) {
+    const list = evidenceBy.get(e.report_id) ?? [];
+    list.push(e);
+    evidenceBy.set(e.report_id, list);
+  }
+
   const archive = {
     exportedAt: isoDate(new Date()),
     notes: [
@@ -456,6 +471,8 @@ meRoutes.get("/me/export", async (c) => {
       hasEmailSignIn: user.has_email,
       stexxPlusExpiresAt: isoDate(user.plus_expires_at),
       boostEndsAt: isoDate(user.boost_ends_at),
+      // Set while the account is hidden pending a moderator's review (never who reported it).
+      hiddenPendingReviewSince: isoDate(user.hidden_at),
     },
     profile: {
       displayName: user.display_name,
@@ -489,6 +506,14 @@ meRoutes.get("/me/export", async (c) => {
       priority: r.priority,
       status: r.status,
       createdAt: isoDate(r.created_at),
+      // Messages you chose to share with moderators (deleted after the report is closed).
+      evidence: (evidenceBy.get(r.id) ?? []).map((e) => ({
+        messageID: e.message_id,
+        fromReported: e.from_reported,
+        sentAt: isoDate(e.sent_at),
+        text: e.text,
+        hasPhoto: e.has_photo,
+      })),
     })),
     conversations: convs.map((cv) => ({
       id: cv.id,

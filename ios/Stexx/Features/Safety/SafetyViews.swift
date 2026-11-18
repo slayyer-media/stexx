@@ -26,6 +26,9 @@ struct SafetyMenu: View {
 struct ReportSheet: View {
     let profile: Profile
     var conversationID: Conversation.ID?
+    /// Messages already loaded in the thread, offered as optional evidence.
+    /// Only used when `conversationID` is set.
+    var messages: [Message] = []
     /// Called after a successful report with whether the person was blocked.
     var onComplete: (Bool) -> Void = { _ in }
 
@@ -39,9 +42,70 @@ struct ReportSheet: View {
     @State private var alsoBlock = true
     @State private var isSubmitting = false
     @State private var errorMessage: String?
+    @State private var selectedMessageIDs: Set<Message.ID> = []
+    @State private var isPickingEvidence = false
+    @State private var isSent = false
+
+    /// The newest sent messages, oldest first, as offered in the picker.
+    private var evidenceCandidates: [Message] {
+        let sent = messages.filter { $0.status != .sending && $0.status != .failed }
+            .filter { ($0.text?.isEmpty == false) || $0.attachment != nil }
+            .sorted { $0.sentAt < $1.sentAt }
+        return Array(sent.suffix(30))
+    }
 
     var body: some View {
         NavigationStack {
+            if isSent {
+                confirmation
+            } else {
+                form
+            }
+        }
+        .interactiveDismissDisabled(isSubmitting || isSent)
+    }
+
+    private var confirmation: some View {
+        VStack(spacing: Theme.Spacing.m) {
+            Spacer()
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 56))
+                .foregroundStyle(Theme.ice)
+                .accessibilityHidden(true)
+            Text("Report sent")
+                .font(.stexxHeadline)
+                .foregroundStyle(Theme.frost)
+            Text("Our moderators review every report. \(profile.displayName) won't know who reported them.")
+                .font(.stexxSub)
+                .foregroundStyle(Theme.slate)
+                .multilineTextAlignment(.center)
+            if alsoBlock {
+                Text("You've blocked \(profile.displayName).")
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
+            }
+            Spacer()
+            Button {
+                dismiss()
+                onComplete(alsoBlock)
+            } label: {
+                Text("Done")
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.ink)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(Theme.frost, in: RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(Theme.Spacing.l)
+        .stexxBackground(intensity: 0.4)
+        .navigationBarBackButtonHidden()
+        .navigationTitle("Report")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var form: some View {
             Form {
                 Section {
                     ForEach(ReportReason.allCases) { item in
@@ -79,6 +143,34 @@ struct ReportSheet: View {
                 }
                 .listRowBackground(Theme.ink1)
 
+                if conversationID != nil {
+                    Section {
+                        Button {
+                            isPickingEvidence = true
+                        } label: {
+                            HStack {
+                                Text("Include messages")
+                                    .foregroundStyle(Theme.frost)
+                                Spacer()
+                                Text(selectedMessageIDs.isEmpty ? "None" : "\(selectedMessageIDs.count) selected")
+                                    .foregroundStyle(Theme.slate)
+                                Image(systemName: "chevron.right")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(Theme.slate)
+                            }
+                            .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                    } header: {
+                        SectionLabel("Include messages (optional)")
+                    } footer: {
+                        Text("Only the messages you tick are shared with our moderators.")
+                            .font(.footnote)
+                            .foregroundStyle(Theme.slate)
+                    }
+                    .listRowBackground(Theme.ink1)
+                }
+
                 Section {
                     Toggle("Also block \(profile.displayName)", isOn: $alsoBlock)
                 } footer: {
@@ -113,20 +205,64 @@ struct ReportSheet: View {
                     }
                 }
             }
-            .interactiveDismissDisabled(isSubmitting)
+            .navigationDestination(isPresented: $isPickingEvidence) {
+                ReportEvidencePicker(
+                    candidates: evidenceCandidates,
+                    reportedID: profile.id,
+                    theirName: profile.displayName,
+                    selection: $selectedMessageIDs
+                )
+            }
+            #if DEBUG
+            .task { await applyScreenshotRoute() }
+            #endif
+    }
+
+    #if DEBUG
+    /// Screenshot-only (compiled out of Release): pre-fills the real sheet
+    /// from `-StexxScreenshotRoute`, then submits to the mock API for the
+    /// confirmation state.
+    private func applyScreenshotRoute() async {
+        guard let route = ScreenshotRoute.current else { return }
+        switch route {
+        case .reportFromChat, .reportPicker, .reportSent:
+            reason = .harassment
+            let theirs = evidenceCandidates.filter { $0.senderID == profile.id }
+            selectedMessageIDs = Set(theirs.suffix(2).map(\.id))
+            if route == .reportPicker {
+                try? await Task.sleep(for: .milliseconds(700))
+                isPickingEvidence = true
+            }
+            if route == .reportSent {
+                try? await Task.sleep(for: .milliseconds(500))
+                submit()
+            }
+        default:
+            break
         }
     }
+    #endif
 
     private func submit() {
         guard let reason else { return }
         isSubmitting = true
         errorMessage = nil
+        // Evidence only goes with a chat report, and only what was ticked.
+        let evidence: [ReportEvidence]? = conversationID == nil ? nil : {
+            let items = ReportEvidence.from(
+                messages: evidenceCandidates,
+                selectedIDs: selectedMessageIDs,
+                reportedID: profile.id
+            )
+            return items.isEmpty ? nil : items
+        }()
         let request = ReportRequest(
             profileID: profile.id,
             reason: reason,
             details: details.isEmpty ? nil : details,
             conversationID: conversationID,
-            alsoBlock: alsoBlock
+            alsoBlock: alsoBlock,
+            evidence: evidence
         )
         Task {
             defer { isSubmitting = false }
@@ -136,12 +272,82 @@ struct ReportSheet: View {
                     appState.markBlocked(profile.id)
                     chatStore.removeConversations(with: profile.id)
                 }
-                dismiss()
-                onComplete(alsoBlock)
+                isSent = true
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+}
+
+/// Lets the reporter tick which recent messages to share with moderators.
+struct ReportEvidencePicker: View {
+    let candidates: [Message]
+    let reportedID: Profile.ID
+    let theirName: String
+    @Binding var selection: Set<Message.ID>
+
+    private var isFull: Bool { selection.count >= ReportEvidence.maxItems }
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(candidates) { message in
+                    let isSelected = selection.contains(message.id)
+                    Button {
+                        if isSelected {
+                            selection.remove(message.id)
+                        } else if !isFull {
+                            selection.insert(message.id)
+                        }
+                    } label: {
+                        HStack(alignment: .top, spacing: Theme.Spacing.m) {
+                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(isSelected ? Theme.ice : Theme.steel)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(message.senderID == reportedID ? theirName : String(localized: "You"))
+                                    .stexxLabelStyle(.micro, color: Theme.slate)
+                                if message.attachment?.kind == .photo {
+                                    Label("Photo", systemImage: "photo")
+                                        .font(.footnote)
+                                        .foregroundStyle(Theme.steel)
+                                }
+                                if let text = message.text, !text.isEmpty {
+                                    Text(text)
+                                        .font(.stexxBody)
+                                        .foregroundStyle(Theme.frost)
+                                        .lineLimit(2)
+                                }
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!isSelected && isFull)
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
+                .listRowBackground(Theme.ink1)
+            } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    if isFull {
+                        Text("You can share up to \(ReportEvidence.maxItems) messages.")
+                    }
+                    Text("Only the messages you tick are shared with our moderators. Photos aren't uploaded; moderators only see that a photo was sent.")
+                }
+                .font(.footnote)
+                .foregroundStyle(Theme.slate)
+            }
+        }
+        .overlay {
+            if candidates.isEmpty {
+                ContentUnavailableView("No messages yet", systemImage: "bubble.left")
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .stexxBackground(intensity: 0.4)
+        .navigationTitle("Include messages")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

@@ -2,9 +2,11 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { sql } from "../db/sql.ts";
 import { currentUserId, requireAuth } from "../lib/auth.ts";
-import { notFound } from "../lib/errors.ts";
+import { badRequest, notFound } from "../lib/errors.ts";
+import { abuseKeyHash } from "../lib/abuse/limits.ts";
+import { assertReportable, evaluateAutoHide } from "../lib/moderation.ts";
 import { isId, newId } from "../lib/ids.ts";
-import { rateLimit } from "../lib/ratelimit.ts";
+import { clientIp, rateLimit } from "../lib/ratelimit.ts";
 import { profilesFor } from "../lib/serialize.ts";
 import { idParam, multilineText, parseJson, reportReasonSchema } from "../lib/validation.ts";
 import type { AppEnv } from "../types.ts";
@@ -18,6 +20,9 @@ import type { AppEnv } from "../types.ts";
  *  - PUT/DELETE /blocks never consult the reverse block: whether the other person has blocked you must
  *    not be observable. PUT is an idempotent upsert; DELETE is an idempotent no-op when nothing matches.
  *  - POST /reports works even when the reported user has blocked the reporter (same reason).
+ *  - POST /reports may carry `evidence`: messages the reporter chose to share, as plaintext from their app (so it
+ *    keeps working with end-to-end encrypted chats). Each report re-runs the auto-hide rules (lib/moderation.ts) in the
+ *    same transaction. The response never reveals whether the account was hidden.
  */
 export const safetyRoutes = new Hono<AppEnv>();
 
@@ -59,12 +64,37 @@ safetyRoutes.delete("/blocks/:id", requireAuth, async (c) => {
   return c.body(null, 204);
 });
 
+/** One message the reporter chose to share. The app sends its plaintext, so this works with E2EE chats too. */
+const evidenceItemSchema = z
+  .strictObject({
+    messageID: z.string().max(64).nullish(),
+    sentAt: z.iso.datetime({ offset: true }).nullish(),
+    /** Sent by the reported person (true) or by the reporter (false). */
+    fromReported: z.boolean(),
+    text: multilineText(4000).nullish(),
+    hasPhoto: z.boolean().optional().default(false),
+  })
+  .refine((e) => (e.text != null && e.text !== "") || e.hasPhoto, "each evidence item needs text or hasPhoto");
+
+export const MAX_EVIDENCE_ITEMS = 20;
+
+/** IPv4 address as is; IPv6 reduced to its /64 (one household or device), lower-cased. */
+export function connectionOf(ip: string): string {
+  if (!ip.includes(":") || /^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(ip)) return ip.replace(/^::ffff:/i, "");
+  const [head = "", tail = ""] = ip.toLowerCase().split("::");
+  const h = head.split(":").filter(Boolean);
+  const t = tail.split(":").filter(Boolean);
+  const groups = [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":")}::/64`;
+}
+
 const reportSchema = z.strictObject({
   profileID: z.string().max(64),
   reason: reportReasonSchema,
   details: multilineText(2000).nullish(),
   conversationID: z.string().max(64).nullish(),
   alsoBlock: z.boolean().optional().default(false),
+  evidence: z.array(evidenceItemSchema).max(MAX_EVIDENCE_ITEMS).nullish(),
 });
 
 safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
@@ -72,10 +102,17 @@ safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
   const body = await parseJson(c, reportSchema);
   if (!isId("user", body.profileID)) throw notFound();
   const reported = body.profileID;
-  if (reported === me || !(await targetExists(reported))) throw notFound();
+  await assertReportable(me, reported);
 
   const details = body.details && body.details.trim() !== "" ? body.details : null;
   const priority = body.reason === "underage" ? "high" : "normal";
+  const evidence = body.evidence ?? [];
+  if (evidence.length > 0 && body.conversationID == null) {
+    throw badRequest("evidence: messages can only be attached to a report from a chat (conversationID).");
+  }
+  // Keyed hash of the reporter's connection (never the address): lets auto-hide tell reports from one connection
+  // apart. IPv4: the address; IPv6: its /64, since one device rotates privacy addresses inside it.
+  const ipHash = abuseKeyHash(connectionOf(clientIp(c)));
 
   await sql.begin(async (tx) => {
     let conversationId: string | null = null;
@@ -89,14 +126,45 @@ safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
       if (!conv) throw notFound();
       conversationId = conv.id;
     }
+    const reportId = newId("report");
     await tx`
-      INSERT INTO reports (id, reporter_id, reported_id, reason, details, conversation_id, priority)
-      VALUES (${newId("report")}, ${me}, ${reported}, ${body.reason}, ${details}, ${conversationId}, ${priority})`;
+      INSERT INTO reports (id, reporter_id, reported_id, reason, details, conversation_id, priority, reporter_ip_hash)
+      VALUES (${reportId}, ${me}, ${reported}, ${body.reason}, ${details}, ${conversationId}, ${priority}, ${ipHash})`;
+
+    if (evidence.length > 0 && conversationId) {
+      // The server can't read E2EE text, so it vouches only for metadata: a message with this id, in this thread,
+      // from the claimed sender. Moderators see which items matched.
+      const ids = evidence.map((e) => e.messageID).filter((id): id is string => id != null && isId("message", id));
+      const known = ids.length
+        ? await tx<{ id: string; sender_id: string; sent_at: Date }[]>`
+            SELECT id, sender_id, sent_at FROM messages WHERE conversation_id = ${conversationId} AND id = ANY(${ids})`
+        : [];
+      const byId = new Map(known.map((m) => [m.id, m]));
+      const rows = evidence.map((e, position) => {
+        const match = e.messageID ? byId.get(e.messageID) : undefined;
+        const verified = match !== undefined && (match.sender_id === reported) === e.fromReported;
+        return {
+          report_id: reportId,
+          position,
+          message_id: e.messageID ?? null,
+          from_reported: e.fromReported,
+          sent_at: verified ? match.sent_at : e.sentAt ? new Date(e.sentAt) : null,
+          text: e.text ? e.text : null,
+          has_photo: e.hasPhoto,
+          verified,
+        };
+      });
+      await tx`INSERT INTO report_evidence ${tx(rows)}`;
+    }
+
     if (body.alsoBlock) {
       await tx`
         INSERT INTO blocks (blocker_id, blocked_id) VALUES (${me}, ${reported})
         ON CONFLICT (blocker_id, blocked_id) DO NOTHING`;
     }
+    // Several independent reports (or an underage one) hide the account until a moderator reviews it.
+    await evaluateAutoHide(reported, tx);
   });
+  // Same response whatever happened to the reported account: the reporter learns nothing about other reports.
   return c.body(null, 204);
 });

@@ -33,6 +33,7 @@ Email sign-in links are printed to the terminal in dev (the link only, never the
 | `bun run dev` / `start` | run with / without file watching |
 | `bun test [file]` | tests against a real Postgres database (`stexx_test`); the preload migrates it |
 | `bun run typecheck` / `check` | `tsc --noEmit` / typecheck + tests |
+| `bun run moderate -- <command>` | moderator CLI: `list`, `show`, `dismiss`, `action`, `hide`, `unhide`, `ban`, `unban`, `log` (see [`docs/security.md`](../docs/security.md#5-reports-auto-hide-and-moderation)) |
 
 Tests share one database with each other: they never truncate tables, they create unique users and use random location cells (`test/helpers.ts`).
 `AGENTS-NOTES.md` documents every internal helper and the conventions route code follows.
@@ -48,7 +49,8 @@ src/lib/                errors, ids, time (isoDate), auth (tokens, sessions), se
                         distance (cell snapping, haversine, buckets), visibility (blocks, incognito), cursor, ratelimit,
                         logger, media (sharp pipeline, storage, trash), mailer, plus, realtime, validation
 src/routes/             auth, me, discovery, chat, safety, plus, ws   (one Hono router per group, mounted at /v1)
-src/jobs/               in-process retention jobs: expiry every 15 s, session/challenge/token and profile-view purges, boosts, orphan media sweep
+src/jobs/               in-process retention jobs: expiry every 15 s, session/challenge/token and profile-view purges, boosts, report evidence, orphan media sweep
+src/moderation/         moderator CLI (entry point scripts/moderate.ts); rules in src/lib/moderation.ts
 src/dev/                dev-only: seed, welcome conversations, bot replies, /v1/dev/*  (dynamically imported only when STEXX_DEV_AUTH=1)
 migrations/NNN_*.sql    plain SQL, applied in order, one transaction each, tracked in schema_migrations
 test/                   bun test, real Postgres
@@ -76,6 +78,7 @@ These are the product promises from `docs/api.md`. "Enforced" names the code tha
 | **`hideDistance`** nulls `distanceMeters` for everyone else, and cannot be used as a filter to learn it | `lib/serialize.ts`, `routes/discovery.ts` | `discovery.test.ts` ("hideDistance") |
 | **Blocks are symmetric and immediate**, a blocked user is a 404 everywhere (never 403) | one SQL helper, `lib/visibility.ts` (`notBlocked`, `assertVisibleUser`), used by every route that surfaces another user; websocket checks it per event | `safety.test.ts` (both directions on every route), `chat.test.ts`, `discovery.test.ts` |
 | **Incognito** (needs active Stexx+, else 402) hides you from nearby/viewers except people you messaged, and records no profile views | `lib/visibility.ts` (`isIncognito`, `visibleToViewer`), `routes/me.ts`, `routes/discovery.ts` | `discovery.test.ts`, `me.test.ts` |
+| **Reports**: several independent reports hide an account until a moderator reviews it (hidden from nearby/viewers, profiles only for people who wrote to it, can't start chats); banned accounts are gone everywhere and can't sign in; nobody learns who reported; shared evidence is deleted 30 days after the report closes | `lib/moderation.ts`, `lib/visibility.ts` (`notModerated`, `moderationVisible`), `routes/safety.ts`, `jobs/retention.ts` (`purgeReportEvidence`) | `moderation.test.ts` |
 | **Expiring content is really deleted** (rows *and* files): timer starts at the recipient's read, view-once files go after first open, unread expiring messages after 14 days | `jobs/retention.ts` (every 15 s), `media_trash` triggers in migration 001, `lib/media.ts` (`drainMediaTrash`) | `jobs.test.ts`, `chat.test.ts` ("read, receipts and expiry"), `foundation.test.ts` (media) |
 | **Account deletion is real**: one transaction cascades every table, unlinks every file, revokes sessions, anonymizes reports you filed. Backups age out within 30 days | `routes/me.ts` (`DELETE /me`), FKs in migration 001, `deploy/backup.sh` (hard 30-day cap, `messages` rows never backed up) | `me.test.ts` ("DELETE /me"); backup retention is a script check, see `deploy/README.md` |
 | **No trackers, no sensitive logs.** The request logger emits method, route *pattern*, status, duration, nothing else. Caddy writes no access logs, Postgres logs no statements or values, journald keeps 7 days | `lib/logger.ts`, `deploy/Caddyfile*`, `deploy/postgres/90-stexx.conf`, `deploy/system/journald-stexx.conf` | `foundation.test.ts` (logger) |
@@ -117,6 +120,7 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `APP_ATTEST_ENVIRONMENTS`, `APP_ATTEST_ROOT_CA` | see security.md | |
 | `MAX_ACCOUNTS_PER_DEVICE` | `1` | |
 | `TRUST_RAMP_*`, `RATE_LIMIT_*` | see security.md | New-account limits and sliding-window rate limits. |
+| `REPORT_*` | see security.md | Auto-hide thresholds (`REPORT_AUTOHIDE_THRESHOLD` 3, window 14 days, underage 1 trusted / 2 any) and evidence retention (30 days after closing, 180 max). |
 | `TRUST_PROXY` | `1` | Trust `CF-Connecting-IP` / `X-Forwarded-For` only from a loopback peer; used transiently for hashed rate-limit keys. |
 | `STEXX_DEV_AUTH` | off | `/auth/register` returns a session; mounts `/v1/dev/*`. **Production refuses to boot if set.** |
 | `STEXX_DEV_DEFAULT_LOCATION` | unset | `lat,lon`; new dev users get this (snapped) cell. Production refuses. |
