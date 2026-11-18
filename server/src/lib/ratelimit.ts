@@ -38,6 +38,8 @@ export const LIMITS = {
   taps: { capacity: 30, windowMs: HOUR },
   reports: { capacity: 10, windowMs: HOUR },
   photoUploads: { capacity: 20, windowMs: HOUR },
+  /** E2E key routes (/keys*), per user: uploads, rotations, status, bundle and identity fetches. */
+  keys: { capacity: 30, windowMs: MINUTE },
   general: { capacity: 300, windowMs: MINUTE },
   /**
    * Requests whose bearer token did not resolve to a live session, per client. Checked BEFORE the session lookup,

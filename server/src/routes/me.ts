@@ -24,6 +24,8 @@ import { cleanText, idParam, locationSchema, lookingForSchema, multilineText, pa
 import { col, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
 import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { envelopeJson } from "../lib/e2e/envelope.ts";
+import { keyStatus } from "../lib/e2e/keys.ts";
 import { checkColumns, checkPhoto, flagPhotoMatches, storedPhash } from "../lib/photocheck/index.ts";
 import { phashToHex } from "../lib/photocheck/phash.ts";
 import type { AppEnv } from "../types.ts";
@@ -438,6 +440,8 @@ meRoutes.get("/me/export", async (c) => {
           sender_id: string;
           client_id: string;
           text: string | null;
+          envelope_type: string | null;
+          envelope_body: Buffer | null;
           attachment_kind: string | null;
           attachment_key: string | null;
           attachment_view_once: boolean;
@@ -447,7 +451,8 @@ meRoutes.get("/me/export", async (c) => {
           expires_at: Date | null;
         }[]
       >`
-        SELECT m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.attachment_kind, m.attachment_key,
+        SELECT m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
+               m.attachment_kind, m.attachment_key,
                m.attachment_view_once, m.sent_at, m.read_at, m.read_receipt, m.expires_at
           FROM messages m
           JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
@@ -462,6 +467,9 @@ meRoutes.get("/me/export", async (c) => {
     list.push(m);
     byConv.set(m.conversation_id, list);
   }
+
+  // Public keys only (the private keys never leave the phone).
+  const encryptionKeys = await keyStatus(me);
 
   type EvidenceRow = { report_id: string; message_id: string | null; from_reported: boolean; sent_at: Date | null; text: string | null; has_photo: boolean };
   const evidenceRows: EvidenceRow[] = reports.length
@@ -569,6 +577,8 @@ meRoutes.get("/me/export", async (c) => {
           senderID: m.sender_id,
           clientID: m.client_id,
           text: m.text,
+          // End-to-end encrypted: the server holds only this ciphertext; the text lives in the apps.
+          envelope: envelopeJson(m.envelope_type, m.envelope_body),
           attachment: m.attachment_kind
             ? {
                 kind: m.attachment_kind,
@@ -582,6 +592,7 @@ meRoutes.get("/me/export", async (c) => {
         };
       }),
     })),
+    encryptionKeys,
     subscriptions: subs.map((s) => ({ productID: s.product_id, expiresAt: isoDate(s.expires_at), environment: s.environment })),
     signIn: {
       passkeys: passkeys.map((p) => ({

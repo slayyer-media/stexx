@@ -11,6 +11,7 @@ import { attestRoutes } from "./routes/attest.ts";
 import { authRoutes } from "./routes/auth.ts";
 import { chatRoutes } from "./routes/chat.ts";
 import { discoveryRoutes } from "./routes/discovery.ts";
+import { keysRoutes } from "./routes/keys.ts";
 import { meRoutes } from "./routes/me.ts";
 import { plusRoutes } from "./routes/plus.ts";
 import { safetyRoutes } from "./routes/safety.ts";
@@ -18,6 +19,8 @@ import { wsRoutes } from "./routes/ws.ts";
 import type { AppEnv } from "./types.ts";
 
 export const JSON_BODY_LIMIT = 64 * 1024;
+/** E2E key uploads: a batch of Kyber prekeys is ~2.2 KB of JSON each (E2E_MAX_PQ_PREKEYS ≤ 200). */
+export const KEYS_BODY_LIMIT = 512 * 1024;
 
 const securityHeaders: MiddlewareHandler = async (c, next) => {
   await next();
@@ -34,17 +37,21 @@ const tooLarge = () => {
 };
 const jsonLimit = bodyLimit({ maxSize: JSON_BODY_LIMIT, onError: tooLarge });
 const imageLimit = bodyLimit({ maxSize: MAX_UPLOAD_BYTES, onError: tooLarge });
+const keysLimit = bodyLimit({ maxSize: KEYS_BODY_LIMIT, onError: tooLarge });
 
 /** The only routes that take an image body. Everything else is JSON. */
 const IMAGE_UPLOAD_ROUTES = new Set(["POST /v1/me/photos", "POST /v1/me/attachments"]);
+/** JSON routes that carry batches of public keys. */
+const KEY_UPLOAD_ROUTES = new Set(["PUT /v1/keys", "POST /v1/keys/prekeys"]);
 
 /**
- * 10 MB for the image upload routes, 64 KB for everything else. Chosen by ROUTE, never by the Content-Type header
+ * 10 MB for the image upload routes, 512 KB for the key uploads, 64 KB for everything else. Chosen by ROUTE, never by the Content-Type header
  * (a client-chosen `Content-Type: image/x` must not lift the JSON cap on every endpoint).
  */
 const bodyLimits: MiddlewareHandler = (c, next) => {
   const route = `${c.req.method} ${c.req.path.replace(/\/+$/, "")}`;
-  return (IMAGE_UPLOAD_ROUTES.has(route) ? imageLimit : jsonLimit)(c, next);
+  const limit = IMAGE_UPLOAD_ROUTES.has(route) ? imageLimit : KEY_UPLOAD_ROUTES.has(route) ? keysLimit : jsonLimit;
+  return limit(c, next);
 };
 
 /**
@@ -110,6 +117,7 @@ export async function createApp(): Promise<Hono<AppEnv>> {
   v1.route("/", meRoutes);
   v1.route("/", discoveryRoutes);
   v1.route("/", chatRoutes);
+  v1.route("/", keysRoutes);
   v1.route("/", safetyRoutes);
   v1.route("/", plusRoutes);
   v1.route("/", wsRoutes);

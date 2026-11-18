@@ -19,7 +19,7 @@
 import { config } from "../../config.ts";
 import { sql, type Sql } from "../../db/sql.ts";
 import { ApiError } from "../errors.ts";
-import { contentPolicy } from "./content.ts";
+import { contentPolicy, encryptedContentPolicy } from "./content.ts";
 import { DAY } from "../time.ts";
 
 export interface TrustSettings {
@@ -79,7 +79,14 @@ export async function trustState(userId: string, db: Sql = sql, now = new Date()
  * Call before inserting. `text` may be null (photo-only messages only count towards first contacts).
  */
 export async function assertMessageAllowed(
-  opts: { senderId: string; conversationId: string; otherId: string; text: string | null },
+  opts: {
+    senderId: string;
+    conversationId: string;
+    otherId: string;
+    text: string | null;
+    /** The message is an end-to-end encrypted envelope: the text rules ran in the sender's app. */
+    encrypted?: boolean;
+  },
   db: Sql = sql,
 ): Promise<void> {
   const s = trustSettings();
@@ -109,8 +116,11 @@ export async function assertMessageAllowed(
     }
   }
 
-  // Text rules (links, identical text to many people): server-side today, in the app once chats are E2EE.
-  await contentPolicy().assertAllowed(
+  // Text rules (links, identical text to many people): on the server for plaintext; for an encrypted envelope the
+  // server can't read the text, so `encryptedContentPolicy` applies and the app enforces them before encrypting
+  // (GET /e2e/config tells it whether it's restricted). The metadata rule above still bounds fan-out either way.
+  const textPolicy = opts.encrypted ? encryptedContentPolicy : contentPolicy();
+  await textPolicy.assertAllowed(
     { senderId: opts.senderId, conversationId: opts.conversationId, text: opts.text },
     { db, duplicateRecipients: s.duplicateRecipients },
   );

@@ -26,6 +26,7 @@
 import { config, type ModerationConfig } from "../config.ts";
 import { sql, type Sql } from "../db/sql.ts";
 import { banDevicesOfUser } from "./abuse/attestation.ts";
+import { deleteKeysOf } from "./e2e/keys.ts";
 import { trustState } from "./abuse/trust.ts";
 import { revokeAllSessions } from "./auth.ts";
 import { accountUnderReview, ApiError, notFound } from "./errors.ts";
@@ -448,7 +449,7 @@ export function actionReports(input: ActionInput & { unhide?: boolean }): Promis
 
 /**
  * Ban: the account disappears from every surface (lib/visibility.ts), its sessions are revoked, sign-in is refused
- * (403 account_banned), every device it was created on is banned (refused at sign-up and sign-in, and the
+ * (403 account_banned), its end-to-end encryption keys are deleted, every device it was created on is banned (refused at sign-up and sign-in, and the
  * DeviceCheck ban bit is written on that device's next request), and its open reports are closed as actioned.
  * The row is kept so its email hash and devices keep blocking a new sign-up.
  */
@@ -459,7 +460,10 @@ export function banAccount(input: ActionInput): Promise<ActionResult> {
     const closedReports = await closeOpenReports(tx, input.userId, "actioned");
     await revokeAllSessions(input.userId, tx);
     const devices = await banDevicesOfUser(input.userId, tx);
-    return { closedReports, details: { devicesBanned: devices } };
+    // E2E keys (identity, signed and one-time prekeys) go too: nobody can start an encrypted session with a banned
+    // account, and an unban means registering fresh keys.
+    const e2eDevices = await deleteKeysOf(input.userId, tx);
+    return { closedReports, details: { devicesBanned: devices, e2eKeysDeleted: e2eDevices } };
   });
 }
 

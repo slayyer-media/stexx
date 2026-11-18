@@ -3,6 +3,7 @@ import { config } from "./config.ts";
 import { sql } from "./db/sql.ts";
 import { startJobs } from "./jobs/index.ts";
 import { logInfo } from "./lib/logger.ts";
+import { verifierName } from "./lib/e2e/crypto.ts";
 import { photoClassifier } from "./lib/photocheck/classifier.ts";
 import { websocket } from "./routes/ws.ts";
 
@@ -27,6 +28,9 @@ logInfo("listening", {
   deviceCheck: config.antiSpam.deviceCheck !== null,
   photoClassifier: config.photoChecks.classifier,
   photoBlocklist: config.photoChecks.blocklist.length,
+  e2e: config.e2e.mode,
+  // libsignal, or the built-in fallback if the native module can't load on this host (docs/security.md).
+  e2eVerifier: config.e2e.mode === "off" ? "unused" : await verifierName(),
 });
 // Load the NSFW model now (logs photo_checks.model_loaded or .model_missing) instead of on the first upload.
 void photoClassifier();

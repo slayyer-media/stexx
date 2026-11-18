@@ -8,8 +8,8 @@
  * They sit behind `ContentPolicy` because chats will become end-to-end encrypted (Signal Protocol, planned
  * separately). Once the server only sees ciphertext it can't read text, so these checks move into the app,
  * which runs the same rules on the plaintext before encrypting (`containsLink` and `normalizeForDuplicate` are
- * the reference to port). The server then swaps in `encryptedContentPolicy` (or one that trusts a client
- * signal). Everything that only needs metadata (rate limits, the first-contact cap, fan-out with no replies)
+ * the reference to port). trust.ts applies `encryptedContentPolicy` to every encrypted envelope (lib/e2e) and the
+ * current policy (plaintext by default) to plaintext messages, so mixed mode works per message. Everything that only needs metadata (rate limits, the first-contact cap, fan-out with no replies)
  * stays on the server in trust.ts and limits.ts and doesn't depend on this file.
  */
 import { config } from "../../config.ts";
@@ -19,7 +19,7 @@ import { ApiError } from "../errors.ts";
 export interface MessageContent {
   senderId: string;
   conversationId: string;
-  /** Plaintext, or null for photo-only (and, later, encrypted) messages. */
+  /** Plaintext, or null for photo-only and encrypted messages. */
   text: string | null;
 }
 
