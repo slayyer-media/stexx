@@ -178,13 +178,30 @@ struct EditProfileView: View {
                             .clipShape(photoTileShape)
                             .hairlineBorder(photoTileShape)
                             .overlay {
-                                if index == 0 {
+                                if photo.id == draft.publicPhotos.first?.id {
                                     // The main photo is the screen's one rim-lit surface.
                                     Color.clear.rimLight(photoTileShape)
                                 }
                             }
                             .overlay(alignment: .bottomLeading) {
-                                if index == 0 {
+                                if photo.isExplicit {
+                                    // The server labelled it explicit: kept for chat, never shown on the profile.
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "eye.slash")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(Theme.frost)
+                                        Text("Hidden")
+                                            .stexxLabelStyle(.micro, color: Theme.frost)
+                                    }
+                                    .lineLimit(1)
+                                    .fixedSize()
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .blackGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous))
+                                    .padding(6)
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel("Hidden from your profile")
+                                } else if photo.id == draft.publicPhotos.first?.id {
                                     Text("Main")
                                         .stexxLabelStyle(.micro, color: Theme.frost)
                                         .padding(.horizontal, 6)
@@ -247,7 +264,11 @@ struct EditProfileView: View {
         } header: {
             SectionLabel("Photos")
         } footer: {
-            EditFooter("Location and camera data are stripped from photos on your phone before upload. Explicit photos belong in chat, not on your profile.")
+            if draft.photos.contains(where: \.isExplicit) {
+                EditFooter("Photos marked Hidden look explicit, so only you can see them on your profile. You can still send them in chat.")
+            } else {
+                EditFooter("Location and camera data are stripped from photos on your phone before upload. Explicit photos belong in chat, not on your profile.")
+            }
         }
         .editRows()
     }

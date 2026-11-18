@@ -30,6 +30,10 @@ struct Profile: Identifiable, Hashable, Codable, Sendable {
     var nameAndAge: String {
         if let age { "\(displayName), \(age)" } else { displayName }
     }
+
+    /// The photos other people see, in order. The server hides photos it
+    /// labelled explicit from everyone but their owner.
+    var publicPhotos: [Photo] { photos.filter { !$0.isExplicit } }
 }
 
 struct Photo: Identifiable, Hashable, Codable, Sendable {
@@ -37,7 +41,8 @@ struct Photo: Identifiable, Hashable, Codable, Sendable {
 
     let id: ID
     var url: URL?
-    /// Explicit photos are only shown in chat, never on the public grid.
+    /// Labelled explicit by the server's photo check: shown to its owner
+    /// (badged "Hidden") and sendable in chat, never on the public profile.
     var isExplicit: Bool = false
 }
 
