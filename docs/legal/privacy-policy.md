@@ -92,7 +92,10 @@ Moderators are people on the Stexx team. They review reports with a tool on our 
 | Rate-limit counters (fingerprints of IPs, networks, account ids, device check key ids and who-fetched-whose-keys pairs) | 2 days at most, also after you delete your account. Copies in backups age out with the backup (28 days) |
 | Report evidence (messages and photos you shared, the details you wrote, your IP fingerprint) | 30 days after the report is closed, 180 days at most. The report itself (reason, status, dates) is kept for safety records, without your account once you delete it |
 | Device check record (App Attest key) | Kept after you delete your account, so the one-account-per-device rule and bans still work; deleted after 90 days without use. Kept for banned devices |
-| Banned accounts | Kept, so the same person can't sign up again [owner: set a limit] |
+| Banned accounts | 30 days after the ban, to allow an appeal and a second look; then deleted like a deleted account. We keep only the fingerprint of the email address and the device ban, so the same person can't sign up again |
+| Anti-spam records about messages (a fingerprint of the text, never the text itself, and which spam rules matched) | 48 hours |
+| Who wrote to whom and when, for spam checks | 7 days after the last message in that chat |
+| Messages held back by a spam limit | Delivered if a moderator clears the account; deleted if the account is banned or nobody reviews it within 30 days |
 | Server logs | 7 days, with no personal data |
 | Backups | 28 days. They leave out messages, locations, profile views and sign-in links, and photo files aren't backed up at all. Everything else in the database is in them, including hashed sign-in sessions, reports and their evidence, device check records and rate-limit counters |
 
