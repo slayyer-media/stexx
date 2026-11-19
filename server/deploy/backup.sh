@@ -48,6 +48,7 @@
 #   STEXX_PREMIGRATE_TTL_HOURS  pre-migrate dumps are deleted after this many hours (default 24, max 24). The
 #                         watchdog (stexx-watch) enforces it every 5 minutes; a tmpfiles rule is the backstop.
 #   STEXX_BACKUP_PG_USER  OS user that runs pg_dump in --pre-migrate mode (peer auth; default stexxbackup)
+#   STEXX_BACKUP_COMPRESS pg_dump --compress value (default zstd:6; PGDG builds have zstd, restoring needs it too)
 # Files: /etc/stexx/rclone.conf (RCLONE_CONFIG), /etc/stexx/backup-recipients.txt (age public keys).
 
 set -euo pipefail
@@ -58,6 +59,7 @@ MODE=nightly
 case "${1:-}" in
   "")            ;;
   --pre-migrate) MODE=premigrate ;;
+  --stream-archive) MODE=stream ;;   # internal, see below
   -h|--help)     usage; exit 0 ;;
   *)             echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 esac
@@ -76,6 +78,7 @@ STATE_DIR="${STATE_DIRECTORY:-/var/lib/stexx-backup}"
 PRE_DIR="${STEXX_PREMIGRATE_DIR:-/var/lib/stexx-backup/pre-migrate}"
 PRE_TTL_HOURS="${STEXX_PREMIGRATE_TTL_HOURS:-24}"
 PG_USER="${STEXX_BACKUP_PG_USER-stexxbackup}"
+COMPRESS="${STEXX_BACKUP_COMPRESS:-zstd:6}"
 MIN_BYTES=2048        # an empty-but-valid dump is still larger than this; anything smaller means a broken pipeline
 MIN_SIDECAR_BYTES=64  # age header + an (encrypted) CSV header line
 
@@ -89,6 +92,44 @@ check_age_setup() {
 }
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+db_label() { if [[ "$DB" == *://* ]]; then echo "${DB##*/}"; else echo "$DB"; fi; }   # never print a URL's password
+
+# Nightly pg_dump arguments: the fixed exclusions, the configured ones, and reports (to the sidecar) when redacting.
+compute_dump_args() {
+  local table t
+  DUMP_ARGS=() EXCLUDED="" SIDECAR_WANTED=0
+  for table in $ALWAYS_EXCLUDE $EXCLUDE_DATA; do
+    [[ "$table" =~ ^[a-z_][a-z0-9_]*$ ]] || die "bad table name in STEXX_BACKUP_EXCLUDE_DATA: $table"
+    case " $EXCLUDED " in *" $table "*) continue ;; esac
+    EXCLUDED="${EXCLUDED:+$EXCLUDED }$table"
+    DUMP_ARGS+=("--exclude-table-data=$table")
+  done
+  case " $EXCLUDED " in
+    *" reports "*) ;;                                      # rows dropped entirely by configuration
+    *) if [ "$REDACT_REPORTS" = 1 ]; then DUMP_ARGS+=("--exclude-table-data=reports"); SIDECAR_WANTED=1; fi ;;
+  esac
+  if [ "$MODE" = nightly ]; then
+    for t in messages report_evidence; do
+      case " $EXCLUDED " in *" $t "*) ;; *) echo "backup note: rows of $t ARE included (STEXX_BACKUP_EXCLUDE_DATA)" >&2 ;; esac
+    done
+  fi
+}
+
+# Internal: the archive half of a nightly run, started by psql (`\!`) inside the snapshot-exporting transaction.
+# Its stdout is psql's stdout (the sidecar stream), so nothing may be written there; the result goes to a file.
+if [ "$MODE" = stream ]; then
+  exec >&2
+  [ -n "${STEXX_SNAPSHOT:-}" ] && [ -n "${STEXX_ARCHIVE_NAME:-}" ] && [ -n "${STEXX_ARCHIVE_STATUS:-}" ] \
+    || die "--stream-archive is internal (started by the nightly run)"
+  compute_dump_args
+  rc=0
+  pg_dump --dbname="$DB" --snapshot="$STEXX_SNAPSHOT" --format=custom --compress="$COMPRESS" --no-owner --no-privileges \
+      "${DUMP_ARGS[@]}" \
+    | age --encrypt --recipients-file "$RECIPIENTS" \
+    | rclone rcat "$REMOTE/$STEXX_ARCHIVE_NAME" --quiet || rc=$?
+  echo "$rc" > "$STEXX_ARCHIVE_STATUS"
+  exit 0
+fi
 
 # ------------------------------------------------------------------------------------------------------------------
 # --pre-migrate: a FULL dump (no exclusions at all) kept on this server for a few hours, so a bad migration can be
@@ -97,7 +138,6 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 if [ "$MODE" = premigrate ]; then
   [[ "$PRE_TTL_HOURS" =~ ^[0-9]+$ ]] && [ "$PRE_TTL_HOURS" -ge 1 ] && [ "$PRE_TTL_HOURS" -le 24 ] \
     || die "STEXX_PREMIGRATE_TTL_HOURS must be 1..24"
-  check_age_setup
   DUMP=(pg_dump)
   if [ "$(id -u)" = 0 ]; then
     # Root writes the file; pg_dump itself runs as the read-only backup role (peer auth over the unix socket).
@@ -111,6 +151,7 @@ if [ "$MODE" = premigrate ]; then
     mkdir -p "$PRE_DIR"
     chmod 0700 "$PRE_DIR"
   fi
+  check_age_setup
 
   # Expired snapshots go first (the watchdog does the same every 5 minutes).
   find "$PRE_DIR" -maxdepth 1 -type f -name 'stexx-premigrate-*' -mmin +"$((PRE_TTL_HOURS * 60))" -print -delete \
@@ -120,8 +161,8 @@ if [ "$MODE" = premigrate ]; then
   OUT="$PRE_DIR/stexx-premigrate-${STAMP}.dump.age"
   PART="$PRE_DIR/.partial-stexx-premigrate-${STAMP}"
   trap 'rm -f "$PART"' EXIT
-  echo "pre-migrate snapshot of $([[ "$DB" == *://* ]] && echo "${DB##*/}" || echo "$DB") (full, no exclusions) -> $OUT"
-  "${DUMP[@]}" --dbname="$DB" --format=custom --compress=zstd:6 --no-owner --no-privileges \
+  echo "pre-migrate snapshot of $(db_label) (full, no exclusions) -> $OUT"
+  "${DUMP[@]}" --dbname="$DB" --format=custom --compress="$COMPRESS" --no-owner --no-privileges \
     | age --encrypt --recipients-file "$RECIPIENTS" > "$PART"
   SIZE="$(wc -c < "$PART" | tr -d ' ')"
   [ "$SIZE" -ge "$MIN_BYTES" ] || die "snapshot too small ($SIZE bytes)"
@@ -141,6 +182,7 @@ command -v rclone >/dev/null  || die "rclone not installed"
 [[ "$KEEP_DAYS" =~ ^[0-9]+$ ]] && [ "$KEEP_DAYS" -ge 1 ] && [ "$KEEP_DAYS" -le 28 ] \
   || die "STEXX_BACKUP_KEEP_DAYS must be 1..28 (the privacy promise is 30 days; keep a margin for timer jitter)"
 [ "$REDACT_REPORTS" = 0 ] || [ "$REDACT_REPORTS" = 1 ] || die "STEXX_BACKUP_REDACT_REPORTS must be 0 or 1"
+[[ "$COMPRESS" =~ ^[a-z0-9:=,]+$ ]] || die "STEXX_BACKUP_COMPRESS has unexpected characters"
 
 # Retention FIRST: hard-delete (no hidden versions) anything older than KEEP_DAYS, whether or not tonight's dump
 # succeeds. A prune failure is reported but does not stop the dump. Covers .dump.age and .reports.csv.age alike.
@@ -153,12 +195,14 @@ else
 fi
 
 check_age_setup
+compute_dump_args
 
 NAME="stexx-${STAMP}.dump.age"
 SIDECAR="stexx-${STAMP}.reports.csv.age"
 
 # Objects being written. If any stage fails, rcat may already have committed a truncated object: whatever is still
-# listed here on exit is removed so it never counts as a backup. Verified objects are taken off the list.
+# listed here on exit is removed so it never counts as a backup. Both objects stay listed until both are verified:
+# the archive alone is not a complete backup (tables referencing reports could not get their foreign keys back).
 PENDING=()
 cleanup_partial() {
   local rc=$? o
@@ -173,66 +217,52 @@ object_size() {
   rclone lsjson "$REMOTE" --files-only --include "$1" | sed -n 's/.*"Size": *\([0-9]*\).*/\1/p' | head -n1
 }
 
-DUMP_ARGS=()
-EXCLUDED=""
-SIDECAR_WANTED=0
-for table in $ALWAYS_EXCLUDE $EXCLUDE_DATA; do
-  [[ "$table" =~ ^[a-z_]+$ ]] || die "bad table name in STEXX_BACKUP_EXCLUDE_DATA: $table"
-  case " $EXCLUDED " in *" $table "*) continue ;; esac
-  EXCLUDED="${EXCLUDED:+$EXCLUDED }$table"
-  DUMP_ARGS+=("--exclude-table-data=$table")
-done
-case " $EXCLUDED " in
-  *" reports "*) ;;                                        # rows dropped entirely by configuration
-  *) if [ "$REDACT_REPORTS" = 1 ]; then DUMP_ARGS+=("--exclude-table-data=reports"); SIDECAR_WANTED=1; fi ;;
-esac
-for t in messages report_evidence; do
-  case " $EXCLUDED " in *" $t "*) ;; *) echo "backup note: rows of $t ARE included (STEXX_BACKUP_EXCLUDE_DATA)" >&2 ;; esac
-done
-
-echo "dumping $([[ "$DB" == *://* ]] && echo "${DB##*/}" || echo "$DB") (rows excluded: $EXCLUDED$([ "$SIDECAR_WANTED" = 1 ] && echo "; reports redacted to sidecar")) -> $REMOTE/$NAME"
+echo "dumping $(db_label) (rows excluded: $EXCLUDED$([ "$SIDECAR_WANTED" = 1 ] && echo "; reports redacted to sidecar")) -> $REMOTE/$NAME"
 PENDING+=("$NAME")
-# --no-owner/--no-privileges: restores must not depend on role names. zstd compression is built into pg_dump (PG 16+).
-# The pipeline fails if any stage fails (pipefail); the EXIT trap above then removes whatever partial object was written.
-pg_dump --dbname="$DB" --format=custom --compress=zstd:6 --no-owner --no-privileges "${DUMP_ARGS[@]}" \
-  | age --encrypt --recipients-file "$RECIPIENTS" \
-  | rclone rcat "$REMOTE/$NAME" --quiet
-
-SIZE="$(object_size "$NAME")"
-[ -n "$SIZE" ] && [ "$SIZE" -ge "$MIN_BYTES" ] || die "uploaded object missing or too small (size='${SIZE:-none}')"
-PENDING=()
-echo "uploaded $NAME ($SIZE bytes)"
-
-SIDECAR_OK=1
 if [ "$SIDECAR_WANTED" = 1 ]; then
   command -v psql >/dev/null || die "psql not installed (needed for the reports sidecar)"
   PENDING+=("$SIDECAR")
-  # jsonb_populate_record keeps every column (so a later migration adding one needs no change here) and overrides
-  # the two that must not be backed up. A key that is not a column is ignored.
-  if psql --dbname="$DB" -X -q -v ON_ERROR_STOP=1 -c \
-      "COPY (SELECT (jsonb_populate_record(r, '{\"details\": null, \"reporter_ip_hash\": null}'::jsonb)).* FROM reports r ORDER BY r.id) TO STDOUT WITH (FORMAT csv, HEADER true)" \
-      | age --encrypt --recipients-file "$RECIPIENTS" \
-      | rclone rcat "$REMOTE/$SIDECAR" --quiet; then
-    SSIZE="$(object_size "$SIDECAR")"
-    if [ -n "$SSIZE" ] && [ "$SSIZE" -ge "$MIN_SIDECAR_BYTES" ]; then
-      PENDING=()
-      echo "uploaded $SIDECAR ($SSIZE bytes)"
-    else
-      SIDECAR_OK=0
-    fi
-  else
-    SIDECAR_OK=0
-  fi
-  if [ "$SIDECAR_OK" = 0 ]; then
-    rclone deletefile "$REMOTE/$SIDECAR" --quiet >/dev/null 2>&1 || true
-    PENDING=()
-  fi
+  # One snapshot for both objects, so every row in the archive that points at a report finds it in the sidecar.
+  # psql opens a read-only REPEATABLE READ transaction and exports its snapshot; while it is open, `\!` runs this
+  # script's --stream-archive mode (pg_dump --snapshot | age | rclone, status in a file); then psql streams the
+  # redacted reports through COPY into the sidecar pipeline. Two connections in all (stexxbackup's limit is 2).
+  # jsonb_populate_record keeps every column (a later migration adding one needs no change here) and overrides the
+  # two that must not be backed up; a key that is not a column is ignored.
+  STEXX_ARCHIVE_STATUS="$(mktemp)"; echo 99 > "$STEXX_ARCHIVE_STATUS"
+  STEXX_BACKUP_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  STEXX_ARCHIVE_NAME="$NAME"
+  export STEXX_ARCHIVE_STATUS STEXX_BACKUP_SELF STEXX_ARCHIVE_NAME
+  psql --dbname="$DB" -X -q -At -v ON_ERROR_STOP=1 -f - <<'SQL' \
+    | age --encrypt --recipients-file "$RECIPIENTS" \
+    | rclone rcat "$REMOTE/$SIDECAR" --quiet
+BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+SELECT pg_export_snapshot() AS stexx_snapshot \gset
+\setenv STEXX_SNAPSHOT :stexx_snapshot
+\! "$STEXX_BACKUP_SELF" --stream-archive
+COPY (SELECT (jsonb_populate_record(r, '{"details": null, "reporter_ip_hash": null}'::jsonb)).* FROM reports r ORDER BY r.id) TO STDOUT WITH (FORMAT csv, HEADER true);
+COMMIT;
+SQL
+  ARC_RC="$(cat "$STEXX_ARCHIVE_STATUS")"; rm -f "$STEXX_ARCHIVE_STATUS"
+  [ "$ARC_RC" = 0 ] || die "archive pipeline failed (status $ARC_RC)"
+else
+  # --no-owner/--no-privileges: restores must not depend on role names. zstd is built into PGDG's pg_dump.
+  # The pipeline fails if any stage fails (pipefail); the EXIT trap above then removes whatever partial object was written.
+  pg_dump --dbname="$DB" --format=custom --compress="$COMPRESS" --no-owner --no-privileges "${DUMP_ARGS[@]}" \
+    | age --encrypt --recipients-file "$RECIPIENTS" \
+    | rclone rcat "$REMOTE/$NAME" --quiet
 fi
 
+SIZE="$(object_size "$NAME")"
+[ -n "$SIZE" ] && [ "$SIZE" -ge "$MIN_BYTES" ] || die "uploaded object missing or too small (size='${SIZE:-none}')"
+echo "uploaded $NAME ($SIZE bytes)"
+if [ "$SIDECAR_WANTED" = 1 ]; then
+  SSIZE="$(object_size "$SIDECAR")"
+  [ -n "$SSIZE" ] && [ "$SSIZE" -ge "$MIN_SIDECAR_BYTES" ] || die "reports sidecar missing or too small (size='${SSIZE:-none}')"
+  echo "uploaded $SIDECAR ($SSIZE bytes)"
+fi
+PENDING=()
+
 [ "$PRUNE_OK" = 1 ] || die "dump uploaded ($NAME) but pruning old backups failed; fix it before the 30-day promise lapses"
-# The archive is a usable backup without the sidecar (reports would just be empty), so it stays; but the run fails
-# and last-success is not updated, so the watchdog and the OnFailure alert both fire.
-[ "$SIDECAR_OK" = 1 ] || die "dump uploaded ($NAME) but the reports sidecar failed; reports are missing from this backup"
 
 mkdir -p "$STATE_DIR"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DIR/last-success"

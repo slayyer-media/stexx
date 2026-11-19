@@ -12,8 +12,9 @@
 #      its reports sidecar (stexx-<stamp>.reports.csv.age) when there is one
 #   2. decrypt with age into a private temp dir (0700; removed on exit)
 #   3. pg_restore into a new scratch database (stexx_drill_<stamp>_<pid>) or, with --restore-into, into an EMPTY
-#      existing database
-#   4. load the reports sidecar (rows with details/reporter_ip_hash already nulled by backup.sh)
+#      existing database: schema and rows first
+#   4. load the reports sidecar (rows with details/reporter_ip_hash already nulled by backup.sh), then restore the
+#      indexes, keys and triggers (so keys that point at reports find them)
 #   5. sanity SQL: row counts for users, photos, subscriptions, reports, conversations; max(schema_migrations);
 #      row counts of the tables the nightly backup leaves out (expected 0)
 #   6. grants.sql: applied for real when the role stexx_app exists on that server, otherwise checked inside a
@@ -196,8 +197,11 @@ if [ -n "$REPORTS" ]; then
   REPORTS_CSV="$WORK/reports.csv"
 fi
 
-ENTRIES="$(pg_restore --list "$PLAIN" 2>/dev/null | grep -c -v '^;' || true)"
-[ "${ENTRIES:-0}" -gt 0 ] || fatal archive "pg_restore cannot read the archive"
+ENTRIES="$(pg_restore --list "$PLAIN" 2>"$WORK/err" | grep -c -v '^;' || true)"
+if grep -q 'does not support compression' "$WORK/err"; then
+  fatal archive "this pg_restore was built without zstd (Homebrew's libpq is); use one with zstd (PGDG's postgresql-client-18; elsewhere check: pg_config --configure | grep -c zstd)"
+fi
+[ "${ENTRIES:-0}" -gt 0 ] || fatal archive "pg_restore cannot read the archive: $(head -n1 "$WORK/err")"
 pass archive "$ENTRIES TOC entries"
 
 # ---- 3. restore --------------------------------------------------------------------------------------------------
@@ -212,17 +216,21 @@ else
     || fatal restore "CREATE DATABASE $DB failed: $(head -n1 "$WORK/err")"
   CREATED=1
 fi
+# In sections: tables first, then rows, then (after the reports sidecar is in) indexes, keys and triggers. A table
+# whose rows reference reports (e.g. a foreign key to reports.id) only gets its key once the reports are loaded.
+restore_section() { pg_restore --dbname="$DB" --no-owner --no-privileges --exit-on-error --section="$1" "$PLAIN" 2>"$WORK/err"; }
+restore_err() { grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err"; }
 T0="$(date +%s)"
-if ! pg_restore --dbname="$DB" --no-owner --no-privileges --exit-on-error "$PLAIN" 2>"$WORK/err"; then
-  fatal restore "pg_restore into $DB failed: $(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"
-fi
-pass restore "into $DB in $(( $(date +%s) - T0 )) s"
+restore_section pre-data || fatal restore "pg_restore (schema) into $DB failed: $(restore_err)"
+restore_section data     || fatal restore "pg_restore (rows) into $DB failed: $(restore_err)"
+pass restore "schema and rows into $DB in $(( $(date +%s) - T0 )) s"
 
 # ---- 4. reports sidecar ------------------------------------------------------------------------------------------
 if [ -n "${REPORTS_CSV:-}" ]; then
   [[ "$REPORTS_CSV" =~ ^[A-Za-z0-9_./-]+$ ]] || fatal reports "unexpected characters in temp path"
-  # The sidecar is written right after the archive, not in the same snapshot: a report can name an account or
-  # conversation created or deleted in between. Those references are cleared, exactly what ON DELETE SET NULL does.
+  # backup.sh writes the sidecar from the same snapshot as the archive, so nothing should dangle; any reference to
+  # an account or conversation that is not in the archive is cleared anyway (what ON DELETE SET NULL would do), so a
+  # hand-made sidecar can't block the keys below.
   if OUT="$(q -1 -f - 2>"$WORK/err" <<SQL
 CREATE TEMP TABLE stexx_reports_in (LIKE reports);
 \\copy stexx_reports_in FROM '$REPORTS_CSV' WITH (FORMAT csv, HEADER match)
@@ -236,7 +244,7 @@ WITH c AS (
      OR (i.conversation_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = i.conversation_id))
   RETURNING 1)
 SELECT count(*) FROM c;
-INSERT INTO reports SELECT * FROM stexx_reports_in ON CONFLICT (id) DO NOTHING;
+INSERT INTO reports SELECT * FROM stexx_reports_in;
 SELECT count(*) FROM stexx_reports_in;
 SQL
   )"; then
@@ -247,6 +255,13 @@ SQL
   fi
 else
   if [ "$KIND" = nightly ]; then warn reports "no reports sidecar: the reports table is empty"; fi
+fi
+
+T1="$(date +%s)"
+if restore_section post-data; then
+  pass constraints "indexes, keys and triggers in $(( $(date +%s) - T1 )) s"
+else
+  fatal constraints "pg_restore (indexes/keys/triggers) failed: $(restore_err)"
 fi
 
 # ---- 5. sanity ---------------------------------------------------------------------------------------------------
