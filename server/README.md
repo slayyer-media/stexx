@@ -85,12 +85,15 @@ test database). hideDistance users come from a second arm over the fixed 3×3 re
 indexes on a copy of `users.hide_distance` kept on the cell rows by triggers (migration 117).
 
 Measured with `bun run bench:nearby -- --compare` (sequential requests, `limit=50`, first pages; "before" is the old single query
-with the old STRICT distance functions and JIT on, as in production before migration 117):
+with the old STRICT distance functions and JIT on, i.e. main before this change):
 
 | Data | Before p50 / p95 | After p50 / p95 (p99) | Statements per request |
 | --- | --- | --- | --- |
-| shared `stexx_test`, 42.5k users, 12.4k located, randomly scattered over the globe (the worst case: nobody nearby) | 269 / 322 ms | 3.9 / 7.4 ms (8.6) | mostly 4 |
-| `--users 100000`: 97k located around a few hundred cities, 8 % hideDistance, 2 % incognito | 528 / 595 ms | 3.3 / 9.9 ms (25) | 1-4 |
+| shared `stexx_test`: 57k users, 15.8k located, scattered at random over the globe (the worst case: hardly anyone nearby) | 244 / 270 ms | 3.2 / 6.3 ms (7.4) | mostly 4 |
+| `--users 100000`: 97k located around a few hundred cities, 8 % hideDistance, 2 % incognito | 521 / 542 ms | 3.0 / 9.5 ms (23) | 1-4 |
+| the same, walking 3 pages per viewer (`--pages 3`) | | 2.5 / 8.9 ms (31) | 1-5 |
+
+The "after" column is the search alone; building the response (photos, profiles) adds about 1 ms.
 
 Rules that keep it that way:
 
