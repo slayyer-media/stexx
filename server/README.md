@@ -83,7 +83,7 @@ These are the product promises from `docs/api.md`. "Enforced" names the code tha
 | **Incognito** (needs active Stexx+, else 402) hides you from nearby/viewers except people you messaged, and records no profile views | `lib/visibility.ts` (`isIncognito`, `visibleToViewer`), `routes/me.ts`, `routes/discovery.ts` | `discovery.test.ts`, `me.test.ts` |
 | **Reports**: several independent reports hide an account until a moderator reviews it (hidden from nearby/viewers, profiles only for people who wrote to it, can't start chats); banned accounts are gone everywhere and can't sign in; nobody learns who reported; shared evidence is deleted 30 days after the report closes | `lib/moderation.ts`, `lib/visibility.ts` (`notModerated`, `moderationVisible`), `routes/safety.ts`, `jobs/retention.ts` (`purgeReportEvidence`) | `moderation.test.ts` |
 | **Expiring content is really deleted** (rows *and* files): timer starts at the recipient's read, view-once files go after first open, unread expiring messages after 14 days | `jobs/retention.ts` (every 15 s), `media_trash` triggers in migration 001, `lib/media.ts` (`drainMediaTrash`) | `jobs.test.ts`, `chat.test.ts` ("read, receipts and expiry"), `foundation.test.ts` (media) |
-| **Account deletion is real**: one transaction cascades every table, unlinks every file, revokes sessions, anonymizes reports you filed. Backups age out within 30 days | `routes/me.ts` (`DELETE /me`), FKs in migration 001, `deploy/backup.sh` (hard 30-day cap, `messages` rows never backed up) | `me.test.ts` ("DELETE /me"); `schema-guards.test.ts` (every foreign key into `users`, or into a table deleted with an account, is `ON DELETE CASCADE` or an allowlisted, anonymizing `SET NULL`; id-like text columns without a key are allowlisted with a reason); backup retention is a script check, see `deploy/README.md` |
+| **Account deletion is real**: one transaction cascades every table, unlinks every file, revokes sessions, anonymizes reports you filed. Backups age out within 30 days | `routes/me.ts` (`DELETE /me`), FKs in migration 001, `deploy/backup.sh` (hard 30-day cap, `messages` rows never backed up) | `me.test.ts` ("DELETE /me"); `schema-guards.test.ts` (every foreign key into `users`, or into a table deleted with an account, is `ON DELETE CASCADE` or an allowlisted, anonymizing `SET NULL`; text columns named like an id or a person (`*_id`, `owner`, `subject`, ...) without a key are allowlisted with a reason; ids under other names, in composite keys or in jsonb need review by hand); backup retention is a script check, see `deploy/README.md` |
 | **No trackers, no sensitive logs.** The request logger emits method, route *pattern*, status, duration, nothing else. Caddy writes no access logs, Postgres logs no statements or values, journald keeps 7 days | `lib/logger.ts`, `deploy/Caddyfile*`, `deploy/postgres/90-stexx.conf`, `deploy/system/journald-stexx.conf` | `foundation.test.ts` (logger) |
 | **Uploads are sanitized**: EXIF/GPS stripped, re-encoded, size and pixel capped, HEIC/other formats rejected | `lib/media.ts` (`sanitizeImage`) | `foundation.test.ts` (media), `me.test.ts` (photos) |
 | **Encrypted chat photos are opaque**: stored verbatim as `.bin`, never decoded or classified, only sendable inside an envelope, refused when `E2E_MODE=off`; under `required` plaintext photos can't be sent in a chat | `lib/media.ts` (`storeBlob`), `routes/me.ts` (`POST /me/attachments`), `routes/chat.ts`, migration 111 | `e2e-media.test.ts` |
@@ -146,7 +146,7 @@ GitHub-hosted Ubuntu runner with a throwaway `postgres:18` service. No secrets: 
 | `lint, typecheck, migrate, test` | `bun install --frozen-lockfile` → `bun scripts/lint-migrations.ts --base <PR base>` → `bun run typecheck` → `bun src/db/migrate.ts --test` on the fresh database → `bun test --timeout 30000` | yes |
 | `shellcheck deploy scripts` | `shellcheck` on `deploy/*.sh` and `ios/scripts/*.sh` | advisory |
 | `caddy validate` | both Caddyfiles in their production layout (`Caddyfile.main` importing `sites/stexx.caddy`), plus `caddy fmt` | advisory |
-| `iOS Release config` | `ios/scripts/check-release-config.sh`: fails while Release ships with the mock API, a non-https API, dev-bypass attestation or local-network ATS | advisory until Release uses the real API |
+| `iOS Release config` | `ios/scripts/check-release-config.sh`: fails while Release ships with the mock API, a non-https API, dev-bypass attestation, local-network ATS or a development App Attest entitlement | advisory until Release uses the real API |
 
 [`.github/workflows/ios.yml`](../.github/workflows/ios.yml) is manual only (Actions → ios → Run workflow): `xcodegen generate` and an unsigned
 build of the "Stexx Local" scheme for a generic simulator on a macOS runner.
@@ -167,8 +167,12 @@ default, `TRUNCATE`, and edits to a migration that is already on `main`. `deploy
 must keep working on the next release's schema.
 
 **Schema guards.** `test/schema-guards.test.ts` migrates a scratch schema and reads the catalog. A new table that holds an account id must
-reference `users(id) ON DELETE CASCADE`. A deliberate exception (an anonymized audit trail, say) goes on `SET_NULL_ALLOWLIST` or
-`UNLINKED_ID_ALLOWLIST` in that file with its reason, and the test names the table and column until it does.
+reference `users(id) ON DELETE CASCADE`. The test fails, naming the table and column, on any foreign key into `users` (or into a table
+deleted with an account) that doesn't cascade, and on any text column named like an id or a person (`*_id`, `*_ids`, or a word such as
+`owner`, `subject`, `author`, `blocked_user`; the list is `ACCOUNT_COLUMN`) that has no foreign key. A deliberate exception (an anonymized
+audit trail, say) goes on `SET_NULL_ALLOWLIST` or `UNLINKED_ID_ALLOWLIST` in that file with its reason. The catalog only shows names and
+types, so an account id under some other name, packed into a composite key (like `abuse_counters.key`) or inside jsonb is not caught: say
+in the migration how such rows go away when the account does, and check it in review.
 
 ## Deploying
 

@@ -7,8 +7,12 @@
  *    is nullable, or the delete would fail).
  * 2. The same for foreign keys into any table that a user's delete cascades into (photos, conversations, messages,
  *    ...): NO ACTION / RESTRICT there would make DELETE /me fail, and SET NULL keeps a row after its owner is gone.
- * 3. Text columns named like an id (`*_id`, `*_ids`) that carry no foreign key are on UNLINKED_ID_ALLOWLIST with a
- *    reason, so a user id stored without a cascade gets a decision and a comment.
+ * 3. Text columns named like an id (`*_id`, `*_ids`) or like an account (`owner`, `subject`, `blocked_user`, ...; see
+ *    ACCOUNT_COLUMN) that carry no foreign key are on UNLINKED_ID_ALLOWLIST with a reason, so a user id stored without a
+ *    cascade gets a decision and a comment.
+ *
+ * Limits: the catalog only shows names and types. An account id stored under a name neither pattern matches (`muter`),
+ * packed into a composite key (abuse_counters.key) or inside jsonb cannot be seen here; review those by hand.
  *
  * The checks run on a scratch schema migrated from this checkout's migrations/, not on the shared `public` schema
  * (other branches' migrations may have been applied to the shared test database).
@@ -46,7 +50,16 @@ const UNLINKED_ID_ALLOWLIST: Record<string, string> = {
   "subscriptions.original_transaction_id": "Apple transaction id; the row cascades through user_id (001_init)",
   "subscriptions.product_id": "App Store product id, not a row id (001_init)",
   "moderation_actions.report_ids": "ids of reports (which outlive accounts, anonymized), not account ids (107)",
+  "moderation_actions.actor": "'system' or a moderator's handle, never an account id (107)",
+  "reports.reporter_ip_hash": "keyed hash of the reporter's IP, not an account id; cleared with the evidence by the retention job (107)",
 };
+
+/**
+ * Column names that look like they hold an account id: `*_id` / `*_ids`, or a role word for a person anywhere in the
+ * name. Matched against lower-case Postgres column names. Widen it when a migration invents a new word for a person.
+ */
+const ACCOUNT_COLUMN =
+  "_ids?$|user|owner|author|member|subject|peer|target|blocker|blocked|muter|muted|reporter|reported|sender|recipient|viewer|actor|account|_by$";
 
 const ACTIONS: Record<string, string> = { a: "NO ACTION", r: "RESTRICT", c: "CASCADE", n: "SET NULL", d: "SET DEFAULT" };
 
@@ -126,11 +139,11 @@ async function deletionViolations(db: postgres.Sql | postgres.TransactionSql, sc
   return problems;
 }
 
-/** Text id-like columns without a foreign key that are not on UNLINKED_ID_ALLOWLIST (and stale allowlist entries). */
+/** Text id- or account-like columns (ACCOUNT_COLUMN) without a foreign key that are not on UNLINKED_ID_ALLOWLIST (and stale allowlist entries). */
 async function unlinkedIdViolations(db: postgres.Sql | postgres.TransactionSql, schema: string): Promise<string[]> {
   const rows = await db<{ name: string; looks_like_id: boolean; has_fk: boolean }[]>`
     SELECT c.relname || '.' || a.attname AS name,
-           (a.attname ~ '_ids?$') AS looks_like_id,
+           (a.attname ~ ${ACCOUNT_COLUMN}) AS looks_like_id,
            EXISTS (SELECT 1 FROM pg_constraint f
                    WHERE f.conrelid = c.oid AND f.contype = 'f' AND a.attnum = ANY (f.conkey)) AS has_fk
     FROM pg_class c
@@ -146,7 +159,7 @@ async function unlinkedIdViolations(db: postgres.Sql | postgres.TransactionSql, 
   for (const r of rows) {
     if (r.looks_like_id && !r.has_fk && !(r.name in UNLINKED_ID_ALLOWLIST)) {
       problems.push(
-        `${r.name} is a text id column with no foreign key. If it can hold an account id, reference users(id) ON DELETE CASCADE; ` +
+        `${r.name} is a text column named like an id or account, with no foreign key. If it can hold an account id, reference users(id) ON DELETE CASCADE; ` +
           `otherwise add "${r.name}" to UNLINKED_ID_ALLOWLIST in test/schema-guards.test.ts with the reason.`,
       );
     }
@@ -240,10 +253,21 @@ describe("schema guards: account deletion", () => {
     await probe(`CREATE TABLE probe_counters (subject_user_id text, peer_ids text[], amount int)`, async (tx) => {
       const problems = await unlinkedIdViolations(tx, scratch.name);
       expect(problems).toEqual([
-        expect.stringContaining("probe_counters.peer_ids is a text id column with no foreign key"),
-        expect.stringContaining("probe_counters.subject_user_id is a text id column with no foreign key"),
+        expect.stringContaining("probe_counters.peer_ids is a text column named like an id or account, with no foreign key"),
+        expect.stringContaining("probe_counters.subject_user_id is a text column named like an id or account, with no foreign key"),
       ]);
     });
+  });
+
+  test("account ids in columns not named *_id are caught too", async () => {
+    await probe(
+      `CREATE TABLE probe_mutes (owner text, subject text, blocked_user text, muter text, muted text[], reason text, until timestamptz)`,
+      async (tx) => {
+        const problems = await unlinkedIdViolations(tx, scratch.name);
+        const named = problems.map((p) => p.split(" ")[0]);
+        expect(named).toEqual(["probe_mutes.blocked_user", "probe_mutes.muted", "probe_mutes.muter", "probe_mutes.owner", "probe_mutes.subject"]);
+      },
+    );
   });
 
   test("stale allowlist entries fail", async () => {

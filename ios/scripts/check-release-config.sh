@@ -5,7 +5,9 @@
 #   - STEXX_USE_MOCK_API is anything but NO (the app falls back to the mock backend unless the value is "NO"),
 #   - STEXX_API_BASE_URL is not https, or points at this machine,
 #   - STEXX_ATTESTATION_MODE is not "attest" (dev-bypass only works against a dev server),
-#   - STEXX_ATS_ALLOWS_LOCAL_NETWORKING is YES.
+#   - STEXX_ATS_ALLOWS_LOCAL_NETWORKING is YES,
+#   - STEXX_APP_ATTEST_ENVIRONMENT is not "production" (the server accepts only production attestations by
+#     default, so a development entitlement would lock every TestFlight / App Store install out of sign-up).
 #
 # Values resolve the way XcodeGen does for one target: target configs[Release] > target base > project
 # configs[Release] > project base. Every configuration of type `release` is checked.
@@ -76,6 +78,9 @@ exec ruby -ryaml -e '
 
     ats = get.("STEXX_ATS_ALLOWS_LOCAL_NETWORKING")
     failures << "#{config}: STEXX_ATS_ALLOWS_LOCAL_NETWORKING is YES; local HTTP must stay out of shipped builds" if ats.to_s.casecmp?("YES")
+
+    env = get.("STEXX_APP_ATTEST_ENVIRONMENT")
+    failures << "#{config}: STEXX_APP_ATTEST_ENVIRONMENT is #{env.inspect}; it must be production, or the server rejects every attestation" unless env == "production"
   end
 
   if failures.empty?

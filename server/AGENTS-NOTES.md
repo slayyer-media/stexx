@@ -252,5 +252,6 @@ random fake IP so unauthenticated rate limits don't collide; pass `ip` to test a
 dev welcome/bots off, no dev default location.
 DDL in tests goes in a scratch schema (`test/scratch-schema.ts`: `createScratchSchema(purpose)` → `{name, url, db, drop}`,
 `url` pins `search_path` to it), never in `public`. `schema-guards.test.ts` fails when a migration adds a key to `users` (or to a
-table deleted with an account) that doesn't `ON DELETE CASCADE`; allowlist deliberate exceptions there with a reason.
+table deleted with an account) that doesn't `ON DELETE CASCADE`, or a text column named like an id or a person (`ACCOUNT_COLUMN`)
+without a key; allowlist deliberate exceptions there with a reason. Ids under other names, in composite keys or jsonb aren't seen.
 `bun scripts/lint-migrations.ts` (CI) checks names, unique numbers, new numbers above `origin/main`'s, and warns on non-additive SQL.

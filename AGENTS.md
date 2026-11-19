@@ -26,4 +26,4 @@ Every PR follows [`.github/pull_request_template.md`](.github/pull_request_templ
 
 - Every PR runs `.github/workflows/server.yml`: migration lint, typecheck, migrations on a fresh Postgres, the server tests. Run the same locally before committing (see `server/README.md#ci`).
 - New migrations take a number above the highest on `main` (gaps are fine) and stay additive; `deploy.sh --rollback` never reverts a migration.
-- A new table holding an account id references `users(id) ON DELETE CASCADE`. Exceptions go on the allowlists in `server/test/schema-guards.test.ts` with a reason, or that test fails.
+- A new table holding an account id references `users(id) ON DELETE CASCADE`. Exceptions go on the allowlists in `server/test/schema-guards.test.ts` with a reason, or that test fails. The test finds foreign keys and text columns named like an id or a person (`*_id`, `owner`, `subject`, ...); an account id under another name, in a composite key or in jsonb is not caught, so the migration must say how those rows go when the account does.
