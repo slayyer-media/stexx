@@ -16,7 +16,7 @@ SyslogIdentifier=stexx-watch
 TimeoutStartSec=3min
 StateDirectory=stexx-watch
 StateDirectoryMode=0700
-ReadWritePaths=-/var/lib/stexx-backup/pre-migrate
+ReadWritePaths=-/var/lib/stexx-premigrate
 Nice=5
 
 NoNewPrivileges=true

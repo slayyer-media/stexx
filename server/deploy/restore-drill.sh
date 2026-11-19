@@ -20,7 +20,10 @@
 #   6. grants.sql: applied for real when the role stexx_app exists on that server, otherwise checked inside a
 #      rolled-back transaction (role names swapped for PUBLIC), which proves every table/function it names exists
 #   7. --revoke-sessions: revoke every session and drop pending sign-in links/challenges (use for real restores)
-#   8. drop the scratch database (unless --keep). A --restore-into target is never dropped.
+#   8. with --restore-into or --revoke-sessions: delete the rows that are dangerous to bring back from any backup
+#      (one-time E2E prekeys that may already have been handed out, attestation challenges, rate-limit counters).
+#      Nightly backups never hold them; a pre-migrate snapshot does. Apps upload new prekeys on launch.
+#   9. drop the scratch database (unless --keep). A --restore-into target is never dropped.
 #
 # Connection: libpq environment (PGHOST, PGPORT, PGUSER, PGPASSWORD or ~/.pgpass). The role must be able to
 # CREATE DATABASE for a drill. For a real restore onto the VPS, tunnel (ssh -L 5433:127.0.0.1:5432 host) and connect as
@@ -34,7 +37,7 @@
 #   --remote REMOTE       rclone remote:path to fetch from (default $STEXX_BACKUP_REMOTE or b2:stexx-backups/db)
 #   --scratch-db NAME     drill database name (must start with stexx_drill_; default stexx_drill_<utc stamp>_<pid>)
 #   --restore-into NAME   REAL restore into an existing, empty database. Never dropped.
-#   --revoke-sessions     revoke all sessions, delete email_link_tokens/auth_challenges after restoring
+#   --revoke-sessions     revoke all sessions, delete email_link_tokens/auth_challenges after restoring (and step 8)
 #   --keep                keep the scratch database (prints its name)
 #   --min-users N         fail if fewer users were restored (default 1; use 0 for an empty install)
 #   --expect-migration V  fail unless max(schema_migrations) is V (default: only warn if it differs from the
@@ -197,7 +200,8 @@ if [ -n "$REPORTS" ]; then
   REPORTS_CSV="$WORK/reports.csv"
 fi
 
-ENTRIES="$(pg_restore --list "$PLAIN" 2>"$WORK/err" | grep -c -v '^;' || true)"
+pg_restore --list "$PLAIN" > "$WORK/toc" 2>"$WORK/err" || true
+ENTRIES="$(grep -c -v '^;' "$WORK/toc" || true)"
 if grep -q 'does not support compression' "$WORK/err"; then
   fatal archive "this pg_restore was built without zstd (Homebrew's libpq is); use one with zstd (PGDG's postgresql-client-18; elsewhere check: pg_config --configure | grep -c zstd)"
 fi
@@ -256,8 +260,10 @@ SQL
   else
     fail reports "loading the sidecar failed: $(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"
   fi
-else
-  if [ "$KIND" = nightly ]; then warn reports "no reports sidecar: the reports table is empty"; fi
+elif grep -Eq '^[0-9]+; [0-9]+ [0-9]+ TABLE DATA public reports( |$)' "$WORK/toc"; then
+  line reports "rows are in the archive (no sidecar: unredacted backup or pre-migrate snapshot)"
+elif [ "$KIND" = nightly ]; then
+  warn reports "no reports sidecar and no report rows in the archive: the reports table is empty"
 fi
 
 T1="$(date +%s)"
@@ -329,6 +335,20 @@ SQL
   else
     fail sessions "$(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"
   fi
+fi
+
+# ---- 8. rows that must not come back -----------------------------------------------------------------------------
+# A one-time prekey is deleted when it is handed out; a restored one may already be in someone's session, and handing
+# it out again would let two session setups share it. Challenges and rate-limit windows are short-lived anyway.
+if [ -n "$TARGET" ] || [ "$REVOKE" = 1 ]; then
+  EPH="" EPH_FAIL=""
+  for t in e2e_one_time_prekeys attest_challenges abuse_counters; do
+    [ "$(count "$t")" != "?" ] || continue      # table not in this schema version
+    if n="$(q -c "WITH d AS (DELETE FROM $t RETURNING 1) SELECT count(*) FROM d" 2>"$WORK/err")"; then EPH="$EPH $t=$n"
+    else EPH_FAIL="$EPH_FAIL $t"; fi
+  done
+  if [ -n "$EPH_FAIL" ]; then fail ephemeral "could not empty:$EPH_FAIL ($(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err"))"
+  else pass ephemeral "rows deleted:${EPH:- none of these tables exist}"; fi
 fi
 
 [ -z "$TARGET" ] || line next "run grants.sql as postgres if not applied above, deploy (migrates forward), restart stexx-api; see deploy/README.md"

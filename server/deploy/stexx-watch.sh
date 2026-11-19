@@ -61,7 +61,7 @@ TLS_FAIL_DAYS="${WATCH_TLS_FAIL_DAYS:-3}"
 ERROR_UNIT="${WATCH_ERROR_UNIT:-stexx-api}"
 ERROR_THRESHOLD="${WATCH_ERROR_THRESHOLD:-20}"
 INTERVAL_SEC="${WATCH_INTERVAL_SEC:-300}"
-PRE_DIR="${STEXX_PREMIGRATE_DIR:-/var/lib/stexx-backup/pre-migrate}"
+PRE_DIR="${STEXX_PREMIGRATE_DIR:-/var/lib/stexx-premigrate}"
 PRE_TTL_HOURS="${STEXX_PREMIGRATE_TTL_HOURS:-24}"
 ALERT_EMAIL="${ALERT_EMAIL:-}"
 ALERT_WEBHOOK_URL="${ALERT_WEBHOOK_URL:-}"
@@ -261,16 +261,21 @@ check_api_errors() {
 }
 
 check_premigrate() {
+  [ ! -L "$PRE_DIR" ] || { result FAIL premigrate_ttl "$PRE_DIR is a symlink (expected a 0700 root directory)"; return; }
   [ -d "$PRE_DIR" ] || { result OK premigrate_ttl "no pre-migrate directory"; return; }
-  local expired n=0 left
+  local expired f n=0 failed=0 left
+  # Snapshots and leftover partial files alike; every delete is checked (not just the last one).
   expired="$(find "$PRE_DIR" -maxdepth 1 -type f \( -name 'stexx-premigrate-*' -o -name '.partial-*' \) -mmin +"$((PRE_TTL_HOURS * 60))" 2>/dev/null || true)"
   if [ -n "$expired" ]; then
-    n="$(printf '%s\n' "$expired" | wc -l | tr -d ' ')"
-    if ! printf '%s\n' "$expired" | while IFS= read -r f; do rm -f -- "$f"; done; then
-      result FAIL premigrate_ttl "could not delete $n expired snapshot(s)"; return
+    while IFS= read -r f; do
+      n=$((n + 1))
+      rm -f -- "$f" 2>/dev/null || failed=$((failed + 1))
+    done <<< "$expired"
+    if [ "$failed" -gt 0 ]; then
+      result FAIL premigrate_ttl "could not delete $failed of $n expired file(s)"; return
     fi
-    if [ -n "$(find "$PRE_DIR" -maxdepth 1 -type f -name 'stexx-premigrate-*' -mmin +"$((PRE_TTL_HOURS * 60))" 2>/dev/null)" ]; then
-      result FAIL premigrate_ttl "expired snapshot(s) still present after delete"; return
+    if [ -n "$(find "$PRE_DIR" -maxdepth 1 -type f \( -name 'stexx-premigrate-*' -o -name '.partial-*' \) -mmin +"$((PRE_TTL_HOURS * 60))" 2>/dev/null)" ]; then
+      result FAIL premigrate_ttl "expired file(s) still present after delete"; return
     fi
   fi
   left="$(find "$PRE_DIR" -maxdepth 1 -type f -name 'stexx-premigrate-*' | wc -l | tr -d ' ')"

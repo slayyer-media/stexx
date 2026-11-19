@@ -28,23 +28,28 @@
 #   e2e_one_time_prekeys                                             a restored one-time prekey may already have been
 #                                                                   handed out and used; bundles fall back to the
 #                                                                   last-resort prekey until apps top up
+#   report_evidence                                                  plaintext a reporter chose to share, on its own
+#                                                                   30-day retention clock; a restore never needs it.
+#                                                                   Fixed (not in EXCLUDE_DATA) so an old backup.env
+#                                                                   that sets EXCLUDE_DATA can't put it back.
 #
 # Config (/etc/stexx/backup.env, optional, sourced if present):
 #   STEXX_BACKUP_REMOTE   rclone remote:bucket/prefix   (default b2:stexx-backups/db)
 #   STEXX_BACKUP_DB       database name or libpq URL    (default stexx)
 #   STEXX_BACKUP_KEEP_DAYS retention in days            (default 28, max 28; the privacy promise is 30 days)
 #   STEXX_BACKUP_EXCLUDE_DATA  space-separated CONTENT tables whose ROWS are left out of the dump (schema is kept), on
-#                         top of the fixed list above. Default: messages report_evidence media_trash locations
-#                         travel_locations profile_views. Message bodies are excluded on purpose: expiring and view-once
-#                         messages must not outlive their timer inside a 30-day backup. report_evidence is the plaintext
-#                         a reporter chose to share; it has its own 30-day retention clock. Location cells and profile
+#                         top of the fixed list above. Default: messages media_trash locations travel_locations
+#                         profile_views. Message bodies are excluded on purpose: expiring and view-once messages must
+#                         not outlive their timer inside a 30-day backup. Location cells and profile
 #                         views are excluded because the product keeps NO location history and only 7 days of views:
 #                         28 nightly snapshots would be exactly that history. (After a restore people simply set their
 #                         location again.) Set to the empty string to include these (restore keeps chat history, but
 #                         every "expired" message then lives up to 30 more days in backups).
 #   STEXX_BACKUP_REDACT_REPORTS 1 (default): reports go to the sidecar with details/reporter_ip_hash nulled.
 #                         0: reports rows go into the archive unchanged. Listing `reports` in EXCLUDE_DATA drops them.
-#   STEXX_PREMIGRATE_DIR  where --pre-migrate writes   (default /var/lib/stexx-backup/pre-migrate, root 0700)
+#   STEXX_PREMIGRATE_DIR  where --pre-migrate writes   (default /var/lib/stexx-premigrate, root 0700). It must not sit
+#                         inside a directory another user can write to (such as stexxbackup's /var/lib/stexx-backup):
+#                         that user could swap it for a symlink, and root would then write through it. backup.sh refuses.
 #   STEXX_PREMIGRATE_TTL_HOURS  pre-migrate dumps are deleted after this many hours (default 24, max 24). The
 #                         watchdog (stexx-watch) enforces it every 5 minutes; a tmpfiles rule is the backstop.
 #   STEXX_BACKUP_PG_USER  OS user that runs pg_dump in --pre-migrate mode (peer auth; default stexxbackup)
@@ -70,12 +75,12 @@ esac
 REMOTE="${STEXX_BACKUP_REMOTE:-b2:stexx-backups/db}"
 DB="${STEXX_BACKUP_DB:-stexx}"
 KEEP_DAYS="${STEXX_BACKUP_KEEP_DAYS:-28}"
-ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys"
-EXCLUDE_DATA="${STEXX_BACKUP_EXCLUDE_DATA-messages report_evidence media_trash locations travel_locations profile_views}"
+ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys report_evidence"
+EXCLUDE_DATA="${STEXX_BACKUP_EXCLUDE_DATA-messages media_trash locations travel_locations profile_views}"
 REDACT_REPORTS="${STEXX_BACKUP_REDACT_REPORTS:-1}"
 RECIPIENTS="${STEXX_BACKUP_RECIPIENTS:-/etc/stexx/backup-recipients.txt}"
 STATE_DIR="${STATE_DIRECTORY:-/var/lib/stexx-backup}"
-PRE_DIR="${STEXX_PREMIGRATE_DIR:-/var/lib/stexx-backup/pre-migrate}"
+PRE_DIR="${STEXX_PREMIGRATE_DIR:-/var/lib/stexx-premigrate}"
 PRE_TTL_HOURS="${STEXX_PREMIGRATE_TTL_HOURS:-24}"
 PG_USER="${STEXX_BACKUP_PG_USER-stexxbackup}"
 COMPRESS="${STEXX_BACKUP_COMPRESS:-zstd:6}"
@@ -97,7 +102,7 @@ db_label() { if [[ "$DB" == *://* ]]; then echo "${DB##*/}"; else echo "$DB"; fi
 
 # Nightly pg_dump arguments: the fixed exclusions, the configured ones, and reports (to the sidecar) when redacting.
 compute_dump_args() {
-  local table t
+  local table
   DUMP_ARGS=() EXCLUDED="" SIDECAR_WANTED=0
   for table in $ALWAYS_EXCLUDE $EXCLUDE_DATA; do
     [[ "$table" =~ ^[a-z_][a-z0-9_]*$ ]] || die "bad table name in STEXX_BACKUP_EXCLUDE_DATA: $table"
@@ -110,9 +115,7 @@ compute_dump_args() {
     *) if [ "$REDACT_REPORTS" = 1 ]; then DUMP_ARGS+=("--exclude-table-data=reports"); SIDECAR_WANTED=1; fi ;;
   esac
   if [ "$MODE" = nightly ]; then
-    for t in messages report_evidence; do
-      case " $EXCLUDED " in *" $t "*) ;; *) echo "backup note: rows of $t ARE included (STEXX_BACKUP_EXCLUDE_DATA)" >&2 ;; esac
-    done
+    case " $EXCLUDED " in *" messages "*) ;; *) echo "backup note: rows of messages ARE included (STEXX_BACKUP_EXCLUDE_DATA)" >&2 ;; esac
   fi
 }
 
@@ -140,18 +143,30 @@ if [ "$MODE" = premigrate ]; then
   [[ "$PRE_TTL_HOURS" =~ ^[0-9]+$ ]] && [ "$PRE_TTL_HOURS" -ge 1 ] && [ "$PRE_TTL_HOURS" -le 24 ] \
     || die "STEXX_PREMIGRATE_TTL_HOURS must be 1..24"
   DUMP=(pg_dump)
-  if [ "$(id -u)" = 0 ]; then
+  ME="$(id -u)"
+  if [ "$ME" = 0 ]; then
     # Root writes the file; pg_dump itself runs as the read-only backup role (peer auth over the unix socket).
     if [ -n "$PG_USER" ]; then DUMP=(runuser -u "$PG_USER" -- pg_dump); fi
-    mkdir -p "$PRE_DIR"
-    chown root:root "$PRE_DIR"
-    chmod 0700 "$PRE_DIR"
   else
     # Only for rehearsals (deploy/selftest.sh): a non-root run must name its own directory.
     [ -n "${STEXX_PREMIGRATE_DIR:-}" ] || die "--pre-migrate must run as root (it writes a root-only dump)"
-    mkdir -p "$PRE_DIR"
-    chmod 0700 "$PRE_DIR"
   fi
+  # Root must never follow a path someone else controls. The parent must belong to root (or, in a rehearsal, to this
+  # user) and not be writable by group/others unless sticky; the directory itself must be a real directory owned by
+  # the same user. Only then are chown/chmod and the writes below safe.
+  [[ "$PRE_DIR" == /* ]] || die "STEXX_PREMIGRATE_DIR must be an absolute path"
+  PRE_PARENT="$(dirname "$PRE_DIR")"
+  [ -d "$PRE_PARENT" ] && [ ! -L "$PRE_PARENT" ] || die "$PRE_PARENT is missing or a symlink"
+  [ -n "$(find "$PRE_PARENT" -maxdepth 0 \( -user 0 -o -user "$ME" \) 2>/dev/null)" ] \
+    || die "$PRE_PARENT is owned by another user; keep STEXX_PREMIGRATE_DIR out of directories other users own (default /var/lib/stexx-premigrate)"
+  [ -z "$(find "$PRE_PARENT" -maxdepth 0 \( -perm -0002 -o -perm -0020 \) ! -perm -1000 2>/dev/null)" ] \
+    || die "$PRE_PARENT is writable by group/others; keep STEXX_PREMIGRATE_DIR out of it"
+  [ ! -L "$PRE_DIR" ] || die "$PRE_DIR is a symlink; refusing to write through it"
+  [ -e "$PRE_DIR" ] || mkdir -m 0700 "$PRE_DIR"
+  [ -d "$PRE_DIR" ] && [ ! -L "$PRE_DIR" ] || die "$PRE_DIR is not a directory"
+  [ -n "$(find "$PRE_DIR" -maxdepth 0 -user "$ME" 2>/dev/null)" ] || die "$PRE_DIR is owned by another user; refusing"
+  [ "$ME" != 0 ] || chown root:root "$PRE_DIR"
+  chmod 0700 "$PRE_DIR"
   check_age_setup
 
   # Expired snapshots go first (the watchdog does the same every 5 minutes).
@@ -160,7 +175,8 @@ if [ "$MODE" = premigrate ]; then
   find "$PRE_DIR" -maxdepth 1 -type f -name '.partial-*' -mmin +120 -delete
 
   OUT="$PRE_DIR/stexx-premigrate-${STAMP}.dump.age"
-  PART="$PRE_DIR/.partial-stexx-premigrate-${STAMP}"
+  # mktemp creates the file exclusively (O_EXCL, 0600) under an unpredictable name: an existing name is never followed.
+  PART="$(mktemp "$PRE_DIR/.partial-stexx-premigrate-${STAMP}.XXXXXX")" || die "cannot create a file in $PRE_DIR"
   trap 'rm -f "$PART"' EXIT
   echo "pre-migrate snapshot of $(db_label) (full, no exclusions) -> $OUT"
   "${DUMP[@]}" --dbname="$DB" --format=custom --compress="$COMPRESS" --no-owner --no-privileges \

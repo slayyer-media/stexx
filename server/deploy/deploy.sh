@@ -19,7 +19,7 @@
 # cannot leave the API down. Migrations are NOT reverted by a rollback: write them additive (new tables, columns,
 # indexes; no drops or renames in the same release that stops using the old shape) so the previous release keeps
 # working against the new schema. Before migrating, `stexx-backup --pre-migrate` writes a FULL encrypted snapshot to
-# /var/lib/stexx-backup/pre-migrate/ (root-only, never uploaded, deleted after 24 h): that is what undoes a bad
+# /var/lib/stexx-premigrate/ (root-only, never uploaded, deleted after 24 h): that is what undoes a bad
 # migration (restore-drill.sh --restore-into, see README "Disaster recovery").
 #
 # Nothing here ships dev code: src/dev/ is excluded from the upload; tests and .env files never leave your machine.
@@ -136,7 +136,7 @@ echo "caddy:          \$(systemctl is-active caddy)"
 echo "postgresql:     \$(systemctl is-active postgresql)"
 echo "last backup:    \$(cat /var/lib/stexx-backup/last-success 2>/dev/null || echo NEVER)"
 echo "backup timer:   \$(systemctl is-active stexx-backup.timer)  (last run: \$(systemctl show -p Result --value stexx-backup.service))"
-echo "pre-migrate:    \$(find /var/lib/stexx-backup/pre-migrate -maxdepth 1 -type f -name 'stexx-premigrate-*' 2>/dev/null | wc -l) snapshot(s) on disk"
+echo "pre-migrate:    \$(find /var/lib/stexx-premigrate -maxdepth 1 -type f -name 'stexx-premigrate-*' 2>/dev/null | wc -l) snapshot(s) on disk"
 echo "watchdog timer: \$(systemctl is-active stexx-watch.timer)"
 echo "watchdog:       \$(cat /var/lib/stexx-watch/last-run 2>/dev/null || echo 'never ran')"
 if grep -Eqs '^[[:space:]]*ALERT_(EMAIL|WEBHOOK_URL)=.+' /etc/stexx/watch.env; then echo "alerting:       configured"; else echo "alerting:       OFF (set ALERT_EMAIL or ALERT_WEBHOOK_URL in /etc/stexx/watch.env)"; fi

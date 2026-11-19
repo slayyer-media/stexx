@@ -10,6 +10,9 @@
 #              server, openssl s_server with short- and long-lived certificates, a stub journalctl, temp dirs for the
 #              disk checks and pre-migrate snapshots, and a fake last-success file. Shows pass, fail, debounce and
 #              recovery output, and checks that alert payloads hold no addresses.
+# 2b. backup   backup.sh with a stub pg_dump (no database): the fixed exclusions survive an old STEXX_BACKUP_EXCLUDE_DATA,
+#              and --pre-migrate refuses a symlinked directory or a parent others can write, and never follows a
+#              planted partial-file name.
 # 3. deploy    deploy.sh --dry-run / --sync-config --dry-run / --status with stub ssh/rsync; every remote root script
 #              deploy.sh would pipe to the server is syntax-checked with bash -n.
 # 4. backup    (needs SELFTEST_DATABASE_URL, read-only use of that database) backup.sh nightly into a local "remote"
@@ -287,6 +290,75 @@ printf 'ALERT_WEBHOOK_URL=http://example.invalid/hook\n' > "$T/plainhttp.env"
 env STATE_DIRECTORY="$W/state3" STEXX_ENV_FILE=/nonexistent STEXX_WATCH_ENV_FILE="$T/plainhttp.env" STEXX_BACKUP_ENV_FILE=/nonexistent \
   bash "$HERE/stexx-watch.sh" --alert-unit stexx-api.service > "$T/plainhttp" 2>&1; echo $? > "$T/plainhttp.rc"
 check "non-https webhook refused, exit 2" bash -c "grep -q 2 '$T/plainhttp.rc' && grep -q 'must be https' '$T/plainhttp'"
+# An expired leftover .partial-* file that can't be deleted must FAIL the check (not just the last rm's status).
+: > "$W/pre/.partial-stexx-premigrate-20261117T000000Z.abc123"; age_file "$W/pre/.partial-stexx-premigrate-20261117T000000Z.abc123" 30
+chmod 0500 "$W/pre"
+watch "$T/undeletable" STATE_DIRECTORY="$W/state5"
+chmod 0700 "$W/pre"
+echo "  expired partial file in a directory the watchdog can't write:"; grep premigrate_ttl "$T/undeletable" | sed -e "s|$T|<tmp>|g" -e 's/^/    | /'
+check "undeletable expired .partial-* file: FAIL premigrate_ttl" has "$T/undeletable" "FAIL premigrate_ttl could not delete 1 of 1"
+watch "$T/deletable" STATE_DIRECTORY="$W/state5"
+check "once writable, the .partial-* file is deleted" bash -c "test ! -e '$W/pre/.partial-stexx-premigrate-20261117T000000Z.abc123' && grep -q 'OK premigrate_ttl deleted 1 expired' '$T/deletable'"
+ln -s "$W/media" "$W/pre-link"
+watch "$T/prelink" STATE_DIRECTORY="$W/state5" STEXX_PREMIGRATE_DIR="$W/pre-link"
+check "a symlinked pre-migrate directory: FAIL premigrate_ttl" has "$T/prelink" "FAIL premigrate_ttl"
+
+# =================================================================================================================
+hdr "2b. backup.sh with a stub pg_dump (no database needed)"
+# Stub pg_dump: logs its arguments, writes a fake custom archive big enough to pass the size check.
+mkdir -p "$T/stubpg"
+cat > "$T/stubpg/pg_dump" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "${STUB_PG_ARGS:?}"
+printf 'PGDMP'; head -c 8192 /dev/zero
+SH
+chmod +x "$T/stubpg/pg_dump"
+age-keygen -o "$T/stub.key" 2>/dev/null; grep -Eo 'age1[a-z0-9]+' "$T/stub.key" > "$T/stub-recipients.txt"
+SB=(env PATH="$T/stubpg:$PATH" STUB_PG_ARGS="$T/stub-args" STEXX_BACKUP_RECIPIENTS="$T/stub-recipients.txt" STEXX_BACKUP_DB=stexx_stub)
+if command -v rclone >/dev/null; then
+  : > "$T/stub-rclone.conf"; mkdir -p "$T/stub-remote" "$T/stub-state"
+  # The exclude list an older backup.env.example set (before report_evidence was added to it).
+  "${SB[@]}" STEXX_BACKUP_REMOTE="$T/stub-remote" STATE_DIRECTORY="$T/stub-state" RCLONE_CONFIG="$T/stub-rclone.conf" \
+    STEXX_BACKUP_REDACT_REPORTS=0 STEXX_BACKUP_EXCLUDE_DATA="messages email_link_tokens auth_challenges media_trash locations travel_locations profile_views" \
+    bash "$HERE/backup.sh" > "$T/stub-nightly" 2>&1; echo $? > "$T/stub-nightly.rc"
+  echo "  nightly with an old STEXX_BACKUP_EXCLUDE_DATA:"; show "$T/stub-nightly"
+  check "nightly (stub) exits 0" has "$T/stub-nightly.rc" 0
+  for t in report_evidence sessions e2e_one_time_prekeys abuse_counters attest_challenges messages; do
+    check "old EXCLUDE_DATA still leaves out $t" grep -qx -- "--exclude-table-data=$t" "$T/stub-args"
+  done
+  "${SB[@]}" STEXX_BACKUP_REMOTE="$T/stub-remote" STATE_DIRECTORY="$T/stub-state" RCLONE_CONFIG="$T/stub-rclone.conf" \
+    STEXX_BACKUP_REDACT_REPORTS=0 STEXX_BACKUP_EXCLUDE_DATA="" bash "$HERE/backup.sh" > "$T/stub-empty" 2>&1
+  check "empty EXCLUDE_DATA still leaves out report_evidence" grep -qx -- "--exclude-table-data=report_evidence" "$T/stub-args"
+  check "empty EXCLUDE_DATA notes that messages are included" has "$T/stub-empty" "rows of messages ARE included"
+else
+  echo "  (rclone not installed; nightly stub runs skipped)"
+fi
+
+# Pre-migrate directory hardening (as non-root the rules are the same, with this user standing in for root).
+mkdir -p "$T/pm"; chmod 0755 "$T/pm"
+"${SB[@]}" STEXX_PREMIGRATE_DIR="$T/pm/snap" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-ok" 2>&1; echo $? > "$T/pm-ok.rc"
+check "pre-migrate (stub) into a fresh directory exits 0" has "$T/pm-ok.rc" 0
+check "pre-migrate leaves no partial file behind" test -z "$(find "$T/pm/snap" -name '.partial-*')"
+# A planted symlink at every predictable partial name for the next few seconds must not be followed.
+: > "$T/victim"; chmod 0600 "$T/victim"
+for d in 0 1 2 3 4 5; do
+  ST="$(python3 -c 'import sys,time; print(time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time()+int(sys.argv[1]))))' "$d")"
+  ln -sf "$T/victim" "$T/pm/snap/.partial-stexx-premigrate-$ST"
+done
+"${SB[@]}" STEXX_PREMIGRATE_DIR="$T/pm/snap" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-planted" 2>&1; echo $? > "$T/pm-planted.rc"
+check "planted .partial-* symlinks are not written through" bash -c "grep -q 0 '$T/pm-planted.rc' && test ! -s '$T/victim'"
+find "$T/pm/snap" -type l -delete
+# The directory swapped for a symlink (what a user who can write the parent could do).
+mkdir -p "$T/pm/elsewhere"; ln -s "$T/pm/elsewhere" "$T/pm/linked"
+"${SB[@]}" STEXX_PREMIGRATE_DIR="$T/pm/linked" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-link" 2>&1; echo $? > "$T/pm-link.rc"
+echo "  pre-migrate into a symlinked directory:"; show "$T/pm-link"
+check "pre-migrate refuses a symlinked directory" bash -c "! grep -qx 0 '$T/pm-link.rc' && grep -q 'is a symlink' '$T/pm-link' && test -z \"\$(ls -A '$T/pm/elsewhere')\""
+# A parent group/others can write to (and not sticky).
+mkdir -p "$T/pm/shared"; chmod 0777 "$T/pm/shared"
+"${SB[@]}" STEXX_PREMIGRATE_DIR="$T/pm/shared/snap" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-shared" 2>&1; echo $? > "$T/pm-shared.rc"
+echo "  pre-migrate under a world-writable parent:"; show "$T/pm-shared"
+check "pre-migrate refuses a parent writable by others" bash -c "! grep -qx 0 '$T/pm-shared.rc' && grep -q 'writable by group/others' '$T/pm-shared'"
+chmod 0755 "$T/pm/shared"
 
 # =================================================================================================================
 hdr "3. deploy.sh with stub ssh/rsync"
@@ -383,6 +455,15 @@ PY
   echo "  restore-drill.sh --file <pre-migrate snapshot> --revoke-sessions:"; show "$T/drill2"
   check "drill on the pre-migrate snapshot passes" has "$T/drill2" "RESULT: PASS"
   check "--revoke-sessions ran" has "$T/drill2" "sessions:    ok (revoked"
+  check "one-time prekeys, challenges and rate-limit counters emptied" has "$T/drill2" "ephemeral:   ok (rows deleted: e2e_one_time_prekeys="
+  check "pre-migrate drill does not claim the reports table is empty" bash -c "! grep -q 'reports table is empty' '$T/drill2'"
+
+  # Unredacted nightly (STEXX_BACKUP_REDACT_REPORTS=0): no sidecar, reports in the archive, no "empty" warning.
+  mkdir -p "$T/remote-raw"
+  "${B[@]}" STEXX_BACKUP_REMOTE="$T/remote-raw" STEXX_BACKUP_REDACT_REPORTS=0 bash "$HERE/backup.sh" > "$T/nightly-raw" 2>&1
+  "${DRILL[@]}" --remote "$T/remote-raw" --scratch-db "stexx_drill_selftest_$$_f" > "$T/drill8" 2>&1
+  echo "  restore-drill.sh on an unredacted nightly (reports in the archive):"; grep -E '^(reports|sanity|RESULT)' "$T/drill8" | sed 's/^/    | /'
+  check "unredacted nightly: drill passes and says reports are in the archive" bash -c "grep -q 'RESULT: PASS' '$T/drill8' && grep -q 'reports:     rows are in the archive' '$T/drill8' && ! grep -q 'reports table is empty' '$T/drill8'"
 
   # Reports redaction: details and reporter_ip_hash must be NULL in every restored row.
   "${DRILL[@]}" --remote "$T/remote" --scratch-db "stexx_drill_selftest_$$_c" --keep > "$T/drill3" 2>&1
