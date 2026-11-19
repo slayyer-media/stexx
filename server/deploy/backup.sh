@@ -35,6 +35,8 @@
 #   spam_message_features                                            per-message sender/conversation/time + MinHash,
 #                                                                   a 48 h spam-detection cache (migration 112); 28
 #                                                                   nightly copies would be a month of who-wrote-where
+#   spam_contacts                                                    who first wrote to whom and when (no content), the
+#                                                                   spam rules' 7-day ledger (migration 112)
 #   taps                                                             who tapped whom and when, deleted after
 #                                                                   TAP_RETENTION_DAYS (30); a restore starts with an
 #                                                                   empty taps inbox
@@ -89,7 +91,7 @@ esac
 REMOTE="${STEXX_BACKUP_REMOTE:-b2:stexx-backups/db}"
 DB="${STEXX_BACKUP_DB:-stexx}"
 KEEP_DAYS="${STEXX_BACKUP_KEEP_DAYS:-28}"
-ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys report_evidence spam_message_features taps"
+ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys report_evidence spam_message_features spam_contacts taps"
 EXCLUDE_DATA="${STEXX_BACKUP_EXCLUDE_DATA-messages media_trash locations travel_locations profile_views}"
 REDACT_REPORTS="${STEXX_BACKUP_REDACT_REPORTS:-1}"
 RECIPIENTS="${STEXX_BACKUP_RECIPIENTS:-/etc/stexx/backup-recipients.txt}"

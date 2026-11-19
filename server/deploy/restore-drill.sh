@@ -295,7 +295,7 @@ else pass migrations "max(schema_migrations)=$MAXMIG"; fi
 
 EXCL=""
 for t in sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys messages \
-         report_evidence spam_message_features taps media_trash locations travel_locations profile_views; do
+         report_evidence spam_message_features spam_contacts taps media_trash locations travel_locations profile_views; do
   n="$(count "$t")"
   [ "$n" = "?" ] && continue    # table not in this schema version
   EXCL="$EXCL $t=$n"

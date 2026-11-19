@@ -332,12 +332,12 @@ if command -v rclone >/dev/null; then
     bash "$HERE/backup.sh" > "$T/stub-nightly" 2>&1; echo $? > "$T/stub-nightly.rc"
   echo "  nightly with an old STEXX_BACKUP_EXCLUDE_DATA:"; show "$T/stub-nightly"
   check "nightly (stub) exits 0" has "$T/stub-nightly.rc" 0
-  for t in report_evidence sessions e2e_one_time_prekeys abuse_counters attest_challenges spam_message_features taps messages; do
+  for t in report_evidence sessions e2e_one_time_prekeys abuse_counters attest_challenges spam_message_features spam_contacts taps messages; do
     check "old EXCLUDE_DATA still leaves out $t" grep -qx -- "--exclude-table-data=$t" "$T/stub-args"
   done
   "${SB[@]}" STEXX_BACKUP_REMOTE="$T/stub-remote" STATE_DIRECTORY="$T/stub-state" RCLONE_CONFIG="$T/stub-rclone.conf" \
     STEXX_BACKUP_REDACT_REPORTS=0 STEXX_BACKUP_EXCLUDE_DATA="" bash "$HERE/backup.sh" > "$T/stub-empty" 2>&1
-  for t in report_evidence spam_message_features taps; do
+  for t in report_evidence spam_message_features spam_contacts taps; do
     check "empty EXCLUDE_DATA still leaves out $t" grep -qx -- "--exclude-table-data=$t" "$T/stub-args"
   done
   check "backup.sh never passes --strict-names (an exclusion naming a table that doesn't exist yet must not fail)" \
@@ -481,7 +481,7 @@ PY
   check "drill on the nightly passes" has "$T/drill1" "RESULT: PASS"
   check "drill loaded the reports sidecar" has "$T/drill1" "reports:     ok"
   check "nightly restore has no sessions" bash -c "grep -q 'sessions=0' '$T/drill1'"
-  for t in spam_message_features taps; do
+  for t in spam_message_features spam_contacts taps; do
     if [ -n "$(psql -X -At -d "$SELFTEST_DATABASE_URL" -c "SELECT to_regclass('$t')" 2>/dev/null)" ]; then
       check "nightly restore has no $t rows" grep -q " $t=0" "$T/drill1"
     else
