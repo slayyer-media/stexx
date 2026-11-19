@@ -108,9 +108,13 @@ only, stored on the server as a keyed hash, and never shown.
      `.onOpenURL` in `RootView`). `EmailLinkRedeemer` shows the 18+ gate first
      on a new iPhone, never uses a link while someone is signed in (it says
      so and leaves the link unused), and explains an expired link or an
-     address without an account in a sheet with a way forward.
+     address without an account in a sheet with a way forward. When a link
+     fails without being used up (offline, 429, email or server trouble) the
+     sheet offers **Try again**, and tapping the same link in Mail again works
+     too.
    - **The code** is typed (or AutoFilled from Mail) on that screen and sent
-     to `POST /v1/auth/email/code`. It covers the link being read on a
+     to `POST /v1/auth/email/code` on its own once all 8 digits are in (if
+     a resend is in flight then, as soon as it finishes). It covers the link being read on a
      computer or another phone, and mail apps that open links in their own
      browser. Opened without the app, the link shows a static page from the
      server saying exactly that.

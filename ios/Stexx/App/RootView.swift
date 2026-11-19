@@ -67,7 +67,14 @@ struct RootView: View {
         }
         .sheet(isPresented: linkFailed) {
             if case .failed(let problem) = linkRedeemer.state {
-                EmailLinkProblemView(problem: problem, isSignedIn: appState.isSignedIn) { followUp in
+                EmailLinkProblemView(
+                    problem: problem,
+                    isSignedIn: appState.isSignedIn,
+                    onRetry: linkRedeemer.canRetry && !appState.isSignedIn ? {
+                        linkRedeemer.retry()
+                        redeemLink()
+                    } : nil
+                ) { followUp in
                     linkRedeemer.dismiss(followUp: followUp)
                 }
                 .presentationDetents([.medium])

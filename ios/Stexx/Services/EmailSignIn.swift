@@ -70,6 +70,17 @@ enum EmailSignInProblem: Equatable, Sendable {
     /// `disposable_email`, 403 `device_account_limit`).
     case other(String)
 
+    /// The server said something final about the link itself (used or
+    /// expired, or no account to sign in to). Anything else (no signal, a
+    /// rate limit, email or server trouble) left the link unused, so the same
+    /// link may be tried again.
+    var isFinalForLink: Bool {
+        switch self {
+        case .expiredLink, .noAccount: true
+        case .wrongCode, .unavailable, .rateLimited, .offline, .other: false
+        }
+    }
+
     static func from(_ error: any Error, now: Date = .now) -> EmailSignInProblem {
         switch error {
         case let error as EmailSignInError:
@@ -169,6 +180,8 @@ final class EmailSignInModel {
 
     @ObservationIgnored private let api: any APIClient
     @ObservationIgnored private let now: () -> Date
+    /// The complete code that last went out on its own (see `claimAutoSubmit`).
+    @ObservationIgnored private var autoSubmittedCode: String?
 
     init(purpose: Purpose, api: any APIClient, now: @escaping () -> Date = { .now }) {
         self.purpose = purpose
@@ -189,6 +202,18 @@ final class EmailSignInModel {
         String(raw.filter { ("0"..."9").contains($0) }.prefix(codeLength))
     }
     var isCodeComplete: Bool { code.count == Self.codeLength }
+
+    /// Whether a complete code should be submitted on its own right now:
+    /// once per code (a wrong one goes again only after an edit), and only
+    /// when it can be (not while an email is being sent or a code checked).
+    /// Says yes once, and remembers the code. Asked when the code changes and
+    /// again when the model is free, so 8 digits pasted during a resend still
+    /// go out when it finishes.
+    func claimAutoSubmit() -> Bool {
+        guard phase == .sent, isCodeComplete, code != autoSubmittedCode else { return false }
+        autoSubmittedCode = code
+        return true
+    }
 
     /// Seconds until a resend is allowed (0 = now).
     func resendWait(at date: Date? = nil) -> TimeInterval {
@@ -311,7 +336,12 @@ final class EmailLinkRedeemer {
     var followUp: FollowUp?
 
     @ObservationIgnored private var pendingToken: String?
+    /// A link that signed in, or that the server called used, expired or
+    /// account-less: delivering it again does nothing.
     @ObservationIgnored private var lastRedeemedToken: String?
+    /// The link of a failed attempt the server didn't burn (offline, 429,
+    /// 503, server error), for "Try again".
+    @ObservationIgnored private var retryToken: String?
     @ObservationIgnored private let now: () -> Date
 
     init(now: @escaping () -> Date = { .now }) {
@@ -326,6 +356,7 @@ final class EmailLinkRedeemer {
         guard let token = EmailSignInLink.token(from: url) else { return false }
         // The same link delivered twice (or tapped again while in flight).
         guard token != lastRedeemedToken, state != .verifying else { return true }
+        retryToken = nil
         if isSignedIn {
             pendingToken = nil
             state = .alreadySignedIn
@@ -347,20 +378,45 @@ final class EmailLinkRedeemer {
     func redeem(with api: any APIClient) async -> Session? {
         guard state == .verifying, let token = pendingToken else { return nil }
         pendingToken = nil
-        lastRedeemedToken = token
+        retryToken = nil
         do {
             let session = try await api.verifyEmailLink(token: token)
+            lastRedeemedToken = token
             state = .idle
             return session
         } catch {
-            state = .failed(EmailSignInProblem.from(error, now: now()))
+            let problem = EmailSignInProblem.from(error, now: now())
+            if problem.isFinalForLink {
+                lastRedeemedToken = token
+            } else {
+                // Not burnt: tapping the link in Mail again, or "Try again", has another go.
+                if lastRedeemedToken == token { lastRedeemedToken = nil }
+                retryToken = token
+            }
+            state = .failed(problem)
             return nil
         }
+    }
+
+    /// Whether the problem sheet can offer "Try again" with the same link.
+    var canRetry: Bool {
+        guard case .failed(let problem) = state else { return false }
+        return !problem.isFinalForLink && retryToken != nil
+    }
+
+    /// "Try again" after a failure that left the link unused. When the state
+    /// becomes `.verifying`, call `redeem(with:)`.
+    func retry() {
+        guard canRetry, let token = retryToken else { return }
+        retryToken = nil
+        pendingToken = token
+        state = .verifying
     }
 
     /// Closes whatever is shown; forgets an unused token.
     func dismiss(followUp: FollowUp? = nil) {
         pendingToken = nil
+        retryToken = nil
         state = .idle
         self.followUp = followUp
     }

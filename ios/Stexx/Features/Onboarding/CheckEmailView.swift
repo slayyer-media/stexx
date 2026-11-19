@@ -11,7 +11,6 @@ struct CheckEmailView: View {
     var onChangeAddress: () -> Void
 
     @FocusState private var isCodeFocused: Bool
-    @State private var autoSubmittedCode: String?
 
     private var explanation: String {
         switch model.purpose {
@@ -96,6 +95,10 @@ struct CheckEmailView: View {
                     .blackGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
             }
         }
+        // 8 digits that landed while a resend was in flight go out once it's done.
+        .onChange(of: model.phase) { _, phase in
+            if phase == .sent, model.claimAutoSubmit() { submit() }
+        }
     }
 
     /// Typing, paste or AutoFill of all 8 digits submits on its own (once
@@ -105,9 +108,7 @@ struct CheckEmailView: View {
             get: { model.code },
             set: { raw in
                 model.updateCode(raw)
-                guard model.isCodeComplete, model.code != autoSubmittedCode else { return }
-                autoSubmittedCode = model.code
-                submit()
+                if model.claimAutoSubmit() { submit() }
             }
         )
     }
@@ -210,6 +211,8 @@ private struct ProblemText: View {
 struct EmailLinkProblemView: View {
     let problem: EmailSignInProblem
     let isSignedIn: Bool
+    /// Offers "Try again" with the same link (it wasn't used up).
+    var onRetry: (() -> Void)?
     var onFollowUp: (EmailLinkRedeemer.FollowUp?) -> Void
 
     private var followUp: (title: LocalizedStringKey, target: EmailLinkRedeemer.FollowUp)? {
@@ -236,7 +239,12 @@ struct EmailLinkProblemView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             VStack(spacing: Theme.Spacing.m) {
-                if let followUp {
+                if let onRetry {
+                    Button(action: onRetry) { WideLabel("Try again") }
+                        .stexxPrimaryButton()
+                    Button { onFollowUp(nil) } label: { WideLabel("Not now") }
+                        .stexxSecondaryButton()
+                } else if let followUp {
                     Button { onFollowUp(followUp.target) } label: { WideLabel(followUp.title) }
                         .stexxPrimaryButton()
                     Button { onFollowUp(nil) } label: { WideLabel("Not now") }
@@ -280,6 +288,11 @@ struct EmailLinkVerifyingOverlay: View {
     }
     .previewEnvironment(signedIn: false)
     .task { await model.send(to: "otter@example.com") }
+}
+
+#Preview("Offline link") {
+    EmailLinkProblemView(problem: .offline, isSignedIn: false, onRetry: {}) { _ in }
+        .previewEnvironment(signedIn: false)
 }
 
 #Preview("Expired link") {

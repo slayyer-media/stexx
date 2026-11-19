@@ -282,6 +282,30 @@ struct EmailSignInModelTests {
         #expect(await server.bodies(codePath).last?["email"] as? String == "otter@example.com")
     }
 
+    @Test("Auto-submit: once per complete code, and 8 digits that land during a resend go out when it's done")
+    func autoSubmit() async throws {
+        let clock = EmailTestClock()
+        let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .milliseconds(300)), now: { clock.now })
+        model.updateCode("12345678")
+        #expect(!model.claimAutoSubmit()) // nothing sent yet
+        await model.send(to: "otter@example.com")
+        model.updateCode("1234567")
+        #expect(!model.claimAutoSubmit()) // incomplete
+
+        clock.advance(EmailSignInModel.resendCooldown)
+        let resend = Task { await model.resend() }
+        while model.phase != .sending { await Task.yield() }
+        model.updateCode("12345678") // pasted while the resend is in flight
+        #expect(!model.claimAutoSubmit())
+        await resend.value
+        #expect(model.phase == .sent)
+        #expect(model.claimAutoSubmit()) // the view asks again when the phase is back to .sent
+        #expect(!model.claimAutoSubmit()) // once per code
+        model.updateCode("1234567")
+        model.updateCode("12345679")
+        #expect(model.claimAutoSubmit()) // an edited code goes out again
+    }
+
     @Test("A code for an address without an account says to sign up")
     func codeWithoutAccount() async throws {
         let server = ScriptedServer()
@@ -406,6 +430,72 @@ struct EmailLinkRedeemerTests {
         redeemer.dismiss(followUp: .signIn)
         #expect(redeemer.state == .idle)
         #expect(redeemer.followUp == .signIn)
+    }
+
+    @Test(
+        "A failure that left the link unused (offline, 503, 429, server error): the same link works again, and Try again too",
+        arguments: [0, 503, 429, 500]
+    )
+    func transientFailureCanRetry(status: Int) async throws {
+        let calls = CallLog()
+        let baseURL = StubURLProtocol.register { _ in
+            await calls.record("verify")
+            if await calls.count("verify") <= 2 {
+                switch status {
+                case 0: throw URLError(.notConnectedToInternet)
+                case 503: return (503, [:], Fixtures.json(["code": "email_unavailable", "message": "down"]))
+                case 429: return (429, ["Retry-After": "30"], Fixtures.json(["code": "rate_limited", "message": "slow"]))
+                default: return (500, [:], Fixtures.json(["code": "internal", "message": "oops"]))
+                }
+            }
+            return (200, [:], sessionJSON)
+        }
+        let api = HTTPAPIClient(
+            configuration: APIConfiguration(baseURL: baseURL, useMock: false),
+            session: StubURLProtocol.session(),
+            sessions: SessionCoordinator(store: InMemorySessionStore())
+        )
+        let redeemer = EmailLinkRedeemer()
+        redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
+        #expect(await redeemer.redeem(with: api) == nil)
+        guard case .failed(let problem) = redeemer.state else {
+            Issue.record("expected a failure, got \(redeemer.state)")
+            return
+        }
+        #expect(!problem.isFinalForLink)
+        #expect(redeemer.canRetry)
+
+        // Tapping the same link in Mail again has another go.
+        redeemer.dismiss()
+        #expect(redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true))
+        #expect(redeemer.state == .verifying)
+        #expect(await redeemer.redeem(with: api) == nil)
+
+        // "Try again" on the sheet uses the same link.
+        #expect(redeemer.canRetry)
+        redeemer.retry()
+        #expect(redeemer.state == .verifying)
+        #expect(await redeemer.redeem(with: api) != nil)
+        #expect(redeemer.state == .idle)
+        #expect(!redeemer.canRetry)
+        #expect(await calls.count("verify") == 3)
+
+        // Once it signed in, the link is spent: a later delivery does nothing.
+        #expect(redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true))
+        #expect(redeemer.state == .idle)
+    }
+
+    @Test("A used or expired link can't be retried from the sheet")
+    func expiredLinkNoRetry() async throws {
+        let server = ScriptedServer()
+        await server.queue(verifyPath, error(400, "invalid_link"))
+        let redeemer = EmailLinkRedeemer()
+        redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
+        _ = await redeemer.redeem(with: client(for: server))
+        #expect(redeemer.state == .failed(.expiredLink))
+        #expect(!redeemer.canRetry)
+        redeemer.retry()
+        #expect(redeemer.state == .failed(.expiredLink))
     }
 
     @Test("The same link delivered twice is used once")
