@@ -30,6 +30,14 @@ Done; see [`security.md`](security.md) for how each works and how to turn it on 
 - Stexx+ adds a small natural deterrent, since spammers rarely pay, but it is not a control on its own.
 - Every measure must respect the privacy rules in the README: no real names, no phone numbers, no exact location, and minimal retained data.
 
+## Operations
+
+Self-hosted on one VPS, so the server has to watch itself. See [`server/deploy/README.md`](../server/deploy/README.md).
+
+- [x] **Restorable backups.** Nightly backups leave out credentials and short-lived state, so a restore never brings back live sessions, and reports are backed up without their free text. A full encrypted snapshot is taken before every migration and kept on the server for 24 hours. `restore-drill.sh` restores the latest backup into a scratch database and checks it, and the README has a disaster-recovery runbook.
+- [x] **Alerts.** A watchdog checks backup age, health (local and through Cloudflare), disk space, origin certificate expiry and API error lines every 5 minutes, and failed units alert too. Alerts go by email or webhook (a self-hosted ntfy works) and carry check names only. Off until a destination is configured.
+- [ ] **Cloudflare range refresh.** A timer that re-runs `ufw-cloudflare.sh --apply` and regenerates Caddy's `trusted_proxies` from the same list, validating before reload. Today both are refreshed by hand.
+
 ## End-to-end encrypted chat
 
 Chat text and chat photos are end-to-end encrypted with the Signal Protocol, using Signal's official [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0, the same license as Stexx). The server relays ciphertext it can't read.

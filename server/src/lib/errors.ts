@@ -47,6 +47,13 @@ export const accountUnderReview = () =>
 export const accountBanned = () =>
   new ApiError(403, "account_banned", "This account has been suspended for breaking the Stexx community rules.");
 export const serviceUnavailable = (code: string, message: string) => new ApiError(503, code, message);
+/**
+ * The media disk is full or below its free-space floor (lib/media.ts). Nothing was stored; the app can retry later.
+ */
+export const storageUnavailable = () =>
+  new ApiError(503, "storage_unavailable", "We can't save photos right now. Please try again in a few minutes.", {
+    "Retry-After": "60",
+  });
 
 export function errorResponse(c: Context, status: ContentfulStatusCode, code: string, message: string) {
   return c.json<ErrorBody>({ code, message }, status);
