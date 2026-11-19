@@ -52,3 +52,17 @@ Chat text and chat photos are end-to-end encrypted with the Signal Protocol, usi
 - **Server-side limits use metadata only:** rate limits, new-account message caps, and fan-out with no replies. None of them need message content.
 - **Reports carry evidence.** When someone reports a chat, their app decrypts and attaches the reported messages and photos, so moderators see only what the reporter chooses to share.
 - **Trade-off:** the server can't detect identical spam text across many chats. We accept this and rely on metadata and reports rather than sending content hashes.
+
+## Launch readiness
+
+What stands between the app and the App Store. Details, answers and owner decisions: [`app-store.md`](app-store.md).
+
+- [x] **Privacy manifest.** `PrivacyInfo.xcprivacy` declares every data type the app collects (all linked to the account, none used for tracking) and the required-reason APIs, including libsignal's `fstat`.
+- [x] **Launch checklist.** App Privacy label answers, age rating, review notes, subscription metadata, TestFlight steps ([`app-store.md`](app-store.md)).
+- [ ] **Legal pages.** Drafts of the Terms, Privacy Policy and Community Guidelines are in [`legal/`](legal/); they still need a lawyer's review, the owner's details, and hosting at `stexx.gay/{terms,privacy,guidelines}`.
+- [ ] **Export compliance.** `ITSAppUsesNonExemptEncryption` is still `false`; owner decision on the mass-market / publicly-available path and France.
+- [ ] **Real backend in Release.** `STEXX_USE_MOCK_API` to `NO` once the API is live; production App Attest and DeviceCheck keys on the server.
+- [ ] **Passkeys on device.** Associated Domains and the `apple-app-site-association` file on `stexx.gay`.
+- [ ] **Sandbox purchases on the production server**, so TestFlight and App Review can buy Stexx+.
+- [ ] **Demo access for App Review** (a review sign-in, labelled team accounts, a screen recording).
+- [ ] **Owner actions:** organization developer account, Sensitive Content Analysis entitlement, Declared Age Range, support contact, final price.
