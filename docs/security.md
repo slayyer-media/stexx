@@ -106,7 +106,8 @@ Chats are planned to become end-to-end encrypted with the Signal Protocol (libsi
 | Trust state (age, repliers, open reports) | account metadata | server, unchanged |
 | `links_not_allowed` | message text | **the app**, before encrypting |
 | `duplicate_message` (same text to many people) | message text | **the app**, against its own recently sent messages; no content hashes go to the server |
-| Report evidence (section 5) | the reported messages | **the app** sends the plaintext of the messages the reporter ticks; the server checks only that message ids, thread and sender match |
+| Report evidence (section 5) | the reported messages and photos | **the app** sends the plaintext of the messages the reporter ticks, and re-uploads the photos it decrypted; the server checks only that message ids, thread and sender match |
+| Explicit chat photos | the photo | **the app**, on the device before showing an incoming photo (section 7, "Encrypted photos") |
 
 The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. The choice is per message: plaintext `text` goes through the current policy (`plaintextContentPolicy`), and an encrypted envelope (section 7) goes through `encryptedContentPolicy` (a no-op), so both work side by side while `E2E_MODE=optional`. The app runs the same rules locally before encrypting; `containsLink` and `normalizeForDuplicate` are the reference to port. The server tells the app whether its account is restricted, and with which numbers, in `GET /v1/e2e/config` → `contentRules`. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server and count encrypted messages exactly like plaintext ones.
 
@@ -125,7 +126,7 @@ Reporting has to be fast for the person being harassed, and several independent 
 
 - **Two taps:** on a profile or in a chat, "•••" → **Report** opens the report sheet; "•••" → **Block** → confirm blocks. Safety actions are free.
 - The sheet's reasons are exactly the server's: `underage`, `harassment`, `spam`, `fakeProfile`, `threatsOrViolence`, `illegalContent`, `other`. "Also block" is on by default. After sending, the sheet confirms ("Report sent", the person won't know who reported them, and that they're blocked).
-- **Evidence from a chat:** "Include messages" lists the thread's last 30 messages; the reporter ticks up to 20. Only ticked messages are sent, as plaintext from the app, so this keeps working once chats are end-to-end encrypted. Photos aren't uploaded (the item says a photo was there). The server records whether each message id exists in that thread from the claimed sender (`verified`), which is all it will be able to check with E2EE.
+- **Evidence from a chat:** "Include messages" lists the thread's last 30 messages; the reporter ticks up to 20. Only ticked messages are sent, as plaintext from the app, so this keeps working with end-to-end encrypted chats. A ticked photo is sent too: the app takes the photo it decrypted, re-encodes it as a JPEG, uploads it with `POST /v1/me/attachments` (sanitized by the server like any upload) and passes the upload's id as the item's `photoID`; the report consumes the upload. Moderators therefore see only the photos the reporter chose to share, never the rest of the thread. `moderate show` prints `photo: <path under MEDIA_DIR>` under the item (and `--json` has `photoPath`); the path appears nowhere else. At most 10 photos per report (the pending-upload cap); a photo the app can't show any more (expired, opened view-once, not on this phone) is sent as "there was a photo" without the image. The server records whether each message id exists in that thread from the claimed sender (`verified`), which is all it can check with E2EE: it can't tell whether a re-uploaded photo is the one that was in the chat.
 
 ### Auto-hide rules
 
@@ -185,7 +186,7 @@ Options that don't belong to a command are refused rather than ignored. Write co
 
 ### Retention
 
-- `report_evidence` rows, the report's free-text `details` and `reporter_ip_hash` are deleted by the slow retention job `REPORT_EVIDENCE_RETENTION_DAYS` (30) after a report is closed, 30 days after filing if the reported account was deleted, and in any case `REPORT_EVIDENCE_MAX_DAYS` (180) after filing.
+- `report_evidence` rows (with their photo files), the report's free-text `details` and `reporter_ip_hash` are deleted by the slow retention job `REPORT_EVIDENCE_RETENTION_DAYS` (30) after a report is closed, 30 days after filing if the reported account was deleted, and in any case `REPORT_EVIDENCE_MAX_DAYS` (180) after filing.
 - The report row itself (reason, priority, status, dates) stays for history; account deletion anonymizes it (`SET NULL`) as before. `moderation_actions` is kept and anonymized the same way.
 - Evidence a reporter shared is part of their data export while it exists.
 - If the reporter deletes their account, the report is anonymized but its evidence keeps the same clock, so a harassed person leaving the app doesn't erase the evidence against the harasser. If the reported account is deleted, the evidence goes 30 days after the report was filed.
@@ -202,7 +203,7 @@ Every **profile** photo is checked at upload. The rule is *label, don't reject*:
 
 On the 61 seed photos (clothed and shirtless men) nothing reaches 0.5; the highest stray explicit score is 0.29.
 
-**What explicit means.** An explicit photo is kept and shown to its owner with `isExplicit: true`, and the app badges it "Hidden". It is never shown to anyone else: not on the grid, a profile, a chat header or a favourites list. This is the same rule the server already applied to `is_explicit`, now set by the classifier. The owner can still send that photo in a chat. Chat photos aren't checked here; they will be moderated on the device once chats are end-to-end encrypted (see "With end-to-end encrypted chats" above).
+**What explicit means.** An explicit photo is kept and shown to its owner with `isExplicit: true`, and the app badges it "Hidden". It is never shown to anyone else: not on the grid, a profile, a chat header or a favourites list. This is the same rule the server already applied to `is_explicit`, now set by the classifier. The owner can still send that photo in a chat. Chat photos aren't checked here: an end-to-end encrypted one is opaque to the server, and the app checks incoming ones on the device instead (section 7, "Encrypted photos").
 
 **Duplicates.** Each photo gets a 64-bit perceptual hash (DCT pHash, the same algorithm as Python's `imagehash.phash`). If it is within `PHOTO_DUPLICATE_MAX_DISTANCE` bits (6 of 64) of a photo on **another** account, the new upload gets a row in `photo_flags` (`kind = 'duplicate'`) naming the older photo and account. Re-encoded and resized copies differ by 0–4 bits. Different photos, even of the same person, differ by 20 or more. Near-uniform images (solid colours, a black frame) aren't hashed, because they would all match each other.
 
@@ -220,9 +221,9 @@ On the 61 seed photos (clothed and shirtless men) nothing reaches 0.5; the highe
 
 ## 7. End-to-end encrypted chat
 
-Chats use the Signal Protocol through Signal's own [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0): PQXDH to start a session, then the Double Ratchet. The server distributes public keys and relays ciphertext; the iOS client (below) holds the private keys and encrypts and decrypts. Encrypted media and the safety-number comparison screen come next ([`roadmap.md`](roadmap.md#end-to-end-encrypted-chat)). The wire contract is in [`api.md`](api.md#end-to-end-encryption).
+Chats use the Signal Protocol through Signal's own [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0): PQXDH to start a session, then the Double Ratchet. The server distributes public keys and relays ciphertext; the iOS client (below) holds the private keys and encrypts and decrypts. Chat photos are encrypted too ("Encrypted photos" below). The safety-number comparison screen and multi-device come next ([`roadmap.md`](roadmap.md#end-to-end-encrypted-chat)). The wire contract is in [`api.md`](api.md#end-to-end-encryption).
 
-Code: `server/src/lib/e2e/` (`crypto.ts` key checks, `keys.ts` storage and bundles, `envelope.ts`), `server/src/routes/keys.ts`, the envelope path in `server/src/routes/chat.ts`; schema in `server/migrations/109_e2e-prekeys.sql`.
+Code: `server/src/lib/e2e/` (`crypto.ts` key checks, `keys.ts` storage and bundles, `envelope.ts`), `server/src/routes/keys.ts`, the envelope path in `server/src/routes/chat.ts`, the encrypted upload in `server/src/routes/me.ts`; schema in `server/migrations/109_e2e-prekeys.sql` and `111_e2e-media.sql`.
 
 ### What the server stores
 
@@ -231,6 +232,7 @@ Code: `server/src/lib/e2e/` (`crypto.ts` key checks, `keys.ts` storage and bundl
 | `e2e_devices` | per account (device 1): registration id, identity **public** key, when it last changed, signed prekey + signature, Kyber last-resort prekey + signature | account deleted (cascade), account banned, replaced by `PUT /v1/keys` |
 | `e2e_one_time_prekeys` | one-time EC and Kyber **public** prekeys (Kyber ones signed) | handed out in a bundle (deleted in the same transaction), re-registration, account deleted or banned |
 | `messages.envelope_type`, `envelope_body` | the opaque ciphertext of an encrypted message (`prekey` or `signal`) | like any message: expiry, both people clearing the thread, account deletion |
+| `<32 hex>.bin` files in `MEDIA_DIR`, `attachment_uploads.encrypted`, `messages.attachment_encrypted` | encrypted chat photos: AES-256-GCM blobs (padded, so only a size bucket shows) and a flag saying the attachment is one | like any chat photo: unsent after 1 h, view-once 30 s after the recipient opens it (or 14 days unopened), expiring messages at `expiresAt`, both people clearing the thread, account deletion |
 
 No private key ever reaches the server. Key material and ciphertext are never logged, and validation errors name the field, never the value. The data export lists the account's public key state and its messages' envelopes.
 
@@ -250,6 +252,22 @@ The checks use libsignal's Node bindings (`@signalapp/libsignal-client`, prebuil
 ### Identity changes (safety numbers)
 
 Key writes and the ban's key deletion take the same per-account lock, and writes refuse a banned account, so an upload racing a ban can't put keys back. Re-registering with a different identity key (a reinstall, or a new phone) records `identity_key_changed_at`, replaces every one-time prekey, and pushes `identity.changed` `{userID, identityKeyChangedAt}` to every chat partner without a block. Their app re-fetches the identity and shows a safety-number warning; libsignal itself refuses the new key until the app accepts it, so a missed event can't switch keys silently. Bundles and `GET /v1/keys/identity/:id` carry `identityKeyChangedAt` too. `PUT /v1/keys` is attested and limited to 10 per account per day, so a stolen session token alone can't swap the identity key on an enforcing server, and nobody can spam peers with warnings.
+
+### Encrypted photos
+
+The app encrypts each chat photo before it leaves the phone: a fresh random 32-byte key, AES-256-GCM with a random nonce, the JPEG padded to a size bucket first (Signal's 5% steps, at least 541 bytes). It uploads the result to `POST /v1/me/attachments` as `application/octet-stream`, and puts the key and the blob's SHA-256 inside the Signal envelope of the message that carries the photo (format in [`api.md`](api.md#encrypted-photos)). The server only ever has the blob and its size bucket. It still sees that a photo was sent, from whom to whom and when, the view-once flag and the expiry timer, and when the recipient first loaded it; it can't see the image, caption, dimensions or key. It stores the bytes as they are, under a new random `.bin` name, and never decodes them, re-encodes them, hashes them or runs the nudity classifier on them (profile photos stay unencrypted and checked, section 6). Uploads share the plaintext ones' limits: 10 MB, 10 pending, 30 an hour, attestation, deleted after an hour unsent.
+
+The recipient's app downloads the blob, checks the SHA-256 from the envelope before decrypting (so a swapped or truncated blob is refused; AES-GCM isn't key-committing, so on its own it wouldn't rule out one blob opening under two keys, and the digest in the authenticated envelope pins exactly one blob to the message), decrypts and strips the padding. Decrypted images stay in memory; nothing decrypted is written to disk or to the URL cache.
+
+**Which photos are encrypted** follows `E2E_MODE` and the same rule as text: with `off`, nothing (the upload is refused with `e2e_disabled`); with `optional`, every photo to someone the app can encrypt to, and a plaintext upload only when the recipient has no keys or the server says E2E is off; with `required`, never a plaintext photo (the server refuses one with `encryption_required`, and the app shows an error before uploading anything). The app decides before uploading, so a photo is never uploaded in plaintext next to encrypted text. An encrypted upload sent without an envelope is refused (`envelope_required`).
+
+**Expiry.** The blob rides on the message's attachment, so every existing deletion path covers it: expiring messages, view-once photos 30 seconds after the recipient first loads the thread (14 days if never opened), unsent uploads after an hour, both people clearing the thread, account deletion. The app drops the key from its local history at the same moments (the message's `expiresAt`, the 14-day cap for a sender who can't see the read time, and right after a view-once photo is viewed), so a copy of the blob kept elsewhere stays unreadable.
+
+**Timer in the payload.** An encrypted photo sent with a timer also carries `expiresAfterSeconds` inside the encrypted payload. The server doesn't tell the recipient the timer, and the recipient's app needs it to set its key deadline (it keeps the key until it decrypted the message, plus 14 days, plus the timer, plus a day of margin, and sets the message's `expiresAt` to the read time plus the timer when the chat is marked read). It is ignored unless it is a whole number from 1 to 2592000, and older builds ignore it. While the app runs, it also prunes expired keys (on foreground and at most once a minute as messages arrive) and removes the decrypted images of dropped keys from memory.
+
+**Report retries.** When a report with photo evidence fails and is retried, the app reuses the photos it already uploaded instead of uploading them again, so a flaky connection doesn't burn the 10-pending-uploads cap.
+
+**On-device moderation.** Before an incoming decrypted photo is shown, the app asks an analyzer whether it is explicit, and blurs an explicit photo until the user taps it when **Blur explicit photos** is on (or when the system-wide Sensitive Content Warning is on). The analyzer is Apple's Sensitive Content Analysis framework, which needs the `com.apple.developer.sensitivecontentanalysis.client` entitlement, granted by Apple on request. This build doesn't have it (adding it would also need Apple's approval for device signing), so the framework reports its policy as disabled, the analyzer answers "unknown" and reports system warnings as off. The rule is: the user's own photos are always shown; an "explicit" verdict blurs when the setting or system warnings are on; "clean" and "unknown" are shown, because blurring everything would make the setting meaningless. So today nothing is blurred automatically, even with **Blur explicit photos** on. Once the entitlement is added the same code path turns on, and it follows the user's own system setting. A Debug-only launch argument (`-StexxDebugFlagChatPhotos YES`, compiled out of Release) swaps in an analyzer that flags every incoming photo, to exercise the blur screen. The check runs on the decrypted image on the phone and nothing about it is sent anywhere.
 
 ### Envelopes and the moderation rules
 
@@ -274,7 +292,7 @@ Code: `ios/Stexx/E2E/`. libsignal's Swift bindings at v0.108.1, with the Rust li
 | --- | --- | --- |
 | `off` | production | `/v1/keys*` → 404 `e2e_disabled`; an `envelope` → 400 `e2e_disabled`; plaintext chat exactly as before. `GET /v1/e2e/config` still answers. |
 | `optional` | development, tests | Keys live. Each message is plaintext or an envelope. The app encrypts when the recipient has keys and sends plaintext when the bundle fetch says `keys_unavailable`. |
-| `required` | – | Plaintext `text` → 400 `encryption_required`. Photo-only messages still work until encrypted media ships. |
+| `required` | – | Plaintext `text` and plaintext photos → 400 `encryption_required`. Photos must be encrypted uploads inside an envelope. Plaintext `image/*` uploads are still accepted, but only as report evidence. |
 
 Migration plan:
 
@@ -297,6 +315,7 @@ Rolling back from `optional` to `off` keeps stored envelopes readable by the app
 | 403 | `account_banned` | Server message on the sign-in screen |
 | 400 | `invalid_key`, `invalid_signature`, `invalid_envelope` | Not shown: a client bug; log and re-generate keys |
 | 400 | `encryption_required` | "Update Stexx to keep chatting." |
+| 400 | `envelope_required`, `invalid_attachment` | Not shown: a client bug (an encrypted photo without an envelope, an empty blob) |
 | 400 / 404 | `e2e_disabled` | Not shown: send plaintext (the server hasn't switched E2E on) |
 | 404 | `keys_unavailable` | Not shown: the recipient can't receive encrypted messages yet; send plaintext while the mode is `optional` |
 | 409 | `keys_not_registered`, `prekey_limit` | Not shown: re-register with `PUT /v1/keys` / upload fewer prekeys |
@@ -356,12 +375,13 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Raw IPs are never stored. Rate-limit rows hold an HMAC of the IP or /24 network (key derived from `EMAIL_PEPPER`) and disappear within two windows.
 - The trust ramp reads message metadata the server already has (sender, conversation, time, text for the duplicate check); nothing new is collected.
 - End-to-end encryption adds public keys only (section 7), deleted with the account or on a ban, and ciphertext the server can't read. One-time prekeys are deleted the moment they are handed out.
-- Reports add two things: the messages a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Nothing in moderation stores or shows a location.
+- Reports add two things: the messages and photos a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Evidence photos are files in `MEDIA_DIR` with random names that no API response contains; only the moderation CLI prints their path. Nothing in moderation stores or shows a location.
+- Encrypted chat photos add nothing readable: a blob, its size bucket and the usual message metadata.
 - Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read.
 
 ## Not done yet
 
-- Report evidence can't include photos yet (only that a photo was sent). With E2EE, the app would need to re-encrypt the chosen photo for moderators; that comes with the E2EE work.
+- Report evidence photos are re-uploaded by the reporter's app, so the server can't prove a photo is the one that was in the chat (same as evidence text).
 - No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Review turnaround depends on someone running `list`; there are no notifications for new high-priority reports yet.
 - The "Report" and "Block" menus were checked by hand; there are no UI tests for them.
 - A moderator screen for `photo_flags`, and a way for a person to contest an "explicit" label. Today a moderator fixes a wrong label with SQL: `UPDATE photos SET is_explicit = false, nsfw_model = 'manual' WHERE id = …`.
@@ -369,7 +389,11 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Moderator tooling to ban an account's devices (`banDevicesOfUser` exists, nothing calls it).
 - Tests against a real-device attestation: the suite uses a synthetic root and devices generated by `server/test/fixtures/app-attest/generate.ts`. Do one manual sign-up on a physical iPhone against a staging server before enforcing.
 - The DeviceCheck "banned" bit is written on the device's next request with a token, not immediately at ban time.
-- End-to-end encryption covers chat text only: encrypted media, the safety-number comparison screen and multi-device are still to come. `E2E_MODE` stays `off` in production until a build with the iOS client is out (rollout step 2).
+- End-to-end encryption covers chat text and chat photos; the safety-number comparison screen and multi-device are still to come. `E2E_MODE` stays `off` in production until a build with the iOS client is out (rollout step 2). Before switching it to `optional`, sync the Caddy site file (`deploy.sh --sync-config`) so `media.stexx.gay` serves the `.bin` blobs.
+- On-device moderation of chat photos is wired but inactive: Apple's Sensitive Content Analysis needs an entitlement this build doesn't have, and there's no bundled model, so no photo is blurred automatically yet (section 7, "Encrypted photos").
+- Known limitation, encrypted view-once photos: the server marks a view-once photo opened when the recipient's app first lists the thread (the existing rule, the same for plaintext), and deletes the blob about 30 seconds later. An encrypted view-once photo that the recipient doesn't tap right away becomes "no longer available". The app itself never sends view-once photos; only other clients (the dev peer) can. Fixing it needs a dedicated open endpoint (follow-up).
+- Known limitation, app switcher: a decrypted photo on screen can appear in iOS's app-switcher snapshot, as plaintext photos already can. A privacy cover is a follow-up.
+- A view-once photo's 30-second window starts when the recipient's app loads the thread, not when they tap the photo, so a view-once photo opened later than that is already gone. That is the server's existing rule for every view-once photo; the iOS app doesn't send view-once photos itself (its "Expiring photos" are deleted a minute after being read).
 - The iOS client was tested in the simulator against a local server and with unit tests, not yet on a physical iPhone: the Keychain classes, App Attest on `PUT /v1/keys` and bundle fetches, and the libsignal device build need one run on a real device against staging before switching to `optional`.
 - Report evidence carries the plaintext the reporter's app decrypted; a message that couldn't be decrypted on the reporter's phone can't be included.
 - The libsignal native module was tested under Bun on macOS arm64 only; on the Linux VPS it is expected to load (glibc 2.39 ≥ 2.34), and if it doesn't, the built-in verifier takes over. Check the `e2eVerifier` boot log after the first deploy.
