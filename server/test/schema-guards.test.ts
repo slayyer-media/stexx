@@ -60,6 +60,8 @@ const UNLINKED_ID_ALLOWLIST: Record<string, string> = {
     "not a FK on purpose: the features outlive an expiring message for their short TTL; the row cascades through sender_id and expires after SPAM_HASH_TTL_HOURS (112)",
   "spam_flags.lifted_by": "'system' or a moderator's handle, never an account id; the row cascades through user_id (112)",
   "photo_hash_blocklist.added_by": "a moderator's handle, never an account id (114)",
+  "spam_contacts.conversation_id":
+    "not a FK on purpose: the ledger row outlives a cleared thread or an expired message for its short TTL; it cascades through sender_id and other_id and expires after SPAM_BLOCKED_DAYS / SPAM_WINDOW_HOURS (112)",
 };
 
 /**
