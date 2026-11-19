@@ -5,6 +5,9 @@ After=network-online.target postgresql.service
 Wants=network-online.target postgresql.service
 StartLimitIntervalSec=120
 StartLimitBurst=6
+# Alert (unit name only) when the API ends up failed, i.e. it ran out of restarts. Configured in /etc/stexx/watch.env;
+# a no-op until then. A flapping-but-restarting API is caught by the watchdog's health checks instead.
+OnFailure=stexx-alert@%n.service
 
 [Service]
 Type=simple

@@ -7,7 +7,9 @@
 #
 # Idempotent: safe to re-run. It never touches an existing /etc/stexx/stexx.env, existing roles' data, or
 # Caddy's main Caddyfile if one exists. It does NOT enable ufw (run ufw-cloudflare.sh --apply yourself)
-# and does NOT start the API or the backup timer (the first deploy and the B2 setup come first).
+# and does NOT start the API or the backup timer (the first deploy and the B2 setup come first). It does enable the
+# watchdog timer (stexx-watch): it only logs until /etc/stexx/watch.env configures an alert destination, and it is what
+# deletes expired pre-migration snapshots.
 #
 # Prerequisites it checks but does not install: PostgreSQL 18 (PGDG apt repo) and Caddy (Caddy apt repo).
 #
@@ -134,19 +136,25 @@ if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(NODE_ENV|HOST|PORT|MEDIA_DIR)[[:
 fi
 install -m 0644 "$HERE/backup.env.example" /etc/stexx/backup.env.example
 install -m 0644 "$HERE/rclone.conf.example" /etc/stexx/rclone.conf.example
+install -m 0644 "$HERE/watch.env.example" /etc/stexx/watch.env.example
 
 if [ "$RESTART_PG" = 1 ]; then systemctl restart "postgresql@${PG_VERSION}-${PG_CLUSTER}"; else systemctl reload "postgresql@${PG_VERSION}-${PG_CLUSTER}"; fi
 sleep 2
 "${PSQL[@]}" -c "SELECT 1" >/dev/null || die "postgres did not come back"
 
-# --- systemd units, backup script -----------------------------------------------------------------
-log "systemd units and backup script"
-install -m 0644 "$HERE/stexx-api.service"    /etc/systemd/system/stexx-api.service
-install -m 0644 "$HERE/stexx-backup.service" /etc/systemd/system/stexx-backup.service
-install -m 0644 "$HERE/stexx-backup.timer"   /etc/systemd/system/stexx-backup.timer
-install -m 0755 "$HERE/backup.sh"            /usr/local/sbin/stexx-backup
+# --- systemd units, backup + watchdog scripts ----------------------------------------------------
+log "systemd units, backup and watchdog scripts"
+install -m 0644 "$HERE/stexx-api.service"     /etc/systemd/system/stexx-api.service
+install -m 0644 "$HERE/stexx-backup.service"  /etc/systemd/system/stexx-backup.service
+install -m 0644 "$HERE/stexx-backup.timer"    /etc/systemd/system/stexx-backup.timer
+install -m 0644 "$HERE/stexx-watch.service"   /etc/systemd/system/stexx-watch.service
+install -m 0644 "$HERE/stexx-watch.timer"     /etc/systemd/system/stexx-watch.timer
+install -m 0644 "$HERE/stexx-alert@.service"  /etc/systemd/system/stexx-alert@.service
+install -m 0755 "$HERE/backup.sh"             /usr/local/sbin/stexx-backup
+install -m 0755 "$HERE/stexx-watch.sh"        /usr/local/sbin/stexx-watch
 systemctl daemon-reload
 systemctl enable stexx-api.service >/dev/null   # starts at boot; first start happens at the first deploy
+systemctl enable --now stexx-watch.timer >/dev/null   # logs only until /etc/stexx/watch.env sets a destination
 
 # --- caddy ----------------------------------------------------------------------------------------
 log "Caddy"
@@ -204,5 +212,8 @@ Next steps (see deploy/README.md):
   2. Backups: create the age key pair on your laptop, put the PUBLIC key in /etc/stexx/backup-recipients.txt,
      copy /etc/stexx/rclone.conf.example -> rclone.conf (chgrp stexxbackup, chmod 0640), then:
        systemctl enable --now stexx-backup.timer && systemctl start stexx-backup.service
-  3. First deploy from your machine:  DEPLOY_HOST=user@host ./deploy/deploy.sh
+  3. First deploy from your machine:  DEPLOY_HOST=user@host ./deploy/deploy.sh --no-backup
+  4. Alerts: copy /etc/stexx/watch.env.example -> watch.env (chmod 0600), set ALERT_EMAIL and/or ALERT_WEBHOOK_URL,
+     then: /usr/local/sbin/stexx-watch --test-alert
+  5. Restore drill from your laptop (deploy/restore-drill.sh) once backups run; see deploy/README.md.
 MSG
