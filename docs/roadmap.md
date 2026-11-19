@@ -43,6 +43,12 @@ Self-hosted on one VPS, so the server has to watch itself. See [`server/deploy/R
 - [x] **Received taps inbox.** Taps are stored and listed (`GET /v1/me/taps`, newest first, one per sender; blocked, hidden, banned and incognito senders left out), so someone who was offline still sees who tapped them. A Taps row at the top of Chats opens the list (tap back from a swipe or long-press); new taps count in the Chats badge until the screen is opened (`POST /v1/me/taps/seen`). Taps are deleted after `TAP_RETENTION_DAYS` (30, owner to confirm). Follow-ups: the seen watermark isn't in the data export yet, and there are no push notifications for taps (or anything else) yet.
 - [x] **Chat list error state.** A failed load shows an error with "Try again" instead of "No chats yet"; with cached chats, a small banner above them offers a retry.
 
+## Accounts and sign-in
+
+No real names or phone numbers: an account is a nickname plus a passkey or an email used only for sign-in.
+
+- [x] **Email sign-up and sign-in that work in production.** The app no longer uses the dev-only `/auth/register` for email. Sign-up and sign-in send one email with a link and an 8-digit code (15 minutes, once); the link opens the app as a universal link and the code works when the link is read on another device. Resends follow the server's limit with a countdown; expired links, wrong codes and addresses without an account get plain explanations; a link opened without the app shows a static page that never uses it. See [`ios/README.md`](../ios/README.md#email-sign-in) and [`api.md`](api.md#auth--account). Still to do: try a real universal-link open from Mail on a device once `stexx.gay` serves the apple-app-site-association file.
+
 ## End-to-end encrypted chat
 
 Chat text and chat photos are end-to-end encrypted with the Signal Protocol, using Signal's official [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0, the same license as Stexx). The server relays ciphertext it can't read.

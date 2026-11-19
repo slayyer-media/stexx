@@ -4,9 +4,9 @@ import { config } from "../config.ts";
 import { serviceUnavailable } from "./errors.ts";
 
 /**
- * Sign-in link delivery.
- * - SMTP_URL set → send via nodemailer. Body contains only the link (no profile content).
- * - Otherwise, outside production → print the LINK (never the address) to stdout and push to devOutbox.
+ * Sign-in link delivery: one email with the link and the same sign-in's one-time code.
+ * - SMTP_URL set → send via nodemailer. Body contains only the link and the code (no profile content).
+ * - Otherwise, outside production → print the LINK and CODE (never the address) to stdout and push to devOutbox.
  * - Otherwise (production without SMTP) → 503 `email_unavailable`.
  */
 
@@ -15,6 +15,8 @@ export interface DevMail {
   to: string;
   url: string;
   token: string;
+  /** The 8-digit code that works instead of the link (POST /auth/email/code). */
+  code: string;
   at: Date;
 }
 
@@ -31,21 +33,35 @@ export function signInLinkUrl(token: string): string {
   return `${config.appLinkBase}/auth/email?token=${encodeURIComponent(token)}`;
 }
 
-export async function sendSignInLink(to: string, token: string): Promise<void> {
+/** Plain-text body. Exported for tests. The code is on a line of its own so iOS can offer it as AutoFill. */
+export function signInMailText(url: string, code: string): string {
+  return [
+    "Tap to sign in to Stexx on your iPhone:",
+    "",
+    url,
+    "",
+    `Or enter this code in the Stexx app: ${code}`,
+    "",
+    "The link and the code work once, for 15 minutes. If you didn't ask for this, ignore this email.",
+  ].join("\n");
+}
+
+export async function sendSignInLink(to: string, token: string, code: string): Promise<void> {
   const url = signInLinkUrl(token);
   if (config.smtpUrl) {
     await smtp().sendMail({
       from: config.mailFrom,
       to,
+      // Not the code: subjects show on the lock screen and in notification previews.
       subject: "Your Stexx sign-in link",
-      text: `Tap to sign in to Stexx:\n\n${url}\n\nThis link expires in 15 minutes and works once. If you didn't ask for it, ignore this email.`,
+      text: signInMailText(url, code),
     });
     return;
   }
   if (config.isProduction) throw serviceUnavailable("email_unavailable", "Email sign-in is temporarily unavailable.");
-  devOutbox.push({ to: to.trim().toLowerCase(), url, token, at: new Date() });
+  devOutbox.push({ to: to.trim().toLowerCase(), url, token, code, at: new Date() });
   if (devOutbox.length > 100) devOutbox.shift();
-  if (!config.isTest) console.log(`[dev-mail] sign-in link: ${url}`);
+  if (!config.isTest) console.log(`[dev-mail] sign-in link: ${url}  code: ${code}`);
 }
 
 /**

@@ -9,12 +9,23 @@ protocol APIClient: PasskeyAPI {
     // MARK: Auth & account
     /// `POST /auth/register`: the dev server's shortcut (a session without
     /// a credential). Production answers 400 `use_passkey_flow` /
-    /// `use_email_link`.
+    /// `use_email_link`; email sign-up there is `requestEmailLink` with a
+    /// nickname (see `EmailSignIn.swift`).
     func register(_ request: RegistrationRequest) async throws -> Session
-    /// Sends a one-time sign-in link. Succeeds whether or not the address exists.
-    func requestEmailLink(email: String) async throws
-    /// Exchanges the token from a sign-in link for a session.
-    func verifyEmailLink(token: String) async throws -> Session
+    /// `POST /auth/email/link`: emails a one-time sign-in link and code.
+    /// Succeeds whether or not the address has an account. 429 carries
+    /// `Retry-After`.
+    func requestEmailLink(_ request: EmailLinkRequest) async throws
+    /// `POST /auth/email/verify`: the token from a sign-in link → session.
+    /// `requestNonce` is this install's (see `EmailRequestNonceStore`); a
+    /// link it didn't ask for throws `.confirmationRequired` unless
+    /// `confirmed`. Throws `EmailSignInError.invalidLink` /
+    /// `.registrationRequired` / `.confirmationRequired`.
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session
+    /// `POST /auth/email/code`: the 8-digit code from the same email →
+    /// session; only with the nonce the email was asked for with. Throws
+    /// `EmailSignInError.invalidCode` / `.registrationRequired`.
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session
     /// Rotates the refresh token. `HTTPAPIClient` calls this itself on 401.
     func refreshSession(refreshToken: String) async throws -> Session
     /// Revokes `session` on the server. Never reads or writes the stored

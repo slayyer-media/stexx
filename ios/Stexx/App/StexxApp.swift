@@ -8,6 +8,8 @@ struct StexxApp: App {
     @State private var e2e: E2EStatus
     private let api: any APIClient
     private let passkeys: PasskeySupport
+    /// Debug builds against a dev server: show its `/auth/register` shortcut.
+    private let allowsDevSignUpShortcut: Bool
 
     init() {
         let configuration = APIConfiguration.fromBundle()
@@ -81,6 +83,11 @@ struct StexxApp: App {
         // Unavailable (button explained) when the build can't use passkeys
         // with its server, e.g. the Local configuration on 127.0.0.1.
         self.passkeys = PasskeySupport.live(configuration)
+        #if DEBUG
+        self.allowsDevSignUpShortcut = !configuration.useMock
+        #else
+        self.allowsDevSignUpShortcut = false
+        #endif
         _appState = State(initialValue: appState)
         _chatStore = State(initialValue: chatStore)
         _e2e = State(initialValue: e2e)
@@ -104,6 +111,7 @@ struct StexxApp: App {
                 .environment(e2e)
                 .environment(\.apiClient, api)
                 .environment(\.passkeys, passkeys)
+                .environment(\.allowsDevSignUpShortcut, allowsDevSignUpShortcut)
                 .preferredColorScheme(.dark)
                 .tint(Theme.violet)
         }

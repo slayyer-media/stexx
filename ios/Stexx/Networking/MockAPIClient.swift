@@ -33,6 +33,22 @@ actor MockAPIClient: APIClient {
     /// Auto-renew status reported with an active subscription.
     private var plusWillRenew: Bool? = true
     private var boostEndsAt: Date?
+    /// Email sign-in links "sent" (token → address), like `email_link_tokens`.
+    private var emailLinks: [String: String] = [:]
+    /// The request nonce each link was asked for with (token → nonce).
+    private var emailLinkNonces: [String: String] = [:]
+    /// Addresses with a live code (address → pending nickname, if a sign-up).
+    private var emailCodes: [String: String?] = [:]
+    /// Send times per address, for the server's 3-per-15-minutes limit.
+    private var emailSends: [String: [Date]] = [:]
+    /// The token in the newest fake email (tests open it as a link).
+    private(set) var lastEmailLinkToken: String?
+
+    /// Every fake sign-in email carries this code (Debug builds: type it on
+    /// the "check your email" screen).
+    static let emailCode = "12345678"
+    /// See `verifyEmailLink`.
+    static let someoneElsesLinkPrefix = "someone-else"
 
     init(latency: Duration = .milliseconds(250), plusActive: Bool = false) {
         let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
@@ -84,8 +100,42 @@ actor MockAPIClient: APIClient {
         return MockData.session
     }
 
-    func requestEmailLink(email: String) async throws {
+    /// Like the server: one email with a link and a code; 3 per address in
+    /// 15 minutes, then 429 with the wait.
+    func requestEmailLink(_ request: EmailLinkRequest) async throws {
         try await pause()
+        let address = request.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard address.contains("@") else { throw APIError.server(status: 400, message: "email: must be a valid email address") }
+        guard (request.displayName == nil) == (request.confirmedAdult == nil), request.confirmedAdult != false else {
+            throw APIError.server(status: 400, message: "displayName and confirmedAdult must be sent together")
+        }
+        let now = Date.now
+        let window: TimeInterval = 15 * 60
+        let recent = (emailSends[address] ?? []).filter { now.timeIntervalSince($0) < window }
+        if recent.count >= 3, let oldest = recent.first {
+            emailSends[address] = recent
+            throw APIError.rateLimited(retryAfter: window - now.timeIntervalSince(oldest))
+        }
+        emailSends[address] = recent + [now]
+        let token = Self.randomBase64URL(32)
+        emailLinks[token] = address
+        emailLinkNonces[token] = request.requestNonce
+        lastEmailLinkToken = token
+        emailCodes.updateValue(request.displayName, forKey: address)
+    }
+
+    /// Like the server: only in the app install that asked for the email.
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session {
+        try await pause()
+        let address = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let askedHere = emailLinks.contains { $0.value == address && emailLinkNonces[$0.key] == requestNonce }
+        guard code == Self.emailCode, askedHere, let pending = emailCodes.removeValue(forKey: address) else {
+            throw EmailSignInError.invalidCode
+        }
+        emailLinks = emailLinks.filter { $0.value != address }
+        emailLinkNonces = emailLinkNonces.filter { emailLinks[$0.key] != nil }
+        if let pending { me.displayName = pending }
+        return MockData.session
     }
 
     // MARK: Passkeys (simulated: pairs with `SimulatedPasskeyAuthenticator`)
@@ -149,8 +199,26 @@ actor MockAPIClient: APIClient {
         return parsed.challenge
     }
 
-    func verifyEmailLink(token: String) async throws -> Session {
+    /// Links from `requestEmailLink` work once; anything else is expired.
+    /// A link asked for with another nonce asks first, like the server.
+    /// A link token starting with `someone-else` stands for a link another
+    /// install asked for (Debug: `-StexxOpenURL` shows "sign in as …?").
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session {
         try await pause()
+        if token.hasPrefix(Self.someoneElsesLinkPrefix) {
+            guard confirmed else {
+                throw EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: false, displayName: "NightOwl"))
+            }
+            return MockData.session
+        }
+        guard let address = emailLinks[token] else { throw EmailSignInError.invalidLink }
+        if !confirmed, emailLinkNonces[token] != requestNonce {
+            let pending = emailCodes[address] ?? nil
+            throw EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: pending != nil, displayName: pending ?? me.displayName))
+        }
+        emailLinks.removeValue(forKey: token)
+        emailLinkNonces.removeValue(forKey: token)
+        if let pending = emailCodes.removeValue(forKey: address), let pending { me.displayName = pending }
         return MockData.session
     }
 

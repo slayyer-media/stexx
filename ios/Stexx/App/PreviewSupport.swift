@@ -15,6 +15,7 @@ extension View {
             .environment(services.purchases)
             .environment(services.e2e)
             .environment(\.apiClient, api)
+            .environment(EmailLinkRedeemer())
             .preferredColorScheme(.dark)
             .tint(Theme.violet)
     }

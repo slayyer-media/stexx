@@ -44,7 +44,7 @@ Everything runs on the single VPS with what is already there: the Bun API and Po
 | Purpose | Routes | Needs attestation |
 | --- | --- | --- |
 | signup | `POST /v1/auth/register` (dev), `POST /v1/auth/passkey/register/finish` | yes |
-| login | `POST /v1/auth/passkey/login/finish`, `POST /v1/auth/email/link`, `POST /v1/auth/email/verify` (which also runs the signup checks when it creates an account) | yes |
+| login | `POST /v1/auth/passkey/login/finish`, `POST /v1/auth/email/link`, `POST /v1/auth/email/verify`, `POST /v1/auth/email/code` (the last two also run the signup checks when they create an account) | yes |
 | message | `POST /v1/conversations/:id/messages`, `PUT /v1/keys`, `GET /v1/keys/bundle/:id` | yes |
 | photo | `POST /v1/me/photos`, `POST /v1/me/attachments` | yes |
 | optional | `DELETE /v1/me` | used if present (to free the device's account slot) |
@@ -81,6 +81,11 @@ Sliding-window limits (the current window plus a weighted share of the previous 
 | key registration, `PUT /v1/keys` | – | – | – | 10 / 1d |
 
 Override any of them with `RATE_LIMIT_<ACTION>_<SCOPE>=<count>/<window>`, e.g. `RATE_LIMIT_SIGNUP_IP=5/1h`, `RATE_LIMIT_MESSAGE_ACCOUNT=500/1d` (key limits: `RATE_LIMIT_KEY_BUNDLE_ACCOUNT`, `…_DEVICE`, `…_IP`, `RATE_LIMIT_KEY_REGISTER_ACCOUNT`, and the prekey budgets `RATE_LIMIT_PREKEY_TARGET`, `RATE_LIMIT_PREKEY_PAIR`). These sit on top of the existing per-route token buckets in `lib/ratelimit.ts` (in memory, per minute). Because these windows run for hours and days, their counters live in Postgres (`abuse_counters`, migration 105): one small row per limit and subject, updated under a transaction-scoped advisory lock so concurrent requests can't overshoot, and kept across restarts and deploys. The retention job deletes rows once they can't affect a decision (at most two windows, so two days for the longest). `MemorySlidingWindowStore` implements the same interface for unit tests.
+
+**Email sign-in codes.** Every sign-in email carries a link (a 32-byte token) and an 8-digit code for the same sign-in, both single use and valid for 15 minutes (the link stored as a SHA-256 hash; the code as an HMAC-SHA256 under a key derived from `EMAIL_PEPPER`, bound to the address's HMAC, so someone who can read the database or a backup but not the pepper can't try the 10^8 codes offline). Each email is bound to the app install that asked for it: the app sends a random 32-byte request nonce with `POST /auth/email/link`, keeps it in the Keychain (this device only) while it waits, and the row stores its SHA-256 (`request_nonce_hash`).
+
+- **Codes only work in the asking install.** `POST /auth/email/code` needs the nonce, and a guess only ever tests, and counts against, the codes that install asked for. A stranger who knows someone's address therefore can't use up or switch off their code. Guessing is capped three ways: 5 wrong codes switch off the codes of that install's emails (their links keep working), at most 10 code attempts per address per client per hour (`emailCode` in `lib/ratelimit.ts`), and the per-client `auth` and `login` limits. To have codes to guess at, an attacker must ask for the emails themselves, at most 3 per 15 minutes per client and 8 per 15 minutes per address, and every one lands in the owner's inbox. So at most 5 guesses per code against 10^8 codes, at most 160 guesses an hour, and only while flooding the inbox with 32 emails an hour from several attested devices: about 1 in 600,000 per hour.
+- **Links opened elsewhere ask first (login CSRF).** Anyone can ask for a link to their own account and send it to someone whose app is signed out; opening it would put that phone into the sender's account, and the victim's location cell, photos and chats would land where the sender can read them. So `POST /auth/email/verify` gets the app's nonce: a link this install asked for signs in at once; any other link gets `409 confirm_link` with the account's nickname and whether it would be a new account, and is left unused. The app shows "Sign in as *nickname*?" (or "Create the account *nickname*?"), says it wasn't asked for in this app, and only on yes sends it again with `confirmed: true`. Nothing starts (location, realtime) before that. The app also only accepts `https` links on the configured app-link host (`STEXX_APP_LINK_HOST`).
 
 Device and account keys are opaque ids. IP and network keys are HMACs with a key derived from `EMAIL_PEPPER` (which is never in the database or its backups), so a stored key can't be turned back into an address; raw IPs are never written anywhere.
 
@@ -461,6 +466,13 @@ stexx-mod spam-clear p_abc… --as mod-a --note "busy night, real person"
 | 403 | `attestation_key_unknown` | Not shown: the app re-attests and retries once |
 | 403 | `device_banned`, `device_account_limit` | Server message on the sign-up screen |
 | 400 | `disposable_email` | "Please use a regular email address. Temporary inboxes aren't supported." |
+| 400 | `invalid_link` | Sheet "this link has expired": links work once, for 15 minutes; button to get a new one |
+| 400 | `invalid_code` | "Check the 8 digits in your latest Stexx email…" under the code field |
+| 400 | `registration_required` | "There's no Stexx account for this address yet…", with a button to sign up |
+| 503 | `email_unavailable` | "We can't send email right now. Try again in a few minutes, or use a passkey." |
+| 409 | `confirm_link` | Sheet "sign in as *nickname*?" (or "create the account *nickname*?") before a link this app didn't ask for is used |
+| 429 | `rate_limited` on `/auth/email/link` | "Send another email in 4:05": a live countdown from `Retry-After` |
+| 429 | `rate_limited` on `/auth/email/code` | "Too many tries with codes. Use the link in the email, or try again in 4:05." under the code field |
 | 403 | `links_not_allowed`, `handles_not_allowed`, `new_account_limit`, `duplicate_message` | Server message above the chat composer (for an encrypted message the app shows the same sentence itself) |
 | 403 | `account_under_review` | Server message where the chat or tap failed |
 | 403 | `account_banned` | Server message on the sign-in screen |

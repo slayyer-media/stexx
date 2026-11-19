@@ -16,6 +16,7 @@ struct OnboardingFlow: View {
     }
 
     @Environment(AppState.self) private var appState
+    @Environment(EmailLinkRedeemer.self) private var linkRedeemer
     @State private var path: [Step] = []
 
     var body: some View {
@@ -34,6 +35,13 @@ struct OnboardingFlow: View {
                     SignInView()
                 }
             }
+        }
+        // An expired link ("Get a new link") or one for an address without an account ("Sign up").
+        .onChange(of: linkRedeemer.followUp) { _, followUp in
+            guard let followUp else { return }
+            linkRedeemer.followUp = nil
+            path = []
+            go(to: followUp == .signIn ? .signIn : .signUp)
         }
     }
 

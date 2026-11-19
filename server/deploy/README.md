@@ -16,7 +16,7 @@ watchdog every 5 minutes (`stexx-watch.timer`).
 | File | Purpose |
 | --- | --- |
 | `Caddyfile` | Site blocks for `api.stexx.gay` and `media.stexx.gay`. Installed as `/etc/caddy/sites/stexx.caddy`. |
-| `Caddyfile.apex` | Optional: `stexx.gay` serving only `/.well-known/apple-app-site-association` (passkeys), when the apex points at this box. Installed by hand as `/etc/caddy/sites/stexx-apex.caddy` (step 8). |
+| `Caddyfile.apex` | Optional: `stexx.gay` serving only `/.well-known/apple-app-site-association` (passkeys, email links) and the `/auth/email` fallback page, when the apex points at this box. Installed by hand as `/etc/caddy/sites/stexx-apex.caddy` (step 8). |
 | `Caddyfile.main` | Global options (Cloudflare trusted proxies, log filtering) + `import sites/*.caddy`. The whole `/etc/caddy/Caddyfile` on a dedicated box. |
 | `stexx-api.service` | The API, with strong systemd sandboxing. |
 | `stexx-backup.service` / `.timer` / `backup.sh` | Encrypted nightly backup; `backup.sh --pre-migrate` is the snapshot `deploy.sh` takes before migrating. |
@@ -45,7 +45,7 @@ watchdog every 5 minutes (`stexx-watch.timer`).
    (every email HMAC would stop matching). **Keep your ssh session open and test a second login before closing it.**
    If the Postgres cluster hosts other databases, bootstrap refuses to install the cluster-wide `90-stexx.conf` unless you pass `INSTALL_PG_CONF=1` (read the file first).
 4. **Firewall.** On the server: `sudo ./ufw-cloudflare.sh` (dry run), then `--apply`. Re-run monthly to follow Cloudflare's published ranges.
-5. **Mail** (optional): set `SMTP_URL` in `/etc/stexx/stexx.env`. Without it, email sign-in returns 503 `email_unavailable` (passkeys still work).
+5. **Mail** (optional): set `SMTP_URL` in `/etc/stexx/stexx.env`. Without it, email sign-up and sign-in return 503 `email_unavailable` (passkeys still work). Each email carries the sign-in link and an 8-digit code (not in the subject, which shows on lock screens).
    **Moderator alerts** (optional): set `MODERATOR_ALERT_EMAIL` (needs `SMTP_URL`) and/or `MODERATOR_ALERT_WEBHOOK_URL` there too, then
    `systemctl restart stexx-api` and check with `stexx-mod alerts test` (docs/security.md section 5, "Alerts").
 6. **Backups** (below), then `systemctl enable --now stexx-backup.timer`.
@@ -62,6 +62,10 @@ watchdog every 5 minutes (`stexx-watch.timer`).
      block: `sudo install -m 0644 Caddyfile.apex /etc/caddy/sites/stexx-apex.caddy`, `caddy validate`, `systemctl reload caddy`
      (`--sync-config` leaves it alone). If `stexx.gay` is a website hosted elsewhere, have that host proxy this one path to
      `https://api.stexx.gay/.well-known/apple-app-site-association`, or publish a copy of the JSON there (and update it if the team or bundle ID changes).
+   - Email sign-in links (`${APP_LINK_BASE}/auth/email?token=…`) open the app through the same file's `applinks`. When one is opened
+     somewhere without the app, the browser loads `https://stexx.gay/auth/email`: the API serves a static explanation page there (it never
+     uses the token), and `Caddyfile.apex` proxies that path too. A website hosted elsewhere should proxy `/auth/email` to the API as well,
+     or show its own page saying to open the link on the iPhone or type the 8-digit code from the email.
    - Verify what Apple sees: `curl -s https://app-site-association.cdn-apple.com/a/v1/stexx.gay` (the CDN caches for up to a day; a device
      re-checks on install and app update). Cloudflare must not redirect, challenge (bot fight mode, WAF) or rewrite that path.
 

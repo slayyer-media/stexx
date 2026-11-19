@@ -87,7 +87,7 @@ lists the app in `https://<domain>/.well-known/apple-app-site-association`
 | Configuration | Entitlement | Passkeys |
 | --- | --- | --- |
 | `Debug` (mock API) | `webcredentials:stexx.gay`, `applinks:stexx.gay` | Simulated: no system sheet, `MockAPIClient` checks the payloads and signs in. |
-| `Local` (`http://127.0.0.1:8787`) | none (`Stexx/Entitlements/StexxLocal.entitlements`) | Unavailable: the buttons are disabled with an explanation. A dev server on 127.0.0.1 has no domain or AASA file, so sign in with email (the dev server's `/auth/register` shortcut or an email link). |
+| `Local` (`http://127.0.0.1:8787`) | none (`Stexx/Entitlements/StexxLocal.entitlements`) | Unavailable: the buttons are disabled with an explanation. A dev server on 127.0.0.1 has no domain or AASA file, so sign in with email: the code the dev server prints, or its no-email shortcut (see [Email sign-in](#email-sign-in)). |
 | `Release` | `webcredentials:stexx.gay`, `applinks:stexx.gay` | Simulated while `STEXX_USE_MOCK_API` is still `YES` there. With the live API: real passkeys, once `stexx.gay` serves the AASA file (see [`../server/deploy/README.md`](../server/deploy/README.md), step 8) and the App ID has the Associated Domains capability (automatic signing adds it). |
 
 `PasskeyAvailability.resolve` decides at launch: available only when the API
@@ -97,6 +97,65 @@ passkeys from a development build on a device, point it at a server whose
 `WEBAUTHN_RP_ID` serves an AASA listing your team's App ID; Apple's CDN can
 take a while to pick up changes (`?mode=developer` on the entitlement skips
 it, with Developer Mode on).
+
+## Email sign-in
+
+For people who'd rather not use a passkey (`Services/EmailSignIn.swift`,
+`Features/Onboarding/CheckEmailView.swift`). The address is used for sign-in
+only, stored on the server as a keyed hash, and never shown.
+
+1. Sign-up (nickname + email) or sign-in (email) calls
+   `POST /v1/auth/email/link`. A sign-up also sends the nickname and the 18+
+   confirmation; the account only exists once the link or code comes back,
+   so an address nobody reads never gets one.
+2. The **check your email** screen explains what was sent. One email carries
+   both a link and an 8-digit code for the same sign-in (15 minutes, once):
+   - **The link** opens the app as a universal link
+     (`https://stexx.gay/auth/email?token=…`, `applinks:` associated domain,
+     `.onOpenURL` in `RootView`). `EmailLinkRedeemer` shows the 18+ gate first
+     on a new iPhone, never uses a link while someone is signed in (it says
+     so and leaves the link unused), and explains an expired link or an
+     address without an account in a sheet with a way forward. When a link
+     fails without being used up (offline, 429, email or server trouble) the
+     sheet offers **Try again**, and tapping the same link in Mail again works
+     too. Only `https` links on `STEXX_APP_LINK_HOST` count.
+   - **Bound to this install.** Every email is asked for with a random
+     request nonce (`EmailRequestNonceStore`, in the Keychain, this device
+     only, reused for an hour after its last email and cleared on sign-in).
+     The code only works with it. A link this install didn't ask for (someone
+     can send you a link to their own account) gets `409 confirm_link`, and
+     the app asks **sign in as *nickname*?** (or **create the account
+     *nickname*?**) before using it; nothing is signed in, and location and
+     realtime stay off, until you say yes.
+   - **The code** is typed (or AutoFilled from Mail) on that screen and sent
+     to `POST /v1/auth/email/code` with the nonce, on its own once all 8
+     digits are in (if a resend is in flight then, as soon as it finishes).
+     It covers the link being read on a
+     computer or another phone, and mail apps that open links in their own
+     browser. Opened without the app, the link shows a static page from the
+     server saying exactly that.
+3. "Send another email" waits 60 s between emails, and follows the server's
+   `Retry-After` on a 429 with a live countdown ("Send another email in
+   4:05"). The server allows 3 emails per address per device in 15 minutes.
+
+Errors become plain sentences (`EmailSignInProblem`): wrong code, expired
+link, no account yet, mail down, offline, rate limited (emails), too many
+code tries.
+
+| Configuration | What happens |
+| --- | --- |
+| `Debug` (mock API) | Faked: every email "contains" code **12345678**; the mock's links work once and anything else is expired; a link asked for with another nonce asks "sign in as …?" first; 3 emails per address per 15 min, then a countdown. |
+| `Local` | The real flow against your dev server, which prints each link and code (`[dev-mail] sign-in link: … code: …`) instead of mailing it. Links can't open the app here (no associated domain), so type the code. A small **Dev server: sign up without the email** button uses the dev server's `POST /auth/register` shortcut (Debug builds against a dev server only; production refuses it). |
+| `Release` | Real email, once the server has `SMTP_URL`. Links open the app once `stexx.gay` serves the AASA file (`server/deploy/README.md`, step 8); until then they open the server's explanation page and the code still works. |
+
+Debug builds take `-StexxOpenURL <url>` to open a link at launch, as a tap in
+Mail would (for screenshots and checks in the simulator, which can't verify
+the real domain): e.g.
+`-StexxOpenURL "https://stexx.gay/auth/email?token=expired-example-token"`.
+
+Tests: `StexxTests/EmailSignInTests.swift` (wire format, error mapping, the
+send/resend/code state machine with a test clock, link handling, the mock)
+and `EmailSignInLinkTests.swift` (URL parsing).
 
 ## End-to-end encryption
 
@@ -402,7 +461,7 @@ Build settings in `project.yml` are exposed through `Info.plist`:
 | `STEXX_API_BASE_URL` | `https://api.stexx.gay` | Backend base URL (`/v1` is appended) |
 | `STEXX_USE_MOCK_API` | `YES` | `YES` uses `MockAPIClient`; `NO` uses `HTTPAPIClient` |
 | `STEXX_PASSKEY_RP_ID` | `stexx.gay` (`Local`: empty) | Passkey relying party: the `webcredentials:` associated domain and `StexxPasskeyRelyingParty` (see [Passkeys](#passkeys)) |
-| `STEXX_APP_LINK_HOST` | `stexx.gay` | Host of the server's `APP_LINK_BASE`: the `applinks:` associated domain that opens email sign-in links in the app (entitlement only, not in `Info.plist`; `Local` has no associated domains) |
+| `STEXX_APP_LINK_HOST` | `stexx.gay` | Host of the server's `APP_LINK_BASE`: the `applinks:` associated domain that opens email sign-in links in the app (`Local` has no associated domains), and `StexxAppLinkHost` in `Info.plist`: the only host whose `https` links the app treats as sign-in links |
 
 Build configurations:
 
@@ -477,7 +536,8 @@ ios/
   (the simulator has no real domain to associate with)
 - Email links open the app (universal links through `applinks:stexx.gay`,
   Debug and Release) only once `stexx.gay` serves the AASA file; until then
-  they open in the browser
+  they open the server's explanation page and the 8-digit code does the job.
+  A real open from Mail hasn't been tried on a device yet
 - Push notifications (taps and messages reach an offline user only through the lists when they next open the app)
 - Discreet alternate app icons, localization
 - End-to-end encryption for chat photos (they're still sent as plain
