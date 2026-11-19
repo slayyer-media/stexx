@@ -252,7 +252,7 @@ SELECT count(*) FROM stexx_reports_in;
 SQL
   )"; then
     CLEARED="$(printf '%s\n' "$OUT" | sed -n 1p)"; LOADED="$(printf '%s\n' "$OUT" | sed -n 2p)"
-    pass reports "$LOADED rows loaded (details and IP hashes were never backed up), $CLEARED dangling references cleared"
+    pass reports "$LOADED rows loaded, details and IP hashes empty by design, $CLEARED dangling references cleared"
   else
     fail reports "loading the sidecar failed: $(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"
   fi
@@ -303,7 +303,7 @@ fi
 # ---- 6. grants ---------------------------------------------------------------------------------------------------
 HAS_APP="$(q -c "SELECT 1 FROM pg_roles WHERE rolname = 'stexx_app'" 2>/dev/null || true)"
 if [ "$HAS_APP" = 1 ]; then
-  if q -f "$GRANTS" >/dev/null 2>"$WORK/err"; then pass grants "applied $(basename "$GRANTS") (role stexx_app exists)"
+  if q -f "$GRANTS" >/dev/null 2>"$WORK/err"; then pass grants "applied $(basename "$GRANTS"); role stexx_app exists"
   else fail grants "$(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"; fi
 else
   # Same statements with the role swapped for PUBLIC, inside a transaction that is rolled back: every table, sequence
@@ -311,7 +311,7 @@ else
   if { echo "BEGIN;"; sed -E 's/(^|[^A-Za-z0-9_])stexx_app([^A-Za-z0-9_]|$)/\1PUBLIC\2/g' "$GRANTS"; echo "ROLLBACK;"; } \
        | q >/dev/null 2>"$WORK/err"; then
     if [ -n "$TARGET" ]; then warn grants "role stexx_app does not exist here: run roles.sql, then grants.sql, before starting the API"
-    else pass grants "checked in a rolled-back transaction (role stexx_app is not on this server)"; fi
+    else pass grants "checked in a rolled-back transaction; role stexx_app is not on this server"; fi
   else
     fail grants "$(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"
   fi
