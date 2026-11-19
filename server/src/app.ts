@@ -15,6 +15,7 @@ import { keysRoutes } from "./routes/keys.ts";
 import { meRoutes } from "./routes/me.ts";
 import { plusRoutes } from "./routes/plus.ts";
 import { safetyRoutes } from "./routes/safety.ts";
+import { tapsRoutes } from "./routes/taps.ts";
 import { wsRoutes } from "./routes/ws.ts";
 import type { AppEnv } from "./types.ts";
 
@@ -121,6 +122,7 @@ export async function createApp(): Promise<Hono<AppEnv>> {
   v1.route("/", chatRoutes);
   v1.route("/", keysRoutes);
   v1.route("/", safetyRoutes);
+  v1.route("/", tapsRoutes);
   v1.route("/", plusRoutes);
   v1.route("/", wsRoutes);
   if (config.devAuth) {

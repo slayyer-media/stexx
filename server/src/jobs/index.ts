@@ -9,6 +9,7 @@ import {
   SLOW_INTERVAL_MS,
   sweepOrphanMedia,
 } from "./retention.ts";
+import { purgeOldTaps, TAP_PURGE_INTERVAL_MS } from "./taps.ts";
 
 export * from "./retention.ts";
 
@@ -57,6 +58,7 @@ export function startJobs(): () => void {
   every("orphans", ORPHAN_INTERVAL_MS, () => sweepOrphanMedia(), 60_000);
   // Retries unchecked photos (model missing/busy at upload) and backfills hashes of older photos.
   every("photoChecks", PHOTO_CHECK_INTERVAL_MS, () => runPhotoChecks(), 20_000);
+  every("taps", TAP_PURGE_INTERVAL_MS, () => purgeOldTaps(), 90_000);
 
   return () => {
     stopped = true;
