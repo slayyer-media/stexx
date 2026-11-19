@@ -6,7 +6,7 @@ import { hitAbuseLimits } from "../src/lib/abuse/limits.ts";
 import { snapToCell } from "../src/lib/distance.ts";
 import { newId } from "../src/lib/ids.ts";
 import { mediaPath, storeJpeg } from "../src/lib/media.ts";
-import { hideAccount, SYSTEM_ACTOR } from "../src/lib/moderation.ts";
+import { hideAccount, SYSTEM_ACTOR, unhideAccount } from "../src/lib/moderation.ts";
 import { rateLimitsDisabled, setRateLimitsDisabled } from "../src/lib/ratelimit.ts";
 import { orderedPair } from "../src/lib/visibility.ts";
 import {
@@ -619,6 +619,10 @@ describe("GET /me/export: account-level records", () => {
     }
     for (const encoding of ["hex", "base64", "base64url"] as const) expect(text).not.toContain(phone.keyId.toString(encoding));
     expect(text).not.toMatch(/publicKey|public_key|key_id|keyId\b|sign_count/);
+
+    // Leave the shared database's moderation queue as we found it.
+    await unhideAccount({ actor: "quiet_moderator", userId: me.id });
+    await sql`UPDATE reports SET status = 'dismissed', closed_at = now() WHERE id = ${reportAboutMe}`;
   });
 
   test("an account with no devices, decisions or counters gets empty lists, and old accounts no new-account limits", async () => {
