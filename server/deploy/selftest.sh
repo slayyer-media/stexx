@@ -270,6 +270,17 @@ env STATE_DIRECTORY="$W/state2" STEXX_ENV_FILE=/nonexistent STEXX_WATCH_ENV_FILE
   STEXX_PREMIGRATE_DIR="$W/pre" bash "$HERE/stexx-watch.sh" > "$T/off" 2>&1; echo $? > "$T/off.rc"
 check "alerting off: problems only logged" has "$T/off" "not sent, alerting not configured"
 check "alerting off: exit 0" has "$T/off.rc" 0
+# One destination broken: the working one still gets the alert once (state saved), the run exits 2.
+printf 'ALERT_EMAIL=ops@stexx.test\nALERT_WEBHOOK_URL=http://127.0.0.1:1/closed\n' > "$T/half.env"
+MAILS0="$(mails)"
+for i in 1 2; do
+  env STATE_DIRECTORY="$W/state4" STEXX_ENV_FILE="$W/stexx.env" STEXX_WATCH_ENV_FILE="$T/half.env" STEXX_BACKUP_ENV_FILE=/nonexistent \
+    WATCH_BACKUP_STAMP=/nonexistent WATCH_LOCAL_HEALTH_URL='' WATCH_PUBLIC_HEALTH_URL='' WATCH_DISK_PATHS='' WATCH_TLS_HOSTS='' \
+    STEXX_PREMIGRATE_DIR="$W/pre" bash "$HERE/stexx-watch.sh" > "$T/half$i" 2>&1; echo $? > "$T/half$i.rc"
+done
+echo "  one destination down (webhook refused), two runs:"; show "$T/half1"; show "$T/half2"
+check "partial delivery: email sent once, not every run" test "$(mails)" = "$((MAILS0 + 1))"
+check "partial delivery: run exits 2" has "$T/half1.rc" 2
 watch "$T/badcfg" WATCH_DISK_WARN_PCT=abc
 check "bad threshold: exit 1" has "$T/badcfg.rc" 1
 printf 'ALERT_WEBHOOK_URL=http://example.invalid/hook\n' > "$T/plainhttp.env"

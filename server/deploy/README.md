@@ -217,7 +217,7 @@ gone too; apps upload new ones on launch.
 | Check | Fails when |
 | --- | --- |
 | `backup_age` | `/var/lib/stexx-backup/last-success` is missing or older than 30 h |
-| `health_local`, `health_public` | `GET /healthz` on `127.0.0.1:8787`, and through Cloudflare, is not 204 |
+| `health_local`, `health_public` | `GET /healthz` on `127.0.0.1:8787`, and through Cloudflare, is not 204. If Cloudflare's bot protection challenges the box's own request, add a WAF skip rule for `/healthz` or set `WATCH_PUBLIC_HEALTH_URL=` |
 | `disk:<path>` | free space on `/srv/stexx/media` or `/var/lib/postgresql` under 15 % (warn), under 5 % (fail) |
 | `tls:<host>` | the **origin** certificate Caddy serves for `api.stexx.gay` / `media.stexx.gay` (read on `127.0.0.1:443`, not Cloudflare's edge certificate) expires within 14 days (warn), 3 days (fail) |
 | `api_errors` | more than 20 `level:"error"` lines from `stexx-api` since the previous run (a journal cursor makes each line count once) |

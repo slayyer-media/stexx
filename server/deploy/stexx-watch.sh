@@ -25,7 +25,7 @@
 # Unit-failure alerts repeat at most once per ALERT_REPEAT_HOURS per unit.
 #
 # Exit: 0 after a run (whatever the checks found: they are alerted, not exit codes), 2 if an alert could not be
-# delivered, 1 on bad configuration. A non-zero exit fails stexx-watch.service, whose OnFailure= alerts in turn.
+# delivered to every configured destination, 1 on bad configuration. A non-zero exit fails stexx-watch.service, whose OnFailure= alerts in turn.
 
 set -euo pipefail
 umask 077
@@ -149,14 +149,19 @@ send_webhook() { # send_webhook <title> <body>
   return "$rc"
 }
 
-# deliver <subject> <body>: to every configured destination. Fails if any destination failed.
+# deliver <subject> <body>: to every configured destination. Succeeds if at least one destination got it (so the
+# debounce state is saved and a working destination isn't re-sent every 5 minutes); DELIVERY_PARTIAL=1 records that
+# another one failed, and the caller then exits 2 so the failure itself surfaces (unit failed -> OnFailure alert).
+DELIVERY_PARTIAL=0
 deliver() {
-  local ok=0
+  local sent=0 failed=0
   if ! alerting_configured; then echo "alert (not sent, alerting not configured): $1"; return 0; fi
-  if [ -n "$ALERT_EMAIL" ]; then send_email "$1" "$2" || ok=1; fi
-  if [ -n "$ALERT_WEBHOOK_URL" ]; then send_webhook "$1" "$2" || ok=1; fi
-  [ "$ok" = 0 ] && echo "alert sent: $1"
-  return "$ok"
+  if [ -n "$ALERT_EMAIL" ]; then if send_email "$1" "$2"; then sent=1; else failed=1; fi; fi
+  if [ -n "$ALERT_WEBHOOK_URL" ]; then if send_webhook "$1" "$2"; then sent=1; else failed=1; fi; fi
+  [ "$sent" = 1 ] || return 1
+  echo "alert sent: $1"
+  [ "$failed" = 0 ] || DELIVERY_PARTIAL=1
+  return 0
 }
 
 # ---- modes: unit failure, test ----------------------------------------------------------------------------------
@@ -173,12 +178,14 @@ if [ "$MODE" = unit ]; then
 Look on the server: systemctl status $UNIT; journalctl -u $UNIT -n 50
 (this message carries unit names only)" || exit 2
   alerting_configured && touch "$f"
+  [ "$DELIVERY_PARTIAL" = 0 ] || exit 2
   exit 0
 fi
 
 if [ "$MODE" = testalert ]; then
   alerting_configured || die "no ALERT_EMAIL or ALERT_WEBHOOK_URL in /etc/stexx/watch.env"
   deliver "[$ALERT_LABEL] test alert" "[$ALERT_LABEL] test alert from stexx-watch --test-alert. Alerts reach this destination." || exit 2
+  [ "$DELIVERY_PARTIAL" = 0 ] || { echo "stexx-watch: at least one destination failed (see above)" >&2; exit 2; }
   exit 0
 fi
 
@@ -317,8 +324,9 @@ fi
 if [ "$SEND" = 1 ]; then
   if deliver "$SUBJECT" "$BODY"; then
     alerting_configured && printf '%s %s\n' "$(now)" "$SIGNATURE" > "$STATE/alert-state"
+    [ "$DELIVERY_PARTIAL" = 0 ] || exit 2
   else
-    exit 2   # state not updated: the next run retries
+    exit 2   # nothing delivered, state not updated: the next run retries
   fi
 fi
 exit 0
