@@ -182,7 +182,7 @@ stexx-mod photos blocklist 12 --as mod-a --label "stock set"
 stexx-mod alerts status                          # alert channels: last digest, failures, pending items
 stexx-mod purge p_abc… --as mod-a --yes          # banned only: delete it now instead of after the review window
 stexx-mod lift-email-ban --as mod-a --note "appeal upheld"   # then type the address and Ctrl-D (read from stdin)
-stexx-mod staff invite admin-1 --role admin --as admin-1   # staff console accounts, see section 9 (also: staff list, staff disable)
+stexx-mod staff invite admin-1 --role admin --as admin-1   # staff console accounts, see section 9 (also: staff list, staff disable, staff audit)
 ```
 
 Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show` and `log` for machine-readable output.
@@ -528,10 +528,12 @@ staff laptop (Tailscale, ACL-allowed device)
 
 - Staff accounts are separate from app accounts: their own table and ids (`st_...`), no link to `users`, no names, no email addresses, no phone numbers. Identity is a handle (letters, digits, `.`, `-`, `_`; never a real name), the same handle `moderation_actions.actor` already uses.
 - Sign-in is a discoverable passkey with user verification required. A wrong relying-party id is refused, and so is a signature counter that goes backwards. Login, enrollment and step-up attempts are rate limited (10 a minute per client).
+- **A copied passkey.** A validly signed assertion whose counter didn't go up means someone else holds a copy of that passkey (hardware keys count up; synced passkeys always send 0, so they never trip this), and whoever used the copy first may already be signed in. So at sign-in and at step-up alike, the console removes that passkey, signs the account out everywhere, voids its pending passkey checks and records `passkey_counter_regression` (not an ordinary failed login). The person needs a re-invite. The counter is only acted on once the signature verified, so knowing a credential id isn't enough to lock someone out. Two overlapping sign-ins with one hardware key can, rarely, look the same (the older assertion arrives after the newer one finished); that costs a re-invite, not access.
 - **Enrollment.** An admin (or the CLI, for the first admin) invites a handle with a role. That creates a single-use link, valid for 30 minutes; only its hash is stored. The person opens it on their own device and creates a passkey. A handle can't look like an id (`st_...`).
 - **Re-invite (lost passkey, or a role change).** Inviting an existing handle again removes its passkeys, signs it out everywhere and voids earlier links; there is no self-service recovery. Whoever opens the new link signs in as that account, so in the console it is never one click: the invite form shows a confirm page that names the account and the consequence, and going ahead needs a passkey check bound to "re-invite" and that account, spent once in the same transaction (a reload of the result can't repeat it). You can't re-invite yourself in the console. Over SSH (`stexx-mod staff invite <handle> --yes`) an admin can, which is how a sole admin who lost their passkey gets back in.
 - **One passkey per person today.** A link enrolls one passkey, and re-inviting replaces it, so there is no way yet to add a second one. Keep at least two admins so a lost device never needs SSH. Adding a passkey from a signed-in session is planned (see "Not done yet").
-- Disabling a staff account signs it out everywhere at once and it can't sign in again. Accounts are never deleted, because the audit log points at them.
+- Disabling a staff account signs it out everywhere at once and it can't sign in again. Accounts are never deleted, because the audit log points at them. The staff list links to a confirm page that names the account (handle, role and id) and the consequence, and runs the passkey check there; it is server-rendered, so it works whatever the browser does with dialogs.
+- Every staff change re-checks, under the staff-change lock, that the admin making it is still an active admin. An admin disabled (or demoted) while their request was in flight changes nothing.
 
 ### Roles
 
@@ -567,11 +569,11 @@ Some actions need proof the person is still there, even inside a session:
 
 Every staff event and, from the moderation pages on, every sensitive read and every action leaves one row in `staff_audit`.
 
-- **Recorded today:** login, failed login, logout, step-up (and failed), invite, enrollment, role change, disable, session revoke, and viewing the staff list. The CLI's `staff` commands (`invite`, `disable` and `list`) write rows too, with channel `cli`. Once an active admin exists, the CLI's `--as` must be an active admin's handle, so every row names who ran it; only while there is none (bootstrapping the first admin) may it be any handle, and that row has no staff id.
+- **Recorded today:** login, failed login, logout, step-up (and failed), a copied passkey (`passkey_counter_regression`), invite, enrollment, role change, disable, session revoke, viewing the staff list, and viewing one account (the re-invite and disable confirm pages: a `staff_list` read with that account as target). The CLI's `staff` commands (`invite`, `disable`, `list` and `audit`) write rows too, with channel `cli`. Once an active admin exists, the CLI's `--as` must be an active admin's handle, so every row names who ran it; only while there is none (bootstrapping the first admin) may it be any handle, and that row has no staff id.
 - **Each row:** time (stamped by the database on insert, so a row can't be backdated), staff id, session id, channel (`console` or `cli`), action name, the role granted (on invite and role-change rows, so privilege history can be rebuilt), target kind, target account (nullable), target reference (a report, flag, staff or session id), purpose, an opaque ticket reference (max 64 characters, never an email), and a pointer to the `moderation_actions` row when there is one.
 - **No free text.** There is no note field; notes stay in `moderation_actions.note`, which is cleared on purge. No IP address, user agent, email, email hash or typed search value is ever written.
 - **Purpose.** Opening an account outside a queue item will ask for a purpose (`report_review`, `spam_review`, `photo_review`, `support_ticket`, `appeal`, `data_request`, `legal`, `escalation`). The column and its check exist now.
-- **Append-only.** A database trigger rejects `UPDATE`, `DELETE` and `TRUNCATE` on `staff_audit`. Two exceptions: the foreign-key action that sets `target_user_id` (or the `moderation_actions` pointer) to NULL when that account or row is deleted, which anonymizes the row, and deleting a *read* row (or a failed login with an unknown passkey, which carries no staff id and is only a count) older than 12 months. The trigger checks the row's age, not who asks. This stops mistakes and the application's own code, not someone with database owner rights; a separate database role without `UPDATE`/`DELETE` and a daily hash-chain checkpoint are planned.
+- **Append-only.** A database trigger rejects `UPDATE`, `DELETE` and `TRUNCATE` on `staff_audit`. Two exceptions: the foreign-key action that sets `target_user_id` to NULL when that account is deleted, which anonymizes the row, and deleting a *read* row (or a failed login with an unknown passkey, which carries no staff id and is only a count) older than 12 months. The trigger checks the row's age, not who asks. A `moderation_actions` row the log points at can't be deleted at all (the pointer has no `ON DELETE` action; nothing in the app deletes decisions, and account deletion and purge keep the row and clear its user and note), so the app's own role can't erase a decision and silently strip the record of it. This stops mistakes and the application's own code, not someone with database owner rights; a separate database role without `UPDATE`/`DELETE` and a daily hash-chain checkpoint are planned.
 - **Retention.**
 
 | Rows | Kept | Then |
@@ -579,7 +581,9 @@ Every staff event and, from the moderation pages on, every sensitive read and ev
 | Reads and lookups, failed logins with an unknown passkey | 12 months | Deleted by the slow retention job (every 10 minutes) |
 | Actions and staff events | Like `moderation_actions` | Account reference anonymized when the account is deleted or purged |
 
-The same job deletes console sessions a week after they ended (signed out, revoked or expired), enrollment links a week after they were used or expired, and expired WebAuthn challenges. Staff accounts are never deleted.
+The same job deletes console sessions a week after they ended (signed out, revoked or expired), enrollment links a week after they were used or expired, and expired WebAuthn challenges. Every cutoff is measured against the database clock, so a job run with a clock set ahead never deletes a live session or a pending link. Staff accounts are never deleted.
+
+- **Reading it.** `stexx-mod staff audit [<handle>] --as <admin> [--limit N] [--json]` prints the newest rows (50 by default), or only those by or about one account: time, channel, kind, action, who, target, role granted, session. Use it when a device or session is suspect (sign-ins, failed ones, step-ups, invites and disables for that handle) and for the weekly review. Reading the log is itself recorded (`audit_view`). A console page for it (admins only, audited) comes with the moderation pages.
 
 - **Backups.** `staff_audit`, `staff_accounts` and `staff_passkeys` are in the nightly backup: the audit log is the accountability record, and a restore has to let staff sign in again. `staff_sessions`, `staff_challenges` and `staff_enrollments` are never in it (`ALWAYS_EXCLUDE` in `backup.sh`), and a real restore revokes every staff session and deletes pending invites, as it does for app sessions.
 
@@ -611,7 +615,7 @@ Local development: `ADMIN_DEV_AUTH=1` mounts a login that skips the passkey (pic
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `ADMIN_HOST`, `ADMIN_PORT` | `127.0.0.1`, `8788` | Loopback only in production (the process refuses otherwise). The unit pins both. |
-| `ADMIN_ORIGIN` | dev: `http://localhost:8788` | `https` origin (with the `:8443` port), no path. Required in production, or the console refuses to start (the API is unaffected). |
+| `ADMIN_ORIGIN` | dev: `http://localhost:8788` | `https` origin (with the `:8443` port), no path. Required in production, or the console refuses to start (the API is unaffected). In production a hostname (not an IP address: WebAuthn refuses one), not one of the public hosts, and equal to `STEXX_ADMIN_HOST`/`STEXX_ADMIN_PORT` in `caddy-admin.env` (the deploy checks). |
 | `ADMIN_RP_ID` | host of `ADMIN_ORIGIN` | Passkey relying party id. Must equal that host and differ from `WEBAUTHN_RP_ID`. |
 | `ADMIN_RP_NAME` | `Stexx staff` | Shown by the passkey prompt. |
 | `ADMIN_ALLOWED_CIDRS` | Tailscale ranges (dev adds loopback) | Forwarded client address must be inside. Checked, never stored. |

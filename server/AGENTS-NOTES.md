@@ -270,7 +270,13 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   unique handles and never truncate. A second trigger stamps `at` on insert; to backdate a row in a test, insert it with
   `SET LOCAL session_replication_role = replica` (tests run as a superuser; production can't). The CLI's `--as` must be
   an active admin once one exists (`cliActorRefusal`); the shared test database always has admins, so CLI tests act as a
-  `makeStaff("admin")` handle. `purgeStaffConsole` (jobs/retention.ts) is the staff retention job.
+  `makeStaff("admin")` handle. `purgeStaffConsole` (jobs/retention.ts) is the staff retention job; its cutoffs are clamped
+  to the database clock, so a test can pass a future `now` without deleting other runs' sessions or links.
+  `readStaffAudit` (same module) is the reader, behind `stexx-mod staff audit`; record the read (`audit_view`).
+- Staff changes re-check the acting admin under the advisory lock (`StaffActorError`, a 403 in the console). The
+  passkey ceremonies pass SimpleWebAuthn counter 0 and check `counterWentBack` themselves after the signature: a
+  regression locks the passkey out (`lockOutCopiedPasskey`). Sign-in locks the account row FOR NO KEY UPDATE (FOR SHARE
+  deadlocked two overlapping sign-ins). Look up keyed tables with a `Map` or `Object.hasOwn`, never `obj[userInput]`.
 - Config is `config.admin` (`ADMIN_*`, docs/security.md section 9); `test/setup.ts` strips `ADMIN_*` from the environment.
   Test helpers: `test/admin-helpers.ts` (`adminGet`/`adminPost`, `makeStaff(role)`, `signInDirect`, `enrolledStaff`, `auditActions`), `test/soft-authenticator.ts` (software passkey).
 - Production runs it as `stexx-admin.service` with settings in `/etc/stexx/admin.env`; `deploy.sh` leaves `src/admin/dev.ts`
