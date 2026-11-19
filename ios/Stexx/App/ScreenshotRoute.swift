@@ -144,8 +144,8 @@ struct ScreenshotRouteView: View {
             default:
                 ChatThreadView(route: ChatRoute(participant: profile))
             }
-            .tint(Theme.ice)
         }
+        .tint(Theme.ice)
     }
 }
 
