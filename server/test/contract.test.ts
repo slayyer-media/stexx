@@ -61,10 +61,6 @@ const Profile = z.strictObject({
   isFavorite: z.boolean(),
 });
 
-// struct Profile, own copy (GET/PATCH /me): `var travel: TravelStatus?` (struct TravelStatus { var isActive: Bool }).
-// Other people's profiles never carry `travel` (Profile is strict above).
-const OwnProfile = Profile.extend({ travel: swiftOptional(z.strictObject({ isActive: z.boolean() })) });
-
 // struct Message.Attachment { var kind: Kind; var url: URL?; var isViewOnce: Bool = false; var isEncrypted: Bool = false }
 // (isEncrypted is decoded with decodeIfPresent, so older servers and the mock may omit it; this server always sends it.)
 const Attachment = z.strictObject({
@@ -121,6 +117,13 @@ const PrivacySettings = z.strictObject({
   expiringPhotosByDefault: z.boolean(),
   blurExplicitPhotos: z.boolean(),
   incognito: z.boolean(),
+});
+
+// struct Profile, own copy (GET/PATCH /me): `var travel: TravelStatus?` (struct TravelStatus { var isActive: Bool })
+// and `var privacy: PrivacySettings?`. Other people's profiles never carry either (Profile is strict above).
+const OwnProfile = Profile.extend({
+  travel: swiftOptional(z.strictObject({ isActive: z.boolean() })),
+  privacy: swiftOptional(PrivacySettings),
 });
 
 // struct SubscriptionStatus { var isActive: Bool; var expiresAt: Date? }
@@ -265,6 +268,7 @@ describe("contract: REST responses match the Swift models", () => {
       expiringPhotosByDefault: false, blurExplicitPhotos: true, incognito: false,
     };
     expect(await body(await api.put("/v1/me/privacy", { json: privacy }), PrivacySettings, "PrivacySettings")).toEqual(privacy);
+    expect((await body(await api.get("/v1/me"), OwnProfile, "Profile(GET /me)")).privacy).toEqual(privacy);
     conforms(ErrorBody, await (await api.get("/v1/me/viewers")).json(), "Error(402)");
 
     const plus = await createUser({ location: home, plusDays: 5 });

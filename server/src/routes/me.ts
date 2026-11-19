@@ -34,7 +34,9 @@ import { DAY, isoDate } from "../lib/time.ts";
 import { cleanText, idParam, locationSchema, lookingForSchema, multilineText, parseJson, positionSchema, privacySchema, tagsSchema } from "../lib/validation.ts";
 import { col, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
 import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
-import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { accountCounters, hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { trustState } from "../lib/abuse/trust.ts";
+import { SYSTEM_ACTOR } from "../lib/moderation.ts";
 import { envelopeJson } from "../lib/e2e/envelope.ts";
 import { e2eMode, keyStatus } from "../lib/e2e/keys.ts";
 import { checkColumns, checkPhoto, flagPhotoMatches, storedPhash } from "../lib/photocheck/index.ts";
@@ -58,18 +60,22 @@ const VIEWERS_LIMIT = 200;
 
 /**
  * The own profile: a Profile plus `travel`, so the app learns after a relaunch whether travel mode is on
- * (and whether it is paused because Stexx+ lapsed). No coordinates, as everywhere else on /me.
+ * (and whether it is paused because Stexx+ lapsed), and `privacy`, the stored privacy settings (the app's source
+ * of truth for its toggles). No coordinates, as everywhere else on /me.
  */
 async function ownProfile(me: string): Promise<OwnProfileJson> {
-  const [[profile], [travel]] = await Promise.all([
+  const [[profile], [own]] = await Promise.all([
     profilesFor(me, [me]),
-    sql<{ is_active: boolean }[]>`
-      SELECT COALESCE(u.plus_expires_at > now(), false) AS is_active
-        FROM travel_locations t JOIN users u ON u.id = t.user_id
-       WHERE t.user_id = ${me}`,
+    sql<(PrivacyRow & { travel_active: boolean | null })[]>`
+      SELECT u.hide_distance, u.show_online_status, u.send_read_receipts, u.expiring_photos_by_default,
+             u.blur_explicit_photos, u.incognito,
+             CASE WHEN t.user_id IS NULL THEN NULL ELSE COALESCE(u.plus_expires_at > now(), false) END AS travel_active
+        FROM users u LEFT JOIN travel_locations t ON t.user_id = u.id
+       WHERE u.id = ${me}`,
   ]);
-  if (!profile) throw notFound();
-  return { ...profile, travel: travelJson(travel) };
+  if (!profile || !own) throw notFound();
+  const travel = own.travel_active === null ? undefined : { is_active: own.travel_active };
+  return { ...profile, travel: travelJson(travel), privacy: privacyJson(own) };
 }
 
 meRoutes.get("/me", async (c) => {
@@ -406,11 +412,17 @@ meRoutes.get("/me/viewers", async (c) => {
 // ---- Export ----------------------------------------------------------------------
 
 /**
- * GDPR-style archive of everything we hold about the caller. Other people appear only as opaque ids; no
+ * GDPR-style archive of what we hold about the caller. Other people appear only as opaque ids; no
  * other user's profile, location, blocks-against-you, views-of-you or reports-about-you are included, nor
  * when they read your messages unless they send read receipts. Expired messages are left out, and incoming
  * view-once photos carry no URL (as everywhere outside the messages listing).
- * Secrets (token hashes, passkey public keys) are never included.
+ * Secrets (token hashes, passkey and App Attest public keys) are never included.
+ *
+ * Also listed: the attested devices the account is linked to (`devices`), moderation decisions about the account
+ * (`moderation`: what and when, never which moderator, their notes, or the reports behind them), the abuse-limit
+ * counters kept for the account and its devices, and whether the new-account limits apply. Left out on purpose
+ * (docs/security.md "Data export"): reports filed by others, photo flags (duplicate / blocklist matches, which name
+ * other accounts' photos), and IP-keyed counters (stored only as a keyed hash, not linked to the account).
  */
 meRoutes.get("/me/export", async (c) => {
   const me = c.get("userId");
@@ -426,16 +438,19 @@ meRoutes.get("/me/export", async (c) => {
         last_active_at: Date;
         created_at: Date;
         hidden_at: Date | null;
+        hidden_reason: string | null;
+        reviewed_at: Date | null;
       })[]
   >`
     SELECT id, display_name, age, pronouns, headline, about, height_cm, position, looking_for, tags,
            confirmed_adult, (email_hmac IS NOT NULL) AS has_email,
            hide_distance, show_online_status, send_read_receipts, expiring_photos_by_default,
-           blur_explicit_photos, incognito, plus_expires_at, boost_ends_at, last_active_at, created_at, hidden_at
+           blur_explicit_photos, incognito, plus_expires_at, boost_ends_at, last_active_at, created_at, hidden_at,
+           hidden_reason, reviewed_at
       FROM users WHERE id = ${me}`;
   if (!user) throw notFound();
 
-  const [photos, uploads, home, travel, favorites, tapsSent, tapsReceived, blocks, views, reports, sessions, passkeys, subs, convs] =
+  const [photos, uploads, home, travel, favorites, tapsSent, tapsReceived, blocks, views, reports, sessions, passkeys, subs, convs, devices, moderation, trust] =
     await Promise.all([
       ownPhotos(me),
       sql<{ id: string; storage_key: string; encrypted: boolean; created_at: Date }[]>`
@@ -454,14 +469,28 @@ meRoutes.get("/me/export", async (c) => {
         SELECT created_at, access_expires_at, refresh_expires_at, revoked_at FROM sessions WHERE user_id = ${me} ORDER BY created_at`,
       sql<{ id: string; transports: string[]; created_at: Date; last_used_at: Date | null }[]>`
         SELECT id, transports, created_at, last_used_at FROM passkey_credentials WHERE user_id = ${me} ORDER BY created_at`,
-      sql<{ product_id: string; expires_at: Date; environment: string }[]>`
-        SELECT product_id, expires_at, environment FROM subscriptions WHERE user_id = ${me} ORDER BY expires_at`,
+      sql<{ product_id: string; expires_at: Date; environment: string; revoked_at: Date | null }[]>`
+        SELECT product_id, expires_at, environment, revoked_at FROM subscriptions WHERE user_id = ${me} ORDER BY expires_at`,
       sql<{ id: string; other_id: string; created_at: Date; updated_at: Date; muted: boolean; hidden: boolean; cleared_before: Date | null; last_read_at: Date | null }[]>`
         SELECT c.id, CASE WHEN c.user_a = ${me} THEN c.user_b ELSE c.user_a END AS other_id,
                c.created_at, c.updated_at, cm.muted, cm.hidden, cm.cleared_before, cm.last_read_at
           FROM conversations c JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = ${me}
          WHERE c.user_a = ${me} OR c.user_b = ${me} ORDER BY c.created_at`,
+      // Attested app installs this account was created or signed in on (docs/security.md section 1).
+      // Never the App Attest key itself, and never the other accounts linked to the same device.
+      sql<{ id: string; environment: string; banned: boolean; created_at: Date; last_seen_on: string; linked_at: Date }[]>`
+        SELECT d.id, d.environment, d.banned_at IS NOT NULL AS banned, d.created_at,
+               to_char(d.last_seen_on, 'YYYY-MM-DD') AS last_seen_on, da.created_at AS linked_at
+          FROM device_accounts da JOIN devices d ON d.id = da.device_id
+         WHERE da.user_id = ${me} ORDER BY da.created_at, d.id`,
+      // Moderation decisions about this account: what and when, never who (the moderator's handle), the note or
+      // the reports behind it.
+      sql<{ action: string; created_at: Date; automatic: boolean }[]>`
+        SELECT action, created_at, actor = ${SYSTEM_ACTOR} AS automatic
+          FROM moderation_actions WHERE user_id = ${me} ORDER BY created_at, id`,
+      trustState(me),
     ]);
+  const counters = await accountCounters(me, devices.map((d) => d.id));
 
   // What the photo checks stored about each photo (docs/security.md "Photo checks"). Moderation flags are not
   // included, like reports filed against the account.
@@ -529,9 +558,10 @@ meRoutes.get("/me/export", async (c) => {
   const archive = {
     exportedAt: isoDate(new Date()),
     notes: [
-      "This is everything Stexx stores about your account.",
+      "This is the data Stexx stores about your account. Reports other members filed about you, and automatic photo-match flags, are left out to protect the people and checks involved; moderation decisions about your account are listed.",
       "Other members appear only as opaque ids. Your email address is never stored, only a one-way hash, so it is not part of this archive.",
       "Locations are the 500 m grid cell centre we keep, never a precise position. We keep no location history.",
+      "End-to-end encrypted messages appear as ciphertext (envelope): their text is only on the phones in the chat.",
     ],
     account: {
       id: user.id,
@@ -543,6 +573,11 @@ meRoutes.get("/me/export", async (c) => {
       boostEndsAt: isoDate(user.boost_ends_at),
       // Set while the account is hidden pending a moderator's review (never who reported it).
       hiddenPendingReviewSince: isoDate(user.hidden_at),
+      hiddenReason: user.hidden_reason,
+      lastModeratorReviewAt: isoDate(user.reviewed_at),
+      // The new-account limits (docs/security.md section 4): worked out from the account's age and
+      // replies when asked, not stored.
+      newAccountLimitsApply: trust.restricted,
     },
     profile: {
       displayName: user.display_name,
@@ -642,7 +677,36 @@ meRoutes.get("/me/export", async (c) => {
       }),
     })),
     encryptionKeys,
-    subscriptions: subs.map((s) => ({ productID: s.product_id, expiresAt: isoDate(s.expires_at), environment: s.environment })),
+    subscriptions: subs.map((s) => ({
+      productID: s.product_id,
+      expiresAt: isoDate(s.expires_at),
+      environment: s.environment,
+      revokedAt: isoDate(s.revoked_at),
+    })),
+    devices: devices.map((d) => ({
+      id: d.id,
+      environment: d.environment,
+      isBanned: d.banned,
+      firstSeenAt: isoDate(d.created_at),
+      // Day granularity only.
+      lastSeenOn: d.last_seen_on,
+      linkedToAccountAt: isoDate(d.linked_at),
+    })),
+    moderation: moderation.map((m) => ({
+      action: m.action,
+      by: m.automatic ? "automatic" : "moderator",
+      createdAt: isoDate(m.created_at),
+    })),
+    rateLimitCounters: counters.map((r) => ({
+      limit: r.limit,
+      appliesTo: r.subject.kind,
+      deviceID: r.subject.kind === "device" ? r.subject.deviceId : null,
+      windowSeconds: Math.round(r.windowMs / 1000),
+      windowStartedAt: isoDate(new Date(r.windowStart)),
+      countThisWindow: r.current,
+      countPreviousWindow: r.previous,
+      deletedAfter: isoDate(r.expiresAt),
+    })),
     signIn: {
       passkeys: passkeys.map((p) => ({
         credentialID: p.id,

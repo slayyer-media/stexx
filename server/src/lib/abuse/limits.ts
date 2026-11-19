@@ -99,8 +99,17 @@ export interface LimiterStore {
    * nothing and return the longest wait in milliseconds.
    */
   hit(entries: LimiterEntry[], now: number): Promise<number>;
+  /** The stored counters for these keys (missing keys are left out), for the data export. */
+  snapshot(keys: string[]): Promise<StoredCounter[]>;
   /** Tests: forget every counter. */
   clear(): void;
+}
+
+export interface StoredCounter extends Counter {
+  key: string;
+  windowMs: number;
+  /** When the row stops mattering and is deleted (end of the window after the current one). */
+  expiresAt: Date;
 }
 
 export interface Counter {
@@ -164,6 +173,13 @@ export class MemorySlidingWindowStore implements LimiterStore {
     return 0;
   }
 
+  async snapshot(keys: string[]): Promise<StoredCounter[]> {
+    return keys.flatMap((key) => {
+      const c = this.counters.get(key);
+      return c ? [{ key, ...c, expiresAt: new Date(c.windowStart + 2 * c.windowMs) }] : [];
+    });
+  }
+
   clear(): void {
     this.counters.clear();
   }
@@ -225,6 +241,21 @@ export class PostgresSlidingWindowStore implements LimiterStore {
       }
       return 0;
     });
+  }
+
+  async snapshot(keys: string[]): Promise<StoredCounter[]> {
+    if (keys.length === 0) return [];
+    const rows = await this.db<(CounterRow & { expires_at: Date })[]>`
+      SELECT key, window_ms, window_start, current_count, previous_count, expires_at
+        FROM abuse_counters WHERE key = ANY(${keys.map((k) => this.namespace + k)}::text[]) ORDER BY key`;
+    return rows.map((r) => ({
+      key: r.key.slice(this.namespace.length),
+      windowMs: r.window_ms,
+      windowStart: Number(r.window_start),
+      current: r.current_count,
+      previous: r.previous_count,
+      expiresAt: r.expires_at,
+    }));
   }
 
   clear(): void {
@@ -322,6 +353,41 @@ export async function tryAbuseLimits(action: AbuseAction, subject: AbuseSubject,
     keys.push([`${name}:${value}`, limits[name]]);
   }
   return store.hit(keys, now);
+}
+
+export interface AccountCounter {
+  limit: AbuseLimitName;
+  /** Whose counter it is: this account, or one of the devices it was created or signed in on. */
+  subject: { kind: "account" } | { kind: "device"; deviceId: string };
+  windowMs: number;
+  windowStart: number;
+  current: number;
+  previous: number;
+  expiresAt: Date;
+}
+
+/**
+ * The abuse-limit counters stored about an account and its attested devices (GET /me/export). Counters keyed by
+ * an IP or network hash are not linked to any account (only the keyed hash is stored) and can't be listed; nor can
+ * the per-pair prekey counters, which name another account.
+ */
+export async function accountCounters(userId: string, deviceIds: string[]): Promise<AccountCounter[]> {
+  const wanted = new Map<string, Omit<AccountCounter, "windowMs" | "windowStart" | "current" | "previous" | "expiresAt">>();
+  for (const steps of Object.values(PLAN)) {
+    for (const [name, field] of steps) {
+      if (field === "userId" || field === "targetId") wanted.set(`${name}:${userId}`, { limit: name, subject: { kind: "account" } });
+      if (field === "deviceId") {
+        for (const deviceId of deviceIds) wanted.set(`${name}:${deviceId}`, { limit: name, subject: { kind: "device", deviceId } });
+      }
+    }
+  }
+  const rows = await store.snapshot([...wanted.keys()]);
+  return rows.flatMap((r) => {
+    const meta = wanted.get(r.key);
+    return meta
+      ? [{ ...meta, windowMs: r.windowMs, windowStart: r.windowStart, current: r.current, previous: r.previous, expiresAt: r.expiresAt }]
+      : [];
+  });
 }
 
 /** The subject for a request: keyed hashes of the IP and network, the attested device (if any) and the signed-in user. */
