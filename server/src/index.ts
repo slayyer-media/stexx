@@ -7,6 +7,7 @@ import { closeAllConnections } from "./lib/realtime.ts";
 import { createShutdown } from "./lib/shutdown.ts";
 import { verifierName } from "./lib/e2e/crypto.ts";
 import { photoClassifier } from "./lib/photocheck/classifier.ts";
+import { listenForReleasedMessages } from "./routes/chat.ts";
 import { websocket } from "./routes/ws.ts";
 
 const app = await createApp();
@@ -21,6 +22,8 @@ const server = Bun.serve({
 });
 
 const stopJobs = startJobs();
+// Held messages a moderator releases (usually from the CLI's own process) are pushed to connected recipients.
+const stopReleasedListener = await listenForReleasedMessages();
 logInfo("listening", {
   host: config.host,
   port: server.port ?? config.port,
@@ -47,7 +50,11 @@ const shutdown = createShutdown({
   server,
   stopJobs,
   closeSockets: () => closeAllConnections(1012, "restarting"),
-  endDb: () => sql.end({ timeout: 5 }),
+  // The LISTEN for released messages holds a pool connection: unlisten before closing the pool.
+  endDb: async () => {
+    await stopReleasedListener().catch(() => {});
+    await sql.end({ timeout: 5 });
+  },
   exit: (code) => process.exit(code),
 });
 process.on("SIGINT", () => void shutdown("SIGINT"));

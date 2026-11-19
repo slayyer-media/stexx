@@ -95,6 +95,31 @@ const envSchema = z.object({
   REPORT_EVIDENCE_RETENTION_DAYS: z.coerce.number().min(1).max(365).default(30),
   REPORT_EVIDENCE_MAX_DAYS: z.coerce.number().min(1).max(3650).default(180),
 
+  // Spam heuristics on messages, shadow limits pending review (src/lib/abuse/spam.ts, docs/security.md section 8).
+  SPAM_HEURISTICS_ENABLED: flag.default(true),
+  /** Window for fan-out, first-contact rate, duplicates, links and handles. */
+  SPAM_WINDOW_HOURS: z.coerce.number().min(1).max(24 * 7).default(24),
+  SPAM_FANOUT_MIN: z.coerce.number().int().min(2).max(1000).default(20),
+  SPAM_FANOUT_MAX_REPLY_RATE: z.coerce.number().min(0).max(1).default(0.1),
+  SPAM_BURST_MINUTES: z.coerce.number().min(1).max(24 * 60).default(10),
+  SPAM_BURST_FIRST_CONTACTS: z.coerce.number().int().min(2).max(1000).default(8),
+  SPAM_FIRST_CONTACT_MIN: z.coerce.number().int().min(2).max(1000).default(10),
+  SPAM_FIRST_CONTACT_RATIO: z.coerce.number().min(0.5).max(1).default(0.9),
+  SPAM_BLOCKED_DAYS: z.coerce.number().min(1).max(90).default(7),
+  SPAM_BLOCKED_HOURS: z.coerce.number().min(1).max(24 * 30).default(24),
+  SPAM_BLOCKED_MIN: z.coerce.number().int().min(1).max(1000).default(3),
+  SPAM_DUPLICATE_RECIPIENTS: z.coerce.number().int().min(2).max(1000).default(5),
+  SPAM_DUPLICATE_SIMILARITY: z.coerce.number().min(0.3).max(1).default(0.6),
+  SPAM_LINK_RECIPIENTS: z.coerce.number().int().min(1).max(1000).default(2),
+  SPAM_HANDLE_RECIPIENTS: z.coerce.number().int().min(1).max(1000).default(1),
+  SPAM_SCORE_NEW: z.coerce.number().int().min(1).max(100).default(3),
+  SPAM_SCORE_ESTABLISHED: z.coerce.number().int().min(1).max(100).default(5),
+  SPAM_ESTABLISHED_DAYS: z.coerce.number().min(0).max(365).default(14),
+  SPAM_COOLDOWN_HOURS: z.coerce.number().min(1).max(24 * 90).default(72),
+  SPAM_HELD_MAX_DAYS: z.coerce.number().min(1).max(365).default(30),
+  SPAM_HASH_TTL_HOURS: z.coerce.number().min(1).max(24 * 30).default(48),
+  SPAM_FLAG_RETENTION_DAYS: z.coerce.number().min(1).max(3650).default(180),
+
   // ---- Photo checks (docs/security.md "Photo checks") ----
   /** auto: use the NSFW model if its file is present (default; "off" in tests) · off: never classify. */
   PHOTO_CLASSIFIER: z.enum(["auto", "off"]).optional(),
@@ -158,6 +183,7 @@ export interface Config {
   trustProxy: boolean;
   antiSpam: AntiSpamConfig;
   moderation: ModerationConfig;
+  spam: SpamConfig;
   photoChecks: PhotoChecksConfig;
   e2e: E2eConfig;
   /** Dev-only auth shortcuts (/auth/register returns a Session, /v1/dev/* mounted). Never true in production. */
@@ -209,6 +235,32 @@ export interface AntiSpamConfig {
     duplicateRecipients: number;
     graduateReplies: number;
   };
+}
+
+/** Spam heuristics on messages (lib/abuse/spam.ts). Every rule and threshold is documented in docs/security.md. */
+export interface SpamConfig {
+  enabled: boolean;
+  windowHours: number;
+  fanOutMin: number;
+  fanOutMaxReplyRate: number;
+  burstMinutes: number;
+  burstFirstContacts: number;
+  firstContactMin: number;
+  firstContactRatio: number;
+  blockedDays: number;
+  blockedHours: number;
+  blockedMin: number;
+  duplicateRecipients: number;
+  duplicateSimilarity: number;
+  linkRecipients: number;
+  handleRecipients: number;
+  scoreNew: number;
+  scoreEstablished: number;
+  establishedDays: number;
+  cooldownHours: number;
+  heldMaxDays: number;
+  hashTtlHours: number;
+  flagRetentionDays: number;
 }
 
 export type E2eMode = "off" | "optional" | "required";
@@ -430,6 +482,30 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       },
       evidenceRetentionDays: e.REPORT_EVIDENCE_RETENTION_DAYS,
       evidenceMaxDays: e.REPORT_EVIDENCE_MAX_DAYS,
+    },
+    spam: {
+      enabled: e.SPAM_HEURISTICS_ENABLED,
+      windowHours: e.SPAM_WINDOW_HOURS,
+      fanOutMin: e.SPAM_FANOUT_MIN,
+      fanOutMaxReplyRate: e.SPAM_FANOUT_MAX_REPLY_RATE,
+      burstMinutes: e.SPAM_BURST_MINUTES,
+      burstFirstContacts: e.SPAM_BURST_FIRST_CONTACTS,
+      firstContactMin: e.SPAM_FIRST_CONTACT_MIN,
+      firstContactRatio: e.SPAM_FIRST_CONTACT_RATIO,
+      blockedDays: e.SPAM_BLOCKED_DAYS,
+      blockedHours: e.SPAM_BLOCKED_HOURS,
+      blockedMin: e.SPAM_BLOCKED_MIN,
+      duplicateRecipients: e.SPAM_DUPLICATE_RECIPIENTS,
+      duplicateSimilarity: e.SPAM_DUPLICATE_SIMILARITY,
+      linkRecipients: e.SPAM_LINK_RECIPIENTS,
+      handleRecipients: e.SPAM_HANDLE_RECIPIENTS,
+      scoreNew: e.SPAM_SCORE_NEW,
+      scoreEstablished: e.SPAM_SCORE_ESTABLISHED,
+      establishedDays: e.SPAM_ESTABLISHED_DAYS,
+      cooldownHours: e.SPAM_COOLDOWN_HOURS,
+      heldMaxDays: e.SPAM_HELD_MAX_DAYS,
+      hashTtlHours: e.SPAM_HASH_TTL_HOURS,
+      flagRetentionDays: e.SPAM_FLAG_RETENTION_DAYS,
     },
     photoChecks: {
       classifier: e.PHOTO_CLASSIFIER ?? (e.NODE_ENV === "test" ? "off" : "auto"),

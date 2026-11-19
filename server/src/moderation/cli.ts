@@ -29,6 +29,7 @@ import {
 } from "../lib/moderation.ts";
 import { isId } from "../lib/ids.ts";
 import { isoDate } from "../lib/time.ts";
+import { AUTOMATIC_REPORTER, automaticReportIds, runSpamCommand, SPAM_ALLOWED, SPAM_USAGE } from "./spam-cli.ts";
 
 export const USAGE = `Stexx moderation
 
@@ -40,7 +41,7 @@ export const USAGE = `Stexx moderation
   unhide <profileID>                            make visible again (only reports filed later count towards auto-hide)
   ban <profileID>                               remove everywhere, revoke sessions, ban its devices
   unban <profileID>                             undo a ban
-  log [<profileID>] [--limit N] [--json]        audit log
+  log [<profileID>] [--limit N] [--json]        audit log${SPAM_USAGE}
 
 Write commands need --as <handle> (or STEXX_MODERATOR) and take an optional --note "...".`;
 
@@ -64,6 +65,7 @@ const ALLOWED: Record<string, string[]> = {
   unhide: WRITE_FLAGS,
   ban: WRITE_FLAGS,
   unban: WRITE_FLAGS,
+  ...SPAM_ALLOWED,
 };
 
 function parse(argv: string[]): Parsed {
@@ -142,7 +144,8 @@ function oneLine(s: string, max = 300): string {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
-function printReview(r: AccountReview, out: (line: string) => void, now: Date): void {
+/** `automatic`: ids of reports the system filed (spam heuristics), labelled as such instead of "(deleted)". */
+function printReview(r: AccountReview, out: (line: string) => void, now: Date, automatic: ReadonlySet<string> = new Set()): void {
   out(`${r.userId}  "${r.displayName}"  ${r.state.toUpperCase()}${r.hiddenReason ? ` (${r.hiddenReason})` : ""}`);
   out(`  age ${r.age ?? "-"} · account ${ago(r.createdAt, now)} old · ${r.photoCount} photos · ${r.devices} device(s)`);
   if (r.headline) out(`  headline: ${oneLine(r.headline)}`);
@@ -162,7 +165,7 @@ function printReview(r: AccountReview, out: (line: string) => void, now: Date): 
   for (const rep of r.reports) {
     out(
       `  [${rep.id}] ${rep.status.toUpperCase()} ${rep.priority} ${rep.reason} · filed ${day(rep.createdAt)}` +
-        `${rep.closedAt ? ` · closed ${day(rep.closedAt)}` : ""} · reporter ${rep.reporterId ?? "(deleted)"}` +
+        `${rep.closedAt ? ` · closed ${day(rep.closedAt)}` : ""} · reporter ${rep.reporterId ?? (automatic.has(rep.id) ? AUTOMATIC_REPORTER : "(deleted)")}` +
         `${rep.conversationId ? ` · from chat ${rep.conversationId}` : ""}`,
     );
     if (rep.details) out(`    details: ${oneLine(rep.details, 2000)}`);
@@ -243,7 +246,7 @@ export async function runModerationCli(
       case "show": {
         const review = await accountReview(profileArg(p)!, undefined, now);
         if (json) emit(review);
-        else printReview(review, out, now);
+        else printReview(review, out, now, await automaticReportIds(review.userId));
         return 0;
       }
       case "log": {
@@ -279,10 +282,13 @@ export async function runModerationCli(
         else printResult(res, out);
         return 0;
       }
-      default:
+      default: {
+        const spam = await runSpamCommand(p, out, env, now);
+        if (spam !== null) return spam;
         out(`error: unknown command "${p.command}"`);
         out(USAGE);
         return 2;
+      }
     }
   } catch (err) {
     if (err instanceof ModerationError) {

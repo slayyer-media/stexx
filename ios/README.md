@@ -82,7 +82,10 @@ Stexx/E2E/
   E2ESecretStorage.swift   Keychain items (this device only, not synced) / in-memory for tests
   E2EProtocolStore.swift   libsignal's identity, prekey, signed, Kyber and session stores over it
   E2EHistoryStore.swift    Decrypted text, kept in an AES-GCM sealed file (key in the Keychain)
-  E2EContentRules.swift    Port of the server's link and duplicate-text rules
+  E2EContentRules.swift    Port of the server's link and duplicate-text rules; payment/crypto/redirect handle rules
+                           read from content-rules.json
+  content-rules.json       Byte-identical copy of server/src/lib/abuse/content-rules.json (patterns + test vectors).
+                           Edit the server file and copy it here; server/test/spam-content.test.ts fails if they differ
   E2EEngine.swift          Keys (register, top up, rotate), PQXDH, encrypt/decrypt, identity holds
   E2EAPIClient.swift       APIClient wrapper: encrypts sends, decrypts conversations and messages
   E2EStatus.swift          Main-actor state for the UI; realtime identity.changed / keys.low
