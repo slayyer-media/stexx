@@ -1,6 +1,6 @@
 # Security and anti-spam
 
-Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5), profile photo checks (section 6) and the server side of end-to-end encrypted chat (section 7): how they work, how to configure them, and what they store.
+Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5), profile photo checks (section 6), the server side of end-to-end encrypted chat (section 7) and spam heuristics on messages with shadow limits (section 8): how they work, how to configure them, and what they store.
 
 The anti-spam code lives in `server/src/lib/abuse/` (plus `server/src/routes/attest.ts`) and `ios/Stexx/Services/AttestationService.swift`; its schema is in `server/migrations/104_anti-spam.sql` and `105_abuse-counters.sql`. Reports and moderation are in `server/src/lib/moderation.ts`, `server/src/routes/safety.ts`, `server/src/moderation/cli.ts` and `server/migrations/107_report-autohide.sql`; moderator alerts and photo-flag review in `server/src/lib/moderator-alerts.ts`, `server/src/lib/photocheck/review.ts`, `server/src/moderation/photos-cli.ts` and `server/migrations/114_mod-tools.sql`.
 
@@ -93,7 +93,8 @@ An account is **restricted** while it is younger than `TRUST_RAMP_HOURS` (24) an
 | Code (403) | Rule |
 | --- | --- |
 | `links_not_allowed` | No URLs, bare domains (`example.xyz`, `t.me/...`) or `www.` links. |
-| `new_account_limit` | At most `TRUST_RAMP_FIRST_MESSAGES_PER_DAY` (10) conversations started in 24h that nobody has replied to yet. |
+| `handles_not_allowed` | No payment or crypto handles (Cash App `$tags`, Venmo, PayPal.me, Zelle, wallet addresses) and no off-platform redirects (Telegram, WhatsApp, Snapchat, Instagram, Kik, Signal usernames, OnlyFans), from the shared table in section 8. |
+| `new_account_limit` | At most `TRUST_RAMP_FIRST_MESSAGES_PER_DAY` (10) conversations started in 24h that nobody has replied to yet. Counted from the messages and from the spam heuristics' ledger (`spam_contacts`, section 8), so a first message that expires right after it is read still counts. |
 | `duplicate_message` | The same text (case, spacing and punctuation ignored, 16+ characters) to more than `TRUST_RAMP_DUPLICATE_RECIPIENTS` (3) people in 24h. |
 
 ### With end-to-end encrypted chats
@@ -106,11 +107,12 @@ Chats are planned to become end-to-end encrypted with the Signal Protocol (libsi
 | `new_account_limit` (first contacts nobody replied to) | who wrote in which conversation, when | server, unchanged |
 | Trust state (age, repliers, open reports) | account metadata | server, unchanged |
 | `links_not_allowed` | message text | **the app**, before encrypting |
+| `handles_not_allowed` | message text | **the app**, before encrypting, from the same pattern table as the server (section 8) |
 | `duplicate_message` (same text to many people) | message text | **the app**, against its own recently sent messages; no content hashes go to the server |
 | Report evidence (section 5) | the reported messages and photos | **the app** sends the plaintext of the messages the reporter ticks, and re-uploads the photos it decrypted; the server checks only that message ids, thread and sender match |
 | Explicit chat photos | the photo | **the app**, on the device before showing an incoming photo (section 7, "Encrypted photos") |
 
-The two text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. The choice is per message: plaintext `text` goes through the current policy (`plaintextContentPolicy`), and an encrypted envelope (section 7) goes through `encryptedContentPolicy` (a no-op), so both work side by side while `E2E_MODE=optional`. The app runs the same rules locally before encrypting; `containsLink` and `normalizeForDuplicate` are the reference to port. The server tells the app whether its account is restricted, and with which numbers, in `GET /v1/e2e/config` → `contentRules`. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server and count encrypted messages exactly like plaintext ones.
+The text rules sit behind `ContentPolicy` in `server/src/lib/abuse/content.ts`. The choice is per message: plaintext `text` goes through the current policy (`plaintextContentPolicy`), and an encrypted envelope (section 7) goes through `encryptedContentPolicy` (a no-op), so both work side by side while `E2E_MODE=optional`. The app runs the same rules locally before encrypting; `containsLink` and `normalizeForDuplicate` are the reference to port. The server tells the app whether its account is restricted, and with which numbers, in `GET /v1/e2e/config` → `contentRules`. A modified client can skip the in-app checks, which is why the metadata limits, which still bound fan-out, stay on the server and count encrypted messages exactly like plaintext ones.
 
 The app shows the server's message above the composer and keeps the failed bubble so the user can edit or retry.
 
@@ -185,6 +187,7 @@ Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show`
 | `ban <profileID>` | See the table above. The account row is kept so its email hash and devices keep blocking a new sign-up |
 | `unban <profileID>` | Undo a ban: clears the ban, the hide and the server-side ban on its devices (unless another banned account was created on the same device). A DeviceCheck ban bit already written at Apple stays set |
 | `log [<profileID>]` | Audit log |
+| `spam [<profileID>]`, `spam-clear <profileID>` | Spam shadow limits: the list, one account's signals and counters, and clearing a false positive (section 8) |
 | `photos …` | Review `photo_flags`, see [section 6](#reviewing-photo-flags) |
 | `alerts status` / `alerts test` | Alert channels, last digest, pending items / send a test alert now, see [Alerts](#alerts) |
 
@@ -369,6 +372,81 @@ Migration plan:
 4. Once old builds are gone (minimum app version), switch to `required`. Then remove the plaintext text rules from the server.
 
 Rolling back from `optional` to `off` keeps stored envelopes readable by the apps (they're plain columns), but stops new key uploads and envelopes.
+## 8. Spam heuristics on messages (shadow limits)
+
+The trust ramp (section 4) only covers the first day. These rules watch **every** account, all the time, and react with a shadow limit instead of an error, so a spammer can't tell what tripped and tune around it. Code: `server/src/lib/abuse/spam.ts` (rules, limit, lifting), `handles.ts` and `content-rules.json` (the pattern table), `minhash.ts` (near-duplicate text), `server/src/moderation/spam-cli.ts`; schema in `server/migrations/112_message-spam.sql`.
+
+### Signals
+
+Every send re-assesses the sender, and every block or report re-assesses the person blocked or reported. Each rule is a count compared with a threshold; the defaults are below and every one has an env variable (Configuration). "Cold" means the other person hadn't written in that conversation.
+
+| Signal | Weight | Fires when (defaults) | Needs |
+| --- | --- | --- | --- |
+| `fan_out_no_replies` | 3 | 20+ conversations started in 24 h and at most 10% got a reply | metadata |
+| `blocked_after_first_contact` | 3 | 3+ **trusted, independent** people blocked or reported it within 24 h of its first message to them (it wrote first), over 7 days | metadata |
+| `duplicate_text` | 3 | near-identical text (similarity 0.6+) to 5+ people in 24 h | plaintext |
+| `first_contact_burst` | 2 | 8+ conversations started inside any 10 minutes | metadata |
+| `payment_handle` | 2 | a payment or crypto handle in 1+ cold conversation in 24 h | plaintext |
+| `first_contact_rate` | 1 | 10+ unanswered cold starts in 24 h, at least 90% of the conversations it wrote in | metadata |
+| `redirect_handle` | 1 | an off-platform redirect in 1+ cold conversation in 24 h | plaintext |
+| `links` | 1 | links in 2+ cold conversations in 24 h | plaintext |
+
+**Decision.** An account younger than `SPAM_ESTABLISHED_DAYS` (14) is limited at a score of 3: one strong signal, or weaker ones together (a burst plus links, a payment handle plus a redirect). An established account needs 5 **and** at least two different signals, so a single signal, however strong, never limits it.
+
+**Metadata signals work forever**, including for end-to-end encrypted chats: they only use who wrote first in which conversation and when, and blocks and reports. They read a small ledger (`spam_contacts`: sender, conversation, the other person, when it first wrote, first wrote something visible, last wrote), not the messages themselves, so a sender can't erase them by making every cold message expire one second after it is read, or by clearing threads.
+
+**Who counts for `blocked_after_first_contact`.** The same people auto-hide trusts (section 5): at least `REPORT_REPORTER_MIN_AGE_HOURS` old, not restricted by the trust ramp, not hidden, banned or spam-limited themselves, and one per device (`device_accounts`) and per report connection (`reports.reporter_ip_hash`), earlier ones first. Otherwise three throwaway accounts with attractive profiles could wait for a newcomer to write to them and block it, silently limiting it. **Content signals are plaintext only**: `ContentPolicy.features` (section 4) turns a plaintext message into features, and an encrypted envelope gets none; the server never tries to read one.
+
+**Near-identical text.** The text is normalized (NFKC, lower case, letters and digits only) and cut into overlapping 5-character shingles, and a 64-position MinHash signature is kept. Two signatures agree in about as many positions as the texts share shingles, so changed names, punctuation and emoji still match ("Hey Jake!! …" and "hey sam …" score about 0.75) and different messages score near 0. The shingle hash is an HMAC with a key derived from `EMAIL_PEPPER`, so the stored numbers can't be checked against a dictionary of guesses without the key, and they are deleted after `SPAM_HASH_TTL_HOURS` (48). Near-duplicates are counted per sender; text repeated by a ring of accounts isn't linked across accounts (follow-up).
+
+**Handles and redirects.** One table, `server/src/lib/abuse/content-rules.json`: an id, a kind (`payment`, `crypto`, `redirect`) and a regular expression per rule (Cash App, `$cashtag`, Venmo, PayPal.me, Zelle; Bitcoin, Ethereum, Tron, Litecoin and Monero addresses and "send to my wallet"; Telegram, WhatsApp, Snapchat, Instagram, Kik, Signal usernames, OnlyFans), plus test vectors. Text is normalized first (NFKC, zero-width characters removed), so full-width letters and invisible separators don't dodge it. The patterns are written to mean the same in JavaScript and in ICU (the app's `NSRegularExpression`). The iOS app bundles a byte-identical copy (`ios/Stexx/E2E/content-rules.json`) and runs it before encrypting; `server/test/spam-content.test.ts` fails if the copies differ, and both test suites run every vector. To change a rule, edit the server file, copy it over, and run both suites.
+
+Handles do two things: a restricted (new) account is refused with `handles_not_allowed` (section 4, enforced by the app for encrypted messages, `contentRules.noHandles` in `GET /v1/e2e/config`), and for every account a handle in a cold conversation feeds `payment_handle` / `redirect_handle`. Ordinary mentions ("do you use venmo?", "$5 drinks", "I'm on whatsapp too") don't match.
+
+### What a shadow limit does
+
+When the score reaches the threshold the account is **shadow-limited** (`users.spam_limited_at`, one `spam_flags` episode with the signal names, score and counters). Nothing tells the account:
+
+| | Shadow-limited |
+| --- | --- |
+| Messages to people who haven't written to it (first messages and follow-ups to non-repliers) | **held**: stored and shown to the sender like any other message (status `delivered` if the recipient was connected when it was sent, otherwise `sent`, exactly as for a message that went through; pushed to the sender's own sockets), never shown or pushed to the recipient: no conversation, no unread count, no re-sorted chat list (a held message doesn't move the thread's `updatedAt` for the recipient; the sender's own list re-sorts as usual), can't be read, left out of the recipient's data export. The message that tripped the limit is already held. |
+| Messages to people who have written to it | delivered as usual |
+| Taps | accepted (204) and dropped |
+| Nearby, viewers | left out for everyone (it still sees nearby itself) |
+| Profile by id, existing conversations, sign-in | unchanged |
+
+A system report (`reports.source = 'spam'`, no reporter, reason `spam`, details listing the signal names and never message text) puts the account in the **existing moderation queue** (`moderate list`). It doesn't count towards auto-hide or the trust ramp (so the limit stays invisible). A new episode reuses an open system report rather than adding another.
+
+### Ending a limit
+
+| How | Limit | Held messages |
+| --- | --- | --- |
+| Moderator `dismiss <id>` (or `dismiss --report <the spam report>`, or `spam-clear <id>`) | lifted | **delivered** (with their original time): recipients connected over the websocket get them pushed right away (the clear sends a Postgres `NOTIFY` of the message ids, never text, and the API process pushes them); everyone else sees them the next time their app loads its chats. No APNs push is sent for them |
+| Moderator `ban <id>` | ends (the ban hides the account everywhere) | **dropped** (deleted, with their files) |
+| Moderator `action <id>` | stays until the cooldown; `--unhide` lifts it | **dropped** |
+| Cooldown: no signal for `SPAM_COOLDOWN_HOURS` (72) and no open report from a person filed since the limit began | lifted automatically (slow job, every 10 minutes) | **stay held** for a moderator: an unreviewed burst is never delivered late. Dropped after `SPAM_HELD_MAX_DAYS` (30) if nobody decides |
+
+Signals that keep firing while limited (it keeps writing to strangers) restart the cooldown. After any lift, only activity after it counts (`users.spam_cleared_at`), so the same messages never limit an account twice. False positives are therefore cheap: a moderator clear delivers everything that was held, and without review the limit ends on its own once the account behaves.
+
+Moderator commands (section 5), all additive:
+
+```sh
+stexx-mod spam                       # limited accounts, and accounts with held messages, with their signals
+stexx-mod spam p_abc…                # signals now, counters, episodes, a COUNT of held messages (never their text)
+stexx-mod spam-clear p_abc… --as mod-a --note "busy night, real person"
+```
+
+`spam-clear` is a dismiss of the spam report that also works when the report was already closed (e.g. after `action`); it writes a `dismiss` row to `moderation_actions`. `dismiss`, `action` and `ban` add `spam: {lifted, delivered, dropped}` to their audit details when a limit or held messages were involved.
+
+### What it stores
+
+- `spam_message_features`: per plaintext message with text worth checking, the sender, the conversation id, the MinHash signature (64 keyed integers) and which rule kinds matched (`has_link`, `has_payment`, `has_redirect`, `cold`). No text, no match. Deleted after `SPAM_HASH_TTL_HOURS` (48).
+- `spam_flags`: one row per episode: signal names, score, counters (numbers such as `started=23 replied=1`), the system report, how and when it ended, how many held messages were delivered or dropped. Deleted `SPAM_FLAG_RETENTION_DAYS` (180) after the episode ended.
+- `spam_contacts`: per sender and conversation, the other person's id and four timestamps (first message, first message the other person could see, last message, expiry). No text, no message ids. Deleted `SPAM_BLOCKED_DAYS` (7) or `SPAM_WINDOW_HOURS` after the sender's last message there, whichever is longer, and with either account; it survives a cleared thread or an expired message for that time on purpose. Only written while the heuristics are on.
+- `messages.held_at`, `users.spam_limited_at` / `spam_cleared_at`, `reports.source`.
+- Moderation records hold no message text from these rules: moderators see only what reporters attach (section 5).
+- The account's own data export doesn't list its spam state, like reports filed against it and photo flags.
+
 ## Error codes the app handles
 
 | Status | Code | Shown as |
@@ -377,7 +455,7 @@ Rolling back from `optional` to `off` keeps stored envelopes readable by the app
 | 403 | `attestation_key_unknown` | Not shown: the app re-attests and retries once |
 | 403 | `device_banned`, `device_account_limit` | Server message on the sign-up screen |
 | 400 | `disposable_email` | "Please use a regular email address. Temporary inboxes aren't supported." |
-| 403 | `links_not_allowed`, `new_account_limit`, `duplicate_message` | Server message above the chat composer |
+| 403 | `links_not_allowed`, `handles_not_allowed`, `new_account_limit`, `duplicate_message` | Server message above the chat composer (for an encrypted message the app shows the same sentence itself) |
 | 403 | `account_under_review` | Server message where the chat or tap failed |
 | 403 | `account_banned` | Server message on the sign-in screen |
 | 400 | `invalid_key`, `invalid_signature`, `invalid_envelope` | Not shown: a client bug; log and re-generate keys |
@@ -414,6 +492,19 @@ Rolling back from `optional` to `off` keeps stored envelopes readable by the app
 | `REPORT_REPORTER_MIN_AGE_HOURS` | `TRUST_RAMP_HOURS` | |
 | `REPORT_EVIDENCE_RETENTION_DAYS` | `30` | After the report is closed. |
 | `REPORT_EVIDENCE_MAX_DAYS` | `180` | Cap for reports that stay open. |
+| `SPAM_HEURISTICS_ENABLED` | `1` | `0` stops new limits and storing content features; existing limits run their course. |
+| `SPAM_WINDOW_HOURS` | `24` | Window for fan-out, first-contact rate, duplicates, links and handles. |
+| `SPAM_FANOUT_MIN`, `SPAM_FANOUT_MAX_REPLY_RATE` | `20`, `0.1` | `fan_out_no_replies`. |
+| `SPAM_BURST_FIRST_CONTACTS`, `SPAM_BURST_MINUTES` | `8`, `10` | `first_contact_burst`. |
+| `SPAM_FIRST_CONTACT_MIN`, `SPAM_FIRST_CONTACT_RATIO` | `10`, `0.9` | `first_contact_rate`. |
+| `SPAM_BLOCKED_MIN`, `SPAM_BLOCKED_HOURS`, `SPAM_BLOCKED_DAYS` | `3`, `24`, `7` | `blocked_after_first_contact`. |
+| `SPAM_DUPLICATE_RECIPIENTS`, `SPAM_DUPLICATE_SIMILARITY` | `5`, `0.6` | `duplicate_text` (estimated Jaccard similarity of 5-character shingles). |
+| `SPAM_HANDLE_RECIPIENTS`, `SPAM_LINK_RECIPIENTS` | `1`, `2` | Cold conversations for `payment_handle` / `redirect_handle`, and for `links`. |
+| `SPAM_SCORE_NEW`, `SPAM_SCORE_ESTABLISHED`, `SPAM_ESTABLISHED_DAYS` | `3`, `5`, `14` | Thresholds; established accounts also need two different signals. |
+| `SPAM_COOLDOWN_HOURS` | `72` | No signal this long (and no open report from a person since the limit began): the limit lifts. |
+| `SPAM_HELD_MAX_DAYS` | `30` | Held messages nobody reviewed are deleted after this. |
+| `SPAM_HASH_TTL_HOURS` | `48` | Content features (MinHash signatures, rule kinds). |
+| `SPAM_FLAG_RETENTION_DAYS` | `180` | Ended episodes. |
 | `PHOTO_CLASSIFIER` | `auto` (`off` in tests) | `auto` uses the model if its file exists; `off` never classifies. |
 | `PHOTO_NSFW_MODEL` | `server/models/nudenet-320n.onnx` | Production unit: `/srv/stexx/models/nudenet-320n.onnx`. |
 | `PHOTO_NSFW_THREADS` | `1` | CPU threads for one inference (1–16). |
@@ -448,10 +539,14 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - End-to-end encryption adds public keys only (section 7), deleted with the account or on a ban, and ciphertext the server can't read. One-time prekeys are deleted the moment they are handed out.
 - Reports add two things: the messages and photos a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Evidence photos are files in `MEDIA_DIR` with random names that no API response contains; only the moderation CLI prints their path. Nothing in moderation stores or shows a location.
 - Encrypted chat photos add nothing readable: a blob, its size bucket and the usual message metadata.
+- Spam heuristics (section 8) store counters, signal names, and per plaintext message a keyed MinHash signature and which rule kinds matched, for 48 hours; never message text. They also keep who wrote in which conversation when (`spam_contacts`) for 7 days after the last message, even if the messages expired or the thread was cleared: metadata the server had anyway, kept a little longer so disappearing messages can't hide spam. Held messages are the sender's own messages, kept as they would be anyway, and deleted if the account is banned or nobody reviews them in 30 days.
 - Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read. Moderator blocklist entries (`photo_hash_blocklist`: hash, label, moderator handle) are kept after the source account is deleted, which is what a blocklist is for (section 6).
 - Moderator alerts leave the server (by email or webhook) but carry only ids, reason codes, counts and commands: no names, profile text, report content, photos, reporter ids or locations. The alert tables store which items were alerted (kind and id) for a few days, and each channel's retry state.
+- Backups (details in [`server/deploy/README.md`](../server/deploy/README.md#what-is-in-a-nightly-backup)): nightly backups never contain sessions, sign-in links, challenges, rate-limit counters, one-time prekeys, report evidence, spam-detection records (48 h message features and the 7-day contact ledger of who first wrote to whom) or taps, and by default no messages, locations or profile views. So none of these outlive their own retention clocks in the 28 days of backups. Reports are backed up with their free text and reporter IP hash removed. A restore therefore signs everyone out, empties the taps inbox, and brings reports back without their text and evidence. The full snapshot taken before each migration stays on the server in a root-only directory, encrypted to a key the server doesn't have, and is deleted after 24 hours (at most two are kept, and one is refused if it would leave the disk under 15 % free). Every real restore revokes all sessions, including ones revoked after the backup was taken, and empties one-time prekeys, challenges and rate-limit counters. The runbook keeps the API away from traffic until the operator has re-applied deletions, blocks and bans made after the backup. Alerts from the watchdog carry check and unit names only.
 
 ## Not done yet
+
+- Spam heuristics (section 8): near-identical text is detected per sender, not across a ring of accounts sending the same text; released held messages are pushed over the websocket only to recipients connected at that moment (no APNs push); the CLI's `show` labels the system's spam report as `reporter automatic (spam heuristics)`; the thresholds are educated defaults that haven't met real traffic yet, so watch `stexx-mod spam` after launch and tune the `SPAM_*` values. A limited account can still guess from indirect hints: its cold messages never turn `read` (people often don't open them anyway), a held message to someone offline stays `sent` where a delivered one turns `delivered` when they open it, and its data export doesn't list taps that were dropped (they were never stored).
 
 - Report evidence photos are re-uploaded by the reporter's app, so the server can't prove a photo is the one that was in the chat (same as evidence text).
 - No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Alerts (section 5) say when to look; acting still means logging in.
@@ -471,3 +566,10 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Report evidence carries the plaintext the reporter's app decrypted; a message that couldn't be decrypted on the reporter's phone can't be included.
 - The libsignal native module was tested under Bun on macOS arm64 only; on the Linux VPS it is expected to load (glibc 2.39 ≥ 2.34), and if it doesn't, the built-in verifier takes over. Check the `e2eVerifier` boot log after the first deploy.
 - Ciphertext stays on the server as long as the message does, though the recipient can only decrypt it once. Deleting envelope bodies after delivery is a possible follow-up once the app keeps its own history.
+
+## Operational logs and shutdown
+
+- **Error lines are redacted.** `logError` writes the error class, the Postgres `code` and `routine`, and a redacted message: quoted literals (`"…"`, `'…'`), email addresses, long tokens (keys, storage names, hashes), coordinates and numbers longer than 6 digits are removed, and the message is cut at 200 characters. Postgres can echo input (`invalid input syntax for type uuid: "<value>"`) and journald keeps lines for 7 days, so the raw message never reaches it. Production logs no stacks; elsewhere the stack is logged without its first line (which repeats the raw message). The Postgres `detail`, `where` and query parameters are never logged. Tests: `server/test/hardening.test.ts`.
+- **Disk and job health.** `disk.low` (under 15 % free on the media disk, every 10 minutes), `disk.refused` (an upload refused below `MEDIA_MIN_FREE_PERCENT` / `MEDIA_MIN_FREE_MB`, at most once a minute) and `media.no_space` (a write hit ENOSPC/EDQUOT) carry only percentages and megabytes. `jobs.heartbeat` (every 10 minutes) carries each job's seconds since its last success (`okAgeSec.<job>`, -1 = not yet) and the live websocket count, for an ops watchdog to grep: `journalctl -u stexx-api --since -30min | grep jobs.heartbeat`.
+- **Failed writes leave nothing behind.** A photo or attachment is written to a temp file and renamed into place; on any failure the temp file is deleted, and the `mediaTmp` job removes `*.tmp` files older than an hour that a crash or SIGKILL left. A full disk is a 503 `storage_unavailable`, never a half-written photo.
+- **Shutdown.** On SIGTERM the server stops accepting connections, closes websockets with 1012 `restarting`, waits for a running job tick (at most 8 s), closes requests still running after a 2 s grace, closes the database pool and exits, with a hard exit after 18 s (systemd kills at 20 s). A second signal joins the shutdown already in progress.

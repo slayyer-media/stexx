@@ -37,6 +37,10 @@ const envSchema = z.object({
 
   MEDIA_DIR: z.string().default("./media"),
   MEDIA_BASE_URL: z.string().url().default("http://127.0.0.1:8787/media"),
+  /** Uploads fail closed (503 storage_unavailable) below this share of free space on the media disk. Default 5 (0 in tests). */
+  MEDIA_MIN_FREE_PERCENT: z.coerce.number().min(0).max(50).optional(),
+  /** ... or below this many free megabytes. Default 500 (0 in tests). */
+  MEDIA_MIN_FREE_MB: z.coerce.number().int().min(0).max(1_000_000).optional(),
   APP_LINK_BASE: z.string().url().default("https://stexx.gay"),
 
   EMAIL_PEPPER: z.string().optional(),
@@ -91,6 +95,30 @@ const envSchema = z.object({
   REPORT_EVIDENCE_RETENTION_DAYS: z.coerce.number().min(1).max(365).default(30),
   REPORT_EVIDENCE_MAX_DAYS: z.coerce.number().min(1).max(3650).default(180),
 
+  // Spam heuristics on messages, shadow limits pending review (src/lib/abuse/spam.ts, docs/security.md section 8).
+  SPAM_HEURISTICS_ENABLED: flag.default(true),
+  /** Window for fan-out, first-contact rate, duplicates, links and handles. */
+  SPAM_WINDOW_HOURS: z.coerce.number().min(1).max(24 * 7).default(24),
+  SPAM_FANOUT_MIN: z.coerce.number().int().min(2).max(1000).default(20),
+  SPAM_FANOUT_MAX_REPLY_RATE: z.coerce.number().min(0).max(1).default(0.1),
+  SPAM_BURST_MINUTES: z.coerce.number().min(1).max(24 * 60).default(10),
+  SPAM_BURST_FIRST_CONTACTS: z.coerce.number().int().min(2).max(1000).default(8),
+  SPAM_FIRST_CONTACT_MIN: z.coerce.number().int().min(2).max(1000).default(10),
+  SPAM_FIRST_CONTACT_RATIO: z.coerce.number().min(0.5).max(1).default(0.9),
+  SPAM_BLOCKED_DAYS: z.coerce.number().min(1).max(90).default(7),
+  SPAM_BLOCKED_HOURS: z.coerce.number().min(1).max(24 * 30).default(24),
+  SPAM_BLOCKED_MIN: z.coerce.number().int().min(1).max(1000).default(3),
+  SPAM_DUPLICATE_RECIPIENTS: z.coerce.number().int().min(2).max(1000).default(5),
+  SPAM_DUPLICATE_SIMILARITY: z.coerce.number().min(0.3).max(1).default(0.6),
+  SPAM_LINK_RECIPIENTS: z.coerce.number().int().min(1).max(1000).default(2),
+  SPAM_HANDLE_RECIPIENTS: z.coerce.number().int().min(1).max(1000).default(1),
+  SPAM_SCORE_NEW: z.coerce.number().int().min(1).max(100).default(3),
+  SPAM_SCORE_ESTABLISHED: z.coerce.number().int().min(1).max(100).default(5),
+  SPAM_ESTABLISHED_DAYS: z.coerce.number().min(0).max(365).default(14),
+  SPAM_COOLDOWN_HOURS: z.coerce.number().min(1).max(24 * 90).default(72),
+  SPAM_HELD_MAX_DAYS: z.coerce.number().min(1).max(365).default(30),
+  SPAM_HASH_TTL_HOURS: z.coerce.number().min(1).max(24 * 30).default(48),
+  SPAM_FLAG_RETENTION_DAYS: z.coerce.number().min(1).max(3650).default(180),
   // Moderator alerts (src/lib/moderator-alerts.ts, docs/security.md section 5). Off unless one channel is set.
   /** Address(es) for alert digests, comma-separated. Needs SMTP_URL. */
   MODERATOR_ALERT_EMAIL: z.string().optional(),
@@ -142,6 +170,8 @@ export interface Config {
   databaseUrl: string;
   databasePoolMax: number;
   mediaDir: string;
+  /** Free-space floor for media writes (lib/media.ts). Either one being crossed refuses the write. */
+  mediaMinFree: { percent: number; mb: number };
   /** No trailing slash. Photo URLs are `${mediaBaseUrl}/${storageKey}`. */
   mediaBaseUrl: string;
   /** No trailing slash. Email link = `${appLinkBase}/auth/email?token=...`. */
@@ -162,6 +192,7 @@ export interface Config {
   trustProxy: boolean;
   antiSpam: AntiSpamConfig;
   moderation: ModerationConfig;
+  spam: SpamConfig;
   photoChecks: PhotoChecksConfig;
   moderatorAlerts: ModeratorAlertsConfig;
   e2e: E2eConfig;
@@ -236,6 +267,32 @@ export interface AntiSpamConfig {
     duplicateRecipients: number;
     graduateReplies: number;
   };
+}
+
+/** Spam heuristics on messages (lib/abuse/spam.ts). Every rule and threshold is documented in docs/security.md. */
+export interface SpamConfig {
+  enabled: boolean;
+  windowHours: number;
+  fanOutMin: number;
+  fanOutMaxReplyRate: number;
+  burstMinutes: number;
+  burstFirstContacts: number;
+  firstContactMin: number;
+  firstContactRatio: number;
+  blockedDays: number;
+  blockedHours: number;
+  blockedMin: number;
+  duplicateRecipients: number;
+  duplicateSimilarity: number;
+  linkRecipients: number;
+  handleRecipients: number;
+  scoreNew: number;
+  scoreEstablished: number;
+  establishedDays: number;
+  cooldownHours: number;
+  heldMaxDays: number;
+  hashTtlHours: number;
+  flagRetentionDays: number;
 }
 
 export type E2eMode = "off" | "optional" | "required";
@@ -438,6 +495,10 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     databaseUrl: e.DATABASE_URL,
     databasePoolMax: e.DATABASE_POOL_MAX,
     mediaDir: e.MEDIA_DIR,
+    mediaMinFree: {
+      percent: e.MEDIA_MIN_FREE_PERCENT ?? (e.NODE_ENV === "test" ? 0 : 5),
+      mb: e.MEDIA_MIN_FREE_MB ?? (e.NODE_ENV === "test" ? 0 : 500),
+    },
     mediaBaseUrl: e.MEDIA_BASE_URL.replace(/\/+$/, ""),
     appLinkBase: e.APP_LINK_BASE.replace(/\/+$/, ""),
     emailPepper: e.EMAIL_PEPPER || DEV_EMAIL_PEPPER,
@@ -486,6 +547,30 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       },
       evidenceRetentionDays: e.REPORT_EVIDENCE_RETENTION_DAYS,
       evidenceMaxDays: e.REPORT_EVIDENCE_MAX_DAYS,
+    },
+    spam: {
+      enabled: e.SPAM_HEURISTICS_ENABLED,
+      windowHours: e.SPAM_WINDOW_HOURS,
+      fanOutMin: e.SPAM_FANOUT_MIN,
+      fanOutMaxReplyRate: e.SPAM_FANOUT_MAX_REPLY_RATE,
+      burstMinutes: e.SPAM_BURST_MINUTES,
+      burstFirstContacts: e.SPAM_BURST_FIRST_CONTACTS,
+      firstContactMin: e.SPAM_FIRST_CONTACT_MIN,
+      firstContactRatio: e.SPAM_FIRST_CONTACT_RATIO,
+      blockedDays: e.SPAM_BLOCKED_DAYS,
+      blockedHours: e.SPAM_BLOCKED_HOURS,
+      blockedMin: e.SPAM_BLOCKED_MIN,
+      duplicateRecipients: e.SPAM_DUPLICATE_RECIPIENTS,
+      duplicateSimilarity: e.SPAM_DUPLICATE_SIMILARITY,
+      linkRecipients: e.SPAM_LINK_RECIPIENTS,
+      handleRecipients: e.SPAM_HANDLE_RECIPIENTS,
+      scoreNew: e.SPAM_SCORE_NEW,
+      scoreEstablished: e.SPAM_SCORE_ESTABLISHED,
+      establishedDays: e.SPAM_ESTABLISHED_DAYS,
+      cooldownHours: e.SPAM_COOLDOWN_HOURS,
+      heldMaxDays: e.SPAM_HELD_MAX_DAYS,
+      hashTtlHours: e.SPAM_HASH_TTL_HOURS,
+      flagRetentionDays: e.SPAM_FLAG_RETENTION_DAYS,
     },
     photoChecks: {
       classifier: e.PHOTO_CLASSIFIER ?? (e.NODE_ENV === "test" ? "off" : "auto"),

@@ -82,7 +82,10 @@ Stexx/E2E/
   E2ESecretStorage.swift   Keychain items (this device only, not synced) / in-memory for tests
   E2EProtocolStore.swift   libsignal's identity, prekey, signed, Kyber and session stores over it
   E2EHistoryStore.swift    Decrypted text, kept in an AES-GCM sealed file (key in the Keychain)
-  E2EContentRules.swift    Port of the server's link and duplicate-text rules
+  E2EContentRules.swift    Port of the server's link and duplicate-text rules; payment/crypto/redirect handle rules
+                           read from content-rules.json
+  content-rules.json       Byte-identical copy of server/src/lib/abuse/content-rules.json (patterns + test vectors).
+                           Edit the server file and copy it here; server/test/spam-content.test.ts fails if they differ
   E2EEngine.swift          Keys (register, top up, rotate), PQXDH, encrypt/decrypt, identity holds
   E2EAPIClient.swift       APIClient wrapper: encrypts sends, decrypts conversations and messages
   E2EStatus.swift          Main-actor state for the UI; realtime identity.changed / keys.low
@@ -204,6 +207,39 @@ xcrun simctl launch booted gay.stexx.app \
 
 `-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
 
+## Travel mode (Stexx+)
+
+Settings → Travel mode opens a map (`Features/Plus/TravelModeView.swift`,
+logic in `TravelModeModel.swift`); free users get the paywall instead. Pan
+the map or search a city (MapKit's `MKLocalSearchCompleter`; queries go to
+Apple, not to Stexx). The square drawn on the map is the 500 m cell around
+its center: `LocationFuzzer` snaps it on the phone, and only that cell is
+sent (`PUT /me/travel`). The picker starts on a world view, never at your
+own position, and won't pick while zoomed out past ~60 km.
+
+- **State.** `AppState.travel` holds the sent cell and a place name looked
+  up on the device (`MKReverseGeocodingRequest` on the fuzzed cell), on this
+  phone only: a small file in Application Support, excluded from backups
+  and protected until first unlock (`FileTravelPlaceStore`), not the
+  backed-up preferences plist. The server never receives the name and never
+  returns coordinates. `GET /me` says whether travel mode is on
+  (`Profile.travel`), and that wins: after a reinstall it shows as on
+  without a place name. Sign-out forgets it.
+- **Stexx+ lapses.** The server keeps the cell but ignores it, so the app
+  shows travel mode as paused (Settings explains it and offers a free
+  "Turn off travel mode", which sends `null`); it resumes on renewal. The
+  app notices without waiting for the next foreground: a timer drops
+  Stexx+ at `plusExpiresAt`, and `GET /me` reporting `travel.isActive:
+  false` does the same; both then re-check with the server, which turns
+  Stexx+ back on after a renewal.
+- **Nearby.** While it's on, a "Browsing from …" pill sits above the grid:
+  tap it to change the place, × to turn it off. While paused it says
+  "Travel paused · You're shown near home" instead (tap for the paywall, ×
+  to turn it off). The grid reloads whenever travel mode changes.
+
+Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
+signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.
+
 ## Configuration
 
 Build settings in `project.yml` are exposed through `Info.plist`:
@@ -283,10 +319,8 @@ ios/
 - Real passkey auth (`AuthenticationServices`, associated domain
   `webcredentials:stexx.gay`); email links are handled in the API layer and
   via `onOpenURL`, but there's no "sign in" screen yet
-- Travel mode UI (`APIClient.setTravelLocation` is ready)
 - Push notifications
 - Discreet alternate app icons, localization
-- Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)
 - End-to-end encryption for chat photos (they're still sent as plain
   attachments), the safety-number comparison screen, and multi-device
 - A run of the E2E client on a physical iPhone (Keychain classes, App Attest

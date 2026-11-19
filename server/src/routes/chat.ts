@@ -7,10 +7,12 @@ import { conflict, badRequest, notFound } from "../lib/errors.ts";
 import { isId, newId } from "../lib/ids.ts";
 import { logError } from "../lib/logger.ts";
 import { copyMedia, drainMediaTrash, unlinkMedia } from "../lib/media.ts";
-import { isConnected, publish } from "../lib/realtime.ts";
+import { isConnected, publish, publishUnlessBlocked } from "../lib/realtime.ts";
 import { consume, rateLimit } from "../lib/ratelimit.ts";
 import { attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { contentPolicy, encryptedContentPolicy } from "../lib/abuse/content.ts";
+import { RELEASED_CHANNEL, screenSentMessage } from "../lib/abuse/spam.ts";
 import { assertMessageAllowed } from "../lib/abuse/trust.ts";
 import { decodeEnvelope, envelopeSchema } from "../lib/e2e/envelope.ts";
 import { e2eMode } from "../lib/e2e/keys.ts";
@@ -49,6 +51,9 @@ import type { AppEnv } from "../types.ts";
  *    conversation list never carry a view-once URL to the recipient.
  *  - DELETE /conversations/:id hides the thread for the caller only (cleared_before = now); a new message
  *    un-hides it. Once both people have cleared it, the rows (and files) are physically deleted.
+ *  - Shadow limit (lib/abuse/spam.ts): a message from a spam-limited sender to someone who hasn't written to them is
+ *    held (messages.held_at). Its sender sees it like any sent message; the recipient never does (no list entry, no
+ *    unread count, no realtime event, can't read it) until a moderator clears the sender.
  */
 export const chatRoutes = new Hono<AppEnv>();
 
@@ -61,10 +66,11 @@ const MSG_COLS = sql`m.id, m.conversation_id, m.sender_id, m.client_id, m.text, 
   m.attachment_kind, m.attachment_key,
   m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
 
-/** SQL: message `m` is visible to the member row `cm` (not cleared, not expired). */
+/** SQL: message `m` is visible to the member row `cm` (not cleared, not expired, not held from them). */
 const visibleTo = (cmAlias: string): Fragment =>
   sql`(m.sent_at > COALESCE(${sql(cmAlias + ".cleared_before")}, '-infinity'::timestamptz)
-       AND (m.expires_at IS NULL OR m.expires_at > now()))`;
+       AND (m.expires_at IS NULL OR m.expires_at > now())
+       AND (m.held_at IS NULL OR m.sender_id = ${sql(cmAlias + ".user_id")}))`;
 
 // ---- Views ----------------------------------------------------------------------
 
@@ -100,7 +106,12 @@ export async function loadConversations(viewerId: string, opts: { ids?: string[]
   const ids = opts.ids;
   if (ids && ids.length === 0) return [];
   const rows = await sql<ConvRow[]>`
-    SELECT c.id, c.updated_at, cm.muted,
+    SELECT c.id, cm.muted,
+           -- A held message never bumps c.updated_at (its recipient would see the thread jump with nothing new);
+           -- its sender's own list still re-sorts on it.
+           GREATEST(c.updated_at,
+                    (SELECT max(m.sent_at) FROM messages m
+                      WHERE m.conversation_id = c.id AND m.sender_id = ${viewerId} AND m.held_at IS NOT NULL)) AS updated_at,
            CASE WHEN c.user_a = ${viewerId} THEN c.user_b ELSE c.user_a END AS other_id,
            (SELECT count(*)::int FROM messages m
              WHERE m.conversation_id = c.id AND m.sender_id <> ${viewerId} AND m.read_at IS NULL
@@ -114,7 +125,7 @@ export async function loadConversations(viewerId: string, opts: { ids?: string[]
            ? sql`c.id = ANY(${ids})`
            : sql`NOT cm.hidden AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND ${visibleTo("cm")})`
        }
-     ORDER BY c.updated_at DESC, c.id DESC
+     ORDER BY updated_at DESC, c.id DESC
      LIMIT ${MAX_CONVERSATIONS}`;
   if (rows.length === 0) return [];
 
@@ -176,16 +187,19 @@ async function pushConversationUpdated(userId: string, conversationId: string): 
   if (conversation) publish(userId, { type: "conversation.updated", data: conversation });
 }
 
-function fanOutNewMessage(row: MessageRow, senderId: string, recipientId: string): void {
+/** `held`: the message was held by a shadow limit, so only its sender hears about it. */
+function fanOutNewMessage(row: MessageRow, senderId: string, recipientId: string, opts: { held?: boolean } = {}): void {
   void (async () => {
     try {
-      publish(recipientId, {
-        type: "message.created",
-        data: viewMessage(row, recipientId, { redactViewOnce: true }),
-      });
+      if (!opts.held) {
+        publish(recipientId, {
+          type: "message.created",
+          data: viewMessage(row, recipientId, { redactViewOnce: true }),
+        });
+      }
       publish(senderId, { type: "message.created", data: viewMessage(row, senderId) });
       await Promise.all([
-        pushConversationUpdated(recipientId, row.conversation_id),
+        opts.held ? Promise.resolve() : pushConversationUpdated(recipientId, row.conversation_id),
         pushConversationUpdated(senderId, row.conversation_id),
       ]);
     } catch (err) {
@@ -205,6 +219,57 @@ export async function publishStoredMessage(messageId: string, recipientId: strin
   } catch (err) {
     logError("chat.fanout", err);
   }
+}
+
+/**
+ * Push held messages that a moderator just released (lib/abuse/spam.ts deliverHeld) to their recipients, as if just
+ * sent; their senders already saw them. Messages since held again, deleted or blocked are skipped. Never throws.
+ */
+export async function publishReleasedMessages(messageIds: string[]): Promise<void> {
+  try {
+    if (messageIds.length === 0) return;
+    const rows = await sql<(MessageRow & { recipient_id: string })[]>`
+      SELECT ${MSG_COLS}, cm.user_id AS recipient_id
+        FROM messages m
+        JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id <> m.sender_id
+       WHERE m.id = ANY(${messageIds}) AND m.held_at IS NULL AND ${visibleTo("cm")}
+       ORDER BY m.sent_at, m.id`;
+    const updated = new Set<string>();
+    for (const row of rows) {
+      if (!isConnected(row.recipient_id)) continue;
+      const sent = await publishUnlessBlocked(row.sender_id, row.recipient_id, {
+        type: "message.created",
+        data: viewMessage(row, row.recipient_id, { redactViewOnce: true }),
+      });
+      if (sent > 0) updated.add(`${row.recipient_id} ${row.conversation_id}`);
+    }
+    await Promise.all(
+      [...updated].map((key) => {
+        const [userId, conversationId] = key.split(" ") as [string, string];
+        return pushConversationUpdated(userId, conversationId);
+      }),
+    );
+  } catch (err) {
+    logError("chat.released_fanout", err);
+  }
+}
+
+/**
+ * Listen for released held messages (RELEASED_CHANNEL), wherever the clear ran (usually the moderator CLI), and push
+ * them over the websocket. Started by the API process (index.ts); returns a stop function.
+ */
+export async function listenForReleasedMessages(): Promise<() => Promise<void>> {
+  const { unlisten } = await sql.listen(RELEASED_CHANNEL, (payload) => {
+    let ids: unknown;
+    try {
+      ids = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(ids)) return;
+    void publishReleasedMessages(ids.filter((id): id is string => typeof id === "string" && isId("message", id)));
+  });
+  return unlisten;
 }
 
 /**
@@ -388,6 +453,8 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   // Hidden pending review: may only write where the other person has written.
   await assertMayMessage(me, conversationId, otherId);
   await assertMessageAllowed({ senderId: me, conversationId, otherId, text, encrypted: envelope !== null });
+  // Content signals for the spam heuristics: plaintext only (an envelope is opaque and never inspected).
+  const features = (envelope ? encryptedContentPolicy : contentPolicy()).features?.(text) ?? null;
 
   // Attachment: either one of the sender's private chat uploads (POST /me/attachments), whose file is handed over
   // to the message, or one of their profile photos, which is COPIED so message and profile lifetimes are
@@ -445,6 +512,7 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
 
   const recipientOnline = isConnected(otherId);
   let row: MessageRow | undefined;
+  let held = false;
   try {
     row = await sql.begin(async (tx) => {
       const [inserted] = await tx<MessageRow[]>`
@@ -466,8 +534,16 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
         if (!consumed) throw notFound(); // sent concurrently in another message: roll this one back
         await tx`DELETE FROM media_trash WHERE storage_key = ${attachmentKey}`;
       }
-      await tx`UPDATE conversations SET updated_at = now() WHERE id = ${conversationId}`;
-      await tx`UPDATE conversation_members SET hidden = false WHERE conversation_id = ${conversationId} AND hidden`;
+      // Spam heuristics (lib/abuse/spam.ts): may hold the message (shadow limit). Same transaction, so a held message
+      // is never visible to the recipient, not even for a moment.
+      // A held message keeps its delivered_at, so its sender's status can't tell it apart from a delivered one.
+      held = (await screenSentMessage(tx, { messageId: inserted.id, senderId: me, conversationId, otherId, features })).held;
+      // A held message leaves no trace for the recipient, not even a re-sorted list (loadConversations re-sorts the
+      // sender's own list from the held message itself; delivery on clear bumps updated_at).
+      if (!held) await tx`UPDATE conversations SET updated_at = now() WHERE id = ${conversationId}`;
+      // A new message un-hides the thread for both people; a held one only for its sender.
+      await tx`UPDATE conversation_members SET hidden = false
+                WHERE conversation_id = ${conversationId} AND hidden ${held ? tx`AND user_id = ${me}` : tx``}`;
       return inserted;
     });
   } catch (err) {
@@ -486,8 +562,8 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
     return c.json(viewMessage(winner, me));
   }
 
-  fanOutNewMessage(row, me, otherId);
-  if (config.devAuth) {
+  fanOutNewMessage(row, me, otherId, { held });
+  if (config.devAuth && !held) {
     // Dev only (never in production): seeded bots read and reply. Fire and forget; never throws.
     const sent = { conversationId, senderId: me, text: row.text };
     void import("../dev/bots.ts").then((m) => m.onDevMessageSent(sent)).catch(() => {});
@@ -521,6 +597,7 @@ chatRoutes.post("/conversations/:id/read", requireAuth, async (c) => {
                                THEN now() + m.expires_after_seconds * interval '1 second' END
         FROM conversation_members cm
        WHERE m.conversation_id = ${conversationId} AND m.sender_id <> ${me} AND m.read_at IS NULL
+         AND m.held_at IS NULL
          AND cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
          AND m.sent_at > COALESCE(cm.cleared_before, '-infinity'::timestamptz)
          AND (m.expires_at IS NULL OR m.expires_at > now())

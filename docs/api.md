@@ -64,6 +64,7 @@ Non-2xx responses carry:
 | 404 | Not found, or hidden because of a block |
 | 409 | Conflict (e.g. nickname taken, if we ever enforce uniqueness) |
 | 429 | Rate limited; `Retry-After` header set |
+| 503 | Temporarily unavailable; show `message` and let the user retry. `storage_unavailable`: the server's disk is full or below its free-space floor, so a photo upload or photo attachment wasn't saved (`Retry-After: 60`). Other 503 codes: `busy` (too many photos being processed, `Retry-After`), `email_unavailable`, `subscriptions_unavailable` |
 
 ## Models
 
@@ -96,6 +97,13 @@ Non-2xx responses carry:
 - `lastActiveAt` is `null` when the user hides their online status.
 - Profile photos on the public grid are never explicit; explicit photos are
   only sent in chat.
+- Your **own** profile (`GET /me`, `PATCH /me`) adds `travel`: `null` when
+  travel mode is off, else `{ "isActive": true }`. `isActive` is `false` while
+  Stexx+ has lapsed: the travel cell is kept but ignored (others see you at
+  your home cell) until Stexx+ is active again or you turn travel mode off.
+  It carries no coordinates, like every `/me` response; the app keeps the
+  place it picked on the device. Other people's profiles never include
+  `travel`.
 - The server labels every uploaded profile photo with a nudity classifier
   ([security.md](security.md#6-photo-checks-profile-photos)). A photo labelled
   explicit is still accepted (`201`) but comes back with `isExplicit: true` and
@@ -181,8 +189,8 @@ Non-2xx responses carry:
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| GET | `/me` | → `Profile` | Own profile (includes hidden fields). |
-| PATCH | `/me` | `ProfileUpdate` → `Profile` | `displayName, age, pronouns, headline, about, heightCm, position, lookingFor, tags` |
+| GET | `/me` | → `Profile` | Own profile (includes hidden fields, and `travel`; see Profile). |
+| PATCH | `/me` | `ProfileUpdate` → `Profile` | `displayName, age, pronouns, headline, about, heightCm, position, lookingFor, tags`. Same own-profile shape as `GET /me`. |
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
@@ -224,6 +232,13 @@ events using the same JSON models. Each frame is `{ "type": "…", "data": … }
 `keys.low` → `{ preKeyCount, pqPreKeyCount }`. Control frames (`ready`, `pong`,
 `error`) carry no `data`; clients ignore unknown types. APNs pushes carry no message content,
 only a conversation ID, and the app fetches the rest.
+
+Close codes: 4401 unauthorized or session revoked (refresh, then reconnect), 4408 no auth frame
+within 5 s, 4009 too many sockets for the account, 1008 policy (frame flood), 1013 busy.
+When the server restarts (deploy, reboot) it closes every socket with **1012 `restarting`**
+before it stops: reconnect with the usual backoff and refetch what may have been missed,
+exactly as after a dropped connection. Expect the first attempts to fail for a few seconds
+while the new process starts.
 
 ### End-to-end encryption
 
@@ -288,7 +303,7 @@ everything else stays at 64 KB.
   "preKeyLowWatermark": 20,
   "pqPreKeyLowWatermark": 5,
   "envelopeMaxBytes": 32768,
-  "contentRules": { "restricted": true, "noLinks": true, "duplicateRecipients": 3, "duplicateMinLength": 16 }
+  "contentRules": { "restricted": true, "noLinks": true, "noHandles": true, "duplicateRecipients": 3, "duplicateMinLength": 16 }
 }
 ```
 
@@ -296,7 +311,10 @@ everything else stays at 64 KB.
 encrypting, because the server can't read ciphertext
 ([`security.md`](security.md#with-end-to-end-encrypted-chats)): while
 `restricted`, refuse links (`noLinks`, same rule as `containsLink` in
-`server/src/lib/abuse/content.ts`) and refuse sending the same text (case and
+`server/src/lib/abuse/content.ts`), refuse payment and crypto handles and
+off-platform redirects (`noHandles`, the rules in
+`server/src/lib/abuse/content-rules.json`, which the app bundles as is; absent
+from older servers, treat as `false`) and refuse sending the same text (case and
 spacing ignored, at least `duplicateMinLength` characters) to more than
 `duplicateRecipients` people in 24 h. Re-read it on launch and after a 403.
 
@@ -420,7 +438,10 @@ last-resort `pqPreKey`, so nobody can drain someone else's one-time prekeys.
   `lastMessage`, `message.created`).
 - Everything else is unchanged: blocks (404), hidden accounts
   (`account_under_review`), rate limits, `new_account_limit`, expiry, read
-  receipts, idempotent `clientID`. The text rules (`links_not_allowed`,
+  receipts, idempotent `clientID`, and the spam heuristics' metadata rules
+  (a shadow-limited sender's envelope can be held like a plaintext message,
+  see [`security.md`](security.md#8-spam-heuristics-on-messages-shadow-limits)).
+  The text rules (`links_not_allowed`, `handles_not_allowed`,
   `duplicate_message`) aren't run on ciphertext: the app runs them
   (`contentRules`).
 - `attachmentPhotoID` next to an `envelope` should be an encrypted upload
@@ -569,5 +590,5 @@ A banned account's sessions stop working (401) and sign-in returns
 | --- | --- | --- | --- |
 | POST | `/subscriptions/apple` | `{ signedTransaction }` → `{ isActive, expiresAt }` | StoreKit 2 JWS, verified server-side. Product `gay.stexx.app.plus.monthly` ($10/month). |
 | GET | `/subscriptions/status` | → `{ isActive, expiresAt }` | |
-| PUT | `/me/travel` | `{ latitude, longitude, precisionMeters }` \| `null` → 204 | Travel mode. |
+| PUT | `/me/travel` | `{ latitude, longitude, precisionMeters }` \| `null` → 204 | Travel mode: you browse, and others see you, from this cell instead of your home cell while Stexx+ is active. Already fuzzed on device (500 m) and re-snapped by the server; overwrites, no history. Setting it needs Stexx+ (402); `null` turns it off and always works, so a lapsed subscriber can still clear it. `GET /me` reports the state (`travel`). |
 | POST | `/boosts` | → `{ endsAt }` | One hour. |

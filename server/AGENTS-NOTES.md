@@ -26,7 +26,10 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   `plus.ts` (/subscriptions/*, /me/travel, /boosts), `ws.ts` (/ws; exports `websocket` for Bun.serve).
 - `src/dev/routes.ts` `devRoutes` is dynamically imported only when `config.devAuth`. Keep all dev-only code
   in `src/dev/*` and never import it statically from non-dev code.
-- `src/jobs/index.ts` `startJobs(): () => void` is called by `src/index.ts` (stub today).
+- `src/jobs/index.ts` `startJobs(): () => Promise<void>` is called by `src/index.ts`; timers live in `jobs/scheduler.ts`
+  (`createScheduler`: skip-while-running ticks, `jobs.heartbeat` every 10 min, `stop()` awaits a running tick ≤ 8 s).
+  Shutdown: `lib/shutdown.ts` `createShutdown(deps)` (stop listening → websockets 1012 → jobs → force-close after 2 s →
+  `sql.end` → exit; hard exit at 18 s; idempotent).
 - `src/types.ts` `AppEnv = { Variables: { userId: string; sessionId: string } }`.
 
 ## Conventions
@@ -56,7 +59,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `badRequest(message, code="validation_error")` 400 · `unauthorized(message?, code="unauthorized")` 401 ·
   `requiresPlus(message?)` 402 `requires_plus` · `forbidden()` 403 · `notFound()` 404 `not_found` ·
   `conflict(message, code="conflict")` 409 · `tooManyRequests(retryAfterSec)` 429 + `Retry-After` ·
-  `serviceUnavailable(code, message)` 503 (e.g. `subscriptions_unavailable`, `email_unavailable`).
+  `serviceUnavailable(code, message)` 503 (e.g. `subscriptions_unavailable`, `email_unavailable`) ·
+  `storageUnavailable()` 503 `storage_unavailable` + `Retry-After: 60` (media disk full / below its floor).
 - `onError` maps ZodError → 400 `validation_error` (message `path: issue`), Hono 413 → `payload_too_large`,
   unknown → 500 `internal_error` (no details in prod). `onNotFound` → 404.
 
@@ -93,6 +97,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   missing + blocked unless `includeBlocked` — only GET /blocks uses that). `profileFor(viewerId, id, opts) → ProfileJson|null`.
   Pass `rows` (from your own `profileColumns` query, e.g. nearby) to avoid a second users query.
 - `viewerCell(userId, db?) → Cell|null` (effective cell) · `photosFor(ownerIds, db?)`.
+- `OwnProfileJson` = Profile + `travel` (`travelJson(row)`: null | `{isActive}`), only for GET/PATCH /me (`ownProfile`
+  in me.ts); never put it on other people's profiles, and never add coordinates to it.
 - `messageJson(row, viewerId)` — status: recipient sees `read` when `read_at`; sender sees `read` only if
   `read_receipt`; else `delivered` (delivered_at or read_at) else `sent`. Attachment `{kind:"photo", url|null, isViewOnce}`.
 - `conversationJson({id, participant, lastMessage, unreadCount, updatedAt, isMuted})` · `privacyJson(row)`.
@@ -151,6 +157,22 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Actions (one tx + `moderation_actions` audit row each): `hideAccount`, `unhideAccount`, `dismissReports`,
   `actionReports`, `banAccount`, `unbanAccount`; read: `reviewQueue`, `accountReview`, `auditLog`. CLI:
   `src/moderation/cli.ts` (`scripts/moderate.ts`). Tests: `overrideAutoHideForTests`.
+- `spam.ts` (spam heuristics, shadow limits; docs/security.md section 8; migration 112): `screenSentMessage(tx, …)` runs in
+  the send transaction after the insert (records `ContentPolicy.features` for plaintext, re-assesses, holds the message
+  via `messages.held_at` if the sender is limited and the recipient hasn't written). `reassessAfterSafetyEvent(id)` after
+  blocks/reports. Pure rules: `assessSpam(facts, settings)`. Moderator hooks `clearSpamLimit` / `confirmSpam` are called
+  by `dismissReports` / `actionReports` / `banAccount`; `runSpamJobs` is in the slow jobs. Any query that shows messages
+  to someone other than their sender must exclude held ones (`held_at IS NULL OR sender_id = viewer`; chat.ts
+  `visibleTo` does it). `notModerated` also hides limited accounts. System reports have `reports.source = 'spam'`.
+  A held message doesn't bump `conversations.updated_at` (loadConversations dates the sender's own list from it). A clear
+  `pg_notify`s `RELEASED_CHANNEL` with the released message ids; index.ts runs `listenForReleasedMessages()` (chat.ts),
+  which pushes them to connected recipients.
+  Metadata signals read the `spam_contacts` ledger (one row per sender+conversation, written in `screenSentMessage`,
+  updated by `deliverHeld`, purged by `runSpamJobs`), never live `messages` alone: messages can expire 1 s after being
+  read. Blockers/reporters only count for `blocked_after_first_contact` if trusted and independent (as auto-hide). A held
+  message keeps `delivered_at` (don't null it: the sender's status must look normal).
+  `handles.ts` loads the shared pattern table `content-rules.json` (copy it to `ios/Stexx/E2E/` after editing).
+  Tests: `overrideSpamForTests`.
 ### moderator-alerts.ts (docs/security.md §5 "Alerts"; migration 114)
 - Off unless `MODERATOR_ALERT_EMAIL` (+ `SMTP_URL`) or `MODERATOR_ALERT_WEBHOOK_URL`. `runModeratorAlerts({now?, profileIds?})`
   (jobs, every minute): per channel, a lease in `moderator_alert_channels`, debounce `MODERATOR_ALERT_INTERVAL_MINUTES`,
@@ -215,6 +237,11 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   queue the file on delete or key change. `POST /reports` evidence `photoID` = the reporter's own pending **plaintext**
   upload (consumed in the report tx; encrypted/foreign/unknown id → 404). `accountReview` returns `photoPath`; only
   `moderation/cli.ts show` prints it. `purgeReportEvidence` drains the trash; the orphan sweep keeps `photo_key`s.
+- Write safety: stores and `copyMedia` write `<key>.<8 hex>.tmp` then rename; any failure deletes the temp file.
+  ENOSPC/EDQUOT → 503 `storage_unavailable` (`isOutOfSpace`). `assertMediaSpace()` (cached `statfs`, 10 s) fails
+  closed below `MEDIA_MIN_FREE_PERCENT`/`MEDIA_MIN_FREE_MB` (0 in tests). `sweepStaleTempFiles(now, {dir?})` (job
+  `mediaTmp`) unlinks `*.tmp` older than 1 h and logs `disk.low` under 15 %. Tests: `setMediaIoForTests({write, copy,
+  statfs})`, `setMediaMinFreeForTests`.
 - Caddy serves `.bin` only after `deploy.sh --sync-config`; do that before switching `E2E_MODE` to `optional`.
 - Dev peer: `scripts/e2e-peer.ts send --to <id> --photo f.jpg [--text …] [--expires s] [--view-once]` encrypts with
   `scripts/e2e-media-crypto.ts` (the format v1 reference, shared with `test/e2e-media.test.ts` and its shared test
@@ -230,7 +257,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 
 ### logger.ts
 - `requestLogger`, `logInfo(event, fields)`, `logError(event, err)`, `setLogSilent(bool)` (tests are silent unless
-  `STEXX_TEST_LOGS=1`).
+  `STEXX_TEST_LOGS=1`). `logError` logs class, pg `code`/`routine` and `redactMessage(err)` (quoted literals, emails,
+  tokens, coordinates, 7+ digit numbers stripped; ≤ 200 chars). Tests capture lines with `setLogSinkForTests(fn|null)`.
 
 ### time.ts / ids.ts / config.ts / db
 - `isoDate(d)`, `inMs(ms, from?)`, `SECOND/MINUTE/HOUR/DAY`, `FRACTIONAL_SECONDS_RE`.
@@ -269,3 +297,8 @@ Rules: the test DB is shared with concurrently running suites — **never trunca
 use `randomCell()` for anything location-based (helpers' users have no location unless given). Each request gets a
 random fake IP so unauthenticated rate limits don't collide; pass `ip` to test a limit. Test env: devAuth on,
 dev welcome/bots off, no dev default location.
+DDL in tests goes in a scratch schema (`test/scratch-schema.ts`: `createScratchSchema(purpose)` → `{name, url, db, drop}`,
+`url` pins `search_path` to it), never in `public`. `schema-guards.test.ts` fails when a migration adds a key to `users` (or to a
+table deleted with an account) that doesn't `ON DELETE CASCADE`, or a text column named like an id or a person (`ACCOUNT_COLUMN`)
+without a key; allowlist deliberate exceptions there with a reason. Ids under other names, in composite keys or jsonb aren't seen.
+`bun scripts/lint-migrations.ts` (CI) checks names, unique numbers, new numbers above `origin/main`'s, and warns on non-additive SQL.
