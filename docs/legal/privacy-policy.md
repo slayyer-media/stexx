@@ -84,7 +84,7 @@ Moderators are people on the Stexx team. They review reports with a tool on our 
 | Location | Replaced each time you move; deleted with your account. Never kept in backups |
 | Messages (no timer) | Both of you delete the chat, or either of you deletes their account (that removes the chat for both) |
 | Expiring messages and photos | The timer runs out after being read; unread ones after 14 days at most |
-| View-once photos | 30 seconds after first opened; 14 days if never opened |
+| View-once photos | 30 seconds after first opened; 3 days after sending if never opened |
 | Chat photo uploads never sent | 1 hour |
 | Profile views | 7 days |
 | Sign-in sessions | Until they expire (30 days after the last refresh) or you sign out (we then keep the revoked record until it would have expired) |
