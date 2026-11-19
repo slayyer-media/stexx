@@ -127,6 +127,7 @@ struct NearbyView: View {
             failure: feed.failure,
             location: location,
             locatingTimedOut: locatingTimedOut,
+            locationUploadFailed: services.location?.lastUploadFailed == true,
             isTravelActive: appState.isTravelActive,
             filtersActive: hasActiveFilters
         )

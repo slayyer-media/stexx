@@ -141,6 +141,62 @@ struct NearbyFeedTests {
         #expect(content(feed, location: .waitingForPermission, timedOut: true) == .findingLocation)
     }
 
+    @Test("Offline cold launch: a failed first page or upload ends 'finding you' at once, without the timeout")
+    func locatingFailsFast() async {
+        let feed = NearbyFeedModel()
+        let server = ScriptedNearbyFetch()
+        func shown(uploadFailed: Bool = false) -> NearbyContent {
+            NearbyContent.resolve(
+                hasProfiles: !feed.profiles.isEmpty,
+                isLoading: feed.isPending,
+                failure: feed.failure,
+                location: .locating,
+                locatingTimedOut: false,
+                locationUploadFailed: uploadFailed,
+                isTravelActive: false,
+                filtersActive: false
+            )
+        }
+
+        // The upload failed while the first page is still in flight: a
+        // spinner, not the first-run copy.
+        let load = Task { await feed.reload(key, using: server.fetch) }
+        await server.settle()
+        #expect(shown() == .findingLocation)
+        #expect(shown(uploadFailed: true) == .loading)
+
+        // The first page failed (offline): the error with Retry, well before
+        // the 20 s timeout, whether or not the upload has failed yet.
+        server.fail(with: URLError(.notConnectedToInternet))
+        await load.value
+        let offline = NearbyFeedModel.message(for: URLError(.notConnectedToInternet))
+        #expect(shown() == .failed(offline))
+        #expect(shown(uploadFailed: true) == .failed(offline))
+
+        // Retry shows a spinner; back online the grid shows.
+        let retry = Task { await feed.reload(key, using: server.fetch) }
+        await server.settle()
+        #expect(shown() == .loading)
+        server.answer(with: page(0..<3))
+        await retry.value
+        #expect(shown() == .grid)
+
+        // The first page answered empty but the upload failed: no waiting
+        // for an upload that won't come; same as after the timeout.
+        let empty = Task { await feed.reload(onlineKey, using: server.fetch) }
+        await server.settle()
+        server.answer(with: Page(items: [], nextCursor: nil))
+        await empty.value
+        #expect(shown() == .findingLocation)
+        #expect(shown(uploadFailed: true) == .empty(filtersActive: false))
+
+        // Location off still explains the grid before any request error.
+        #expect(NearbyContent.resolve(
+            hasProfiles: false, isLoading: false, failure: offline, location: .denied,
+            locationUploadFailed: true, isTravelActive: false, filtersActive: false
+        ) == .locationOff(restricted: false))
+    }
+
     // MARK: Location off
 
     @Test("Denied or restricted explains the empty grid; tiles or travel mode win")

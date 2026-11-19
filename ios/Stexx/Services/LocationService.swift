@@ -50,6 +50,9 @@ final class LocationService {
     private(set) var status: Status = .idle
     /// The last cell that was successfully uploaded.
     private(set) var lastUploadedCell: FuzzedLocation?
+    /// The latest upload attempt failed (offline, server error, rate limit).
+    /// Cleared by the next successful upload.
+    private(set) var lastUploadFailed = false
 
     @ObservationIgnored private let manager: any LocationManaging
     @ObservationIgnored private let upload: @Sendable (FuzzedLocation) async throws -> Void
@@ -114,6 +117,7 @@ final class LocationService {
         generation += 1
         isUploading = false
         lastUploadedCell = nil
+        lastUploadFailed = false
         lastUploadAt = nil
         notBefore = nil
     }
@@ -201,9 +205,11 @@ final class LocationService {
         switch result {
         case .success:
             lastUploadedCell = cell
+            lastUploadFailed = false
             lastUploadAt = now()
             notBefore = nil
         case .failure(let error):
+            lastUploadFailed = true
             if case .rateLimited(let retryAfter)? = error as? APIError {
                 notBefore = now().addingTimeInterval(retryAfter ?? failureBackoff)
             } else {

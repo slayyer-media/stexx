@@ -71,8 +71,12 @@ enum NearbyContent: Equatable {
     ///    loaded): the grid's page cell keeps loading (or offers Retry)
     ///    instead of claiming nobody is nearby.
     /// 2. Unless travel mode places you, an empty grid is explained by the
-    ///    location first (off, or not uploaded yet). A request error in that
-    ///    state would not be what the user can fix.
+    ///    location first (off, or not uploaded yet). Off wins over a request
+    ///    error, since turning location on is what the user can fix.
+    ///    "Finding you" only while it can still come true: not after the
+    ///    timeout, a failed location upload or a failed first page. Offline,
+    ///    both fail at once; a returning user (the server already has a
+    ///    location) then sees the error with Retry, not the first-run copy.
     /// 3. A first page in flight shows a spinner (also while retrying).
     /// 4. A failed first page shows the error with Retry.
     /// 5. Otherwise nobody matched: friendly empty, or "clear filters".
@@ -83,6 +87,7 @@ enum NearbyContent: Equatable {
         failure: String?,
         location: NearbyLocationState,
         locatingTimedOut: Bool = false,
+        locationUploadFailed: Bool = false,
         isTravelActive: Bool,
         filtersActive: Bool
     ) -> NearbyContent {
@@ -92,7 +97,8 @@ enum NearbyContent: Equatable {
             case .denied: return .locationOff(restricted: false)
             case .restricted: return .locationOff(restricted: true)
             case .waitingForPermission: return .findingLocation
-            case .locating where !locatingTimedOut: return .findingLocation
+            case .locating where !locatingTimedOut && !locationUploadFailed && failure == nil:
+                return .findingLocation
             case .locating, .located, .unavailable: break
             }
         }

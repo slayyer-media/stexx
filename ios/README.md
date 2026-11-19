@@ -247,7 +247,7 @@ coordinate):
 | State | When | Shows |
 | --- | --- | --- |
 | Grid | Any tiles, or more pages on the server | Tiles; a spinner cell at the end while the next page loads, or a **Retry** cell if it failed (no automatic retry loop) |
-| Finding you | Empty grid while the permission prompt is up, or before this session's first location upload (up to 20 s) | "Finding guys near you…". The grid reloads by itself once the first upload succeeds, and again when location is turned back on |
+| Finding you | Empty grid while the permission prompt is up, or before this session's first location upload (up to 20 s; ends early if that upload or the first page fails, so offline shows Error) | "Finding guys near you…". The grid reloads by itself once the first upload succeeds, and again when location is turned back on |
 | Location off | Empty grid and location denied, Location Services off, or restricted | Why, **Open Settings** (not for restricted), and travel mode, which works without device location (Stexx+; paywall otherwise) |
 | Error | The first page failed | A plain sentence ("You're offline…") and **Try again** |
 | Nobody nearby | Loaded and empty | "Nobody here yet", or with filters on "Nobody matches your filters" and **Clear filters** |
