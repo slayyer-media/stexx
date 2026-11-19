@@ -46,7 +46,9 @@ describe("GET /nearby", () => {
     const b = await createUser({ location: near(home, 2000) });
     const c = await createUser({ location: near(home, 8000) });
     const page = await nearby(me.token);
-    expect(ids(page).slice(0, 3)).toEqual([a.id, b.id, c.id]);
+    // Only our own users: the shared test database can have someone else's hideDistance user in this region,
+    // legitimately placed anywhere in the first 10 km of the list.
+    expect(ids(page).filter((id) => [a.id, b.id, c.id].includes(id))).toEqual([a.id, b.id, c.id]);
     for (const p of page.items) {
       expect(p.distanceMeters === null || ALLOWED_BUCKETS(p.distanceMeters)).toBe(true);
       expect(Object.keys(p).sort()).toEqual(

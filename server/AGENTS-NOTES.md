@@ -47,6 +47,11 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   Blocked → 404, never 403.
 - Lists of other users (nearby, viewers) must also apply `visibleToViewer(...)` (incognito) and `notModerated("u")`
   (accounts hidden after reports / banned). `profilesFor` and `assertVisibleUser` already apply `moderationVisible`.
+  A query that scans MANY candidates (nearby) uses the scan-shaped twins `notBlockedByViewer` / `visibleToViewerInScan`
+  (same rules, read once per statement instead of probed per row).
+- Performance (see README "Performance"): the API connection runs with JIT off; `LANGUAGE sql` helpers must stay
+  inlinable (no `STRICT` on a non-strict body); a migration that adds a column a hot query filters on also `ANALYZE`s
+  the table. `bun run bench:nearby` measures /nearby.
 - Location: always `snapToCell()` client coords before storing; never return coordinates.
 - Logging: the request logger already logs method/route-pattern/status/ms. Don't `console.log` request data.
   Use `logError(event, err)` / `logInfo(event, fields)` with no user content.
@@ -115,8 +120,10 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 ### visibility.ts
 - `col("u.id")` identifier fragment · `val(id)` bound value fragment.
 - `notBlocked(a, b)` — SQL boolean, symmetric. `WHERE ${notBlocked(val(me), col("u.id"))}`.
+- `notBlockedByViewer(viewerId, target)` — the same rule for scans over many targets (one hashed set per statement).
 - `isIncognito("u")` — `(u.incognito AND u.plus_expires_at > now())`.
 - `visibleToViewer(val(me), "u")` — incognito gate for lists: hidden unless target sent the viewer a message.
+  `visibleToViewerInScan(viewerId, "u")` — the same rule for scans (the viewer's correspondents read once, lazily).
 - `notModerated("u")` — list gate: not hidden, not banned. `moderationVisible(val(me), "u")` — single-profile gate: never
   banned; hidden only visible to people who have written to them.
 - `isBlockedEitherWay(a, b, db?)` · `assertVisibleUser(viewer, target, {allowSelf?, db?})` → 404 if missing/self/blocked/
@@ -127,7 +134,19 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `snapToCell(lat, lon, cell=500) → {latitude, longitude}` (exact port of LocationFuzzer.swift).
 - `haversineMeters(...)`, `bucketDistance(m)`, `bucketedDistanceBetween(cellA|null, cellB|null)`.
 - SQL twins (parity-tested): `stexx_haversine_m(lat1,lon1,lat2,lon2)`, `stexx_distance_bucket(m)` — use them to
-  sort/filter nearby (`maxDistanceMeters`) in SQL.
+  sort/filter nearby (`maxDistanceMeters`) in SQL. Since migration 117 they are inlined by the planner (not STRICT;
+  NULL still gives NULL). `stexx_distance_bucket` only inlines when its argument is a plain column.
+- `boundingBox(center, radiusM) → LatLonBox {minLat, maxLat, lonRanges}`: a box containing the whole circle (split at
+  the antimeridian, all longitudes near a pole); `lonRanges(lo, hi)` normalizes an interval past ±180.
+
+### nearby.ts (GET /nearby search; the route only parses and checks Stexx+)
+- `nearbyPage(viewerId, query, db?) → {items, nextCursor}` (what the route returns) · `nearbyRows(search, db?) →
+  {rows (limit+1), windows}` · `nearbyStatement(search, window|null)` (one statement, for EXPLAIN).
+- Searches `NEARBY_WINDOWS` (bucket fixed points, 5 km … 5,000 km) through bounding boxes on the cell indexes, then one
+  unbounded query; provably the same rows, order and cursor as a single query over everybody (file comment has the
+  proof, `test/nearby-search.test.ts` checks it against `test/nearby-reference.ts`, the old query). Effective cells
+  come straight from `locations`/`travel_locations` (the `effective_locations` rule, re-expressed; change both).
+- `HIDDEN_SORT_SPAN`, `HIDDEN_REGION_DEG`, `hiddenRegion(cell)`, `hiddenRegionBox(cell)`: the hideDistance placement.
 
 ### cursor.ts
 - `encodeCursor(value)` base64url JSON · `decodeCursor(raw, zodSchema)` → value | null; 400 `invalid_cursor`.
@@ -292,7 +311,10 @@ e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), mes
 attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers). Migration 113:
 messages.attachment_open_receipt. Migration 114:
 photos.hidden_at, photo_hash_blocklist, moderator_alert_channels/moderator_alert_sent; moderation_actions.action is a
-format CHECK (`^[a-z][a-z_]{0,31}$`) instead of a fixed list (photo_clear, photo_hide, photo_blocklist, photo_escalate).
+format CHECK (`^[a-z][a-z_]{0,31}$`) instead of a fixed list (photo_clear, photo_hide, photo_blocklist, photo_escalate). Migration 117:
+`travel_locations_cell_idx`; `locations.hide_distance` / `travel_locations.hide_distance` = a trigger-maintained copy of
+`users.hide_distance` (never write it yourself; partial indexes `*_hidden_cell_idx` for the nearby hideDistance arm);
+distance functions made inlinable.
 
 ## Tests
 
