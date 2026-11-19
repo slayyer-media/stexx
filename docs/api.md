@@ -97,6 +97,13 @@ Non-2xx responses carry:
 - `lastActiveAt` is `null` when the user hides their online status.
 - Profile photos on the public grid are never explicit; explicit photos are
   only sent in chat.
+- Your **own** profile (`GET /me`, `PATCH /me`) adds `travel`: `null` when
+  travel mode is off, else `{ "isActive": true }`. `isActive` is `false` while
+  Stexx+ has lapsed: the travel cell is kept but ignored (others see you at
+  your home cell) until Stexx+ is active again or you turn travel mode off.
+  It carries no coordinates, like every `/me` response; the app keeps the
+  place it picked on the device. Other people's profiles never include
+  `travel`.
 - The server labels every uploaded profile photo with a nudity classifier
   ([security.md](security.md#6-photo-checks-profile-photos)). A photo labelled
   explicit is still accepted (`201`) but comes back with `isExplicit: true` and
@@ -175,8 +182,8 @@ Non-2xx responses carry:
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| GET | `/me` | → `Profile` | Own profile (includes hidden fields). |
-| PATCH | `/me` | `ProfileUpdate` → `Profile` | `displayName, age, pronouns, headline, about, heightCm, position, lookingFor, tags` |
+| GET | `/me` | → `Profile` | Own profile (includes hidden fields, and `travel`; see Profile). |
+| PATCH | `/me` | `ProfileUpdate` → `Profile` | `displayName, age, pronouns, headline, about, heightCm, position, lookingFor, tags`. Same own-profile shape as `GET /me`. |
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
@@ -570,5 +577,5 @@ A banned account's sessions stop working (401) and sign-in returns
 | --- | --- | --- | --- |
 | POST | `/subscriptions/apple` | `{ signedTransaction }` → `{ isActive, expiresAt }` | StoreKit 2 JWS, verified server-side. Product `gay.stexx.app.plus.monthly` ($10/month). |
 | GET | `/subscriptions/status` | → `{ isActive, expiresAt }` | |
-| PUT | `/me/travel` | `{ latitude, longitude, precisionMeters }` \| `null` → 204 | Travel mode. |
+| PUT | `/me/travel` | `{ latitude, longitude, precisionMeters }` \| `null` → 204 | Travel mode: you browse, and others see you, from this cell instead of your home cell while Stexx+ is active. Already fuzzed on device (500 m) and re-snapped by the server; overwrites, no history. Setting it needs Stexx+ (402); `null` turns it off and always works, so a lapsed subscriber can still clear it. `GET /me` reports the state (`travel`). |
 | POST | `/boosts` | → `{ endsAt }` | One hour. |

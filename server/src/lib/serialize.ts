@@ -35,6 +35,21 @@ export interface ProfileJson {
   isFavorite: boolean;
 }
 
+/**
+ * Travel mode as its owner sees it: only on the user's OWN profile (GET/PATCH /me), never on anyone else's.
+ * Deliberately carries no coordinates (/me never returns any): the app keeps the place it picked on the device.
+ * `isActive` is false while Stexx+ has lapsed: the travel cell is kept but ignored (effective_locations) until
+ * Plus is active again or the user clears it.
+ */
+export interface TravelJson {
+  isActive: boolean;
+}
+
+/** The own profile (GET/PATCH /me): a Profile plus `travel` (null = travel mode off). */
+export interface OwnProfileJson extends ProfileJson {
+  travel: TravelJson | null;
+}
+
 export interface AttachmentJson {
   kind: "photo";
   url: string | null;
@@ -248,6 +263,11 @@ export function conversationJson(input: {
     updatedAt: isoDate(input.updatedAt),
     isMuted: input.isMuted,
   };
+}
+
+/** `travel` for the own profile: null without a travel row, else whether it applies right now. */
+export function travelJson(row: { is_active: boolean } | undefined): TravelJson | null {
+  return row ? { isActive: row.is_active } : null;
 }
 
 export function privacyJson(r: PrivacyRow): PrivacyJson {

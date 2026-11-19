@@ -12,7 +12,7 @@ struct RootView: View {
     var body: some View {
         ZStack {
             #if DEBUG
-            if let route = ScreenshotRoute.current {
+            if let route = ScreenshotRoute.current, route.replacesRoot {
                 ScreenshotRouteView(route: route)
             } else if appState.isSignedIn {
                 MainTabView()

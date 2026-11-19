@@ -24,7 +24,7 @@ An open-source, ad-free, privacy-first gay dating and hookup app. A Grindr alter
 - End-to-end encrypted chat with photos and expiring media (Signal Protocol via libsignal). The app and server both support it; it switches on in production once a build with it is out. See [`docs/security.md`](docs/security.md#7-end-to-end-encrypted-chat) and [`docs/roadmap.md`](docs/roadmap.md)
 - Taps, favorites, and blocking that actually works
 - Dark, glassy, minimalist UI
-- Premium: more filters, incognito browsing, travel mode, and other extras (exact features TBD)
+- Premium: more filters, incognito browsing, travel mode (browse from a city you pick, still rounded to a 500 m cell on the phone), and other extras
 - Anti-spam without giving up anonymity: device attestation, per-device limits, and new-account limits (see [`docs/roadmap.md`](docs/roadmap.md))
 
 ## Status

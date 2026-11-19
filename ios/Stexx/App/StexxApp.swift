@@ -19,7 +19,9 @@ struct StexxApp: App {
         let sessionStore = ScreenshotRoute.current == .liveChat
             ? CachedSessionStore(backing: InMemorySessionStore(session: ScreenshotRoute.devSession))
             : CachedSessionStore(backing: KeychainSessionStore())
-        let appState = ScreenshotRoute.current?.usesMockData == true ? AppState.preview() : AppState(sessionStore: sessionStore)
+        let appState = ScreenshotRoute.current?.usesMockData == true
+            ? AppState.preview(plus: ScreenshotRoute.startsWithPlus)
+            : AppState(sessionStore: sessionStore)
         #else
         let sessionStore = CachedSessionStore(backing: KeychainSessionStore())
         let appState = AppState(sessionStore: sessionStore)
