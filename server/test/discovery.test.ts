@@ -239,12 +239,8 @@ describe("GET /nearby", () => {
     const victim = await createUser({ location: target });
     const hiddenVictim = await createUser({ location: near(target, 50), privacy: { hide_distance: true } });
     const seen = new Set<number>();
-    // Attacker walks a line of positions around the victim and reads distances. Each position is an
-    // independent attacker, so the probes run concurrently: the assertions are the same, but the test no
-    // longer pays ~250 sequential round trips to the (possibly remote) shared test database.
-    const offsets: number[] = [];
-    for (let m = 0; m <= 4000; m += 130) offsets.push(m);
-    await Promise.all(offsets.map(async (m) => {
+    // Attacker walks a line of positions around the victim and reads distances.
+    for (let m = 0; m <= 4000; m += 130) {
       const pos: Cell = snapToCell(target.latitude + (m - 2000) / 111_320 + 0.00013, target.longitude + 0.00007);
       const attacker = await createUser({ location: pos, plusDays: 2 });
       const page = await nearby(attacker.token, "?limit=100");
@@ -261,11 +257,11 @@ describe("GET /nearby", () => {
       const bucket = v.distanceMeters;
       expect(ids(await nearby(attacker.token, `?maxDistanceMeters=${bucket}`))).toContain(victim.id);
       if (bucket > 100) expect(ids(await nearby(attacker.token, `?maxDistanceMeters=${bucket - 1}`))).not.toContain(victim.id);
-    }));
+    }
     for (const d of seen) expect(ALLOWED_BUCKETS(d)).toBe(true);
     // Far fewer distinct values than raw positions probed.
     expect(seen.size).toBeLessThan(30);
-  }, 60_000); // ~250 HTTP requests against the shared test database, 31 attackers in parallel
+  }, 60_000); // ~250 HTTP round trips against the shared test database
 });
 
 describe("GET /profiles/:id", () => {

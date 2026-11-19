@@ -36,6 +36,7 @@ explicit or not at upload (see [Photo checks](../docs/security.md#6-photo-checks
 | `bun run dev` / `start` | run with / without file watching |
 | `bun test [file]` | tests against a real Postgres database (`stexx_test`); the preload migrates it |
 | `bun run typecheck` / `check` | `tsc --noEmit` / typecheck + tests |
+| `bun run bench:nearby [-- --users 100000 --compare]` | benchmark `GET /v1/nearby` against `stexx_test` (synthetic users go in a throwaway schema; see [Performance](#performance)) |
 | `bun run moderate -- <command>` | moderator CLI: `list`, `show`, `dismiss`, `action`, `hide`, `unhide`, `ban`, `unban`, `log` (see [`docs/security.md`](../docs/security.md#5-reports-auto-hide-and-moderation)) |
 
 Tests share one database with each other: they never truncate tables, they create unique users and use random location cells (`test/helpers.ts`).
@@ -49,7 +50,8 @@ src/app.ts              createApp(): security headers -> request logger -> /heal
 src/config.ts           zod-parsed env; fails fast; production guards
 src/db/                 postgres.js client (sql.ts), migration runner (migrate.ts)
 src/lib/                errors, ids, time (isoDate), auth (tokens, sessions), serialize (the only builders of wire JSON),
-                        distance (cell snapping, haversine, buckets), visibility (blocks, incognito), cursor, ratelimit,
+                        distance (cell snapping, haversine, buckets, bounding boxes), nearby (the /nearby search),
+                        visibility (blocks, incognito), cursor, ratelimit,
                         logger, media (sharp pipeline, storage, trash), mailer, plus, realtime, validation
 src/routes/             auth, me, discovery, chat, safety, plus, ws   (one Hono router per group, mounted at /v1)
 src/jobs/               in-process retention jobs: expiry every 15 s, session/challenge/token and profile-view purges, boosts, report evidence, orphan media sweep
@@ -71,6 +73,39 @@ deploy/                 VPS deployment: Caddy, systemd, Postgres hardening, back
   Database triggers queue a file for deletion whenever the row that owns it disappears (including cascades); the app unlinks the queue. Dev serves `/media`; production serves it with Caddy from `media.stexx.gay`.
 - **Stexx+.** `POST /v1/subscriptions/apple` verifies the StoreKit 2 JWS against Apple's root CA (`certs/`); without verification configured it returns 503 `subscriptions_unavailable`. It never grants on trust.
 
+## Performance
+
+`GET /v1/nearby` is the app's core query: everyone visible to the viewer, nearest first, by bucketed distance then id.
+It must not measure every user on Earth per request, so `src/lib/nearby.ts` searches growing distance **windows**
+(5 km, 20 km, 50 km, … 5,000 km, then one unbounded query). Each window size is a fixed point of the distance
+bucketing, so everyone with a bucket below it is provably inside a latitude/longitude box that the `(cell_lat,
+cell_lon)` indexes read directly; a window that yields a full page is exactly the page one query over everybody would
+return (same rows, order and cursor; `test/nearby-search.test.ts` checks it against that query on the whole shared
+test database). hideDistance users come from a second arm over the fixed 3×3 region block, read through partial
+indexes on a copy of `users.hide_distance` kept on the cell rows by triggers (migration 117).
+
+Measured with `bun run bench:nearby -- --compare` (sequential requests, `limit=50`, first pages; "before" is the old single query
+with the old STRICT distance functions and JIT on, as in production before migration 117):
+
+| Data | Before p50 / p95 | After p50 / p95 (p99) | Statements per request |
+| --- | --- | --- | --- |
+| shared `stexx_test`, 42.5k users, 12.4k located, randomly scattered over the globe (the worst case: nobody nearby) | 269 / 322 ms | 3.9 / 7.4 ms (8.6) | mostly 4 |
+| `--users 100000`: 97k located around a few hundred cities, 8 % hideDistance, 2 % incognito | 528 / 595 ms | 3.3 / 9.9 ms (25) | 1-4 |
+
+Rules that keep it that way:
+
+- **No JIT.** `src/db/sql.ts` turns it off for the API connection: compiling cost 30+ ms on statements that run in 5.
+- **Inlinable SQL functions.** A `LANGUAGE sql` function is only inlined if Postgres can substitute its body; a
+  `STRICT` function whose body isn't strict (e.g. uses `least()` or `CASE`) never is, and then every row pays a function
+  call (~1-3 µs). Migration 117 redefined `stexx_haversine_m` / `stexx_distance_bucket` for this; keep new ones the same.
+  An argument that is itself an expression and is used several times in the body also blocks inlining, which is why
+  the search computes the raw distance in a subquery and buckets the column.
+- **Scan-shaped gates for lists.** Over many candidate rows, use `notBlockedByViewer` / `visibleToViewerInScan`
+  (`lib/visibility.ts`): they read the viewer's blocks / correspondents once instead of probing per row, and keep the
+  planner's cost estimates sane.
+- **Statistics after schema changes.** A column added by a migration has no planner statistics until auto-analyze
+  runs; if a hot query filters on it, `ANALYZE` the table in the same migration (117 does it for `users`).
+
 ## Privacy guarantees and where each is enforced
 
 These are the product promises from `docs/api.md`. "Enforced" names the code that makes it true; "Proven by" the tests that fail if it breaks.
@@ -78,7 +113,7 @@ These are the product promises from `docs/api.md`. "Enforced" names the code tha
 | Promise | Enforced in | Proven by |
 | --- | --- | --- |
 | **Fuzzed location only.** The server re-snaps client coordinates to its own 500 m grid (exact port of `LocationFuzzer.swift`), stores one cell per user, never returns coordinates; distances are cell-to-cell, bucketed (100 m minimum, coarser with distance) | `lib/distance.ts` (`snapToCell`, buckets), `routes/me.ts` (`PUT /me/location`, `/me/travel`), `routes/discovery.ts` + SQL `stexx_haversine_m` / `stexx_distance_bucket` (migration 001, parity-tested with the TS versions), `lib/serialize.ts` | `foundation.test.ts` (distance), `me.test.ts` (re-snaps, no history), `discovery.test.ts` (bucketed, no coordinates) |
-| **`hideDistance`** nulls `distanceMeters` for everyone else, and cannot be used as a filter to learn it | `lib/serialize.ts`, `routes/discovery.ts` | `discovery.test.ts` ("hideDistance") |
+| **`hideDistance`** nulls `distanceMeters` for everyone else, and cannot be used as a filter to learn it | `lib/serialize.ts`, `routes/discovery.ts`, `lib/nearby.ts` | `discovery.test.ts` ("hideDistance"), `nearby-search.test.ts` (the fast search returns exactly what the plain query did) |
 | **Blocks are symmetric and immediate**, a blocked user is a 404 everywhere (never 403) | one SQL helper, `lib/visibility.ts` (`notBlocked`, `assertVisibleUser`), used by every route that surfaces another user; websocket checks it per event | `safety.test.ts` (both directions on every route), `chat.test.ts`, `discovery.test.ts` |
 | **Incognito** (needs active Stexx+, else 402) hides you from nearby/viewers except people you messaged, and records no profile views | `lib/visibility.ts` (`isIncognito`, `visibleToViewer`), `routes/me.ts`, `routes/discovery.ts` | `discovery.test.ts`, `me.test.ts` |
 | **Reports**: several independent reports hide an account until a moderator reviews it (hidden from nearby/viewers, profiles only for people who wrote to it, can't start chats); banned accounts are gone everywhere and can't sign in; nobody learns who reported; shared evidence is deleted 30 days after the report closes | `lib/moderation.ts`, `lib/visibility.ts` (`notModerated`, `moderationVisible`), `routes/safety.ts`, `jobs/retention.ts` (`purgeReportEvidence`) | `moderation.test.ts` |

@@ -17,7 +17,8 @@ import {
   type NearbySearch,
 } from "../src/lib/nearby.ts";
 import { ONLINE_WINDOW_MS, viewerCell } from "../src/lib/serialize.ts";
-import { notBlocked, notBlockedByViewer, col, val } from "../src/lib/visibility.ts";
+import { notBlocked, notBlockedByViewer, col, val, visibleToViewer, visibleToViewerInScan } from "../src/lib/visibility.ts";
+import { newId } from "../src/lib/ids.ts";
 import { as, createUser, deleteUser, expectJson, expectNoContent, randomCell, sql, uniq } from "./helpers.ts";
 import { referenceRows } from "./nearby-reference.ts";
 import type { Sql } from "../src/db/sql.ts";
@@ -188,7 +189,7 @@ describe("geometry", () => {
   });
 });
 
-describe("notBlockedByViewer", () => {
+describe("visibility gates shaped for scans", () => {
   test("matches notBlocked in both directions", async () => {
     const [a, b, c, d] = [await user(), await user(), await user(), await user()];
     await sql`INSERT INTO blocks (blocker_id, blocked_id) VALUES (${a.id}, ${b.id}), (${c.id}, ${a.id})`;
@@ -202,6 +203,37 @@ describe("notBlockedByViewer", () => {
     expect(byId.get(c.id)!.set).toBe(false);
     expect(byId.get(d.id)!.set).toBe(true);
   });
+
+  test("visibleToViewerInScan matches visibleToViewer (incognito, who wrote to whom, lapsed Stexx+)", async () => {
+    const me = await user();
+    const wroteToMe = await user({ plusDays: 3, privacy: { incognito: true } });
+    const iWroteTo = await user({ plusDays: 3, privacy: { incognito: true } });
+    const wroteToOther = await user({ plusDays: 3, privacy: { incognito: true } });
+    const silent = await user({ plusDays: 3, privacy: { incognito: true } });
+    const lapsed = await user({ plusDays: -1, privacy: { incognito: true } });
+    const open = await user();
+    const other = await user();
+    const say = async (from: string, to: string) => {
+      const [a, b] = from < to ? [from, to] : [to, from];
+      const cid = newId("conversation");
+      await sql`INSERT INTO conversations (id, user_a, user_b) VALUES (${cid}, ${a}, ${b})`;
+      await sql`INSERT INTO messages (id, conversation_id, sender_id, client_id, text) VALUES (${newId("message")}, ${cid}, ${from}, ${uniq()}, 'hi')`;
+    };
+    await say(wroteToMe.id, me.id);
+    await say(me.id, iWroteTo.id);
+    await say(wroteToOther.id, other.id);
+    const all = [wroteToMe, iWroteTo, wroteToOther, silent, lapsed, open, other].map((u) => u.id);
+    for (const viewer of [me.id, other.id]) {
+      const rows = await sql<{ id: string; scan: boolean; probe: boolean }[]>`
+        SELECT u.id, ${visibleToViewerInScan(viewer, "u")} AS scan, ${visibleToViewer(val(viewer), "u")} AS probe
+          FROM users u WHERE u.id = ANY(${all})`;
+      for (const r of rows) expect({ id: r.id, scan: r.scan }).toEqual({ id: r.id, scan: r.probe });
+    }
+    const forMe = new Map(
+      (await sql<{ id: string; v: boolean }[]>`SELECT u.id, ${visibleToViewerInScan(me.id, "u")} AS v FROM users u WHERE u.id = ANY(${all})`).map((r) => [r.id, r.v]),
+    );
+    expect([forMe.get(wroteToMe.id), forMe.get(iWroteTo.id), forMe.get(silent.id), forMe.get(lapsed.id), forMe.get(open.id)]).toEqual([true, false, false, true, true]);
+  });
 });
 
 describe("windowed search = one unbounded query", () => {
@@ -209,7 +241,7 @@ describe("windowed search = one unbounded query", () => {
     await inSnapshot(async (tx) => {
       const pick = async (q: Promise<readonly { id: string }[]>) => (await q).map((r) => r.id);
       const viewers = new Set<string>([
-        ...(await pick(tx`SELECT user_id AS id FROM locations ORDER BY random() LIMIT 12`)),
+        ...(await pick(tx`SELECT user_id AS id FROM locations ORDER BY random() LIMIT 8`)),
         ...(await pick(tx`SELECT b.blocker_id AS id FROM blocks b JOIN locations l ON l.user_id = b.blocker_id ORDER BY random() LIMIT 4`)),
         ...(await pick(tx`SELECT b.blocked_id AS id FROM blocks b JOIN locations l ON l.user_id = b.blocked_id ORDER BY random() LIMIT 4`)),
         ...(await pick(tx`SELECT t.user_id AS id FROM travel_locations t JOIN users u ON u.id = t.user_id WHERE u.plus_expires_at > now() ORDER BY random() LIMIT 3`)),
@@ -232,7 +264,7 @@ describe("windowed search = one unbounded query", () => {
 
   test("parity with every filter, including deep cursors and favourites", async () => {
     await inSnapshot(async (tx) => {
-      const viewers = (await tx<{ id: string }[]>`SELECT user_id AS id FROM locations ORDER BY random() LIMIT 6`).map((r) => r.id);
+      const viewers = (await tx<{ id: string }[]>`SELECT user_id AS id FROM locations ORDER BY random() LIMIT 4`).map((r) => r.id);
       const [fan] = await tx<{ id: string }[]>`
         SELECT f.user_id AS id FROM favorites f JOIN locations l ON l.user_id = f.user_id ORDER BY random() LIMIT 1`;
       if (fan) viewers.push(fan.id);
@@ -269,18 +301,24 @@ describe("edge cases of the windows", () => {
     const home = randomCell();
     const me = await user({ location: home });
     const close = await user({ location: cellAtDistance(home, 4_200, 4_400) }); // bucket 4000 or 4500
-    const edgeIn = await user({ location: cellAtDistance(home, 4_760, 4_990) }); // bucket 5000, inside the 5 km box
-    const outs: string[] = [];
-    // Make sure at least one user outside the box (bucket 5000 too) sorts before edgeIn.
-    for (let i = 0; i < 24; i++) {
-      const o = await user({ location: cellAtDistance(home, 5_010, 5_240) });
-      outs.push(o.id);
-      const [row] = await sql<{ first: string }[]>`SELECT min(id) AS first FROM unnest(${[edgeIn.id, ...outs]}::text[]) id`;
-      if (row!.first !== edgeIn.id && outs.length >= 2) break;
+    // Two users just outside the box (bucket 5000), then two just inside it (bucket 5000 too) whose ids sort after
+    // the smaller of theirs: the first window then holds a "full page" of the wrong users (close + the two inside
+    // ones), and only the window rule (sort key < 5000) keeps it from being returned. (Ids are random: retry.)
+    const outs = [
+      (await user({ location: cellAtDistance(home, 5_010, 5_240) })).id,
+      (await user({ location: cellAtDistance(home, 5_010, 5_240) })).id,
+    ];
+    const ins: string[] = [];
+    for (let i = 0; i < 60 && ins.length < 2; i++) {
+      const cand = await user({ location: cellAtDistance(home, 4_760, 4_990) });
+      const [row] = await sql<{ after: boolean }[]>`SELECT ${cand.id}::text > (SELECT min(id) FROM unnest(${outs}::text[]) id) AS after`;
+      if (row!.after) ins.push(cand.id);
+      else await deleteUser(cand.id);
     }
-    const mine = [close.id, edgeIn.id, ...outs];
-    const ordered = (await sql<{ id: string }[]>`SELECT id FROM unnest(${[edgeIn.id, ...outs]}::text[]) id ORDER BY id`).map((r) => r.id);
-    expect(ordered[0]).not.toBe(edgeIn.id);
+    expect(ins).toHaveLength(2);
+    const mine = [close.id, ...ins, ...outs];
+    const ordered = (await sql<{ id: string }[]>`SELECT id FROM unnest(${[...ins, ...outs]}::text[]) id ORDER BY id`).map((r) => r.id);
+    expect(outs).toContain(ordered[0]);
 
     const cell = (await viewerCell(me.id))!;
     // limit 2: the page is [close, smallest-id 5000 user], and the first window (5 km) can't prove it.

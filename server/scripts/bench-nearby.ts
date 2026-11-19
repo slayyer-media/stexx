@@ -6,9 +6,10 @@
  *   bun scripts/bench-nearby.ts --compare --explain  # also time the old single query; print query plans
  *
  * Options: --users N (synthetic users in a throwaway schema; 0 = use the existing public tables), --requests N
- * (default 200), --pages N (pages walked per viewer, default 1), --limit N (default 50), --compare (time the
- * pre-window reference query on the same requests), --jit (leave Postgres JIT on, as before this change),
- * --explain (EXPLAIN ANALYZE one request's statements), --keep (don't drop the throwaway schema).
+ * (default 200), --pages N (pages walked per viewer, default 1), --limit N (default 50), --compare (also time the
+ * code before this change on the same requests: the single query of test/nearby-reference.ts, the STRICT distance
+ * functions of migration 001 and JIT on, and check every page is identical), --jit (leave Postgres JIT on for the
+ * new code too), --explain (EXPLAIN ANALYZE the slowest request's statements), --keep (don't drop the schemas).
  *
  * Synthetic data lives in its own schema (bench_nearby_<random>) that is dropped at the end: shared tables are
  * never written. The schema copies the real tables (LIKE ... INCLUDING ALL, so every index from the migrations)
@@ -47,7 +48,11 @@ const { ONLINE_WINDOW_MS } = await import("../src/lib/serialize.ts");
 const { referenceStatement } = await import("../test/nearby-reference.ts");
 const { sql: appSql } = await import("../src/db/sql.ts");
 
-const schema = USERS > 0 ? `bench_nearby_${Math.random().toString(36).slice(2, 10)}` : null;
+const tag = Math.random().toString(36).slice(2, 10);
+const schema = USERS > 0 ? `bench_nearby_${tag}` : null;
+// --compare: the distance functions exactly as migration 001 defined them (STRICT, so never inlined), in a schema of
+// their own that shadows public's on the "before" connection.
+const legacySchema = flag("compare") ? `bench_nearby_legacy_${tag}` : null;
 const admin = postgres(url, { max: 1, onnotice: () => {} });
 const db = postgres(url, {
   max: 1,
@@ -59,6 +64,39 @@ const db = postgres(url, {
     ...(schema ? { search_path: `${schema}, public` } : {}),
   },
 });
+
+const legacy = legacySchema
+  ? postgres(url, {
+      max: 1,
+      onnotice: () => {},
+      transform: { undefined: null },
+      connection: { application_name: "stexx-bench-legacy", search_path: `${legacySchema}, ${schema ?? "public"}, public` },
+    })
+  : null;
+
+async function createLegacyFunctions(s: string) {
+  await admin.unsafe(`CREATE SCHEMA ${s}`);
+  await admin.unsafe(`
+    CREATE FUNCTION ${s}.stexx_haversine_m(lat1 double precision, lon1 double precision,
+                                           lat2 double precision, lon2 double precision)
+    RETURNS double precision LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+      SELECT 2 * 6371000.0 * asin(least(1.0, sqrt(
+        power(sin(radians(lat2 - lat1) / 2), 2) +
+        cos(radians(lat1)) * cos(radians(lat2)) * power(sin(radians(lon2 - lon1) / 2), 2)
+      )))
+    $$`);
+  await admin.unsafe(`
+    CREATE FUNCTION ${s}.stexx_distance_bucket(m double precision) RETURNS integer
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+      SELECT CASE
+        WHEN m < 1000   THEN greatest(100, (ceil(m / 100.0) * 100)::integer)
+        WHEN m < 5000   THEN (floor(m / 500.0 + 0.5) * 500)::integer
+        WHEN m < 25000  THEN (floor(m / 1000.0 + 0.5) * 1000)::integer
+        WHEN m < 100000 THEN (floor(m / 5000.0 + 0.5) * 5000)::integer
+        ELSE (floor(m / 10000.0 + 0.5) * 10000)::integer
+      END
+    $$`);
+}
 
 const TABLES = ["users", "locations", "travel_locations", "blocks", "favorites", "conversations", "messages", "photos"];
 
@@ -174,6 +212,7 @@ function stats(xs: number[]) {
 }
 
 try {
+  if (legacySchema) await createLegacyFunctions(legacySchema);
   if (schema) {
     const t0 = performance.now();
     await createSchema(schema);
@@ -218,7 +257,7 @@ try {
       page.push(performance.now() - t);
       if (flag("compare")) {
         t = performance.now();
-        await db`${referenceStatement(s)}`;
+        await legacy!`${referenceStatement(s)}`;
         reference.push(performance.now() - t);
         // Same page from both, compared in one snapshot (other suites may be writing to the shared tables).
         const k = (x: { id: string; sort_d: number }) => `${x.id}:${x.sort_d}`;
@@ -237,7 +276,7 @@ try {
   console.log(`search  (nearbyRows)            ${stats(search)}`);
   console.log(`endpoint (nearbyPage, no HTTP)  ${stats(page)}`);
   if (flag("compare")) {
-    console.log(`old single query (reference)    ${stats(reference)}`);
+    console.log(`before (old query, STRICT fns, JIT on) ${stats(reference)}`);
     console.log(`pages differing from the reference (same snapshot): ${mismatches}`);
   }
   console.log(`statements per request: ${[...windows.entries()].sort((a, b) => a[0] - b[0]).map(([k, c]) => `${k}: ${c}`).join(", ")}`);
@@ -252,12 +291,14 @@ try {
       console.log(`\n--- window ${w ?? "unbounded"} ---\n${plan.map((x: any) => x["QUERY PLAN"]).join("\n")}`);
     }
     if (flag("compare")) {
-      const plan = await db`EXPLAIN (ANALYZE, BUFFERS) ${referenceStatement(s)}`;
-      console.log(`\n--- old single query ---\n${plan.map((x: any) => x["QUERY PLAN"]).join("\n")}`);
+      const plan = await legacy!`EXPLAIN (ANALYZE, BUFFERS) ${referenceStatement(s)}`;
+      console.log(`\n--- before: old single query ---\n${plan.map((x: any) => x["QUERY PLAN"]).join("\n")}`);
     }
   }
 } finally {
   if (schema && !flag("keep")) await admin.unsafe(`DROP SCHEMA ${schema} CASCADE`);
+  if (legacySchema && !flag("keep")) await admin.unsafe(`DROP SCHEMA ${legacySchema} CASCADE`);
+  await legacy?.end({ timeout: 5 });
   await db.end({ timeout: 5 });
   await admin.end({ timeout: 5 });
   await appSql.end({ timeout: 5 });
