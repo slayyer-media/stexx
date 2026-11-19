@@ -19,6 +19,8 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type postgres from "postgres";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import { migrate } from "../src/db/migrate.ts";
 import { createScratchSchema, type ScratchSchema } from "./scratch-schema.ts";
 
@@ -33,6 +35,8 @@ const SET_NULL_ALLOWLIST: Record<string, string> = {
   "photo_flags.matched_owner_id": "a duplicate-photo flag belongs to the newer photo's owner; the other account may go (106)",
   "photo_flags.matched_photo_id": "same: the matched photo on the other account may be deleted first (106)",
   "moderation_actions.user_id": "the moderation audit trail survives account deletion, anonymized (107)",
+  "photo_hash_blocklist.source_flag_id":
+    "a moderator's blocklist entry outlives the flag (and account) it came from: that is what a blocklist is for; only the hash, a label and the moderator handle are kept (114)",
 };
 
 /**
@@ -52,7 +56,27 @@ const UNLINKED_ID_ALLOWLIST: Record<string, string> = {
   "moderation_actions.report_ids": "ids of reports (which outlive accounts, anonymized), not account ids (107)",
   "moderation_actions.actor": "'system' or a moderator's handle, never an account id (107)",
   "reports.reporter_ip_hash": "keyed hash of the reporter's IP, not an account id; cleared with the evidence by the retention job (107)",
+  "spam_message_features.conversation_id":
+    "not a FK on purpose: the features outlive an expiring message for their short TTL; the row cascades through sender_id and expires after SPAM_HASH_TTL_HOURS (112)",
+  "spam_flags.lifted_by": "'system' or a moderator's handle, never an account id; the row cascades through user_id (112)",
+  "photo_hash_blocklist.added_by": "a moderator's handle, never an account id (114)",
 };
+
+/**
+ * Allowlist reasons end with the migration that adds the column, e.g. "(112)". Several branches add migrations in
+ * parallel, so an entry may land before its migration does: an entry whose migration number is above the highest
+ * migration in this checkout is not reported as stale (it can't exist yet). Every other stale entry still fails.
+ */
+const HIGHEST_MIGRATION = Math.max(
+  ...readdirSync(join(import.meta.dir, "..", "migrations"))
+    .map((f) => /^(\d{3})_/.exec(f)?.[1])
+    .filter((n): n is string => n !== undefined)
+    .map(Number),
+);
+export function migrationNotYetHere(reason: string, highest = HIGHEST_MIGRATION): boolean {
+  const m = /\((\d{3})\)\s*$/.exec(reason);
+  return m !== null && Number(m[1]) > highest;
+}
 
 /**
  * Column names that look like they hold an account id: `*_id` / `*_ids`, or a role word for a person anywhere in the
@@ -131,8 +155,8 @@ async function deletionViolations(db: postgres.Sql | postgres.TransactionSql, sc
     const effect = fk.on_delete === "d" ? "the row outlives the account" : "DELETE /me fails while such a row exists";
     problems.push(`${name} references ${target} ON DELETE ${action}: ${effect}. Use ON DELETE CASCADE.`);
   }
-  for (const name of Object.keys(SET_NULL_ALLOWLIST)) {
-    if (!setNullSeen.has(name)) {
+  for (const [name, reason] of Object.entries(SET_NULL_ALLOWLIST)) {
+    if (!setNullSeen.has(name) && !migrationNotYetHere(reason)) {
       problems.push(`SET_NULL_ALLOWLIST has "${name}", which is no longer an ON DELETE SET NULL key into the deletion closure: remove it.`);
     }
   }
@@ -164,8 +188,9 @@ async function unlinkedIdViolations(db: postgres.Sql | postgres.TransactionSql, 
       );
     }
   }
-  for (const name of Object.keys(UNLINKED_ID_ALLOWLIST)) {
+  for (const [name, reason] of Object.entries(UNLINKED_ID_ALLOWLIST)) {
     const r = byName.get(name);
+    if (!r && migrationNotYetHere(reason)) continue;
     if (!r) problems.push(`UNLINKED_ID_ALLOWLIST has "${name}", which is not a text column any more: remove it.`);
     else if (r.has_fk) problems.push(`UNLINKED_ID_ALLOWLIST has "${name}", which now has a foreign key: remove it.`);
   }
@@ -268,6 +293,13 @@ describe("schema guards: account deletion", () => {
         expect(named).toEqual(["probe_mutes.blocked_user", "probe_mutes.muted", "probe_mutes.muter", "probe_mutes.owner", "probe_mutes.subject"]);
       },
     );
+  });
+
+  test("entries for a migration that isn't in this checkout yet are not stale; all others are", () => {
+    expect(migrationNotYetHere("a reason (112)", 111)).toBe(true);
+    expect(migrationNotYetHere("a reason (112)", 112)).toBe(false);
+    expect(migrationNotYetHere("a reason without a migration", 111)).toBe(false);
+    expect(migrationNotYetHere("(112) only at the end counts: (107)", 111)).toBe(false);
   });
 
   test("stale allowlist entries fail", async () => {
