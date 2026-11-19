@@ -12,6 +12,7 @@
  *   bun scripts/moderate.ts log [<profileID>] [--limit N] [--json]
  *   bun scripts/moderate.ts photos list|show|clear|hide|blocklist|hide-account|ban …   (photos-cli.ts)
  *   bun scripts/moderate.ts alerts status|test                                         (photos-cli.ts)
+ *   bun scripts/moderate.ts staff invite|list|disable …                                (staff-cli.ts)
  *
  * `--as` (or STEXX_MODERATOR) is the moderator's handle for the audit log; use a handle, never a real name.
  * The CLI never prints location data and never shows message threads: only what reporters chose to share.
@@ -36,6 +37,7 @@ import {
 import { isId } from "../lib/ids.ts";
 import { isoDate } from "../lib/time.ts";
 import { PHOTOS_USAGE, runPhotoAndAlertCli } from "./photos-cli.ts";
+import { runStaffCli, STAFF_USAGE } from "./staff-cli.ts";
 import { AUTOMATIC_REPORTER, automaticReportIds, runSpamCommand, SPAM_ALLOWED, SPAM_USAGE } from "./spam-cli.ts";
 
 export const USAGE = `Stexx moderation
@@ -55,6 +57,8 @@ export const USAGE = `Stexx moderation
   log [<profileID>] [--limit N] [--json]        audit log${SPAM_USAGE}
 
 ${PHOTOS_USAGE}
+
+${STAFF_USAGE}
 
 Write commands need --as <handle> (or STEXX_MODERATOR) and take an optional --note "..." (except purge: notes about a
 purged account are not kept).`;
@@ -228,6 +232,7 @@ export async function runModerationCli(
   readStdin: () => Promise<string> = () => Bun.stdin.text(),
 ): Promise<number> {
   if (argv[0] === "photos" || argv[0] === "alerts") return runPhotoAndAlertCli(argv[0], argv.slice(1), out, env, now, USAGE);
+  if (argv[0] === "staff") return runStaffCli(argv.slice(1), out, env);
   let p: Parsed;
   try {
     p = parse(argv);
