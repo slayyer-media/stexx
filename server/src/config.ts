@@ -157,6 +157,23 @@ const envSchema = z.object({
   /** Most one-time Kyber prekeys stored per device (and per upload). ~1.6 KB each, so kept small on one VPS. */
   E2E_MAX_PQ_PREKEYS: z.coerce.number().int().min(0).max(200).default(25),
 
+  // ---- Staff console (src/admin/*, its own process; docs/security.md "Staff console") ----
+  /** Must be loopback in production: the console is reached only through Caddy on the private network. */
+  ADMIN_HOST: z.string().default("127.0.0.1"),
+  ADMIN_PORT: z.coerce.number().int().min(1).max(65535).default(8788),
+  /** The console's own origin (scheme://host[:port]). Checked against Origin on every write. Required in production. */
+  ADMIN_ORIGIN: z.string().optional(),
+  /** WebAuthn relying party for staff passkeys. Default: ADMIN_ORIGIN's host. Must equal it. */
+  ADMIN_RP_ID: z.string().optional(),
+  ADMIN_RP_NAME: z.string().default("Stexx staff"),
+  /** Comma list of CIDRs the forwarded client address must be in (defense in depth; never stored). */
+  ADMIN_ALLOWED_CIDRS: z.string().optional(),
+  ADMIN_SESSION_IDLE_MINUTES: z.coerce.number().int().min(5).max(120).default(30),
+  ADMIN_SESSION_ABSOLUTE_HOURS: z.coerce.number().int().min(1).max(24).default(8),
+  ADMIN_STEP_UP_MINUTES: z.coerce.number().int().min(1).max(15).default(5),
+  /** Dev-only console login without a passkey (pick a staff handle). Refused in production; loopback only. */
+  ADMIN_DEV_AUTH: flag,
+
   STEXX_DEV_AUTH: flag,
   STEXX_DEV_DEFAULT_LOCATION: z.string().optional(),
   STEXX_DEV_WELCOME: flag,
@@ -203,12 +220,117 @@ export interface Config {
   photoChecks: PhotoChecksConfig;
   moderatorAlerts: ModeratorAlertsConfig;
   e2e: E2eConfig;
+  admin: AdminConfig;
   /** Dev-only auth shortcuts (/auth/register returns a Session, /v1/dev/* mounted). Never true in production. */
   devAuth: boolean;
   /** Dev-only: new users get this cell so the grid isn't empty. null when unset or in production. */
   devDefaultLocation: { latitude: number; longitude: number } | null;
   devWelcome: boolean;
   devBots: boolean;
+}
+
+/** Staff console (src/admin/*). Unused by the public API process. */
+export interface AdminConfig {
+  /** False in production until ADMIN_ORIGIN is set: the console refuses to start (the API is unaffected). */
+  configured: boolean;
+  host: string;
+  port: number;
+  /** No trailing slash, no path. */
+  origin: string;
+  rpId: string;
+  rpName: string;
+  /** Parsed ADMIN_ALLOWED_CIDRS. */
+  allowedCidrs: Cidr[];
+  idleMs: number;
+  absoluteMs: number;
+  stepUpMs: number;
+  /** Dev-only login (src/admin/dev.ts). Never true in production or on a non-loopback host. */
+  devAuth: boolean;
+}
+
+export interface Cidr {
+  /** The text it was parsed from (for messages). */
+  text: string;
+  version: 4 | 6;
+  bytes: Uint8Array;
+  prefix: number;
+}
+
+/** Tailscale's address ranges: the default for ADMIN_ALLOWED_CIDRS in production. */
+export const TAILSCALE_CIDRS = "100.64.0.0/10,fd7a:115c:a1e0::/48";
+/** Outside production, loopback is allowed too (no proxy in front of a local console). */
+const DEV_ADMIN_CIDRS = `127.0.0.0/8,::1/128,${TAILSCALE_CIDRS}`;
+
+/** True for 127.0.0.0/8, ::1, localhost (and their bracketed / mapped forms). */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "::1") return true;
+  const v4 = h.startsWith("::ffff:") ? h.slice(7) : h;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
+}
+
+/** Parse an IPv4 or IPv6 address to bytes (IPv4-mapped IPv6 becomes IPv4). null when it isn't one. */
+export function parseIp(text: string): { version: 4 | 6; bytes: Uint8Array } | null {
+  let s = text.trim().replace(/^\[|\]$/g, "");
+  const zone = s.indexOf("%");
+  if (zone >= 0) s = s.slice(0, zone);
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(s);
+  if (mapped) s = mapped[1]!;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) {
+    const parts = s.split(".").map(Number);
+    if (parts.some((p) => p > 255)) return null;
+    return { version: 4, bytes: Uint8Array.from(parts) };
+  }
+  if (!/^[0-9a-f:.]+$/i.test(s) || !s.includes(":")) return null;
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const words = (part: string): number[] | null => {
+    if (part === "") return [];
+    const out: number[] = [];
+    for (const w of part.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/i.test(w)) return null;
+      out.push(parseInt(w, 16));
+    }
+    return out;
+  };
+  const head = words(halves[0]!);
+  const tail = halves.length === 2 ? words(halves[1]!) : [];
+  if (!head || !tail) return null;
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 2 ? fill < 1 : fill !== 0) return null;
+  const all = [...head, ...Array<number>(halves.length === 2 ? fill : 0).fill(0), ...tail];
+  const bytes = new Uint8Array(16);
+  all.forEach((w, i) => {
+    bytes[i * 2] = w >> 8;
+    bytes[i * 2 + 1] = w & 0xff;
+  });
+  return { version: 6, bytes };
+}
+
+export function parseCidr(text: string): Cidr | null {
+  const [addr, bits, extra] = text.trim().split("/");
+  if (!addr || extra !== undefined) return null;
+  const ip = parseIp(addr);
+  if (!ip) return null;
+  const max = ip.version === 4 ? 32 : 128;
+  const prefix = bits === undefined ? max : /^\d{1,3}$/.test(bits) ? Number(bits) : NaN;
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > max) return null;
+  return { text: text.trim(), version: ip.version, bytes: ip.bytes, prefix };
+}
+
+/** Whether `address` (an IP) is inside any of `cidrs`. Anything that doesn't parse is outside. */
+export function ipInCidrs(address: string, cidrs: readonly Cidr[]): boolean {
+  const ip = parseIp(address);
+  if (!ip) return false;
+  return cidrs.some((c) => {
+    if (c.version !== ip.version) return false;
+    let bits = c.prefix;
+    for (let i = 0; bits > 0; i++, bits -= 8) {
+      const mask = bits >= 8 ? 0xff : (0xff << (8 - bits)) & 0xff;
+      if ((ip.bytes[i]! & mask) !== (c.bytes[i]! & mask)) return false;
+    }
+    return true;
+  });
 }
 
 export interface PhotoChecksConfig {
@@ -357,7 +479,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   const isProduction = e.NODE_ENV === "production";
 
   if (isProduction) {
-    const devFlags = ["STEXX_DEV_AUTH", "STEXX_DEV_WELCOME", "STEXX_DEV_BOTS", "STEXX_DEV_DEFAULT_LOCATION"].filter(
+    const devFlags = ["STEXX_DEV_AUTH", "STEXX_DEV_WELCOME", "STEXX_DEV_BOTS", "STEXX_DEV_DEFAULT_LOCATION", "ADMIN_DEV_AUTH"].filter(
       (k) => {
         const v = env[k];
         return v !== undefined && v !== "" && v !== "0" && v !== "false";
@@ -492,6 +614,8 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     devDefaultLocation = loc.data;
   }
 
+  const admin = adminConfig(e, env, isProduction);
+
   const appleEnabled =
     !!e.APPLE_ROOT_CA_DIR && (e.APPLE_ENVIRONMENT !== "Production" || e.APPLE_APP_APPLE_ID !== undefined);
 
@@ -605,10 +729,84 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       maxPreKeys: e.E2E_MAX_PREKEYS,
       maxPqPreKeys: e.E2E_MAX_PQ_PREKEYS,
     },
+    admin,
     devAuth: !isProduction && e.STEXX_DEV_AUTH,
     devDefaultLocation,
     devWelcome: !isProduction && e.STEXX_DEV_WELCOME,
     devBots: !isProduction && e.STEXX_DEV_BOTS,
+  };
+}
+
+/**
+ * Staff console settings. When none of ADMIN_* is set the public API boots exactly as before (production then just
+ * has an unconfigured console that refuses to start). Values that are set must be consistent, or nothing boots.
+ */
+function adminConfig(e: z.infer<typeof envSchema>, env: Record<string, string | undefined>, isProduction: boolean): AdminConfig {
+  if (isProduction && !isLoopbackHost(e.ADMIN_HOST)) {
+    throw new ConfigError("ADMIN_HOST must be a loopback address in production (the console is reached only through the private proxy)");
+  }
+  if (e.ADMIN_PORT === e.PORT && (e.ADMIN_HOST === e.HOST || (isLoopbackHost(e.ADMIN_HOST) && isLoopbackHost(e.HOST)))) {
+    throw new ConfigError("ADMIN_PORT must differ from PORT");
+  }
+  const originText = e.ADMIN_ORIGIN?.trim() || (isProduction ? null : `http://localhost:${e.ADMIN_PORT}`);
+  let origin = "";
+  let originHost = "";
+  if (originText !== null) {
+    let u: URL;
+    try {
+      u = new URL(originText);
+    } catch {
+      throw new ConfigError("ADMIN_ORIGIN: not a URL");
+    }
+    if (u.protocol !== "https:" && u.protocol !== "http:") throw new ConfigError("ADMIN_ORIGIN: http(s) only");
+    if ((u.pathname !== "/" && u.pathname !== "") || u.search || u.hash || u.username || u.password) {
+      throw new ConfigError("ADMIN_ORIGIN must be an origin only (scheme://host[:port]), with no path");
+    }
+    if (isProduction && u.protocol !== "https:") throw new ConfigError("ADMIN_ORIGIN must be https in production");
+    origin = u.origin;
+    originHost = u.hostname;
+  }
+  const rpId = (e.ADMIN_RP_ID?.trim() || originHost).toLowerCase();
+  if (originText !== null && rpId !== originHost.toLowerCase()) {
+    throw new ConfigError("ADMIN_RP_ID must equal the host of ADMIN_ORIGIN");
+  }
+  if (originText === null && e.ADMIN_RP_ID) {
+    throw new ConfigError("ADMIN_RP_ID is set without ADMIN_ORIGIN");
+  }
+  if (isProduction && originText !== null) {
+    if (rpId === "localhost" || isLoopbackHost(rpId)) throw new ConfigError("ADMIN_RP_ID must be the console's private hostname in production");
+    if (rpId === e.WEBAUTHN_RP_ID.toLowerCase()) {
+      throw new ConfigError("ADMIN_RP_ID must differ from WEBAUTHN_RP_ID (staff passkeys must never work on the app, and the reverse)");
+    }
+  }
+  const cidrText = e.ADMIN_ALLOWED_CIDRS ?? (isProduction ? TAILSCALE_CIDRS : DEV_ADMIN_CIDRS);
+  const allowedCidrs: Cidr[] = [];
+  for (const part of cidrText.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const cidr = parseCidr(part);
+    if (!cidr) throw new ConfigError(`ADMIN_ALLOWED_CIDRS: not a CIDR: ${part}`);
+    allowedCidrs.push(cidr);
+  }
+  if (allowedCidrs.length === 0) throw new ConfigError("ADMIN_ALLOWED_CIDRS: list at least one range");
+  const idleMs = e.ADMIN_SESSION_IDLE_MINUTES * 60_000;
+  const absoluteMs = e.ADMIN_SESSION_ABSOLUTE_HOURS * 3_600_000;
+  if (idleMs > absoluteMs) throw new ConfigError("ADMIN_SESSION_IDLE_MINUTES must not exceed ADMIN_SESSION_ABSOLUTE_HOURS");
+  // ADMIN_DEV_AUTH in production is refused with the other dev flags above.
+  const devAuth = !isProduction && e.ADMIN_DEV_AUTH && isLoopbackHost(e.ADMIN_HOST);
+  if (e.ADMIN_DEV_AUTH && !devAuth && !isProduction && env.ADMIN_DEV_AUTH) {
+    throw new ConfigError("ADMIN_DEV_AUTH needs a loopback ADMIN_HOST");
+  }
+  return {
+    configured: originText !== null,
+    host: e.ADMIN_HOST,
+    port: e.ADMIN_PORT,
+    origin,
+    rpId,
+    rpName: e.ADMIN_RP_NAME,
+    allowedCidrs,
+    idleMs,
+    absoluteMs,
+    stepUpMs: e.ADMIN_STEP_UP_MINUTES * 60_000,
+    devAuth,
   };
 }
 
