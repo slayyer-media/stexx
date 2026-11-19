@@ -560,7 +560,42 @@ A banned account's sessions stop working (401) and sign-in returns
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| POST | `/subscriptions/apple` | `{ signedTransaction }` → `{ isActive, expiresAt }` | StoreKit 2 JWS, verified server-side. Product `gay.stexx.app.plus.monthly` ($10/month). |
-| GET | `/subscriptions/status` | → `{ isActive, expiresAt }` | |
+| POST | `/subscriptions/apple` | `{ signedTransaction }` → `SubscriptionStatus` | StoreKit 2 JWS, verified server-side. Product `gay.stexx.app.plus.monthly` ($10/month). |
+| GET | `/subscriptions/status` | → `SubscriptionStatus` | |
+| POST | `/subscriptions/apple/notifications` | `{ signedPayload }` → 200, empty body | Called by Apple (App Store Server Notifications V2), not the app. No auth. |
 | PUT | `/me/travel` | `{ latitude, longitude, precisionMeters }` \| `null` → 204 | Travel mode. |
 | POST | `/boosts` | → `{ endsAt }` | One hour. |
+
+`SubscriptionStatus` is `{ isActive, expiresAt, willRenew, boostEndsAt }`:
+
+- `expiresAt`: end of the current entitlement (the latest expiry over the user's non-revoked subscriptions, extended
+  through a billing grace period), or `null` if the user never subscribed or the subscription was refunded.
+- `willRenew`: `true` if the subscription behind `expiresAt` renews then ("Stexx+ renews on …"), `false` if auto-renew
+  is off ("Stexx+ ends on …"), `null` when not active or not known yet. The server learns it only from Apple's
+  notifications, so it stays `null` until the first one arrives for that subscription.
+- `boostEndsAt`: end of the running boost, `null` when no boost is running (so the app can show a boost after a relaunch).
+
+Older apps ignore the two new fields; the app treats them as optional.
+
+#### App Store Server Notifications
+
+`POST /subscriptions/apple/notifications` with Apple's body `{ "signedPayload": "<JWS>" }` (extra fields are ignored).
+The URL to enter in App Store Connect is in [`server/deploy/README.md`](../server/deploy/README.md#app-store-server-notifications-stexx).
+
+- The payload and the `signedTransactionInfo` / `signedRenewalInfo` inside it are verified like a purchase: signature,
+  certificate chain to Apple's root, bundle id, environment (and app Apple ID in Production). Renewal info must be for
+  the same original transaction. Any failure is **400 `invalid_notification`** with one fixed message ("The notification
+  could not be verified."), whatever the reason. **503 `subscriptions_unavailable`** when verification isn't configured
+  (or `APPLE_ENVIRONMENT` is `Xcode`/`LocalTesting`) or Apple's certificate status check is unreachable; Apple retries.
+- The subscription is looked up by `originalTransactionId`; a notification never creates one or moves it to another
+  account. Handled types: `SUBSCRIBED`, `DID_RENEW`, `DID_CHANGE_RENEWAL_STATUS`, `DID_FAIL_TO_RENEW` (with
+  `GRACE_PERIOD`, Stexx+ lasts until the grace period ends), `EXPIRED`, `GRACE_PERIOD_EXPIRED`, `REFUND` and `REVOKE`
+  (Stexx+ from that subscription ends at once; a refund of an earlier month that had already ended doesn't touch the
+  current one), `REFUND_REVERSED` (restores it, unless a later refund happened). Expiry only ever grows, so a late or
+  repeated notification can't shorten it, and a renewal bought after a refund lifts the refund.
+- **200** (empty body) for everything accepted: applied, `TEST`, unknown types, other products, unknown
+  `originalTransactionId`s (e.g. a notification that arrives before the app posted the purchase), and replays. Each
+  `notificationUUID` is applied once; a replay is acknowledged without being applied again.
+- Rate limit: its own bucket, 60 a minute per client (429 + `Retry-After`; Apple retries).
+- Stored: the notification UUID and arrival time (deleted after 30 days) and the subscription's auto-renew flag. No
+  Apple payload.
