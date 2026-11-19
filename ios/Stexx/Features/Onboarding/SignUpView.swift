@@ -5,6 +5,7 @@ import SwiftUI
 struct SignUpView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
+    @Environment(\.passkeys) private var passkeys
 
     @State private var displayName = ""
     @State private var email = ""
@@ -57,12 +58,14 @@ struct SignUpView: View {
                         WideLabel("Continue with a passkey", systemImage: "person.badge.key.fill")
                     }
                     .stexxPrimaryButton()
-                    .disabled(!isNameValid || isWorking)
+                    .disabled(!isNameValid || isWorking || !passkeys.availability.isAvailable)
 
-                    Text("Recommended. Uses Face ID or Touch ID. Nothing to remember, nothing to leak.")
+                    Text(passkeys.availability.explanation
+                        ?? String(localized: "Recommended. Uses Face ID or Touch ID. Nothing to remember, nothing to leak."))
                         .font(.footnote)
                         .foregroundStyle(Theme.slate)
                         .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 HStack(spacing: Theme.Spacing.m) {
@@ -124,13 +127,13 @@ struct SignUpView: View {
         }
     }
 
+    /// Options → system passkey sheet → finish (`PasskeyFlow`). Closing the
+    /// sheet just returns here, without an error.
     private func signUpWithPasskey() {
-        // TODO: Real passkey flow with AuthenticationServices:
-        // fetch options from POST /v1/auth/passkey/register/options, create
-        // an ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: "stexx.gay")
-        // registration request, then send the attestation to .../finish.
-        // Requires the `webcredentials:stexx.gay` associated domain.
-        register(RegistrationRequest(displayName: trimmedName, method: .passkey, email: nil, confirmedAdult: true))
+        guard isNameValid, passkeys.availability.isAvailable else { return }
+        let flow = PasskeyFlow(api: api, authenticator: passkeys.authenticator, availability: passkeys.availability)
+        let name = trimmedName
+        start { try await flow.signUp(displayName: name) }
     }
 
     private func signUpWithEmail() {
@@ -144,15 +147,21 @@ struct SignUpView: View {
     }
 
     private func register(_ request: RegistrationRequest) {
+        start { [api] in try await api.register(request) }
+    }
+
+    private func start(_ makeSession: @escaping @MainActor () async throws -> Session) {
         focusedField = nil
         isWorking = true
         errorMessage = nil
         Task {
             defer { isWorking = false }
             do {
-                let session = try await api.register(request)
+                let session = try await makeSession()
                 appState.signIn(session)
                 appState.me = try? await api.fetchMe()
+            } catch PasskeyError.canceled {
+                // The user closed the passkey sheet: nothing to report.
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -183,4 +192,12 @@ private struct SignUpField<Content: View>: View {
         SignUpView()
     }
     .previewEnvironment(signedIn: false)
+}
+
+#Preview("Passkeys unavailable") {
+    NavigationStack {
+        SignUpView()
+    }
+    .previewEnvironment(signedIn: false)
+    .environment(\.passkeys, PasskeySupport(availability: .unavailable(.localServer), authenticator: SimulatedPasskeyAuthenticator()))
 }

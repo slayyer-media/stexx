@@ -1,9 +1,15 @@
 /**
  * Content checks for restricted (new) accounts: the rules that read message TEXT.
  *
- *   - links_not_allowed  no URLs, "www." or bare domains (containsLink)
- *   - duplicate_message  the same text (16+ chars, case and spacing ignored) to more than
- *                        TRUST_RAMP_DUPLICATE_RECIPIENTS people in 24 h
+ *   - links_not_allowed    no URLs, "www." or bare domains (containsLink)
+ *   - handles_not_allowed  no payment or crypto handles and no off-platform redirects (handles.ts, the table shared
+ *                          with the app in content-rules.json)
+ *   - duplicate_message    the same text (16+ chars, case and spacing ignored) to more than
+ *                          TRUST_RAMP_DUPLICATE_RECIPIENTS people in 24 h
+ *
+ * For EVERY account (not just new ones), `features` turns a plaintext message into the content signals the spam
+ * heuristics score (spam.ts): a keyed MinHash signature for near-duplicate text, links, and payment/crypto handles and
+ * redirects. Nothing here stores text; spam.ts keeps the features (never the text) for a short TTL.
  *
  * They sit behind `ContentPolicy` because chats will become end-to-end encrypted (Signal Protocol, planned
  * separately). Once the server only sees ciphertext it can't read text, so these checks move into the app,
@@ -15,6 +21,8 @@
 import { config } from "../../config.ts";
 import type { Sql } from "../../db/sql.ts";
 import { ApiError } from "../errors.ts";
+import { findHandles } from "./handles.ts";
+import { textSignature } from "./minhash.ts";
 
 export interface MessageContent {
   senderId: string;
@@ -29,10 +37,29 @@ export interface ContentPolicyContext {
   duplicateRecipients: number;
 }
 
+/** What the spam heuristics may know about a plaintext message: hashes and rule kinds, never the text. */
+export interface ContentFeatures {
+  /** Keyed MinHash signature (minhash.ts), or null for short texts. */
+  signature: number[] | null;
+  hasLink: boolean;
+  /** Payment or crypto handle (Cash App, Venmo, PayPal.me, wallet addresses...). */
+  hasPayment: boolean;
+  /** Off-platform redirect (Telegram, WhatsApp, Snapchat, OnlyFans...). */
+  hasRedirect: boolean;
+}
+
 export interface ContentPolicy {
   readonly name: string;
-  /** Throws a 403 ApiError (`links_not_allowed`, `duplicate_message`) if a restricted sender may not send this. */
+  /**
+   * Throws a 403 ApiError (`links_not_allowed`, `handles_not_allowed`, `duplicate_message`) if a restricted sender may
+   * not send this.
+   */
   assertAllowed(content: MessageContent, ctx: ContentPolicyContext): Promise<void>;
+  /**
+   * Content signals of a message from ANY account, for the spam heuristics. Absent or null when the server can't read
+   * the content (end-to-end encrypted envelopes are opaque and are never inspected).
+   */
+  features?(text: string | null): ContentFeatures | null;
 }
 
 /** Shorter texts ("hey", "what's up?") are too common to treat as copy-paste spam. */
@@ -51,6 +78,18 @@ export function containsLink(text: string): boolean {
   return LINK_RE.test(text.normalize("NFKC"));
 }
 
+/** Content features of plaintext `text` (null for photo-only messages). Pure. */
+export function plaintextFeatures(text: string | null): ContentFeatures | null {
+  if (!text) return null;
+  const handles = findHandles(text);
+  return {
+    signature: textSignature(text, DUPLICATE_MIN_LENGTH),
+    hasLink: containsLink(text),
+    hasPayment: handles.some((h) => h.kind === "payment" || h.kind === "crypto"),
+    hasRedirect: handles.some((h) => h.kind === "redirect"),
+  };
+}
+
 /** Case- and whitespace-insensitive form used for duplicate detection (mirrors the SQL below). */
 export function normalizeForDuplicate(text: string): string {
   return text.toLowerCase().replace(/\s+/g, " ").trim();
@@ -66,6 +105,12 @@ export const plaintextContentPolicy: ContentPolicy = {
     if (containsLink(text)) {
       throw policyError("links_not_allowed", "New accounts can't send links yet. Try again in a day or so.");
     }
+    if (findHandles(text).length > 0) {
+      throw policyError(
+        "handles_not_allowed",
+        "New accounts can't share payment, crypto or messenger handles yet. Try again in a day or so.",
+      );
+    }
     const normalized = normalizeForDuplicate(text);
     if (normalized.length < DUPLICATE_MIN_LENGTH) return;
     const [d] = await db<{ n: number }[]>`
@@ -79,6 +124,7 @@ export const plaintextContentPolicy: ContentPolicy = {
       throw policyError("duplicate_message", "You've sent this exact message to several people already. Try something personal.");
     }
   },
+  features: plaintextFeatures,
 };
 
 /** For end-to-end encrypted chats: the server can't see text, so the app enforces these rules itself. */

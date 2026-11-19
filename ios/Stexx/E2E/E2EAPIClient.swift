@@ -66,18 +66,54 @@ struct E2EAPIClient: APIClient {
     func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message> {
         var page = try await base.messages(in: conversationID, before: before)
         page.items = await engine.reveal(page.items)
-        // Only this listing hands out every live photo's URL (realtime events
-        // withhold view-once ones from the recipient), so `null` here means
-        // the photo is gone for good: drop its key.
-        let gone = Set(page.items.filter { $0.attachment?.isEncrypted == true && $0.attachment?.url == nil }.map(\.id))
+        // A view-once photo the server says was opened (on this phone; only
+        // its recipient can open it) whose key is still here, e.g. the app
+        // quit before the viewer closed: the key goes now.
+        let me = await currentUserID()
+        let opened = page.items.filter {
+            $0.senderID != me && $0.attachment?.isEncrypted == true && $0.attachment?.isViewOnce == true
+                && $0.attachment?.openedAt != nil && $0.e2eAttachment != nil
+        }.map(\.id)
+        for id in opened {
+            await engine.forgetAttachmentKey(messageID: id)
+        }
+        // Only this listing hands out every live photo's URL to its
+        // recipient (realtime events withhold view-once ones; the sender of
+        // a view-once photo never gets one), so `null` here means the photo
+        // is gone for good, or is a view-once photo this phone sent: either
+        // way this phone has no use for its key.
+        let gone = Set(page.items.filter {
+            $0.attachment?.isEncrypted == true && $0.attachment?.url == nil && !opened.contains($0.id)
+        }.map(\.id))
         if !gone.isEmpty {
             await engine.attachmentsGone(messageIDs: Array(gone))
-            for index in page.items.indices where gone.contains(page.items[index].id) && page.items[index].e2eAttachment != nil {
+        }
+        for index in page.items.indices where page.items[index].e2eAttachment != nil {
+            if opened.contains(page.items[index].id) {
+                page.items[index].e2eAttachment = nil
+                page.items[index].e2eAttachmentRemoval = .opened
+            } else if gone.contains(page.items[index].id) {
                 page.items[index].e2eAttachment = nil
                 page.items[index].e2eAttachmentRemoval = .gone
             }
         }
         return page
+    }
+
+    /// Opens a view-once photo on the server; for an encrypted one, its key
+    /// is forgotten as soon as the server has it marked opened (the viewer
+    /// already holds the decrypted image in memory).
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        let opened = try await base.openViewOnce(messageID: messageID, in: conversationID)
+        if opened.attachment?.isEncrypted == true {
+            if opened.attachment?.openedAt != nil {
+                await engine.forgetAttachmentKey(messageID: messageID)
+            } else if opened.attachment?.url == nil {
+                // Gone before it was opened (the server's cap on unopened ones).
+                await engine.attachmentsGone(messageIDs: [messageID])
+            }
+        }
+        return await engine.reveal(opened)
     }
 
     func send(_ draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message {
@@ -220,6 +256,16 @@ struct E2EAPIClient: APIClient {
     // MARK: Pass-through
 
     func register(_ request: RegistrationRequest) async throws -> Session { try await base.register(request) }
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions {
+        try await base.passkeyRegistrationOptions(displayName: displayName)
+    }
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session {
+        try await base.finishPasskeyRegistration(credential)
+    }
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions { try await base.passkeyLoginOptions() }
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session {
+        try await base.finishPasskeyLogin(credential)
+    }
     func requestEmailLink(email: String) async throws { try await base.requestEmailLink(email: email) }
     func verifyEmailLink(token: String) async throws -> Session { try await base.verifyEmailLink(token: token) }
     func refreshSession(refreshToken: String) async throws -> Session { try await base.refreshSession(refreshToken: refreshToken) }

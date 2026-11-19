@@ -40,6 +40,30 @@ struct HTTPAPIClient: APIClient {
         try await call("POST", "auth/register", body: request, auth: .none)
     }
 
+    // MARK: Passkeys
+
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions {
+        // Only reached after the 18+ gate, so the confirmation travels with
+        // the pending sign-up (and again with `finish`).
+        struct Body: Encodable { let displayName: String; let confirmedAdult: Bool }
+        return try await call("POST", "auth/passkey/register/options", body: Body(displayName: displayName, confirmedAdult: true), auth: .none)
+    }
+
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session {
+        try await call("POST", "auth/passkey/register/finish", body: credential, auth: .none)
+    }
+
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions {
+        struct Empty: Encodable {}
+        return try await call("POST", "auth/passkey/login/options", body: Empty(), auth: .none)
+    }
+
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session {
+        try await call("POST", "auth/passkey/login/finish", body: credential, auth: .none)
+    }
+
+    // MARK: Email
+
     func requestEmailLink(email: String) async throws {
         struct Body: Encodable { let email: String }
         try await callVoid("POST", "auth/email/link", body: Body(email: email), auth: .none)
@@ -180,6 +204,10 @@ struct HTTPAPIClient: APIClient {
 
     func markRead(conversationID: Conversation.ID) async throws {
         try await callVoid("POST", "conversations/\(conversationID)/read")
+    }
+
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        try await call("POST", "conversations/\(conversationID)/messages/\(messageID)/open")
     }
 
     func deleteConversation(_ conversationID: Conversation.ID) async throws {
