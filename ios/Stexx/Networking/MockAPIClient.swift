@@ -20,6 +20,9 @@ actor MockAPIClient: APIClient {
     private var nextID = 1
     private var plusExpiresAt: Date?
     private var travelLocation: FuzzedLocation?
+    /// Passkey sign-up in progress: challenge → nickname (like `auth_challenges`).
+    private var pendingPasskeySignUps: [String: String] = [:]
+    private var pendingPasskeyLogins: Set<String> = []
 
     init(latency: Duration = .milliseconds(250), plusActive: Bool = false) {
         let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
@@ -73,6 +76,66 @@ actor MockAPIClient: APIClient {
 
     func requestEmailLink(email: String) async throws {
         try await pause()
+    }
+
+    // MARK: Passkeys (simulated: pairs with `SimulatedPasskeyAuthenticator`)
+
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions {
+        try await pause()
+        let challenge = Self.randomBase64URL(32)
+        pendingPasskeySignUps[challenge] = displayName
+        return PasskeyCreationOptions(
+            challenge: challenge,
+            rp: .init(id: PasskeyAvailability.defaultRelyingPartyID, name: "Stexx"),
+            user: .init(id: Self.randomBase64URL(32), name: displayName, displayName: ""),
+            timeout: 300_000,
+            attestation: "none",
+            excludeCredentials: [],
+            authenticatorSelection: .init(residentKey: "required", userVerification: "required")
+        )
+    }
+
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session {
+        try await pause()
+        guard credential.confirmedAdult else {
+            throw APIError.server(status: 400, message: "You must confirm that you are 18 or older.")
+        }
+        guard let challenge = Self.challenge(in: credential.response.clientDataJSON, type: "webauthn.create"),
+              let displayName = pendingPasskeySignUps.removeValue(forKey: challenge),
+              Data(base64URLEncoded: credential.rawId) != nil,
+              Data(base64URLEncoded: credential.response.attestationObject) != nil
+        else { throw APIError.server(status: 400, message: "This sign-up expired. Please start again.") }
+        me.displayName = displayName
+        return MockData.session
+    }
+
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions {
+        try await pause()
+        let challenge = Self.randomBase64URL(32)
+        pendingPasskeyLogins.insert(challenge)
+        return PasskeyRequestOptions(challenge: challenge, rpId: PasskeyAvailability.defaultRelyingPartyID, timeout: 300_000, userVerification: "required", allowCredentials: [])
+    }
+
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session {
+        try await pause()
+        guard let challenge = Self.challenge(in: credential.response.clientDataJSON, type: "webauthn.get"),
+              pendingPasskeyLogins.remove(challenge) != nil
+        else { throw APIError.unauthorized }
+        return MockData.session
+    }
+
+    private static func randomBase64URL(_ count: Int) -> String {
+        Data((0..<count).map { _ in UInt8.random(in: .min ... .max) }).base64URLEncodedString()
+    }
+
+    /// The challenge inside a base64url `clientDataJSON` of the given type.
+    private static func challenge(in clientDataJSON: String, type: String) -> String? {
+        struct ClientData: Decodable { let type: String; let challenge: String }
+        guard let data = Data(base64URLEncoded: clientDataJSON),
+              let parsed = try? JSONDecoder().decode(ClientData.self, from: data),
+              parsed.type == type
+        else { return nil }
+        return parsed.challenge
     }
 
     func verifyEmailLink(token: String) async throws -> Session {
