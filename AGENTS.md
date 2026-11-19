@@ -21,3 +21,9 @@ Every PR follows [`.github/pull_request_template.md`](.github/pull_request_templ
   - Capture from the simulator at full resolution: `xcrun simctl io booted screenshot shot.png` (iPhone 17 Pro). Never publish a downscaled preview. Look at each PNG before publishing.
   - Upload with `gh pr edit <N> --body-file body.md --attach` (gh ≥ 2.99), which hosts images on GitHub and commits nothing to the repo.
 - **Details accordion:** What changed (per area, with paths), Testing (named commands, not "tests pass"), Risk (what could break, what wasn't tested), and How to revert.
+
+## Checks (CI)
+
+- Every PR runs `.github/workflows/server.yml`: migration lint, typecheck, migrations on a fresh Postgres, the server tests. Run the same locally before committing (see `server/README.md#ci`).
+- New migrations take a number above the highest on `main` (gaps are fine) and stay additive; `deploy.sh --rollback` never reverts a migration.
+- A new table holding an account id references `users(id) ON DELETE CASCADE`. Exceptions go on the allowlists in `server/test/schema-guards.test.ts` with a reason, or that test fails.
