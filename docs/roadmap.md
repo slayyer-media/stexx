@@ -30,6 +30,12 @@ Done; see [`security.md`](security.md) for how each works and how to turn it on 
 - Stexx+ adds a small natural deterrent, since spammers rarely pay, but it is not a control on its own.
 - Every measure must respect the privacy rules in the README: no real names, no phone numbers, no exact location, and minimal retained data.
 
+## Accounts and sign-in
+
+No real names or phone numbers: an account is a nickname plus a passkey or an email used only for sign-in.
+
+- [x] **Email sign-up and sign-in that work in production.** The app no longer uses the dev-only `/auth/register` for email. Sign-up and sign-in send one email with a link and an 8-digit code (15 minutes, once); the link opens the app as a universal link and the code works when the link is read on another device. Resends follow the server's limit with a countdown; expired links, wrong codes and addresses without an account get plain explanations; a link opened without the app shows a static page that never uses it. See [`ios/README.md`](../ios/README.md#email-sign-in) and [`api.md`](api.md#auth--account). Still to do: try a real universal-link open from Mail on a device once `stexx.gay` serves the apple-app-site-association file.
+
 ## End-to-end encrypted chat
 
 Chat text and chat photos are end-to-end encrypted with the Signal Protocol, using Signal's official [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0, the same license as Stexx). The server relays ciphertext it can't read.

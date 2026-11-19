@@ -1,4 +1,5 @@
-# Stexx: OPTIONAL site block for the apex domain stexx.gay (the passkey relying party, WEBAUTHN_RP_ID).
+# Stexx: OPTIONAL site block for the apex domain stexx.gay (the passkey relying party, WEBAUTHN_RP_ID, and the host of
+# email sign-in links, APP_LINK_BASE).
 #
 # iOS only lets the app use passkeys for stexx.gay after Apple's CDN has fetched
 # https://stexx.gay/.well-known/apple-app-site-association (JSON, HTTPS, no redirect). The API builds that file from
@@ -25,7 +26,22 @@ stexx.gay {
 		path /.well-known/apple-app-site-association
 	}
 
+	# Email sign-in links (${APP_LINK_BASE}/auth/email?token=...) that did not open the app land here: the API answers with
+	# a static page that never reads or uses the token. Query strings are not logged (no `log` directive at all).
+	@emaillink {
+		method GET HEAD
+		path /auth/email
+	}
+
 	handle @aasa {
+		reverse_proxy 127.0.0.1:8787 {
+			header_up CF-Connecting-IP {client_ip}
+			header_up -X-Real-IP
+			header_up -True-Client-IP
+		}
+	}
+
+	handle @emaillink {
 		reverse_proxy 127.0.0.1:8787 {
 			header_up CF-Connecting-IP {client_ip}
 			header_up -X-Real-IP

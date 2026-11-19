@@ -159,23 +159,36 @@ Non-2xx responses carry:
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| POST | `/auth/register` | `RegistrationRequest` → `Session` | `{ displayName, method: "passkey"\|"email", email?, confirmedAdult: true }`. No real name or phone number, ever. Birth dates are never sent. |
+| POST | `/auth/register` | `RegistrationRequest` → `Session` | **Dev servers only** (`config.devAuth`): a session without a credential, for local testing. `{ displayName, method: "passkey"\|"email", email?, confirmedAdult: true }`. Production answers 400 `use_email_link` (email) or `use_passkey_flow` (passkey). Attested (`signup`). |
 | POST | `/auth/passkey/register/options` | `{ displayName, confirmedAdult? }` → WebAuthn creation options | RP ID `stexx.gay` (`WEBAUTHN_RP_ID`). SimpleWebAuthn `PublicKeyCredentialCreationOptionsJSON`: binary fields base64url, `user.id` is an opaque handle (not the user ID); `user.name` and `user.displayName` are the fixed label `Stexx account`, never the nickname (the passkey syncs to the password manager, where others may see its label). Challenge single use, 5 min. |
 | POST | `/auth/passkey/register/finish` | `RegistrationResponseJSON` + `confirmedAdult?` → `Session` | `{ id, rawId, type: "public-key", authenticatorAttachment?, clientExtensionResults, response: { clientDataJSON, attestationObject, transports? } }`, all base64url. 18+ must be confirmed at options or here. Attested (`signup`). 400 `invalid_challenge` / `invalid_credential`, 409 `credential_exists`. |
 | POST | `/auth/passkey/login/options` | → WebAuthn request options | `{ rpId, challenge, timeout, userVerification }`; no `allowCredentials` (discoverable passkeys pick the account). Body ignored. |
 | POST | `/auth/passkey/login/finish` | `AuthenticationResponseJSON` → `Session` | `response: { clientDataJSON, authenticatorData, signature, userHandle? }`. Attested (`login`). 401 `invalid_credential` for an unknown passkey, a bad signature, a used or expired challenge. |
-| POST | `/auth/email/link` | `{ email }` → 204 | Sends a one-time sign-in link. Same response whether or not the address exists. |
-| POST | `/auth/email/verify` | `{ token }` → `Session` | Token from the link (a universal link to the app through `applinks:stexx.gay` once `stexx.gay` serves the AASA file; otherwise it opens in the browser). |
+| POST | `/auth/email/link` | `{ email, displayName?, confirmedAdult? }` → 204 | Emails a one-time sign-in link **and** an 8-digit code (same sign-in, either works, 15 min, once). Sign-up sends `displayName` + `confirmedAdult: true` together (both or neither; the account is created only when the link or code comes back); sign-in sends `{ email }` alone. Same 204 whether or not the address has an account. Attested (`login`). 400 `disposable_email` / `validation_error`, 429 + `Retry-After` (3 per address per client per 15 min, 8 per address overall), 503 `email_unavailable`. |
+| POST | `/auth/email/verify` | `{ token }` → `Session` | The token from the link `${APP_LINK_BASE}/auth/email?token=…`, a universal link to the app (`applinks:stexx.gay`). Signs in, or creates the account from the pending sign-up. Attested (`login`). 400 `invalid_link` (used, expired, unknown), 400 `registration_required` (no account and the link was requested without `displayName`; the link stays unused). Using the link burns its code. |
+| POST | `/auth/email/code` | `{ email, code }` → `Session` | The 8-digit code from the same email (`^[0-9]{8}$`), for a link read on another device. Same outcome and errors as `verify`, with 400 `invalid_code`. Every wrong code counts against all live codes of the address: after 5, those codes stop working (the links still do). 10 attempts per address per hour across all clients (429 + `Retry-After`). Attested (`login`). Using the code burns its link. |
 | POST | `/auth/refresh` | `{ refreshToken }` → `Session` | Rotates the refresh token. |
 | POST | `/auth/logout` | → 204 | Revokes the current session. |
 | DELETE | `/me` | → 204 | Deletes the account and all data. |
 
-Outside `/v1`: `GET /.well-known/apple-app-site-association` → the
-apple-app-site-association JSON for `APPLE_TEAM_ID.APPLE_BUNDLE_ID`
-(`webcredentials` for passkeys, `applinks` for `/auth/email` links), served as
-`application/json` with `Cache-Control: public, max-age=3600`; 404 while
-`APPLE_TEAM_ID` is unset. The relying-party domain (`stexx.gay`) must serve the
-same file ([`server/deploy/README.md`](../server/deploy/README.md), step 8).
+The attested routes need the device attestation headers (`X-Stexx-Attestation`
+and friends, see [`security.md`](security.md#1-device-attestation-app-attest-devicecheck-fallback)); without them
+they answer 403 `attestation_required` when `ATTESTATION_MODE` enforces it.
+
+Outside `/v1`:
+
+- `GET /.well-known/apple-app-site-association` → the
+  apple-app-site-association JSON for `APPLE_TEAM_ID.APPLE_BUNDLE_ID`
+  (`webcredentials` for passkeys; `applinks` for `/auth/email` with a `token`
+  query item only), served as `application/json` with
+  `Cache-Control: public, max-age=3600`; 404 while `APPLE_TEAM_ID` is unset. The
+  relying-party domain (`stexx.gay`) must serve the same file
+  ([`server/deploy/README.md`](../server/deploy/README.md), step 8).
+- `GET /auth/email` → a static HTML page for a sign-in link that did not open
+  the app (another device, no app, universal links turned off): it says to open
+  the link on the iPhone or type the code. It never reads or redeems the token,
+  so mail scanners that fetch links can't use them up. `no-store`, `noindex`,
+  inline styles only.
 
 ### Me
 
