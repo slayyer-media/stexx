@@ -1,0 +1,141 @@
+# Server checks: migration lint, typecheck, migrations on a fresh Postgres 18, and the full test suite.
+# Advisory jobs (continue-on-error, they never fail the run): shellcheck on the deploy scripts, caddy validate on
+# both Caddyfiles, and the iOS Release config guard (red until Release stops using the mock API).
+#
+# No path filters on purpose: if this becomes a required check, a filtered-out PR would wait on it forever.
+# No secrets: the job writes a CI-only server/.env with throwaway values.
+name: server
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.3.12" # same as production (server/deploy/bootstrap.sh)
+
+jobs:
+  test:
+    name: lint, typecheck, migrate, test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: server
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: stexx
+          POSTGRES_PASSWORD: stexx
+          POSTGRES_DB: stexx_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stexx -d stexx_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Cache bun packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ env.BUN_VERSION }}-${{ hashFiles('server/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-${{ env.BUN_VERSION }}-
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # Compares with the PR base (or, on main, the commit before the push): fails on names the runner would skip,
+      # duplicate numbers, and new numbers not above the base's highest; warns on non-additive statements.
+      - name: Lint migrations
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=""
+          if [ "$EVENT" = pull_request ]; then
+            git fetch --no-tags --depth=1 origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+            base="origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            # After a force push the old tip may be gone; then only names and duplicates are checked.
+            if git fetch --no-tags --depth=1 origin "$BEFORE"; then base="$BEFORE"; else echo "::notice::$BEFORE not fetchable; linting without a base"; fi
+          fi
+          bun scripts/lint-migrations.ts ${base:+--base "$base"}
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Only what test/setup.ts doesn't set itself (it forces NODE_ENV=test, dev auth on, attestation and the photo
+      # classifier off, and points DATABASE_URL at TEST_DATABASE_URL). Throwaway values, nothing secret.
+      - name: CI environment (no secrets)
+        run: |
+          cat > .env <<'EOF'
+          DATABASE_URL=postgres://stexx:stexx@127.0.0.1:5432/stexx_test
+          TEST_DATABASE_URL=postgres://stexx:stexx@127.0.0.1:5432/stexx_test
+          EMAIL_PEPPER=ci-only-throwaway-pepper-ci-only-throwaway-pepper
+          EOF
+
+      - name: Migrate a fresh database
+        run: bun src/db/migrate.ts --test
+
+      - name: Test
+        run: bun test --timeout 30000
+
+  shellcheck:
+    name: shellcheck deploy scripts (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -f gcc server/deploy/*.sh ios/scripts/*.sh
+
+  caddy:
+    name: caddy validate (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      # Production layout: Caddyfile.main is /etc/caddy/Caddyfile and imports /etc/caddy/sites/*.caddy, where
+      # deploy.sh installs Caddyfile as stexx.caddy. Same layout in a temp dir, validated by the official image.
+      - name: caddy validate
+        run: |
+          d="$(mktemp -d)"
+          mkdir -p "$d/sites"
+          cp server/deploy/Caddyfile "$d/sites/stexx.caddy"
+          sed "s#import /etc/caddy/sites/\*.caddy#import $d/sites/*.caddy#" server/deploy/Caddyfile.main > "$d/Caddyfile"
+          grep -q "^import $d/sites/" "$d/Caddyfile" || { echo "Caddyfile.main no longer imports /etc/caddy/sites/*.caddy"; exit 1; }
+          docker run --rm -v "$d:$d:ro" caddy:2 caddy validate --adapter caddyfile --config "$d/Caddyfile"
+          docker run --rm -v "$PWD/server/deploy:/w:ro" caddy:2 sh -c 'caddy fmt /w/Caddyfile | diff -u /w/Caddyfile - && caddy fmt /w/Caddyfile.main | diff -u /w/Caddyfile.main -'
+
+  ios-release-config:
+    name: iOS Release config (advisory)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Advisory until the owner flips STEXX_USE_MOCK_API to NO for Release in ios/project.yml; then drop this line.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: check-release-config
+        run: ios/scripts/check-release-config.sh

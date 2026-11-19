@@ -60,3 +60,9 @@ Chat text and chat photos are end-to-end encrypted with the Signal Protocol, usi
 - **Server-side limits use metadata only:** rate limits, new-account message caps, and fan-out with no replies. None of them need message content.
 - **Reports carry evidence.** When someone reports a chat, their app decrypts and attaches the reported messages and photos, so moderators see only what the reporter chooses to share.
 - **Trade-off:** the server can't detect identical spam text across many chats. We accept this and rely on metadata and reports rather than sending content hashes.
+
+## Engineering and CI
+
+- [x] **Server CI.** Every pull request and push to `main` lints the migrations, typechecks, migrates a fresh Postgres 18 and runs the server tests ([`server/README.md`](../server/README.md#ci)). Schema guards fail the tests when a new table keeps an account's data after `DELETE /me` (a foreign key to `users` without `ON DELETE CASCADE`, unless allowlisted with a reason).
+- [x] **Advisory checks.** shellcheck on the deploy scripts, `caddy validate` on both Caddyfiles, and a guard that fails while the iOS Release configuration still uses the mock API. They report without failing the run.
+- [ ] **Owner decisions.** Make the server job a required check with branch protection on `main`. Make the Release-config guard blocking once Release talks to the real API. Decide whether the iOS build (manual only today, on a macOS runner) should run on pull requests.
