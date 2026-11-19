@@ -15,8 +15,15 @@ import UIKit
 /// shows for all of them. Flows that the app itself starts and that bring up
 /// a system prompt call `expectSystemPrompt()` first: the next deactivation
 /// within a few seconds doesn't cover (the prompt sits over the app anyway),
-/// but going to the background always does. The photo picker and share
-/// sheets run inside the app and never deactivate it, so they never flash.
+/// but going to the background always does. The exemption is single-use (the
+/// first deactivation spends it, covered or not) and the flow ends it when its
+/// call returns (`endSystemPrompt()`), so a prompt that never appeared can't
+/// leave the next real trip to the app switcher uncovered. The cost: while an
+/// app-started prompt is up, the app is already inactive, so swiping into the
+/// app switcher from there shows the live card uncovered (iOS sends no new
+/// event); the saved snapshot is still covered when the app reaches the
+/// background. The photo picker and share sheets run inside the app and never
+/// deactivate it, so they never flash.
 ///
 /// On by default; Settings › Privacy can turn it off (stored on this phone
 /// only, `enabledKey`).
@@ -76,6 +83,12 @@ final class PrivacyCover {
         systemPromptUntil = now.addingTimeInterval(Self.systemPromptWindow)
     }
 
+    /// The flow that called `expectSystemPrompt()` is done (its call
+    /// returned): drop the exemption if no deactivation used it.
+    func endSystemPrompt() {
+        systemPromptUntil = nil
+    }
+
     // MARK: Scene phases
 
     enum Transition {
@@ -97,18 +110,24 @@ final class PrivacyCover {
         }
     }
 
+    /// Applies `transition`: spends the system-prompt exemption on the first
+    /// deactivation and on reactivation, and returns whether to cover.
+    func handle(_ transition: Transition, now: Date = .now) -> Bool {
+        let cover = wantsCover(after: transition, now: now)
+        if transition != .didEnterBackground { systemPromptUntil = nil }
+        return cover
+    }
+
     func sceneWillDeactivate(_ scene: UIWindowScene?) {
-        if wantsCover(after: .willDeactivate) { show(in: scene) }
+        if handle(.willDeactivate) { show(in: scene) }
     }
 
     func sceneDidEnterBackground(_ scene: UIWindowScene?) {
-        if wantsCover(after: .didEnterBackground) { show(in: scene) }
+        if handle(.didEnterBackground) { show(in: scene) }
     }
 
     func sceneDidActivate(_ scene: UIWindowScene?) {
-        let keep = wantsCover(after: .didActivate)
-        systemPromptUntil = nil
-        if keep { show(in: scene) } else { hide() }
+        if handle(.didActivate) { show(in: scene) } else { hide() }
     }
 
     // MARK: Window

@@ -6,7 +6,7 @@
  * these jobs never touch other suites' rows (their clocks are 2000 and 2001).
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import {
   purgeUnopenedViewOnceAttachments,
   purgeViewedOnceAttachments,
@@ -16,7 +16,7 @@ import {
 import { resetAbuseLimits } from "../src/lib/abuse/limits.ts";
 import { setE2eModeForTests } from "../src/lib/e2e/keys.ts";
 import { newId } from "../src/lib/ids.ts";
-import { drainMediaTrash, mediaPath } from "../src/lib/media.ts";
+import { drainMediaTrash, mediaPath, mediaUrl } from "../src/lib/media.ts";
 import { LIMITS, resetRateLimits } from "../src/lib/ratelimit.ts";
 import { addConnection, removeConnection } from "../src/lib/realtime.ts";
 import { captureRealtime } from "./e2e-helpers.ts";
@@ -60,7 +60,13 @@ async function sendPhoto(from: TestUser, conv: string, extra: Record<string, unk
       json: { clientID: `vo-${uniq()}`, attachmentPhotoID: up.id, isViewOnce: true, ...extra },
     }),
   );
-  return { msg, url: up.url as string };
+  return { msg, url: await messageUrl(msg.id), uploadUrl: up.url as string };
+}
+
+/** The message's own file URL (a view-once message gets a fresh name, so it is not the upload's URL). */
+async function messageUrl(id: string): Promise<string> {
+  const [r] = await sql<{ attachment_key: string }[]>`SELECT attachment_key FROM messages WHERE id = ${id}`;
+  return mediaUrl(r!.attachment_key);
 }
 
 /** An end-to-end encrypted (opaque `.bin`) photo, view-once. */
@@ -72,7 +78,7 @@ async function sendEncryptedPhoto(from: TestUser, conv: string) {
       json: { clientID: `vo-${uniq()}`, envelope: fakeEnvelope(), attachmentPhotoID: up.id, isViewOnce: true },
     }),
   );
-  return { msg, url: up.url as string };
+  return { msg, url: await messageUrl(msg.id), uploadUrl: up.url as string };
 }
 
 const openPath = (conv: string, messageId: string) => `/v1/conversations/${conv}/messages/${messageId}/open`;
@@ -246,6 +252,61 @@ describe("POST /conversations/:id/messages/:messageID/open", () => {
     } finally {
       resetRateLimits();
     }
+  });
+});
+
+describe("the sender's upload URL", () => {
+  for (const kind of ["plaintext", "encrypted"] as const) {
+    test(`${kind}: a view-once send gives the message a fresh file name; the upload's URL stops working`, async () => {
+      const [a, b] = await Promise.all([createUser(), createUser()]);
+      const conv = await conversation(a, b);
+      const send = kind === "plaintext" ? sendPhoto : sendEncryptedPhoto;
+      const { msg, url, uploadUrl } = await send(a, conv);
+      expect(url).not.toBe(uploadUrl);
+      expect(url).toEndWith(kind === "plaintext" ? ".jpg" : ".bin");
+      // Gone before the send even returns, so polling it tells the sender nothing about the open.
+      expect(onDisk(uploadUrl)).toBe(false);
+      expect(onDisk(url)).toBe(true);
+      expect(statSync(mediaPath(keyOf(url))).nlink).toBe(1);
+      const [queued] = await sql`SELECT 1 FROM media_trash WHERE storage_key IN ${sql([keyOf(url), keyOf(uploadUrl)])}`;
+      expect(queued).toBeUndefined();
+      // The recipient gets the new name; the sender never gets either.
+      const listed = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
+      expect(listed.items[0].attachment.url).toBe(url);
+      const mine = await expectJson(await as(a).get(`/v1/conversations/${conv}/messages`));
+      expect(mine.items[0].attachment.url).toBeNull();
+      // An idempotent replay of the send doesn't relink again.
+      const replay = await expectJson(
+        await as(a).post(`/v1/conversations/${conv}/messages`, { json: { clientID: msg.clientID, attachmentPhotoID: "photo_x" } }),
+      );
+      expect(replay.id).toBe(msg.id);
+      expect(await messageUrl(msg.id)).toBe(url);
+    });
+  }
+
+  test("an ordinary (not view-once) photo keeps the upload's file", async () => {
+    const [a, b] = await Promise.all([createUser(), createUser()]);
+    const conv = await conversation(a, b);
+    const { url, uploadUrl } = await sendPhoto(a, conv, { isViewOnce: false });
+    expect(url).toBe(uploadUrl);
+    expect(onDisk(url)).toBe(true);
+  });
+
+  test("the same upload sent twice at once: one message, one file name left on disk", async () => {
+    const [a, b] = await Promise.all([createUser(), createUser()]);
+    const conv = await conversation(a, b);
+    const up = await expectJson(await as(a).post("/v1/me/attachments", { body: await makeJpeg(), contentType: "image/jpeg" }), 201);
+    const sendIt = () =>
+      as(a).post(`/v1/conversations/${conv}/messages`, {
+        json: { clientID: `vo-${uniq()}`, attachmentPhotoID: up.id, isViewOnce: true },
+      });
+    const results = await Promise.all([sendIt(), sendIt()]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 404]);
+    const [sent] = await sql<{ attachment_key: string }[]>`
+      SELECT attachment_key FROM messages WHERE conversation_id = ${conv}`;
+    expect(onDisk(up.url)).toBe(false);
+    // The loser's fresh name was unlinked: the message's file is the only name left for those bytes.
+    expect(statSync(mediaPath(sent!.attachment_key)).nlink).toBe(1);
   });
 });
 

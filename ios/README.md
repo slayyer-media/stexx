@@ -180,8 +180,10 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   the app went inactive, so Notification Center, Control Center and system
   alerts get the cover too; prompts the app starts itself (location
   permission, the purchase sheet) call `expectSystemPrompt()` first and don't
-  flash it, but the background always does. The photo picker doesn't
-  deactivate the app.
+  flash it, but the background always does. The exemption is single-use and
+  `endSystemPrompt()` drops it when the purchase call returns; while such a
+  prompt is up, the switcher's live card isn't covered (no new scene event),
+  only the saved snapshot. The photo picker doesn't deactivate the app.
 - **Moderation hook.** Incoming decrypted photos go through
   `ChatPhotoAnalyzer` (`ChatPhotoModeration`). The real analyzer is Apple's
   Sensitive Content Analysis, which needs the

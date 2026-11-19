@@ -406,26 +406,33 @@ describe("encrypted blobs are deleted on the same schedule", () => {
     expect(opened.attachment.url).toBeNull(); // never to the sender
     // Realtime / list never carry the URL to the recipient; the messages listing does, without opening it.
     const listed = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
-    expect(listed.items.find((m: any) => m.id === opened.id).attachment.url).toBe(openedUpload.url);
+    // A view-once send gives the message its own file name; the sender's upload URL is dead at once.
+    const openedUrl: string = listed.items.find((m: any) => m.id === opened.id).attachment.url;
+    const unopenedUrl: string = listed.items.find((m: any) => m.id === unopened.id).attachment.url;
+    expect(openedUrl).toEndWith(".bin");
+    expect(openedUrl).not.toBe(openedUpload.url);
+    expect(onDisk(openedUpload.url)).toBe(false);
+    expect(onDisk(unopenedUpload.url)).toBe(false);
+    expect((await mediaRoute(openedUpload.url)).status).toBe(404);
     expect(await sql`SELECT 1 FROM messages WHERE id = ${opened.id} AND attachment_opened_at IS NULL`).toHaveLength(1);
     // The recipient's app opens the first one; re-dated to T0 so the purge clock stays in 2000.
     const open = await expectJson(await as(b).post(`/v1/conversations/${conv}/messages/${opened.id}/open`));
-    expect(open.attachment).toMatchObject({ url: openedUpload.url, isEncrypted: true, openedAt: expect.any(String) });
+    expect(open.attachment).toMatchObject({ url: openedUrl, isEncrypted: true, openedAt: expect.any(String) });
     await sql`UPDATE messages SET attachment_opened_at = ${T0} WHERE id = ${opened.id}`;
     // The second one counts as never opened, sent long ago.
     await sql`UPDATE messages SET sent_at = ${T0} WHERE id = ${unopened.id}`;
 
     await purgeViewedOnceAttachments(at(T0, VIEW_ONCE_GRACE_MS - 1000));
-    expect(onDisk(openedUpload.url)).toBe(true);
+    expect(onDisk(openedUrl)).toBe(true);
     await purgeViewedOnceAttachments(at(T0, VIEW_ONCE_GRACE_MS + 1000));
-    expect(onDisk(openedUpload.url)).toBe(false);
-    expect((await mediaRoute(openedUpload.url)).status).toBe(404);
-    expect(onDisk(unopenedUpload.url)).toBe(true); // listed, never opened: not touched by the grace purge
+    expect(onDisk(openedUrl)).toBe(false);
+    expect((await mediaRoute(openedUrl)).status).toBe(404);
+    expect(onDisk(unopenedUrl)).toBe(true); // listed, never opened: not touched by the grace purge
 
     await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS - 1000));
-    expect(onDisk(unopenedUpload.url)).toBe(true);
+    expect(onDisk(unopenedUrl)).toBe(true);
     await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS + 1000));
-    expect(onDisk(unopenedUpload.url)).toBe(false);
+    expect(onDisk(unopenedUrl)).toBe(false);
 
     const after = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
     expect(after.items.find((m: any) => m.id === opened.id).attachment).toEqual({

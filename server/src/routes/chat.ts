@@ -6,7 +6,7 @@ import { currentUserId, requireAuth } from "../lib/auth.ts";
 import { conflict, badRequest, notFound } from "../lib/errors.ts";
 import { isId, newId } from "../lib/ids.ts";
 import { logError } from "../lib/logger.ts";
-import { copyMedia, drainMediaTrash, unlinkMedia } from "../lib/media.ts";
+import { copyMedia, drainMediaTrash, relinkMedia, unlinkMedia } from "../lib/media.ts";
 import { isConnected, publish } from "../lib/realtime.ts";
 import { consume, rateLimit } from "../lib/ratelimit.ts";
 import { attest, deviceOf } from "../lib/abuse/attestation.ts";
@@ -446,8 +446,12 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   // to the message, or one of their profile photos, which is COPIED so message and profile lifetimes are
   // independent. Every attachment is a file on disk, so both paths count against the `attachments` limit.
   let attachmentKey: string | null = null;
-  /** Set when the key belongs to a pending upload: consumed in the insert transaction, never unlinked here. */
+  /** Set when the attachment comes from a pending upload: consumed in the insert transaction. */
   let uploadId: string | null = null;
+  /** The upload's own file name, when the message gets a fresh one (view-once): unlinked once the send commits. */
+  let uploadKey: string | null = null;
+  /** A file this request created for the message (copy or fresh name): unlinked if the send doesn't commit. */
+  let ownedKey: string | null = null;
   let viewOnce = false;
   /** The attachment is an end-to-end encrypted blob (its key is inside the envelope). */
   let encryptedPhoto = false;
@@ -484,6 +488,7 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
         if ((err as NodeJS.ErrnoException).code === "ENOENT") throw notFound();
         throw err;
       }
+      ownedKey = attachmentKey;
     }
     if (draft.isViewOnce != null) {
       viewOnce = draft.isViewOnce;
@@ -491,6 +496,20 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
       const [u] = await sql<{ expiring_photos_by_default: boolean }[]>`
         SELECT expiring_photos_by_default FROM users WHERE id = ${me}`;
       viewOnce = u?.expiring_photos_by_default ?? false;
+    }
+    if (uploadId && viewOnce) {
+      // POST /me/attachments gave the sender this upload's URL, and media is served without auth. If the message
+      // kept that file name, the sender could poll it and see it vanish when the recipient opens the photo, read
+      // receipts or not. So a view-once message gets its own name (hard link) and the upload's name is unlinked
+      // after the send commits. A crash in between leaves an unreferenced file for the orphan sweep.
+      uploadKey = attachmentKey!;
+      try {
+        attachmentKey = await relinkMedia(uploadKey);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") throw notFound();
+        throw err;
+      }
+      ownedKey = attachmentKey;
     }
   }
 
@@ -515,26 +534,33 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
         const [consumed] = await tx`
           DELETE FROM attachment_uploads WHERE id = ${uploadId} AND owner_id = ${me} RETURNING storage_key`;
         if (!consumed) throw notFound(); // sent concurrently in another message: roll this one back
-        await tx`DELETE FROM media_trash WHERE storage_key = ${attachmentKey}`;
+        // Same file name: take it back off the queue. Fresh name (view-once): leave the old name queued.
+        if (!uploadKey) await tx`DELETE FROM media_trash WHERE storage_key = ${attachmentKey}`;
       }
       await tx`UPDATE conversations SET updated_at = now() WHERE id = ${conversationId}`;
       await tx`UPDATE conversation_members SET hidden = false WHERE conversation_id = ${conversationId} AND hidden`;
       return inserted;
     });
   } catch (err) {
-    if (attachmentKey && !uploadId) await unlinkMedia(attachmentKey).catch(() => {});
+    if (ownedKey) await unlinkMedia(ownedKey).catch(() => {});
     throw err;
   }
 
   if (!row) {
-    // Lost a race with a concurrent identical request: return the winner, drop our copy (a pending upload is
-    // left alone: it still belongs to its row).
-    if (attachmentKey && !uploadId) await unlinkMedia(attachmentKey).catch(() => {});
+    // Lost a race with a concurrent identical request: return the winner, drop our copy or fresh name (a pending
+    // upload is left alone: it still belongs to its row).
+    if (ownedKey) await unlinkMedia(ownedKey).catch(() => {});
     const winner = await findByClientId(me, draft.clientID);
     if (!winner || winner.conversation_id !== conversationId) {
       throw conflict("That clientID was already used for a different message.", "client_id_reused");
     }
     return c.json(viewMessage(winner, me));
+  }
+
+  if (uploadKey) {
+    // The upload's old name, queued by the delete trigger: unlink it now rather than at the next job tick.
+    await unlinkMedia(uploadKey).catch((err) => logError("media.unlink", err));
+    await sql`DELETE FROM media_trash WHERE storage_key = ${uploadKey}`.catch(() => {});
   }
 
   fanOutNewMessage(row, me, otherId);

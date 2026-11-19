@@ -266,4 +266,33 @@ struct PrivacyCoverTests {
         // Only for a short while after asking.
         #expect(cover.wantsCover(after: .willDeactivate, now: now.addingTimeInterval(PrivacyCover.systemPromptWindow + 1)))
     }
+
+    @Test("The exemption is single-use: the prompt's deactivation spends it, the next one covers")
+    func systemPromptSingleUse() {
+        let cover = cover(enabled: true)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        cover.expectSystemPrompt(now: now)
+        #expect(!cover.handle(.willDeactivate, now: now.addingTimeInterval(1)))
+        // Going to the background while the prompt is up still covers, and doesn't need the exemption back.
+        #expect(cover.handle(.didEnterBackground, now: now.addingTimeInterval(2)))
+        #expect(cover.handle(.willDeactivate, now: now.addingTimeInterval(3)))
+    }
+
+    @Test("Reactivating ends the exemption")
+    func systemPromptEndsOnActivate() {
+        let cover = cover(enabled: true)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        cover.expectSystemPrompt(now: now)
+        #expect(!cover.handle(.didActivate, now: now.addingTimeInterval(1)))
+        #expect(cover.handle(.willDeactivate, now: now.addingTimeInterval(2)))
+    }
+
+    @Test("A prompt that never appeared (the call returned first) leaves the next deactivation covered")
+    func systemPromptEndedByCaller() {
+        let cover = cover(enabled: true)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        cover.expectSystemPrompt(now: now)
+        cover.endSystemPrompt()
+        #expect(cover.handle(.willDeactivate, now: now.addingTimeInterval(1)))
+    }
 }

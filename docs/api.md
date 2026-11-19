@@ -184,7 +184,7 @@ Non-2xx responses carry:
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
-| POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
+| POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send; a view-once send moves the file to a new name, so the upload's `url` stops working), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
 | PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito` (incognito → 402 without Stexx+) |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
@@ -251,7 +251,10 @@ recipient, then the server deletes it.
   - 60 per minute per account (**429** with `Retry-After`).
 - **Never opened.** 14 days after sending, the file is deleted anyway.
 - **The sender** never gets the `url` of their own view-once photo (seeing
-  the file disappear would tell them it was opened). They learn that it was
+  the file disappear would tell them it was opened). The upload's `url` from
+  `POST /me/attachments` stops working when the photo is sent view-once: the
+  message gets its own, new file name and the upload's name is deleted, so
+  the sender has no URL to watch. They learn that it was
   opened only through `attachment.openedAt`, and only if the recipient's
   `sendReadReceipts` was on at the moment they opened it (recorded then, like
   read receipts; turning receipts on later doesn't reveal an earlier open).
