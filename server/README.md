@@ -36,7 +36,7 @@ explicit or not at upload (see [Photo checks](../docs/security.md#6-photo-checks
 | `bun run dev` / `start` | run with / without file watching |
 | `bun test [file]` | tests against a real Postgres database (`stexx_test`); the preload migrates it |
 | `bun run typecheck` / `check` | `tsc --noEmit` / typecheck + tests |
-| `bun run moderate -- <command>` | moderator CLI: `list`, `show`, `dismiss`, `action`, `hide`, `unhide`, `ban`, `unban`, `purge`, `log` (see [`docs/security.md`](../docs/security.md#5-reports-auto-hide-and-moderation)) |
+| `bun run moderate -- <command>` | moderator CLI: `list`, `show`, `dismiss`, `action`, `hide`, `unhide`, `ban`, `unban`, `purge`, `lift-email-ban`, `log` (see [`docs/security.md`](../docs/security.md#5-reports-auto-hide-and-moderation)) |
 
 Tests share one database with each other: they never truncate tables, they create unique users and use random location cells (`test/helpers.ts`).
 `AGENTS-NOTES.md` documents every internal helper and the conventions route code follows.
@@ -128,7 +128,7 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `MAX_ACCOUNTS_PER_DEVICE` | `1` | |
 | `TRUST_RAMP_*`, `RATE_LIMIT_*` | see security.md | New-account limits and sliding-window rate limits. |
 | `REPORT_*` | see security.md | Auto-hide thresholds (`REPORT_AUTOHIDE_THRESHOLD` 3, window 14 days, underage 1 trusted / 2 any) and evidence retention (30 days after closing, 180 max). |
-| `BANNED_RETENTION_DAYS` | `30` | 1..3650. Review/appeal window after a ban; then the slow job purges the account like `DELETE /me`, keeping only its email HMAC and device bans ([security.md section 5](../docs/security.md#banned-accounts-review-window-and-purge)). Owner decision. |
+| `BANNED_RETENTION_DAYS` | `30` | 1..3650. Review/appeal window after a ban; then the slow job purges the account like `DELETE /me`, keeping only its email HMAC and device bans ([security.md section 5](../docs/security.md#banned-accounts-review-window-and-purge)). Bans that predate migration 123 count the window from its deploy, so the first run purges nothing. Owner decision. |
 | `SPAM_HEURISTICS_ENABLED` | `1` | Spam heuristics on messages and shadow limits ([security.md section 8](../docs/security.md#8-spam-heuristics-on-messages-shadow-limits)). `0` stops new limits and content features; existing limits run their course. |
 | `SPAM_WINDOW_HOURS` | `24` | Window for fan-out, first-contact rate, duplicate text, links and handles. |
 | `SPAM_FANOUT_MIN`, `SPAM_FANOUT_MAX_REPLY_RATE` | `20`, `0.1` | `fan_out_no_replies` (weight 3): conversations started in the window, and the reply rate at or under which it fires. |

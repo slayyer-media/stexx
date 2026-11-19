@@ -152,12 +152,14 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   `actionReports`, `banAccount`, `unbanAccount`; read: `reviewQueue`, `accountReview`, `auditLog`. CLI:
   `src/moderation/cli.ts` (`scripts/moderate.ts`). Tests: `overrideAutoHideForTests`.
 - Banned-account purge (migration 123): a ban keeps the account for `BANNED_RETENTION_DAYS` (`bannedRetentionDays()`,
-  `purgeDueAt`), then `purgeBannedAccount(id, {actor, reason, dueBefore?})` deletes it via `lib/account.ts`
+  `purgeDueAt(purgeWindowStart(banned_at, purge_window_start))`; `users.purge_window_start` is the deploy-time grace
+  for bans older than migration 123, cleared by ban/unban), then `purgeBannedAccount(id, {actor, reason, dueBefore?})` deletes it via `lib/account.ts`
   `deleteAccountRows` (the DELETE /me code), keeping the email HMAC in `banned_emails` and the device bans
   (`devices.ban_from_purged`, which `unbanAccount` never lifts), and clearing the account's audit notes. Callers drain the
   media trash. `purgeNow` is the CLI's `purge --yes`; `purgeBannedAccounts(now, {userIds?})` is in the slow jobs
   (tests must scope it with `userIds`: the DB is shared). `assertEmailNotBanned(hmac)` (account.ts) guards account
-  creation by email. Tests: `setBannedRetentionDaysForTests`. A new table that references `users` must CASCADE or be
+  creation by email; `liftEmailBan({actor, email})` (CLI `lift-email-ban`, address on stdin) removes a row, audited
+  with `user_id` NULL. Tests: `setBannedRetentionDaysForTests`. A new table that references `users` must CASCADE or be
   added to the SET NULL list in `test/banned-purge.test.ts` (schema guard).
 - `spam.ts` (spam heuristics, shadow limits; docs/security.md section 8; migration 112): `screenSentMessage(tx, …)` runs in
   the send transaction after the insert (records `ContentPolicy.features` for plaintext, re-assesses, holds the message
@@ -257,7 +259,8 @@ expires_at; UNIQUE(sender_id, client_id)), reports (SET NULL FKs, priority norma
 reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL). Migration 109:
 e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), messages.envelope_type/envelope_body. Migration 111:
 attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers). Migration 123:
-banned_emails (email_hmac PK, banned_at day), devices.ban_from_purged, users_banned_at_idx, moderation action `purge`.
+banned_emails (email_hmac PK, banned_at day), devices.ban_from_purged, users.purge_window_start, users_banned_at_idx,
+moderation actions `purge` and `lift_email_ban`.
 
 ## Tests
 

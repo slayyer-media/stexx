@@ -171,6 +171,7 @@ stexx-mod show p_abc…                            # profile text, reports, shar
 stexx-mod dismiss p_abc… --as mod-a --note "brigading"
 stexx-mod ban p_abc… --as mod-a --note "illegal content"
 stexx-mod purge p_abc… --as mod-a --yes          # banned only: delete it now instead of after the review window
+stexx-mod lift-email-ban --as mod-a --note "appeal upheld"   # then type the address and Ctrl-D (read from stdin)
 ```
 
 Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show` and `log` for machine-readable output.
@@ -185,6 +186,7 @@ Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show`
 | `ban <profileID>` | See the table above. The account is kept intact for the review window (`BANNED_RETENTION_DAYS`, 30), then purged; the output says when (`purgeDue`), and so does `show` |
 | `unban <profileID>` | Undo a ban (a mistake, or an appeal upheld inside the window): clears the ban and the hide, which cancels the purge, and the server-side ban on its devices (unless another banned account was created on the same device, still present or already purged). A DeviceCheck ban bit already written at Apple stays set |
 | `purge <profileID> --yes` | Purge a banned account now instead of at the end of the window, for clear-cut cases. Refused unless the account is banned, refused without `--yes`, takes no `--note`. Irreversible. Audited as `purge` |
+| `lift-email-ban` | After a purge: let the banned address sign up again (an appeal upheld too late for `unban`). Reads the address from stdin, never an argument, so it stays out of shell history; only its HMAC is looked up. Audited as `lift_email_ban` with the actor and note only (no account, address or hash). Exit code 1 when the address isn't banned. The device bans stay (a phone ban can only be cleared by hand, and its DeviceCheck bit not at all) |
 | `log [<profileID>]` | Audit log |
 | `spam [<profileID>]`, `spam-clear <profileID>` | Spam shadow limits: the list, one account's signals and counters, and clearing a false positive (section 8) |
 
@@ -195,12 +197,13 @@ Options that don't belong to a command are refused rather than ignored. Write co
 A ban takes the account out of circulation at once, but deleting it at once would leave no room to correct a mistake, and keeping it forever would keep someone's photos, messages and location indefinitely, with no way for them to delete it (they can't sign in, so `DELETE /me` is out of reach). So:
 
 1. **Review window.** For `BANNED_RETENTION_DAYS` (default **30**, an owner decision: long enough for an appeal through support and a second look, short enough that a banned person's data doesn't linger) the account stays exactly as the ban left it. `unban` during the window restores it and cancels the purge; a later ban starts a new window.
+   **Bans made before the purge shipped** (migration 123) get a full window from the deploy, not from the ban: the migration sets `users.purge_window_start` to the deploy time for every account banned then, and the window starts at whichever is later. So the first run after the deploy purges nothing; existing bans are purged `BANNED_RETENTION_DAYS` after the deploy unless unbanned. `ban` and `unban` clear the column, so it only ever applies to those older bans. `show` prints the actual due date.
 2. **Purge.** After the window the slow retention job (every 10 minutes, `purgeBannedAccounts`) deletes the account with the same code as `DELETE /me` (`lib/account.ts`): every table that references the account cascades, its photo and attachment files are unlinked, pending sign-in links for its address are dropped. Accounts are purged one per transaction, under the moderation lock, re-checked inside it (a racing `unban` wins), in batches of 100; a run is idempotent and safe from several processes, an account that fails is retried on the next run, and the log line carries only counts (`moderation.purge {reason, accounts}`), never an id. `purge <profileID> --yes` does the same at once.
 3. **What survives**, and nothing else:
 
 | Kept after the purge | Where | Why | Until |
 | --- | --- | --- | --- |
-| The email address's HMAC | `banned_emails` (with the day of the ban) | Signing in or up with that address gets 403 `account_banned`, as it did while the account existed. The server already used the account row's HMAC for exactly this; it is never the address | Kept; delete the row by hand to lift it |
+| The email address's HMAC | `banned_emails` (with the day of the ban) | Signing in or up with that address gets 403 `account_banned`, as it did while the account existed. The server already used the account row's HMAC for exactly this; it is never the address | Kept with no expiry (owner decision) until a moderator runs `lift-email-ban`. It is keyed by `EMAIL_PEPPER` like every email account, so changing the pepper voids these bans as it orphans every account |
 | Device bans | `devices.banned_at` (already outlives accounts), marked `ban_from_purged`; the DeviceCheck ban bit at Apple | Sign-up from the same phone gets `device_banned`; the mark stops an `unban` of another account made on the same phone from lifting it once the purged account's device link is gone | Kept (banned devices are never purged as idle) |
 | Reports about it and by it | `reports`, anonymized (`reported_id`/`reporter_id` NULL) | Moderation history (reason, status, dates) | Kept, as for any deleted account. Their evidence, free-text details and IP hash keep their own clock (below) and are **never** kept longer because of the ban |
 | The audit trail | `moderation_actions`, anonymized: account id NULL **and every free-text note cleared** (notes may describe the person); actor, action, date, report ids and numeric details stay. The purge adds a `purge` row with reason and counts, never a note | Accountability for moderator decisions | Kept |
@@ -214,7 +217,7 @@ Not kept, on purpose: the profile photos' perceptual hashes (they would catch th
 | `report_evidence` (with photo files), report `details`, `reporter_ip_hash` | `REPORT_EVIDENCE_RETENTION_DAYS` (30) after the report is closed; 30 days after filing if the reported account was deleted (or purged after a ban); `REPORT_EVIDENCE_MAX_DAYS` (180) after filing at most | Deleted by the slow job |
 | Report row (reason, priority, status, dates) | Kept | Anonymized when either account is deleted or purged |
 | `moderation_actions` | Kept | Anonymized when the account is deleted; a purge also clears its notes |
-| A banned account (profile, photos, messages, locations, everything `DELETE /me` removes) | `BANNED_RETENTION_DAYS` (30) after the ban, unless unbanned | Purged like `DELETE /me`; only its email HMAC (`banned_emails`) and device bans remain |
+| A banned account (profile, photos, messages, locations, everything `DELETE /me` removes) | `BANNED_RETENTION_DAYS` (30) after the ban (after the deploy of migration 123 for bans made before it), unless unbanned | Purged like `DELETE /me`; only its email HMAC (`banned_emails`) and device bans remain |
 
 - `report_evidence` rows (with their photo files), the report's free-text `details` and `reporter_ip_hash` are deleted by the slow retention job `REPORT_EVIDENCE_RETENTION_DAYS` (30) after a report is closed, 30 days after filing if the reported account was deleted, and in any case `REPORT_EVIDENCE_MAX_DAYS` (180) after filing. A ban closes the account's open reports, so with the defaults their evidence is gone by the time the account is purged; the purge never extends it.
 - The report row itself (reason, priority, status, dates) stays for history; account deletion anonymizes it (`SET NULL`) as before. `moderation_actions` is kept and anonymized the same way.

@@ -257,8 +257,10 @@ export interface BannedPurgeOptions {
 
 /**
  * Banned accounts whose review window (BANNED_RETENTION_DAYS after the ban) has passed are purged: deleted like
- * DELETE /me, keeping only the email HMAC and the device bans (lib/moderation.ts purgeBannedAccount). An unban during
- * the window clears banned_at, so the account is never selected. Each account is its own transaction under the
+ * DELETE /me, keeping only the email HMAC and the device bans (lib/moderation.ts purgeBannedAccount). Bans made before
+ * migration 123 have their window start at that deploy instead (users.purge_window_start; GREATEST ignores NULL), so
+ * the first run never purges old bans in one go. An unban during the window clears banned_at, so the account is never
+ * selected. Each account is its own transaction under the
  * moderation lock and re-checked inside it, so concurrent runs and a racing unban are safe; an account that fails is
  * logged (no id, no data) and retried on the next run. Returns how many accounts were purged.
  */
@@ -269,7 +271,7 @@ export async function purgeBannedAccounts(now: Date = new Date(), opts: BannedPu
   for (;;) {
     const rows = await sql<{ id: string }[]>`
       SELECT id FROM users
-       WHERE banned_at IS NOT NULL AND banned_at <= ${cutoff}
+       WHERE banned_at IS NOT NULL AND GREATEST(banned_at, purge_window_start) <= ${cutoff}
          ${opts.userIds ? sql`AND id = ANY(${opts.userIds as string[]}::text[])` : sql``}
          AND NOT (id = ANY(${failed}::text[]))
        ORDER BY banned_at, id LIMIT ${BANNED_PURGE_BATCH}`;

@@ -46,7 +46,7 @@ import {
 import { orderedPair } from "../src/lib/visibility.ts";
 import { runModerationCli } from "../src/moderation/cli.ts";
 import { purgeBannedAccounts, purgeReportEvidence, runSlowJobs } from "../src/jobs/retention.ts";
-import { DAY } from "../src/lib/time.ts";
+import { DAY, isoDate } from "../src/lib/time.ts";
 
 // ---- Helpers --------------------------------------------------------------------------------------------
 
@@ -69,8 +69,12 @@ async function user(opts: CreateUserOptions = {}): Promise<TestUser> {
 }
 
 async function cli(...argv: string[]): Promise<{ code: number; out: string }> {
+  return cliWithStdin("", ...argv);
+}
+
+async function cliWithStdin(stdin: string, ...argv: string[]): Promise<{ code: number; out: string }> {
   const lines: string[] = [];
-  const code = await runModerationCli(argv, (l) => lines.push(l), {});
+  const code = await runModerationCli(argv, (l) => lines.push(l), {}, new Date(), async () => stdin);
   return { code, out: lines.join("\n") };
 }
 
@@ -295,6 +299,39 @@ describe("review window", () => {
     expect(await purgeBannedAccounts(inDays(31), { userIds: [target.id] })).toBe(1);
   });
 
+  test("bans made before the purge shipped get a full window from the deploy, not from the ban", async () => {
+    // Migration 123 starts the window of every existing ban at deploy, so the first run never purges old bans in bulk.
+    const migration = await Bun.file(new URL("../migrations/123_banned-purge.sql", import.meta.url)).text();
+    expect(migration).toContain("UPDATE users SET purge_window_start = now() WHERE banned_at IS NOT NULL;");
+
+    const target = await user();
+    await banAccount({ actor: "mod-w", userId: target.id });
+    // Banned 90 days ago, before the purge existed; the migration ran now.
+    await sql`UPDATE users SET banned_at = now() - interval '90 days', purge_window_start = now() WHERE id = ${target.id}`;
+    const scope = { userIds: [target.id] };
+    expect(await purgeBannedAccounts(new Date(), scope)).toBe(0);
+    expect(await purgeBannedAccounts(inDays(29), scope)).toBe(0);
+    expect(await purgeBannedAccount(target.id, { actor: "system", reason: "retention", dueBefore: inDays(-1) })).toBeNull();
+    expect(await exists(target.id)).toBe(true);
+    // `show` reports the real due date (deploy + window), not ban + window.
+    const due = (await cli("show", target.id)).out.match(/purge due (\d{4}-\d\d-\d\d)/)?.[1];
+    expect(due).toBe(isoDate(inDays(30)).slice(0, 10));
+    expect(await purgeBannedAccounts(inDays(30.01), scope)).toBe(1);
+    expect(await exists(target.id)).toBe(false);
+  });
+
+  test("a new ban and an unban both clear the deploy grace, so it never outlives the ban it was for", async () => {
+    const target = await user();
+    await banAccount({ actor: "mod-w", userId: target.id });
+    await sql`UPDATE users SET purge_window_start = now() + interval '1 day' WHERE id = ${target.id}`;
+    await unbanAccount({ actor: "mod-w", userId: target.id });
+    const [u] = await sql<{ purge_window_start: Date | null }[]>`SELECT purge_window_start FROM users WHERE id = ${target.id}`;
+    expect(u!.purge_window_start).toBeNull();
+    await sql`UPDATE users SET purge_window_start = now() + interval '1 day' WHERE id = ${target.id}`;
+    await banAccount({ actor: "mod-w", userId: target.id });
+    expect(await purgeBannedAccounts(inDays(30.01), { userIds: [target.id] })).toBe(1);
+  });
+
   test("a purge that loses the race to an unban does nothing", async () => {
     const target = await user();
     await banAccount({ actor: "mod-u", userId: target.id });
@@ -453,6 +490,46 @@ describe("the ban record left after a purge", () => {
       await post("/v1/auth/register", { json: register({ method: "email", email: `purge-ok-${uniq()}@example.com` }) }),
     );
     created.push(other.userID);
+  });
+
+  test("lift-email-ban lets the address sign up again; it reads the address from stdin and audits nothing personal", async () => {
+    const address = `lift-${uniq()}@example.com`;
+    const s = await expectJson(await post("/v1/auth/register", { json: register({ method: "email", email: address }) }));
+    created.push(s.userID);
+    await banAccount({ actor: "mod-l", userId: s.userID });
+    await purgeNow({ actor: "mod-l", userId: s.userID });
+    await expectError(
+      await post("/v1/auth/register", { json: register({ method: "email", email: address }) }),
+      403,
+      "account_banned",
+    );
+
+    // Never as an argument (shell history), always with a moderator, and it must look like an address.
+    expect((await cliWithStdin("", "lift-email-ban", address, "--as", "mod-l")).code).toBe(1);
+    expect((await cliWithStdin(address, "lift-email-ban")).code).toBe(1);
+    expect((await cliWithStdin("", "lift-email-ban", "--as", "mod-l")).out).toContain("No address on stdin");
+    expect((await cliWithStdin("not-an-address", "lift-email-ban", "--as", "mod-l")).out).toContain("not an email");
+    expect(await sql`SELECT 1 FROM banned_emails WHERE email_hmac = ${emailHmac(address)}`).toHaveLength(1);
+
+    const [last] = await sql<{ id: string }[]>`SELECT coalesce(max(id), '0') AS id FROM moderation_actions`;
+    const note = `appeal upheld ${uniq()}`;
+    const lifted = await cliWithStdin(`  ${address.toUpperCase()}\n`, "lift-email-ban", "--as", "mod-l", "--note", note);
+    expect(lifted).toEqual({ code: 0, out: "lift-email-ban: that address can sign up again" });
+    expect(await sql`SELECT 1 FROM banned_emails WHERE email_hmac = ${emailHmac(address)}`).toHaveLength(0);
+    const again = await cliWithStdin(address, "lift-email-ban", "--as", "mod-l");
+    expect(again).toEqual({ code: 1, out: "lift-email-ban: that address is not banned" });
+
+    // Audited: who, when and the moderator's note; no account, no address, no hash.
+    const rows = await sql<{ user_id: string | null; actor: string; note: string | null; details: Record<string, unknown> }[]>`
+      SELECT user_id, actor, note, details FROM moderation_actions
+       WHERE action = 'lift_email_ban' AND actor = 'mod-l' AND id > ${last!.id}`;
+    expect([...rows]).toEqual([{ user_id: null, actor: "mod-l", note, details: {} }]);
+    expect(await tablesMentioning(address)).toEqual([]);
+    expect(await tablesMentioning(emailHmac(address).toString("hex"))).toEqual([]);
+    expect((await cli("log", "--limit", "1000")).out).toContain(`mod-l lift_email_ban (an address) · ${note}`);
+
+    const back = await expectJson(await post("/v1/auth/register", { json: register({ method: "email", email: address }) }));
+    created.push(back.userID);
   });
 });
 
