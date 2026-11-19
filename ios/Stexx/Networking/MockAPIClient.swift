@@ -30,6 +30,9 @@ actor MockAPIClient: APIClient {
     private var pendingPasskeyLogins: Set<String> = []
     /// Injected failures and delays, by method name (see `inject(_:for:)`).
     private var injectedOutcomes: [String: InjectedOutcome] = [:]
+    /// Auto-renew status reported with an active subscription.
+    private var plusWillRenew: Bool? = true
+    private var boostEndsAt: Date?
 
     init(latency: Duration = .milliseconds(250), plusActive: Bool = false) {
         let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
@@ -168,6 +171,7 @@ actor MockAPIClient: APIClient {
         blocked.removeAll()
         plusExpiresAt = nil
         travelLocation = nil
+        boostEndsAt = nil
     }
 
     // MARK: Me
@@ -508,7 +512,11 @@ actor MockAPIClient: APIClient {
     func startBoost() async throws -> Boost {
         try await pause()
         guard currentPlusStatus.isActive else { throw APIError.requiresPlus }
-        return Boost(endsAt: Date.now.addingTimeInterval(3600))
+        // Not stackable, like the server: a running boost keeps its end time.
+        if let boostEndsAt, boostEndsAt > .now { return Boost(endsAt: boostEndsAt) }
+        let endsAt = Date.now.addingTimeInterval(3600)
+        boostEndsAt = endsAt
+        return Boost(endsAt: endsAt)
     }
 
     #if DEBUG
@@ -519,8 +527,11 @@ actor MockAPIClient: APIClient {
     #endif
 
     private var currentPlusStatus: SubscriptionStatus {
-        guard let plusExpiresAt, plusExpiresAt > .now else { return .inactive }
-        return SubscriptionStatus(isActive: true, expiresAt: plusExpiresAt)
+        let boost = boostEndsAt.flatMap { $0 > .now ? $0 : nil }
+        guard let plusExpiresAt, plusExpiresAt > .now else {
+            return SubscriptionStatus(isActive: false, expiresAt: nil, boostEndsAt: boost)
+        }
+        return SubscriptionStatus(isActive: true, expiresAt: plusExpiresAt, willRenew: plusWillRenew, boostEndsAt: boost)
     }
 
     // MARK: Helpers

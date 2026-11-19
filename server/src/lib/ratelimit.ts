@@ -44,6 +44,11 @@ export const LIMITS = {
   keys: { capacity: 30, windowMs: MINUTE },
   general: { capacity: 300, windowMs: MINUTE },
   /**
+   * POST /subscriptions/apple/notifications (App Store Server Notifications, unauthenticated), per client. Each request
+   * verifies up to three JWS chains, so it gets its own bucket; Apple retries anything we turn away.
+   */
+  appleNotifications: { capacity: 60, windowMs: MINUTE },
+  /**
    * Requests whose bearer token did not resolve to a live session, per client. Checked BEFORE the session lookup,
    * so a flood of made-up tokens cannot buy itself fresh buckets or unlimited database lookups.
    */

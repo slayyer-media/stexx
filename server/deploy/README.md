@@ -338,3 +338,29 @@ loading a missing model every 5 minutes) or restart. A malformed `PHOTO_HASH_BLO
 - Suspected key leak: rotate the B2 key and age recipient (new `backup-recipients.txt`; old dumps stay readable only with the old private key until they age out in 30 days),
   rotate `stexx_app`/`stexx_owner` passwords, revoke all sessions (`UPDATE sessions SET revoked_at = now()` as `stexx_owner`).
 - Report handling lives in the `reports` table (`priority = 'high'` for under-18 reports); there is no admin UI in this repo yet.
+
+## App Store Server Notifications (Stexx+)
+
+Apple tells the server about renewals, cancellations, billing problems and refunds even while the app is closed, so
+`plus_expires_at` and the "renews on / ends on" line in the paywall stay right. The endpoint is
+`POST /v1/subscriptions/apple/notifications` (contract in [docs/api.md](../../docs/api.md#stexx)); it is unauthenticated and
+trusts only Apple's signature, checked against the same root certificates and config as `POST /v1/subscriptions/apple`.
+
+**Manual step (owner), in App Store Connect → the app → App Information → App Store Server Notifications:**
+
+| Field | Value |
+| --- | --- |
+| Production Server URL | `https://api.stexx.gay/v1/subscriptions/apple/notifications`, **Version 2** |
+| Sandbox Server URL | The same path on a server running `APPLE_ENVIRONMENT=Sandbox` (e.g. a staging box), **Version 2**. Leave it empty if there is none. |
+
+- Don't point the sandbox URL at production: a production server (`APPLE_ENVIRONMENT=Production`) answers every Sandbox
+  notification with 400 by design, and a sandbox server rejects Production ones the same way.
+- Needs `APPLE_ROOT_CA_DIR` (and `APPLE_APP_APPLE_ID` in Production) like the purchase endpoint. Without them, or with
+  `APPLE_ENVIRONMENT=Xcode`/`LocalTesting` (unsigned data), the endpoint answers 503 and Apple retries for about three days.
+- After saving, press **Request a Test Notification** (or call the App Store Server API's test endpoint): the server answers
+  200 and logs `subscriptions.notification` with `type=TEST` (`journalctl -u stexx-api | grep subscriptions.notification`).
+  Logs carry only the notification UUID, type, subtype, original transaction id and outcome.
+- Cloudflare: Apple's servers must reach this path. Don't put a challenge (Bot Fight Mode, "I'm Under Attack", a managed
+  challenge rule) on `api.stexx.gay/v1/subscriptions/*`; a WAF rate-limit rule there should allow at least 60 requests a minute.
+- Nothing from Apple's payload is stored: only each notification's UUID and arrival time (`apple_notifications`, purged once
+  older than 30 days, each time a notification arrives) and the subscription's auto-renew flag (`subscriptions.auto_renew`). Migration 119 adds both.

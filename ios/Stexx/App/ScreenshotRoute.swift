@@ -25,6 +25,9 @@ import UIKit
 /// `me` opens the You tab with no profile loaded yet, so it shows the real
 /// fetch (pair it with `-StexxMockFail fetchMe=offline` or `fetchMe=hang`);
 /// `filters` opens the filter sheet over Nearby with filters already applied.
+///
+/// `paywall` / `paywallPlus` open the app with the Stexx+ paywall sheet up,
+/// for a free user and for a subscriber (mock Plus, auto-renew on).
 enum ScreenshotRoute: String {
     case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, app, settings
     /// Taps inbox: the tab bar (Chats badge counts new taps), the chat list
@@ -34,6 +37,7 @@ enum ScreenshotRoute: String {
     /// on a cold launch with the server down.
     case tabs, chatList, chatListError, chatListStale, chatListOffline, taps, tapsEmpty
     case me, filters
+    case paywall, paywallPlus
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -127,6 +131,8 @@ struct ScreenshotRouteView: View {
             MyProfileView().tint(Theme.ice)
         case .filters:
             FiltersRoute().tint(Theme.ice)
+        case .paywall, .paywallPlus:
+            PaywallRoute(plus: route == .paywallPlus)
         default:
             legacyRoutes
         }
@@ -146,6 +152,28 @@ struct ScreenshotRouteView: View {
             }
         }
         .tint(Theme.ice)
+    }
+}
+
+/// The app with the paywall sheet up; `plus` grants mock Stexx+ first.
+private struct PaywallRoute: View {
+    let plus: Bool
+    @Environment(AppState.self) private var appState
+    @Environment(PurchaseService.self) private var purchases
+    @Environment(\.apiClient) private var api
+
+    var body: some View {
+        MainTabView()
+            .task {
+                if plus {
+                    try? await api.debugGrantPlus()
+                    await purchases.refreshEntitlement()
+                    // Sign-in's own status fetch may land after ours; settle on the latest.
+                    try? await Task.sleep(for: .seconds(1))
+                    await purchases.refreshEntitlement()
+                }
+                appState.isPaywallPresented = true
+            }
     }
 }
 

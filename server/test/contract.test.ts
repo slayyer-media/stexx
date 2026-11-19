@@ -125,8 +125,13 @@ const PrivacySettings = z.strictObject({
   incognito: z.boolean(),
 });
 
-// struct SubscriptionStatus { var isActive: Bool; var expiresAt: Date? }
-const SubscriptionStatus = z.strictObject({ isActive: z.boolean(), expiresAt: swiftOptional(SwiftDate) });
+// struct SubscriptionStatus { var isActive: Bool; var expiresAt: Date?; var willRenew: Bool?; var boostEndsAt: Date? }
+const SubscriptionStatus = z.strictObject({
+  isActive: z.boolean(),
+  expiresAt: swiftOptional(SwiftDate),
+  willRenew: swiftOptional(z.boolean()),
+  boostEndsAt: swiftOptional(SwiftDate),
+});
 // struct Boost { var endsAt: Date }
 const Boost = z.strictObject({ endsAt: SwiftDate });
 // HTTPAPIClient.ErrorBody { code: String?; message: String? } (docs/api.md: both always present)
@@ -357,13 +362,17 @@ describe("contract: REST responses match the Swift models", () => {
     expect(await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus")).toEqual({
       isActive: false,
       expiresAt: null,
+      willRenew: null,
+      boostEndsAt: null,
     });
     conforms(ErrorBody, await (await as(u).post("/v1/boosts")).json(), "Error(402)");
     // debugGrantPlus() posts an empty JSON object
     expect((await as(u).post("/v1/dev/plus", { json: {} })).ok).toBe(true);
     const st = await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus(active)");
     expect(st.isActive).toBe(true);
-    await body(await as(u).post("/v1/boosts"), Boost, "Boost");
+    const boost = await body(await as(u).post("/v1/boosts"), Boost, "Boost");
+    const boosted = await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus(boosted)");
+    expect(boosted.boostEndsAt).toBe(boost.endsAt);
   });
 
   test("safety: [Profile] blocks list", async () => {

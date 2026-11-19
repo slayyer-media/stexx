@@ -377,6 +377,22 @@ with sample data.
   screenshot routes `-StexxScreenshotRoute me` (the You tab before your profile
   has loaded), `profile` or `filters`.
 
+The mock routes `paywall` and `paywallPlus` (Debug build) open the app with the
+Stexx+ paywall up, for a free user and for a subscriber whose mock
+subscription renews:
+`xcrun simctl launch booted gay.stexx.app -StexxScreenshotRoute paywallPlus`.
+
+## Stexx+ paywall
+
+The paywall shows the plan, the price and links to the Terms of Use and
+Privacy Policy (`Models/LegalLinks.swift`, which also has the community
+guidelines URL). Subscribers instead see "Stexx+ renews on <date>" or "Stexx+
+ends on <date>" (from `willRenew` in `GET /subscriptions/status`; "is active
+until" while the server doesn't know yet) and a **Manage subscription** button
+that opens StoreKit's manage-subscriptions sheet; the status is fetched again
+when the sheet closes. `GET /subscriptions/status` also returns `boostEndsAt`,
+kept in `AppState.boostEndsAt` so a running boost survives a relaunch.
+
 ## Configuration
 
 Build settings in `project.yml` are exposed through `Info.plist`:
@@ -419,7 +435,7 @@ ios/
 │   │   ├── Taps/               Received taps inbox (opened from the Taps row in Chats)
 │   │   ├── Me/                 Own profile, edit profile, settings
 │   │   ├── Safety/             Block/report UI, blocked list
-│   │   └── Paywall/            Stexx+ placeholder
+│   │   └── Paywall/            Stexx+ paywall (StoreKit 2, renewal date, Manage subscription, legal links)
 │   └── Resources/              Asset catalog (AppIcon, StexxMark SVG, colors)
 ├── Packages/LibSignalFfi/      Binary target for Signal's prebuilt libsignal XCFramework
 └── StexxTests/                 Unit tests (Swift Testing)
