@@ -45,9 +45,15 @@ export interface TravelJson {
   isActive: boolean;
 }
 
-/** The own profile (GET/PATCH /me): a Profile plus `travel` (null = travel mode off). */
+/**
+ * The own profile (GET/PATCH /me): a Profile plus `travel` (null = travel mode off) and `privacy`, the six stored
+ * privacy settings, so the app shows what the server applies instead of a local copy (after a reinstall, on a new
+ * phone, or after signing in to another account). `privacy.incognito` is the stored choice; it only applies while
+ * Stexx+ is active.
+ */
 export interface OwnProfileJson extends ProfileJson {
   travel: TravelJson | null;
+  privacy: PrivacyJson;
 }
 
 export interface AttachmentJson {

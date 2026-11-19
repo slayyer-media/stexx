@@ -21,8 +21,6 @@ struct MyProfileView: View {
     }
 
     var body: some View {
-        @Bindable var bindable = appState
-
         NavigationStack {
             ScrollView {
                 VStack(spacing: Theme.Spacing.xxl) {
@@ -31,12 +29,20 @@ struct MyProfileView: View {
                     VStack(spacing: 0) {
                         SectionLabel("Quick privacy")
                             .padding(.bottom, Theme.Spacing.s)
-                        MeRow { Toggle("Hide my distance", isOn: $bindable.privacy.hideDistance) }
+                        MeRow { Toggle("Hide my distance", isOn: appState.privacyBinding(\.hideDistance)) }
                         HairlineDivider()
-                        MeRow { Toggle("Show when I'm online", isOn: $bindable.privacy.showOnlineStatus) }
+                        MeRow { Toggle("Show when I'm online", isOn: appState.privacyBinding(\.showOnlineStatus)) }
                         HairlineDivider()
-                        MeRow { PlusToggle("Incognito", isOn: $bindable.privacy.incognito) }
+                        MeRow { PlusToggle("Incognito", isOn: appState.privacyBinding(\.incognito)) }
+                        if let privacyError = appState.privacyError {
+                            Text(privacyError)
+                                .font(.stexxSub)
+                                .foregroundStyle(Theme.danger)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, Theme.Spacing.s)
+                        }
                     }
+                    .disabled(!appState.isPrivacyEditable)
                     .font(.stexxBody)
                     .foregroundStyle(Theme.frost)
                     .tint(Theme.ice)
@@ -82,7 +88,9 @@ struct MyProfileView: View {
                 }
             }
             .task {
-                if appState.me == nil { await loadMe() }
+                // Also when only the privacy settings failed to load: setting
+                // `me` adopts them (`AppState.adoptServerPrivacy`).
+                if appState.me == nil || appState.privacyStatus == .unavailable { await loadMe() }
             }
         }
     }
@@ -365,6 +373,17 @@ private struct MeRow<Content: View>: View {
 
 /// A toggle for a Stexx+ feature: works normally with Stexx+, otherwise
 /// shows the badge and opens the paywall instead of flipping.
+extension AppState {
+    /// A toggle binding for one privacy setting: reads the current value and
+    /// saves changes through `setPrivacy` (rolled back if the save fails).
+    func privacyBinding(_ setting: WritableKeyPath<PrivacySettings, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { self.privacy[keyPath: setting] },
+            set: { self.setPrivacy(setting, to: $0) }
+        )
+    }
+}
+
 struct PlusToggle: View {
     let title: LocalizedStringKey
     @Binding var isOn: Bool

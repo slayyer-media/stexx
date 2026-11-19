@@ -28,8 +28,17 @@ import UIKit
 ///
 /// `paywall` / `paywallPlus` open the app with the Stexx+ paywall sheet up,
 /// for a free user and for a subscriber (mock Plus, auto-renew on).
+///
+/// `settings` opens Settings on the mock backend; `liveSettings` opens it on
+/// the dev server with `-StexxDevSession` (like `liveChat`), so the privacy
+/// toggles show what that server stores. `-StexxScreenshotAction` then
+/// does one thing once the settings have loaded: `hideDistance` (flips that
+/// toggle), `export` (Download my data), `signOut` or `delete` (opens the
+/// confirmation). `-StexxMockMeDelay <seconds>` slows the mock's `GET /me`
+/// (the loading state); `-StexxMockFailPrivacy YES` makes its
+/// `PUT /me/privacy` fail (the rollback).
 enum ScreenshotRoute: String {
-    case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, app, settings
+    case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, app, settings, liveSettings
     /// Taps inbox: the tab bar (Chats badge counts new taps), the chat list
     /// with its Taps row, the list failing with nothing cached / with cached
     /// chats, and the taps screen with and without taps. Each gets its own
@@ -43,11 +52,28 @@ enum ScreenshotRoute: String {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
     }
 
-    /// Mock routes swap in a preview `AppState`; `liveChat` uses the real one.
-    var usesMockData: Bool { self != .liveChat }
+    /// Mock routes swap in a preview `AppState`; live routes use the real one.
+    var usesMockData: Bool { !isLive }
+
+    /// On the configured dev server with an in-memory `-StexxDevSession`.
+    var isLive: Bool { self == .liveChat || self == .liveSettings }
 
     /// Shown in place of the normal root (`app` is the normal root).
     var replacesRoot: Bool { self != .app }
+
+    enum Action: String {
+        case hideDistance, export, signOut, delete
+    }
+
+    static var action: Action? {
+        UserDefaults.standard.string(forKey: "StexxScreenshotAction").flatMap(Action.init)
+    }
+
+    static var mockMeDelay: Duration {
+        .seconds(max(0, UserDefaults.standard.double(forKey: "StexxMockMeDelay")))
+    }
+
+    static var mockFailsPrivacySaves: Bool { UserDefaults.standard.bool(forKey: "StexxMockFailPrivacy") }
 
     /// Mock routes start with Stexx+ (`-StexxScreenshotPlus YES`).
     static var startsWithPlus: Bool {
@@ -83,9 +109,9 @@ enum ScreenshotRoute: String {
         return image.jpegData(compressionQuality: 0.85)
     }
 
-    /// A dev-server session for `liveChat`.
+    /// A dev-server session for the live routes.
     static var devSession: Session? {
-        guard current == .liveChat,
+        guard current?.isLive == true,
               let encoded = UserDefaults.standard.string(forKey: "StexxDevSession"),
               let json = Data(base64Encoded: encoded)
         else { return nil }
@@ -145,7 +171,7 @@ struct ScreenshotRouteView: View {
                 ProfileDetailView(profile: profile)
             case .liveChat:
                 LiveChatRoute()
-            case .settings:
+            case .settings, .liveSettings:
                 SettingsView()
             default:
                 ChatThreadView(route: ChatRoute(participant: profile))

@@ -100,8 +100,17 @@ export interface LimiterStore {
    * nothing and return the longest wait in milliseconds.
    */
   hit(entries: LimiterEntry[], now: number): Promise<number>;
+  /** The stored counters for these keys (missing keys are left out), for the data export. */
+  snapshot(keys: string[]): Promise<StoredCounter[]>;
   /** Tests: forget every counter. */
   clear(): void;
+}
+
+export interface StoredCounter extends Counter {
+  key: string;
+  windowMs: number;
+  /** When the row stops mattering and is deleted (end of the window after the current one). */
+  expiresAt: Date;
 }
 
 export interface Counter {
@@ -165,6 +174,13 @@ export class MemorySlidingWindowStore implements LimiterStore {
     return 0;
   }
 
+  async snapshot(keys: string[]): Promise<StoredCounter[]> {
+    return keys.flatMap((key) => {
+      const c = this.counters.get(key);
+      return c ? [{ key, ...c, expiresAt: new Date(c.windowStart + 2 * c.windowMs) }] : [];
+    });
+  }
+
   clear(): void {
     this.counters.clear();
   }
@@ -226,6 +242,21 @@ export class PostgresSlidingWindowStore implements LimiterStore {
       }
       return 0;
     });
+  }
+
+  async snapshot(keys: string[]): Promise<StoredCounter[]> {
+    if (keys.length === 0) return [];
+    const rows = await this.db<(CounterRow & { expires_at: Date })[]>`
+      SELECT key, window_ms, window_start, current_count, previous_count, expires_at
+        FROM abuse_counters WHERE key = ANY(${keys.map((k) => this.namespace + k)}::text[]) ORDER BY key`;
+    return rows.map((r) => ({
+      key: r.key.slice(this.namespace.length),
+      windowMs: r.window_ms,
+      windowStart: Number(r.window_start),
+      current: r.current_count,
+      previous: r.previous_count,
+      expiresAt: r.expires_at,
+    }));
   }
 
   clear(): void {
@@ -326,6 +357,40 @@ export async function tryAbuseLimits(action: AbuseAction, subject: AbuseSubject,
     keys.push([`${name}:${abuseKeyHash(value)}`, limits[name]]);
   }
   return store.hit(keys, now);
+}
+
+export interface AccountCounter {
+  limit: AbuseLimitName;
+  windowMs: number;
+  windowStart: number;
+  current: number;
+  previous: number;
+  expiresAt: Date;
+}
+
+/**
+ * The abuse-limit counters stored about an account (GET /me/export): the ones keyed by the account itself
+ * (`userId`, or `targetId` for fetches of its prekeys), looked up by the same keyed hash tryAbuseLimits stores. Left out
+ * on purpose:
+ * - counters keyed by an attested device: they count every account that uses that app install, so on a shared
+ *   phone they would tell one account how active another is (docs/security.md "Data export");
+ * - counters keyed by an IP or network hash, which are not linked to any account (only the keyed hash is stored);
+ * - the per-pair prekey counters, which name another account.
+ */
+export async function accountCounters(userId: string): Promise<AccountCounter[]> {
+  const wanted = new Map<string, AbuseLimitName>();
+  for (const steps of Object.values(PLAN)) {
+    for (const [name, field] of steps) {
+      if (field === "userId" || field === "targetId") wanted.set(`${name}:${abuseKeyHash(userId)}`, name);
+    }
+  }
+  const rows = await store.snapshot([...wanted.keys()]);
+  return rows.flatMap((r) => {
+    const limit = wanted.get(r.key);
+    return limit
+      ? [{ limit, windowMs: r.windowMs, windowStart: r.windowStart, current: r.current, previous: r.previous, expiresAt: r.expiresAt }]
+      : [];
+  });
 }
 
 /**

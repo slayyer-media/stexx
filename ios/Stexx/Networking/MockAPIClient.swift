@@ -6,7 +6,11 @@ import Foundation
 actor MockAPIClient: APIClient {
     #if DEBUG
     /// `-StexxScreenshotPlus YES` starts the mock with Stexx+ (screenshots).
-    static let shared = MockAPIClient(plusActive: ScreenshotRoute.startsWithPlus)
+    static let shared = MockAPIClient(
+        plusActive: ScreenshotRoute.startsWithPlus,
+        meLatency: ScreenshotRoute.mockMeDelay,
+        failsPrivacySaves: ScreenshotRoute.mockFailsPrivacySaves
+    )
     #else
     static let shared = MockAPIClient()
     #endif
@@ -22,6 +26,11 @@ actor MockAPIClient: APIClient {
     private(set) var lastReport: ReportRequest?
     private var privacy = PrivacySettings()
     private let latency: Duration
+    /// Extra wait on `GET /me` (screenshots of the loading state).
+    private let meLatency: Duration
+    /// `PUT /me/privacy` fails like a dropped connection (screenshots of the
+    /// rollback).
+    private let failsPrivacySaves: Bool
     private var nextID = 1
     private var plusExpiresAt: Date?
     private var travelLocation: FuzzedLocation?
@@ -50,7 +59,9 @@ actor MockAPIClient: APIClient {
     /// See `verifyEmailLink`.
     static let someoneElsesLinkPrefix = "someone-else"
 
-    init(latency: Duration = .milliseconds(250), plusActive: Bool = false) {
+    init(latency: Duration = .milliseconds(250), plusActive: Bool = false, meLatency: Duration = .zero, failsPrivacySaves: Bool = false) {
+        self.meLatency = meLatency
+        self.failsPrivacySaves = failsPrivacySaves
         let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
         var seededConversations: [Conversation.ID: Conversation] = [:]
         var seededMessages: [Conversation.ID: [Message]] = [:]
@@ -240,12 +251,14 @@ actor MockAPIClient: APIClient {
         plusExpiresAt = nil
         travelLocation = nil
         boostEndsAt = nil
+        privacy = PrivacySettings()
     }
 
     // MARK: Me
 
     func fetchMe() async throws -> Profile {
         try await pause()
+        if meLatency > .zero { try await Task.sleep(for: meLatency) }
         return ownProfile
     }
 
@@ -263,11 +276,13 @@ actor MockAPIClient: APIClient {
         return ownProfile
     }
 
-    /// `GET`/`PATCH /me`: the profile plus travel mode, like the server
-    /// (paused while Stexx+ is off; never any coordinates).
+    /// `GET`/`PATCH /me`: the profile plus travel mode and the stored privacy
+    /// settings, like the server (travel paused while Stexx+ is off; never
+    /// any coordinates).
     private var ownProfile: Profile {
         var profile = me
         profile.travel = travelLocation.map { _ in TravelStatus(isActive: currentPlusStatus.isActive) }
+        profile.privacy = privacy
         return profile
     }
 
@@ -317,7 +332,15 @@ actor MockAPIClient: APIClient {
 
     func updatePrivacy(_ settings: PrivacySettings) async throws -> PrivacySettings {
         try await pause()
-        privacy = settings
+        if failsPrivacySaves { throw URLError(.networkConnectionLost) }
+        var next = settings
+        // Like the server: turning incognito on needs Stexx+; a lapsed
+        // subscriber echoing it back just has it switched off.
+        if next.incognito, !currentPlusStatus.isActive {
+            guard privacy.incognito else { throw APIError.requiresPlus }
+            next.incognito = false
+        }
+        privacy = next
         return privacy
     }
 

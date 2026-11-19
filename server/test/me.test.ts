@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import sharp from "sharp";
+import { randomBytes } from "node:crypto";
+import { hitAbuseLimits } from "../src/lib/abuse/limits.ts";
 import { snapToCell } from "../src/lib/distance.ts";
 import { newId } from "../src/lib/ids.ts";
 import { mediaPath, storeJpeg } from "../src/lib/media.ts";
+import { hideAccount, SYSTEM_ACTOR, unhideAccount } from "../src/lib/moderation.ts";
+import { rateLimitsDisabled, setRateLimitsDisabled } from "../src/lib/ratelimit.ts";
 import { orderedPair } from "../src/lib/visibility.ts";
 import {
   as,
@@ -273,6 +277,33 @@ describe("PUT /me/privacy", () => {
     await expectError(await as(lapsed2).put("/v1/me/privacy", { json: settings({ incognito: true }) }), 402);
   });
 
+  test("GET and PATCH /me read the stored settings back (the app's source of truth)", async () => {
+    const u = await createUser({ privacy: { hide_distance: true, send_read_receipts: false } });
+    const defaults = { hideDistance: true, showOnlineStatus: true, sendReadReceipts: false, expiringPhotosByDefault: true, blurExplicitPhotos: true, incognito: false };
+    expect((await expectJson(await as(u).get("/v1/me"))).privacy).toEqual(defaults);
+
+    await expectJson(await as(u).put("/v1/me/privacy", { json: settings() }));
+    // A fresh install (or another phone) sees what the server applies, not the defaults.
+    expect((await expectJson(await as(u).get("/v1/me"))).privacy).toEqual(settings());
+    expect((await expectJson(await as(u).patch("/v1/me", { json: { headline: "hi" } }))).privacy).toEqual(settings());
+
+    // Nobody else sees anyone's privacy settings.
+    const other = await createUser();
+    const seen = await expectJson(await as(other).get(`/v1/profiles/${u.id}`));
+    expect(seen).not.toHaveProperty("privacy");
+    expect(seen).not.toHaveProperty("travel");
+  });
+
+  test("GET /me reports the stored incognito choice, which applies only while Stexx+ is active", async () => {
+    const lapsed = await createUser({ plusDays: -1, privacy: { incognito: true } });
+    expect((await expectJson(await as(lapsed).get("/v1/me"))).privacy.incognito).toBe(true);
+    // Echoing it back without Plus switches it off rather than locking the user out (see above).
+    const echoed = await expectJson(await as(lapsed).get("/v1/me"));
+    const out = await expectJson(await as(lapsed).put("/v1/me/privacy", { json: { ...echoed.privacy, hideDistance: true } }));
+    expect(out).toMatchObject({ hideDistance: true, incognito: false });
+    expect((await expectJson(await as(lapsed).get("/v1/me"))).privacy).toEqual(out);
+  });
+
   test("validation: all six booleans required, no unknown keys", async () => {
     const u = await createUser();
     const { incognito: _omit, ...missing } = settings();
@@ -509,6 +540,124 @@ describe("GET /me/export", () => {
     expect(text).not.toContain(me.token);
     expect(text).not.toContain(me.refreshToken);
     expect(JSON.stringify(dump)).not.toMatch(/\.\d+Z/);
+  });
+});
+
+describe("GET /me/export: account-level records", () => {
+  /** An attested app install linked to these accounts, as sign-up / sign-in on one phone would leave it. */
+  async function device(...users: TestUser[]) {
+    const id = newId("device");
+    const keyId = randomBytes(32);
+    await sql`INSERT INTO devices (id, key_id, public_key, environment) VALUES (${id}, ${keyId}, ${randomBytes(65)}, 'development')`;
+    for (const u of users) await sql`INSERT INTO device_accounts (device_id, user_id) VALUES (${id}, ${u.id})`;
+    return { id, keyId };
+  }
+
+  test("lists linked devices, moderation decisions, abuse counters and limits; no moderator, key or other account", async () => {
+    const me = await createUser();
+    const sharer = await createUser({ displayName: "PhoneSharer" });
+    const stranger = await createUser();
+    const phone = await device(me, sharer);
+    const notMine = await device(stranger);
+
+    // Reports about me and the moderation that followed. The export lists the decisions, not who made them,
+    // their note, or the reports behind them.
+    const reportAboutMe = newId("report");
+    await sql`INSERT INTO reports (id, reporter_id, reported_id, reason) VALUES (${reportAboutMe}, ${stranger.id}, ${me.id}, 'spam')`;
+    await sql`INSERT INTO moderation_actions (actor, action, user_id, report_ids, details, created_at)
+              VALUES (${SYSTEM_ACTOR}, 'auto_hide', ${me.id}, ${[reportAboutMe]}, ${sql.json({ reporters: 3, secret: "AUTO-DETAILS" })}, now() - interval '1 minute')`;
+    await hideAccount({ actor: "quiet_moderator", userId: me.id, note: "SECRET-MODERATOR-NOTE" });
+    await sql`INSERT INTO moderation_actions (actor, action, user_id) VALUES ('quiet_moderator', 'ban', ${stranger.id})`;
+
+    // Abuse-limit counters for my account (made on the shared phone), and some that aren't mine.
+    const wasDisabled = rateLimitsDisabled();
+    setRateLimitsDisabled(false);
+    try {
+      await hitAbuseLimits("message", { userId: me.id, deviceId: phone.id, ip: "203.0.113.77" });
+      await hitAbuseLimits("message", { userId: me.id, deviceId: phone.id, ip: "203.0.113.77" });
+      await hitAbuseLimits("photo", { userId: stranger.id, deviceId: notMine.id });
+    } finally {
+      setRateLimitsDisabled(wasDisabled);
+    }
+
+    const res = await as(me).get("/v1/me/export");
+    const text = await res.text();
+    const dump = JSON.parse(text);
+    expect(text).not.toMatch(/\.\d+Z/);
+
+    expect(dump.notes[0]).not.toContain("everything");
+    expect(dump.account).toMatchObject({ hiddenReason: "moderator", newAccountLimitsApply: true });
+    expect(dump.account.hiddenPendingReviewSince).toMatch(/Z$/);
+
+    expect(dump.devices).toEqual([
+      {
+        id: phone.id,
+        environment: "development",
+        linkedToAccountAt: expect.stringMatching(/Z$/),
+      },
+    ]);
+
+    expect(dump.moderation.map((m: { action: string; by: string }) => [m.action, m.by])).toEqual([
+      ["auto_hide", "automatic"],
+      ["hide", "moderator"],
+    ]);
+    for (const m of dump.moderation) expect(Object.keys(m).sort()).toEqual(["action", "by", "createdAt"]);
+
+    // Only the account's own counters: the phone's counters also count everyone else who uses it.
+    const counters = dump.rateLimitCounters as { limit: string; countThisWindow: number; windowSeconds: number }[];
+    expect(counters.map((c) => [c.limit, c.countThisWindow])).toEqual([["messageAccount", 2]]);
+    expect(counters.every((c) => c.windowSeconds > 0)).toBe(true);
+
+    // Nothing about the people on the other side, the moderator, or keys.
+    for (const secret of [sharer.id, "PhoneSharer", stranger.id, notMine.id, reportAboutMe, "quiet_moderator", "SECRET-MODERATOR-NOTE", "AUTO-DETAILS", "203.0.113.77"]) {
+      expect(text).not.toContain(secret);
+    }
+    for (const encoding of ["hex", "base64", "base64url"] as const) expect(text).not.toContain(phone.keyId.toString(encoding));
+    expect(text).not.toMatch(/publicKey|public_key|key_id|keyId\b|sign_count/);
+
+    // Leave the shared database's moderation queue as we found it.
+    await unhideAccount({ actor: "quiet_moderator", userId: me.id });
+    await sql`UPDATE reports SET status = 'dismissed', closed_at = now() WHERE id = ${reportAboutMe}`;
+  });
+
+  test("a shared phone: another account's activity on it doesn't show in my export", async () => {
+    const me = await createUser();
+    const partner = await createUser({ displayName: "PartnerOnPhone" });
+    const phone = await device(me, partner);
+
+    const before = await expectJson(await as(me).get("/v1/me/export"));
+
+    // The partner signs in on the shared install and messages people; the install is seen today and later banned.
+    const wasDisabled = rateLimitsDisabled();
+    setRateLimitsDisabled(false);
+    try {
+      await hitAbuseLimits("login", { deviceId: phone.id, ip: "198.51.100.9" });
+      for (let i = 0; i < 3; i++) await hitAbuseLimits("message", { userId: partner.id, deviceId: phone.id });
+      await hitAbuseLimits("photo", { userId: partner.id, deviceId: phone.id });
+      await hitAbuseLimits("keyBundle", { userId: partner.id, deviceId: phone.id });
+    } finally {
+      setRateLimitsDisabled(wasDisabled);
+    }
+    await sql`UPDATE devices SET last_seen_on = current_date + 1, banned_at = now(), created_at = now() - interval '9 days' WHERE id = ${phone.id}`;
+
+    const after = await expectJson(await as(me).get("/v1/me/export"));
+    for (const key of ["devices", "rateLimitCounters", "moderation", "notes"] as const) expect(after[key]).toEqual(before[key]);
+    expect(after.rateLimitCounters).toEqual([]);
+    expect(after.devices).toEqual([{ id: phone.id, environment: "development", linkedToAccountAt: expect.stringMatching(/Z$/) }]);
+    const text = JSON.stringify(after);
+    for (const leak of [partner.id, "PartnerOnPhone", "lastSeen", "isBanned", "firstSeen"]) expect(text).not.toContain(leak);
+    expect(text).not.toMatch(/(signup|login|message|photo|keyBundle)Device/);
+    expect(after.notes.join(" ")).toContain("shared by every account");
+  });
+
+  test("an account with no devices, decisions or counters gets empty lists, and old accounts no new-account limits", async () => {
+    const me = await createUser();
+    await sql`UPDATE users SET created_at = now() - interval '30 days' WHERE id = ${me.id}`;
+    const dump = await expectJson(await as(me).get("/v1/me/export"));
+    expect(dump.devices).toEqual([]);
+    expect(dump.moderation).toEqual([]);
+    expect(dump.rateLimitCounters).toEqual([]);
+    expect(dump.account).toMatchObject({ hiddenReason: null, lastModeratorReviewAt: null, newAccountLimitsApply: false });
   });
 });
 

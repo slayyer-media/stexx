@@ -258,7 +258,7 @@ struct TravelModeTests {
         let model = makeModel(state, spy: TravelSpy())
         model.centerChanged(to: precise)
         #expect(await model.browseFromSelection())
-        state.privacy.incognito = true
+        state.adoptServerPrivacy(PrivacySettings(incognito: true))
         let expiresAt = Date.now.addingTimeInterval(3600)
         state.applySubscription(SubscriptionStatus(isActive: true, expiresAt: expiresAt))
 

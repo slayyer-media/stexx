@@ -17,9 +17,9 @@ struct StexxApp: App {
         // so a failed Keychain write can't leave the app signed in without
         // a usable token.
         #if DEBUG
-        // `liveChat` screenshots: a dev-server session kept in memory only;
+        // Live screenshot routes: a dev-server session kept in memory only;
         // the stored (Keychain) session is never read or written.
-        let sessionStore = ScreenshotRoute.current == .liveChat
+        let sessionStore = ScreenshotRoute.current?.isLive == true
             ? CachedSessionStore(backing: InMemorySessionStore(session: ScreenshotRoute.devSession))
             : CachedSessionStore(backing: KeychainSessionStore())
         let appState = ScreenshotRoute.current?.usesMockData == true
@@ -68,6 +68,12 @@ struct StexxApp: App {
             sessions = coordinator
             e2e = E2EStatus(engine: engine)
         }
+        // The server is the source of truth for privacy settings.
+        appState.savePrivacy = { try await api.updatePrivacy($0) }
+        // An explicit sign-out erases the account's E2E keys and history.
+        appState.eraseAccountData = { userID in e2e.erase(userID: userID) }
+        // A data export left behind (the app quit with the share sheet open).
+        DataExportFile.removeAll()
         appState.revokeSession = { session in
             // Refreshes an expired access token with the session's own
             // refresh token and retries network failures.
