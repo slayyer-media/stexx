@@ -197,7 +197,7 @@ struct E2EAPIClient: APIClient {
             }
             return try await sendPhoto(jpeg, draft: draft, to: peer, in: conversationID, isRetry: true)
         } catch let error as APIError {
-            if case .server(403, _) = error { await engine.invalidateConfig() }
+            if case .server(403, _, _) = error { await engine.invalidateConfig() }
             throw error
         }
     }
@@ -227,7 +227,7 @@ struct E2EAPIClient: APIClient {
             return try await sendText(text, draft: draft, to: peer, in: conversationID, isRetry: true)
         } catch let error as APIError {
             // A 403 (trust ramp, review): `contentRules` may have changed.
-            if case .server(403, _) = error { await engine.invalidateConfig() }
+            if case .server(403, _, _) = error { await engine.invalidateConfig() }
             throw error
         }
     }
@@ -292,6 +292,9 @@ struct E2EAPIClient: APIClient {
     }
     func setTravelLocation(_ location: FuzzedLocation?) async throws { try await base.setTravelLocation(location) }
     func startBoost() async throws -> Boost { try await base.startBoost() }
+    func setMuted(_ isMuted: Bool, conversationID: Conversation.ID) async throws {
+        try await base.setMuted(isMuted, conversationID: conversationID)
+    }
 
     #if DEBUG
     func debugGrantPlus() async throws { try await base.debugGrantPlus() }

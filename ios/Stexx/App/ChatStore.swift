@@ -30,9 +30,15 @@ final class ChatStore {
 
     @ObservationIgnored private let api: any APIClient
     @ObservationIgnored private var threadContinuations: [Conversation.ID: [UUID: AsyncStream<ThreadUpdate>.Continuation]] = [:]
-    /// Sanitized JPEGs of photo messages that haven't been sent yet, by
-    /// client ID, so a failed send can be retried.
-    @ObservationIgnored private var pendingPhotos: [String: Data] = [:]
+    /// Sanitized JPEGs of photo messages that haven't been sent yet, with
+    /// the timer chosen when they were sent, by client ID, so a failed send
+    /// is retried exactly as it was first sent.
+    @ObservationIgnored private var pendingPhotos: [String: PendingPhoto] = [:]
+
+    private struct PendingPhoto {
+        let jpeg: Data
+        let timer: PhotoTimer
+    }
     /// Bumped by every `load()` and by `reset()`: only the newest load may
     /// apply its result, and nothing started before a sign-out lands after it.
     @ObservationIgnored private var loadGeneration = 0
@@ -199,35 +205,29 @@ final class ChatStore {
     /// Sends a photo message (`APIClient.sendPhoto`): the (already
     /// sanitized) JPEG goes up as a private chat attachment
     /// (`POST /me/attachments`, never on the public profile), end-to-end
-    /// encrypted when the chat is, and is sent as `attachmentPhotoID`.
+    /// encrypted when the chat is, and is sent as `attachmentPhotoID` with
+    /// the sender's `timer` (`PhotoTimer`: keep, view once, or expire a set
+    /// time after it's read).
     ///
-    /// `isViewOnce` sends a view-once photo (no timer). Otherwise
-    /// `expiresAfterSeconds == nil` sends the photo explicitly as not
-    /// view-once (`isViewOnce: false`); otherwise the server would apply the
-    /// sender's "expiring photos by default" setting.
-    ///
-    /// Re-sending the same `clientID` after a failure is safe: the server
-    /// deduplicates by client ID, an unsent upload expires on its own, and an
-    /// encrypted photo is re-sent with the same key.
+    /// A retry passes no `jpegData` (and no timer): the photo and timer from
+    /// the first attempt are reused. Re-sending the same `clientID` after a
+    /// failure is safe: the server deduplicates by client ID, an unsent
+    /// upload expires on its own, and an encrypted photo is re-sent with the
+    /// same key.
     func sendPhoto(
         jpegData: Data? = nil,
         clientID: String,
         text: String? = nil,
-        expiresAfterSeconds: Int?,
-        isViewOnce: Bool = false,
+        timer: PhotoTimer? = nil,
         in conversation: Conversation
     ) async throws -> Message {
-        if let jpegData { pendingPhotos[clientID] = jpegData }
-        guard let jpeg = pendingPhotos[clientID] else { throw APIError.invalidResponse }
+        if let jpegData { pendingPhotos[clientID] = PendingPhoto(jpeg: jpegData, timer: timer ?? .keep) }
+        guard let pending = pendingPhotos[clientID] else { throw APIError.invalidResponse }
         let epoch = self.epoch
 
-        let draft = MessageDraft(
-            clientID: clientID,
-            text: text,
-            expiresAfterSeconds: isViewOnce ? nil : expiresAfterSeconds,
-            isViewOnce: isViewOnce ? true : expiresAfterSeconds == nil ? false : nil
-        )
-        let sent = try await api.sendPhoto(jpegData: jpeg, draft: draft, in: conversation.id)
+        var draft = MessageDraft(clientID: clientID, text: text)
+        pending.timer.apply(to: &draft)
+        let sent = try await api.sendPhoto(jpegData: pending.jpeg, draft: draft, in: conversation.id)
         guard epoch == self.epoch else { return sent }
         pendingPhotos[clientID] = nil
         didSend(sent, in: conversation)
@@ -236,6 +236,41 @@ final class ChatStore {
 
     func hasPendingPhoto(clientID: String) -> Bool {
         pendingPhotos[clientID] != nil
+    }
+
+    /// The timer a pending (failed) photo will be retried with.
+    func pendingPhotoTimer(clientID: String) -> PhotoTimer? {
+        pendingPhotos[clientID]?.timer
+    }
+
+    /// The user deleted a failed photo message: forget its JPEG.
+    func discardPendingPhoto(clientID: String) {
+        pendingPhotos[clientID] = nil
+    }
+
+    // MARK: Mute
+
+    /// Mutes or unmutes a conversation for this user (`PUT`/`DELETE
+    /// /conversations/{id}/mute`). Shown at once; put back if the server
+    /// refuses. A muted chat still shows its unread count in the list but
+    /// is left out of the tab badge (`unreadTotal`).
+    @discardableResult
+    func setMuted(_ isMuted: Bool, conversationID: Conversation.ID) async -> Bool {
+        let epoch = self.epoch
+        let index = conversations.firstIndex { $0.id == conversationID }
+        let previous = index.map { conversations[$0].isMuted }
+        if let index { conversations[index].isMuted = isMuted }
+        do {
+            try await api.setMuted(isMuted, conversationID: conversationID)
+            return true
+        } catch {
+            guard epoch == self.epoch else { return false }
+            if let previous, let index = conversations.firstIndex(where: { $0.id == conversationID }) {
+                conversations[index].isMuted = previous
+            }
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     // MARK: Realtime
@@ -332,7 +367,7 @@ final class ChatStore {
 
     /// Merges a live update into a thread's messages (oldest first).
     /// Replaces the optimistic copy of my own message by client ID.
-    static func merge(_ update: ThreadUpdate, into messages: inout [Message], myID: Profile.ID) {
+    nonisolated static func merge(_ update: ThreadUpdate, into messages: inout [Message], myID: Profile.ID) {
         switch update {
         case .created(let message):
             if let index = messages.firstIndex(where: {
@@ -370,34 +405,39 @@ final class ChatStore {
     /// Keeps local messages the snapshot doesn't have yet: optimistic ones
     /// still sending or failed, and live events at least as new as the
     /// snapshot's newest message (they arrived while the fetch was in
-    /// flight). Older local messages missing from the snapshot are gone on
-    /// the server (expired, deleted) and are dropped.
-    static func reconcile(snapshot: [Message], with local: [Message], myID: Profile.ID) -> [Message] {
+    /// flight). With `keepsOlder` (the snapshot is the newest page and the
+    /// server has older ones), local messages older than the snapshot are
+    /// older pages already loaded and are kept in front of it. Other local
+    /// messages missing from the snapshot are gone on the server (expired,
+    /// deleted) and are dropped.
+    nonisolated static func reconcile(snapshot: [Message], with local: [Message], myID: Profile.ID, keepsOlder: Bool = false) -> [Message] {
         var result = snapshot
         let newest = snapshot.map(\.sentAt).max()
+        let oldest = snapshot.map(\.sentAt).min()
+        var olderPages: [Message] = []
         for message in local {
-            let isInSnapshot = snapshot.contains {
-                $0.id == message.id
-                    || (message.clientID != nil && $0.clientID == message.clientID && $0.senderID == message.senderID)
-            }
-            guard !isInSnapshot else { continue }
+            guard !ThreadHistory.contains(message, in: snapshot) else { continue }
             let isUnsent = message.status == .sending || message.status == .failed
+            if !isUnsent, keepsOlder, let oldest, message.sentAt < oldest {
+                olderPages.append(message)
+                continue
+            }
             let isNewer = newest.map { message.sentAt >= $0 } ?? true
             guard isUnsent || isNewer else { continue }
             merge(.created(message), into: &result, myID: myID)
         }
-        return result
+        return olderPages + result
     }
 
     /// `current` replaced by a newer server copy, keeping a locally newer
     /// `read` status.
-    static func updating(_ current: Message, with update: Message) -> Message {
+    nonisolated static func updating(_ current: Message, with update: Message) -> Message {
         var merged = update
         if current.status == .read && update.status != .read { merged.status = .read }
         return merged
     }
 
-    private static func readReceipt(_ receipt: RealtimeEvent.ReadReceipt, covers message: Message) -> Bool {
+    nonisolated private static func readReceipt(_ receipt: RealtimeEvent.ReadReceipt, covers message: Message) -> Bool {
         if let ids = receipt.messageIDs { return ids.contains(message.id) }
         if let readAt = receipt.readAt { return message.sentAt <= readAt }
         return true

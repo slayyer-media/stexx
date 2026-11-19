@@ -487,7 +487,7 @@ actor E2EEngine {
     /// A 4xx other than 429: re-sending the same body can't succeed.
     private static func isPermanentRejection(_ error: APIError) -> Bool {
         switch error {
-        case .server(let status, _): (400..<500).contains(status) && status != 429
+        case .server(let status, _, _): (400..<500).contains(status) && status != 429
         case .e2e(let code, _): code != E2EErrorCode.disabled
         default: false
         }

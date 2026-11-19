@@ -240,7 +240,7 @@ extension ReportEvidence {
             do {
                 result[index].photoID = try await upload(jpeg)
                 attached += 1
-            } catch APIError.server(status: 409, message: _) {
+            } catch APIError.server(status: 409, message: _, code: _) {
                 // `attachment_limit`: more uploads would fail too.
                 atLimit = true
             } catch {

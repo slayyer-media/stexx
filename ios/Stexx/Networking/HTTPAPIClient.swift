@@ -186,6 +186,10 @@ struct HTTPAPIClient: APIClient {
         try await call("POST", "conversations/\(conversationID)/messages/\(messageID)/open")
     }
 
+    func setMuted(_ isMuted: Bool, conversationID: Conversation.ID) async throws {
+        try await callVoid(isMuted ? "PUT" : "DELETE", "conversations/\(conversationID)/mute")
+    }
+
     func deleteConversation(_ conversationID: Conversation.ID) async throws {
         try await callVoid("DELETE", "conversations/\(conversationID)")
     }
@@ -486,7 +490,7 @@ struct HTTPAPIClient: APIClient {
             }
             // 403 anti-spam codes (new_account_limit, links_not_allowed, duplicate_message, device_account_limit,
             // disposable_email, ...) carry a message written for people; it is shown as is.
-            throw APIError.server(status: http.statusCode, message: body?.message)
+            throw APIError.server(status: http.statusCode, message: body?.message, code: body?.code)
         }
     }
 

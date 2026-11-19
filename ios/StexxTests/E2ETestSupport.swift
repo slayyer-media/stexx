@@ -317,6 +317,7 @@ struct FakeE2EClient: APIClient {
     func identityKey(for profileID: Profile.ID) async throws -> IdentityKeyResponse { try await server.identity(of: profileID) }
     func markRead(conversationID: Conversation.ID) async throws {}
     func deleteConversation(_ conversationID: Conversation.ID) async throws {}
+    func setMuted(_ isMuted: Bool, conversationID: Conversation.ID) async throws {}
     func deleteAccount() async throws {}
 
     func register(_ request: RegistrationRequest) async throws -> Session { throw Self.unused }

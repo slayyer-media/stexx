@@ -93,7 +93,7 @@ enum MockData {
             (false, "Haha same. Museum this weekend? The new physics exhibit looks fun.", 12),
             (false, "No pressure, I just want an excuse to explain interferometry", 11),
         ]),
-        ("p04", [
+        ("p04", homelabHistory + [
             (true, "Ok your homelab photo is incredible", 60 * 5),
             (false, "Thank you, it's mostly Raspberry Pis held together with hope", 60 * 4.8),
         ]),
@@ -106,6 +106,30 @@ enum MockData {
             (true, "Respect", 60 * 70),
         ]),
     ]
+
+    /// A long earlier history for one seed thread (more than one 50-message
+    /// page), so older pages load as you scroll up.
+    static let homelabHistory: [(Bool, String, Double)] = {
+        let lines: [(Bool, String)] = [
+            (false, "Did the new switch arrive?"),
+            (true, "It did. Eight ports, zero instructions."),
+            (false, "Classic."),
+            (true, "Rack is now officially a shelf with ambitions"),
+            (false, "Mine is a bookcase. The books moved out."),
+            (true, "Respect the sacrifice"),
+            (false, "How's the DNS saga?"),
+            (true, "It was DNS. It's always DNS."),
+            (false, "Ha"),
+            (true, "Anyway, coffee sometime?"),
+            (false, "Yes. Somewhere with good wifi, obviously."),
+            (true, "Obviously"),
+        ]
+        // Oldest first: 72 messages, two days ago up to a few hours ago.
+        return (0..<72).map { index in
+            let line = lines[index % lines.count]
+            return (line.0, line.1, 60 * 48 - Double(index) * 35)
+        }
+    }()
 
     private static func make(
         _ id: Profile.ID,

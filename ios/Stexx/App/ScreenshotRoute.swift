@@ -19,7 +19,7 @@ import UIKit
 /// again once it counts as opened). `-StexxShowPrivacyCover YES` keeps the
 /// app-switcher cover up (`PrivacyCover`). See `ios/README.md`.
 enum ScreenshotRoute: String {
-    case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, settings
+    case profile, chat, chats, reportFromChat, reportPicker, reportSent, liveChat, settings
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -29,6 +29,20 @@ enum ScreenshotRoute: String {
     var usesMockData: Bool { self != .liveChat }
 
     static var peerID: Profile.ID? { UserDefaults.standard.string(forKey: "StexxScreenshotPeer") }
+    /// `-StexxScreenshotScrollToTop YES`: a thread jumps to its oldest loaded
+    /// message once loaded, so the next older page starts loading.
+    static var scrollsToTop: Bool { UserDefaults.standard.bool(forKey: "StexxScreenshotScrollToTop") }
+    /// `-StexxScreenshotPhotoTimer <PhotoTimer raw value>`: the thread's photo timer.
+    static var photoTimer: PhotoTimer? {
+        UserDefaults.standard.string(forKey: "StexxScreenshotPhotoTimer").flatMap(PhotoTimer.init(rawValue:))
+    }
+    /// `-StexxMockSendFailure <kind>`: the mock refuses every send the way the
+    /// server would (`rateLimited`, `newAccountLimit`, `linksNotAllowed`,
+    /// `underReview`, `offline`), so failed bubbles can be captured.
+    static var mockSendFailure: String? { UserDefaults.standard.string(forKey: "StexxMockSendFailure") }
+    /// `-StexxMockOlderPageDelay <seconds>`: the mock takes this long for an
+    /// older page, so the loading row can be captured.
+    static var mockOlderPageDelay: Double { UserDefaults.standard.double(forKey: "StexxMockOlderPageDelay") }
     static var draft: String? { UserDefaults.standard.string(forKey: "StexxScreenshotDraft") }
     /// `viewOnce`: send a generated photo as view-once once the thread loads.
     static var sendsViewOncePhoto: Bool { UserDefaults.standard.string(forKey: "StexxScreenshotSendPhoto") == "viewOnce" }
@@ -69,22 +83,31 @@ enum ScreenshotRoute: String {
 
 struct ScreenshotRouteView: View {
     let route: ScreenshotRoute
-    private let profile = MockData.profiles[0]
+    /// `-StexxScreenshotPeer` picks the mock profile for mock routes too.
+    private var profile: Profile {
+        ScreenshotRoute.peerID.flatMap { id in MockData.profiles.first { $0.id == id } } ?? MockData.profiles[0]
+    }
 
     var body: some View {
-        NavigationStack {
-            switch route {
-            case .profile:
-                ProfileDetailView(profile: profile)
-            case .liveChat:
-                LiveChatRoute()
-            case .settings:
-                SettingsView()
-            default:
-                ChatThreadView(route: ChatRoute(participant: profile))
+        if route == .chats {
+            // The Chats tab has its own NavigationStack.
+            ChatListView()
+                .tint(Theme.ice)
+        } else {
+            NavigationStack {
+                switch route {
+                case .profile:
+                    ProfileDetailView(profile: profile)
+                case .liveChat:
+                    LiveChatRoute()
+                case .settings:
+                    SettingsView()
+                default:
+                    ChatThreadView(route: ChatRoute(participant: profile))
+                }
             }
+            .tint(Theme.ice)
         }
-        .tint(Theme.ice)
     }
 }
 

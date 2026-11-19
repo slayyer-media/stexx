@@ -24,7 +24,8 @@ struct ChatListView: View {
 
     var body: some View {
         let visible = conversations
-        let unread = visible.reduce(0) { $0 + $1.unreadCount }
+        // Muted chats keep their own count but stay out of the total (like the tab badge).
+        let unread = visible.reduce(0) { $0 + ($1.isMuted ? 0 : $1.unreadCount) }
 
         NavigationStack(path: $path) {
             List {
@@ -50,6 +51,16 @@ struct ChatListView: View {
                         } label: {
                             Label("Delete", systemImage: "trash")
                         }
+                        Button {
+                            Task { await chatStore.setMuted(!conversation.isMuted, conversationID: conversation.id) }
+                        } label: {
+                            if conversation.isMuted {
+                                Label("Unmute", systemImage: "bell")
+                            } else {
+                                Label("Mute", systemImage: "bell.slash")
+                            }
+                        }
+                        .tint(Theme.slate)
                     }
                 }
             }
@@ -168,7 +179,8 @@ private struct ConversationRow: View {
                         .lineLimit(2)
                     Spacer(minLength: Theme.Spacing.s)
                     if hasUnread {
-                        XXBadge(verbatim: conversation.unreadCount.formatted())
+                        // Muted: the count stays, but quiet (outlined, not solid).
+                        XXBadge(verbatim: conversation.unreadCount.formatted(), style: conversation.isMuted ? .outline : .solid)
                             .accessibilityHidden(true)
                     }
                 }
