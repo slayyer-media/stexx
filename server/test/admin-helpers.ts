@@ -118,12 +118,24 @@ export async function enroll(token: string, auth: SoftAuthenticator, over: { uv?
   return adminPost("/enroll/verify", { json: { token, credential: auth.register(options, over) } });
 }
 
-/** Run the login ceremony. Returns the verify response. */
+/**
+ * The user handle a real authenticator returns with a discoverable credential: the account's webauthn_user_id, as
+ * passkey.js sends it (base64url). null for a passkey the console doesn't know.
+ */
+export async function storedUserHandle(auth: SoftAuthenticator): Promise<string | null> {
+  const [row] = await sql<{ webauthn_user_id: Buffer }[]>`
+    SELECT a.webauthn_user_id FROM staff_passkeys p JOIN staff_accounts a ON a.id = p.staff_id
+     WHERE p.id = ${auth.credentialId.toString("base64url")}`;
+  return row ? row.webauthn_user_id.toString("base64url") : null;
+}
+
+/** Run the login ceremony, with the user handle a real browser sends (unless `over` sets one). Returns the verify response. */
 export async function login(auth: SoftAuthenticator, over: Parameters<SoftAuthenticator["assert"]>[1] = {}): Promise<Response> {
+  const userHandle = over.userHandle ?? (await storedUserHandle(auth)) ?? undefined;
   const optsRes = await adminPost("/login/options", { json: {} });
   expect(optsRes.status).toBe(200);
   const options = (await optsRes.json()) as { challenge: string };
-  return adminPost("/login/verify", { json: auth.assert(options, over) });
+  return adminPost("/login/verify", { json: auth.assert(options, { ...over, ...(userHandle ? { userHandle } : {}) }) });
 }
 
 /** Enrolled + signed in through the real ceremonies. */

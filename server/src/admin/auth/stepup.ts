@@ -9,6 +9,8 @@
  *                                                  this session, on that action and target (spendActionStepUp).
  *   POST /step-up/verify  (assertion)            → {ok, token?}; `token` is the per-action proof to submit with
  *                                                  the form (field `step_up`).
+ * A verified assertion whose signature counter went backwards removes that passkey and signs the account out everywhere
+ * (lockOutCopiedPasskey), as at sign-in.
  * Either kind is a fresh assertion with user verification, so either marks the session as recently stepped up: a
  * form that runs only the bound ceremony (disabling or re-inviting another admin) also passes the route guard's
  * "recent" check.
@@ -21,7 +23,16 @@ import { sql, type Sql } from "../../db/sql.ts";
 import { ApiError, badRequest } from "../../lib/errors.ts";
 import { staffAudit, staffAuditNow, type AuditTargetKind } from "../../lib/staff/audit.ts";
 import type { AdminRoutes } from "../guard.ts";
-import { authenticationSchema, challengeOf, jsonBody, limitCeremony, storeChallenge, type ChallengeRow } from "./webauthn.ts";
+import {
+  authenticationSchema,
+  challengeOf,
+  counterWentBack,
+  jsonBody,
+  limitCeremony,
+  lockOutCopiedPasskey,
+  storeChallenge,
+  type ChallengeRow,
+} from "./webauthn.ts";
 
 /** Per-action step-up targets: the actions that need one, and the shape of their target ids. */
 export const ACTION_STEP_UPS = {
@@ -122,7 +133,8 @@ export function registerStepUpRoutes(r: AdminRoutes): void {
             credential: {
               id: credential.id,
               publicKey: new Uint8Array(stored.public_key),
-              counter: Number(stored.counter),
+              // 0 turns the library's own counter check off (it runs before the signature check): see counterWentBack.
+              counter: 0,
               transports: stored.transports as never,
             },
           });
@@ -134,6 +146,10 @@ export function registerStepUpRoutes(r: AdminRoutes): void {
         // One attempt per challenge.
         await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
         return { ok: false as const };
+      }
+      if (counterWentBack(verified.authenticationInfo.newCounter, Number(stored!.counter))) {
+        await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
+        return { ok: false as const, copied: true };
       }
       // The counter only moves forward, as at sign-in: a concurrent sign-in that stored a higher value wins, and this
       // assertion fails rather than rolling the counter back.
@@ -163,7 +179,12 @@ export function registerStepUpRoutes(r: AdminRoutes): void {
       return { ok: true as const, token: pending.kind === "action" ? challenge : undefined };
     });
     if (!outcome.ok) {
-      await staffAuditNow({ kind: "event", action: "step_up_failed", channel: "console", staffId: staff.id, sessionId: session.id });
+      if ("copied" in outcome) {
+        // In its own transaction (after the challenge lock is released), like at sign-in.
+        await lockOutCopiedPasskey({ staffId: staff.id, credentialId: credential.id, sessionId: session.id });
+      } else {
+        await staffAuditNow({ kind: "event", action: "step_up_failed", channel: "console", staffId: staff.id, sessionId: session.id });
+      }
       throw stepUpFailed();
     }
     return c.json(outcome.token ? { ok: true, token: outcome.token } : { ok: true }, 200);

@@ -6,8 +6,9 @@
  * sessions and pending enrollment links at once. Lost passkeys are replaced by re-inviting, which removes the old
  * passkeys; there is no self-service recovery.
  *
- * Every staff change takes one advisory lock and then the account row (FOR UPDATE); enrollment takes the account row
- * FOR SHARE (consumeEnrollment), so a re-invite or disable and an in-flight enrollment from an old link never overlap.
+ * Every staff change takes one advisory lock, re-checks that the acting admin is still an active admin, and then takes
+ * the account row (FOR UPDATE); enrollment takes the account row FOR SHARE (consumeEnrollment), so a re-invite or
+ * disable and an in-flight enrollment from an old link never overlap.
  */
 import { randomBytes } from "node:crypto";
 import { sql, type Sql } from "../../db/sql.ts";
@@ -24,6 +25,11 @@ export const ENROLLMENT_TTL_MS = 30 * MINUTE;
 /** A refused staff operation, with a message fit to show the operator. */
 export class StaffError extends Error {
   override name = "StaffError";
+}
+
+/** The acting admin was disabled, or is no longer an admin, by the time the change got its turn. */
+export class StaffActorError extends StaffError {
+  override name = "StaffActorError";
 }
 
 export interface StaffAccount {
@@ -112,6 +118,21 @@ export interface InviteResult {
   previousRole: StaffRole | null;
 }
 
+/**
+ * Re-checks the acting staff account under the staff-change lock. The session was checked when the request came in,
+ * but another admin may have disabled this one (or changed their role) since: that change held the lock and
+ * committed first, so this read sees it. Without this a just-disabled admin's in-flight request could still create
+ * an admin account that outlives the disable. Nothing to check for a change made with no acting staff (bootstrap).
+ */
+async function checkActorStillAdmin(tx: Sql, actor: StaffActor): Promise<void> {
+  if (!actor.staffId) return;
+  const [row] = await tx<{ role: StaffRole; disabled_at: Date | null }[]>`
+    SELECT role, disabled_at FROM staff_accounts WHERE id = ${actor.staffId}`;
+  if (!row || row.disabled_at || row.role !== "admin") {
+    throw new StaffActorError("Your account was disabled or is no longer an admin, so this change was not made.");
+  }
+}
+
 /** Active admins other than `exceptId`, counted under the caller's lock. */
 async function otherActiveAdmins(tx: Sql, exceptId: string): Promise<number> {
   const [row] = await tx<{ n: number }[]>`
@@ -150,6 +171,7 @@ export async function inviteStaff(input: {
   return sql.begin(async (tx) => {
     // One staff change at a time: the last-admin rule below must see a stable count.
     await tx`SELECT pg_advisory_xact_lock(hashtext('stexx staff accounts'))`;
+    await checkActorStillAdmin(tx, input.actor);
     const [existing] = await tx<StaffRow[]>`
       SELECT id, handle, role, created_at, created_by, disabled_at, last_login_at FROM staff_accounts
        WHERE lower(handle) = lower(${input.handle}) FOR UPDATE`;
@@ -219,6 +241,7 @@ export async function disableStaff(input: {
   const now = input.now ?? new Date();
   return sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtext('stexx staff accounts'))`;
+    await checkActorStillAdmin(tx, input.actor);
     const [row] = await tx<StaffRow[]>`
       SELECT id, handle, role, created_at, created_by, disabled_at, last_login_at FROM staff_accounts
        WHERE id = ${input.handleOrId} OR lower(handle) = lower(${input.handleOrId})

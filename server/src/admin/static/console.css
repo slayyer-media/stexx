@@ -47,6 +47,7 @@ input, select { padding: 4px 6px; border: 1px solid var(--line); border-radius: 
 button { padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: transparent; cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.danger { color: var(--danger); border-color: var(--danger); }
+a.danger { color: var(--danger); }
 button.link { border: none; padding: 0; color: var(--fg); text-decoration: underline; }
 .flash, .notice, .error { padding: 8px 12px; border-radius: 6px; }
 .flash { background: var(--ok-bg); }

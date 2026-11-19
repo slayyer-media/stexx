@@ -29,6 +29,7 @@ import {
   sql,
   staffAuthenticator,
   staffHandle,
+  storedUserHandle,
 } from "./admin-helpers.ts";
 import { createUser, uniq } from "./helpers.ts";
 
@@ -49,16 +50,16 @@ async function errorCode(res: Response): Promise<string | undefined> {
   return body?.code;
 }
 
-/** Waits until some backend of this database is blocked on a lock in a statement containing every fragment. */
-async function waitForLockWait(fragments: string[], timeoutMs = 15_000): Promise<void> {
+/** Waits until `count` backends of this database are blocked on a lock in a statement containing every fragment. */
+async function waitForLockWait(fragments: string[], count = 1, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const rows = await sql<{ query: string }[]>`
       SELECT query FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`;
-    if (rows.some((r) => fragments.every((f) => r.query.includes(f)))) return;
+    if (rows.filter((r) => fragments.every((f) => r.query.includes(f))).length >= count) return;
     await Bun.sleep(20);
   }
-  throw new Error(`no statement with ${fragments.join(" … ")} waited on a lock`);
+  throw new Error(`fewer than ${count} statement(s) with ${fragments.join(" … ")} waited on a lock`);
 }
 
 /** Inserts a staff_audit row dated `age` ago. The table stamps `at` itself, so only a superuser (tests) can backdate. */
@@ -233,14 +234,71 @@ describe("passkey login", () => {
     expect((await login(s.auth)).status).toBe(200);
   });
 
-  test("a counter that goes backwards (a cloned authenticator) is refused", async () => {
+  test("a counter that goes backwards (a copied passkey) is refused, removes the passkey and signs the account out", async () => {
     const s = await enrolledStaff("support");
     expect((await login(s.auth, { counter: 10 })).status).toBe(200);
-    expect((await login(s.auth, { counter: 7 })).status).toBe(401);
-    expect((await login(s.auth, { counter: 10 })).status).toBe(401);
-    const [pk] = await sql<{ counter: string }[]>`SELECT counter FROM staff_passkeys WHERE staff_id = ${s.id}`;
-    expect(Number(pk!.counter)).toBe(10);
+    // Whoever used the copy first is signed in; so is the owner, elsewhere.
+    const sessions = await sql<{ id: string }[]>`SELECT id FROM staff_sessions WHERE staff_id = ${s.id} AND revoked_at IS NULL`;
+    expect(sessions.length).toBe(2);
+    const o = await adminPost("/step-up/options", { cookie: s.session.cookie, csrf: s.session.csrf, json: {} });
+    expect(o.status).toBe(200);
+
+    // The same passkey, validly signed, with a counter that didn't go up.
+    const res = await login(s.auth, { counter: 10 });
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("invalid_credential");
+    expect(await sql`SELECT 1 FROM staff_passkeys WHERE staff_id = ${s.id}`).toHaveLength(0);
+    expect(await sql`SELECT 1 FROM staff_sessions WHERE staff_id = ${s.id} AND revoked_at IS NULL`).toHaveLength(0);
+    expect(await sql`SELECT 1 FROM staff_challenges WHERE staff_id = ${s.id}`).toHaveLength(0);
+    expect((await adminGet("/", { cookie: s.session.cookie })).status).toBe(303);
+    // Recorded as what it is, not as an ordinary failed login.
+    const [row] = await sql<{ action: string; kind: string; channel: string }[]>`
+      SELECT action, kind, channel FROM staff_audit WHERE staff_id = ${s.id} ORDER BY id DESC LIMIT 1`;
+    expect(row).toEqual({ action: "passkey_counter_regression", kind: "event", channel: "console" });
+    expect((await auditActions(s.id)).filter((a) => a === "login_failed")).toEqual([]);
+    // Neither copy works any more: the owner needs a re-invite.
+    expect((await login(s.auth, { counter: 11 })).status).toBe(401);
+  });
+
+  test("a forged assertion with a low counter is an ordinary failed login: nothing is revoked", async () => {
+    // The counter is only acted on once the signature verified, so knowing a credential id can't lock its owner out.
+    const s = await enrolledStaff("support");
+    expect((await login(s.auth, { counter: 10 })).status).toBe(200);
+    const otherKey = generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey;
+    expect((await login(s.auth, { counter: 3, key: otherKey })).status).toBe(401);
+    expect(await sql`SELECT 1 FROM staff_passkeys WHERE staff_id = ${s.id}`).toHaveLength(1);
+    expect((await adminGet("/", { cookie: s.session.cookie })).status).toBe(200);
+    expect((await auditActions(s.id)).at(-1)).toBe("login_failed");
+    expect(await auditActions(s.id)).not.toContain("passkey_counter_regression");
     expect((await login(s.auth, { counter: 11 })).status).toBe(200);
+  });
+
+  test("two overlapping sign-ins for one account queue on the account row: no deadlock, no 500", async () => {
+    const s = await enrolledStaff("support");
+    const assertion = async (counter: number) => {
+      const o = (await (await adminPost("/login/options", { json: {} })).json()) as { challenge: string };
+      return s.auth.assert(o, { counter, userHandle: (await storedUserHandle(s.auth))! });
+    };
+    // Two ceremonies of the same passkey (two tabs), both verified and waiting on the account row at once.
+    const first = await assertion(20);
+    const second = await assertion(21);
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    const holding = sql.begin(async (tx) => {
+      await tx`SELECT id FROM staff_accounts WHERE id = ${s.id} FOR UPDATE`;
+      await released;
+    });
+    const a = adminPost("/login/verify", { json: second });
+    const b = adminPost("/login/verify", { json: first });
+    await waitForLockWait(["staff_accounts", "FOR NO KEY UPDATE"], 2);
+    release();
+    await holding;
+    const statuses = [(await a).status, (await b).status];
+    // Whichever runs second with the lower counter fails like any stale assertion; nothing errors.
+    expect(statuses.every((st) => st === 200 || st === 401)).toBe(true);
+    expect(statuses).toContain(200);
+    const [pk] = await sql<{ counter: string }[]>`SELECT counter FROM staff_passkeys WHERE staff_id = ${s.id}`;
+    expect(Number(pk!.counter)).toBe(21);
   });
 
   test("a bad signature, an unknown passkey, a replayed challenge and a wrong user handle are refused", async () => {
@@ -249,6 +307,10 @@ describe("passkey login", () => {
     expect((await login(s.auth, { key: otherKey })).status).toBe(401);
     expect((await login(staffAuthenticator())).status).toBe(401);
     expect((await login(s.auth, { userHandle: Buffer.alloc(32, 7).toString("base64url") })).status).toBe(401);
+    // The handle every real authenticator sends for a discoverable credential: the account's own, base64url.
+    const handle = (await storedUserHandle(s.auth))!;
+    expect(handle).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect((await login(s.auth, { userHandle: handle })).status).toBe(200);
 
     const optsRes = await adminPost("/login/options", { json: {} });
     const assertion = s.auth.assert((await optsRes.json()) as { challenge: string });
@@ -292,7 +354,7 @@ describe("passkey login", () => {
       await tx`UPDATE staff_sessions SET revoked_at = now() WHERE staff_id = ${s.id} AND revoked_at IS NULL`;
     });
     const signingIn = adminPost("/login/verify", { json: assertion });
-    await waitForLockWait(["staff_accounts", "FOR SHARE"]);
+    await waitForLockWait(["staff_accounts", "FOR NO KEY UPDATE"]);
     release();
     await disabling;
     expect((await signingIn).status).toBe(401);
@@ -612,6 +674,85 @@ describe("step-up", () => {
     expect(m!.disabled_at).toBeNull();
   });
 
+  test("an admin disabled while their request waits for the staff lock changes nothing", async () => {
+    const admin = await makeStaff("admin");
+    const session = await signInDirect(admin.id, { stepUp: true });
+    const mod = await makeStaff("moderator");
+    const newHandle = staffHandle("admin");
+    // Plays another admin's disable of `admin`: holds the staff lock, disables, revokes, commits once both requests
+    // (which already passed the session check) are waiting on that lock.
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    const disabling = sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('stexx staff accounts'))`;
+      await released;
+      await tx`UPDATE staff_accounts SET disabled_at = now() WHERE id = ${admin.id}`;
+      await tx`UPDATE staff_sessions SET revoked_at = now() WHERE staff_id = ${admin.id} AND revoked_at IS NULL`;
+    });
+    const inviting = adminPost("/staff/invite", { cookie: session.cookie, csrf: session.csrf, form: { handle: newHandle, role: "admin" } });
+    const disablingMod = adminPost(`/staff/${mod.id}/disable`, { cookie: session.cookie, csrf: session.csrf, form: {} });
+    await waitForLockWait(["pg_advisory_xact_lock", "stexx staff accounts"], 2);
+    release();
+    await disabling;
+    for (const res of [await inviting, await disablingMod]) {
+      expect(res.status).toBe(403);
+      expect(await res.text()).toContain("no longer an admin");
+    }
+    expect(await sql`SELECT 1 FROM staff_accounts WHERE lower(handle) = lower(${newHandle})`).toHaveLength(0);
+    const [m] = await sql<{ disabled_at: Date | null }[]>`SELECT disabled_at FROM staff_accounts WHERE id = ${mod.id}`;
+    expect(m!.disabled_at).toBeNull();
+    expect(await auditActions(admin.id)).toEqual([]);
+    // The same rule on the command line, and for a demoted admin.
+    const cli = await makeStaff("admin");
+    await sql`UPDATE staff_accounts SET role = 'moderator' WHERE id = ${cli.id}`;
+    await expect(inviteStaff({ handle: staffHandle("support"), role: "support", actor: { staffId: cli.id, channel: "cli" } })).rejects.toThrow(
+      "no longer an admin",
+    );
+  });
+
+  test("disabling asks first on its own page (account id and consequence), then runs the passkey check there", async () => {
+    const admin = await makeStaff("admin");
+    const session = await signInDirect(admin.id, { stepUp: true });
+    const mod = await makeStaff("moderator");
+    const other = await makeStaff("admin");
+
+    // The list links to the confirm page; no browser dialog is involved.
+    const list = await (await adminGet("/staff", { cookie: session.cookie })).text();
+    expect(list).toContain(`href="/staff/${mod.id}/disable"`);
+    expect(list).not.toContain("data-confirm");
+    expect(list).not.toContain(`action="/staff/${mod.id}/disable"`);
+    const js = await (await adminGet("/static/passkey.js")).text();
+    expect(js).not.toMatch(/\bconfirm\(/);
+
+    const page = await adminGet(`/staff/${mod.id}/disable`, { cookie: session.cookie });
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain(mod.handle);
+    expect(html).toContain(mod.id);
+    expect(html).toContain("signed out everywhere");
+    expect(html).toContain(`action="/staff/${mod.id}/disable"`);
+    expect(html).toContain('data-step-up="recent"');
+    expect(html).toContain('data-step-up-fresh="1"');
+    // Another admin: the form runs the step-up bound to that account.
+    const adminPage = await (await adminGet(`/staff/${other.id}/disable`, { cookie: session.cookie })).text();
+    expect(adminPage).toContain('data-step-up="action"');
+    expect(adminPage).toContain(`data-step-up-target="${other.id}"`);
+    // Viewing it is recorded as a read of that account; nothing is disabled yet.
+    const reads = await sql<{ target_ref: string }[]>`
+      SELECT target_ref FROM staff_audit WHERE staff_id = ${admin.id} AND action = 'staff_list' AND kind = 'read' AND target_ref IS NOT NULL ORDER BY id`;
+    expect(reads.map((r) => r.target_ref)).toEqual([mod.id, other.id]);
+    const [m] = await sql<{ disabled_at: Date | null }[]>`SELECT disabled_at FROM staff_accounts WHERE id = ${mod.id}`;
+    expect(m!.disabled_at).toBeNull();
+
+    // Not yourself, not an unknown or already disabled account, and not for other roles.
+    expect((await adminGet(`/staff/${admin.id}/disable`, { cookie: session.cookie })).status).toBe(400);
+    expect((await adminGet("/staff/st_aaaaaaaaaaaaaaaaaaaaaaaaaa/disable", { cookie: session.cookie })).status).toBe(404);
+    await disableStaff({ handleOrId: other.id, actor: { staffId: null, channel: "cli" } });
+    expect((await adminGet(`/staff/${other.id}/disable`, { cookie: session.cookie })).status).toBe(400);
+    const modSession = await signInDirect(mod.id);
+    expect((await adminGet(`/staff/${other.id}/disable`, { cookie: modSession.cookie })).status).toBe(403);
+  });
+
   test("re-inviting an existing account asks first, then needs a step-up bound to that account; a reload can't repeat it", async () => {
     const admin = await enrolledStaff("admin");
     const other = await enrolledStaff("admin");
@@ -632,6 +773,11 @@ describe("step-up", () => {
     expect(html).not.toMatch(/\/enroll\/[A-Za-z0-9_-]{43}/);
     expect(await passkeys()).toBe(1);
     expect((await adminGet("/", { cookie: other.session.cookie })).status).toBe(200);
+    // The page shows that account's role and passkey count: recorded as a read of it, like the staff list.
+    const [read] = await sql<{ kind: string; session_id: string; target_kind: string }[]>`
+      SELECT kind, session_id, target_kind FROM staff_audit
+       WHERE staff_id = ${admin.id} AND action = 'staff_list' AND target_ref = ${other.id}`;
+    expect(read).toEqual({ kind: "read", session_id: admin.session.id, target_kind: "staff" });
 
     // A made-up proof, a proof for another action, or for another account: refused, nothing changes.
     expect((await post({ ...form, step_up: "x".repeat(43) })).status).toBe(403);
@@ -712,12 +858,26 @@ describe("step-up", () => {
     expect(row!.n).toBe(6);
   });
 
-  test("step-up refuses a counter that goes backwards, and never rolls the stored counter back", async () => {
+  test("a step-up whose counter went backwards removes the passkey and signs the account out everywhere", async () => {
     const admin = await enrolledStaff("admin");
     expect((await login(admin.auth, { counter: 10 })).status).toBe(200);
-    expect((await stepUp(admin, {}, { counter: 7 })).status).toBe(401);
+    const res = await stepUp(admin, {}, { counter: 7 });
+    expect(res.status).toBe(401);
+    expect(await sql`SELECT 1 FROM staff_passkeys WHERE staff_id = ${admin.id}`).toHaveLength(0);
+    expect(await sql`SELECT 1 FROM staff_sessions WHERE staff_id = ${admin.id} AND revoked_at IS NULL`).toHaveLength(0);
+    const [row] = await sql<{ action: string; session_id: string }[]>`
+      SELECT action, session_id FROM staff_audit WHERE staff_id = ${admin.id} ORDER BY id DESC LIMIT 1`;
+    expect(row).toEqual({ action: "passkey_counter_regression", session_id: admin.session.id });
+    expect(await auditActions(admin.id)).not.toContain("step_up_failed");
+    const [session] = await sql<{ step_up_at: Date | null }[]>`SELECT step_up_at FROM staff_sessions WHERE id = ${admin.session.id}`;
+    expect(session!.step_up_at).toBeNull();
+    expect((await adminGet("/", { cookie: admin.session.cookie })).status).toBe(303);
+  });
+
+  test("step-up never rolls the stored counter back", async () => {
+    const admin = await enrolledStaff("admin");
+    expect((await login(admin.auth, { counter: 10 })).status).toBe(200);
     const counter = async () => Number((await sql<{ counter: string }[]>`SELECT counter FROM staff_passkeys WHERE staff_id = ${admin.id}`)[0]!.counter);
-    expect(await counter()).toBe(10);
 
     // A step-up (counter 12) racing a sign-in that stores 13 first: the step-up fails instead of writing 12 over 13.
     const o = await adminPost("/step-up/options", { cookie: admin.session.cookie, csrf: admin.session.csrf, json: {} });
@@ -925,6 +1085,40 @@ describe("stexx-mod staff", () => {
     expect([...reads]).toEqual([{ kind: "read", channel: "cli", n: 3 }]);
   });
 
+  test("audit shows the log (all, or by and about one handle), newest first, and is itself recorded", async () => {
+    const s = await enrolledStaff("moderator");
+    expect((await login(staffAuthenticator())).status).toBe(401); // an unknown passkey: no staff id
+    await disableStaff({ handleOrId: s.id, actor: { staffId: ops.id, channel: "cli" } });
+
+    const res = await run(["audit", s.handle, "--as", ops.handle]);
+    expect(res.code).toBe(0);
+    const lines = res.out.split("\n");
+    // Newest first: this read itself, the disable (by ops, about s), then s's own sign-in, enrollment and invite.
+    expect(lines.map((l) => l.split(/\s+/)[3])).toEqual(["audit_view", "staff_disable", "login", "staff_enroll", "staff_invite"]);
+    expect(lines[0]).toContain(`by ${ops.handle} (${ops.id})`);
+    expect(lines[0]).toContain(`target staff ${s.handle} (${s.id})`);
+    expect(lines[1]).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ  cli +event +staff_disable/);
+    expect(lines[2]).toContain(`by ${s.handle} (${s.id})`);
+    expect(lines[2]).toContain(`session ${s.session.id}`);
+    expect(lines.at(-1)).toContain("role moderator");
+    expect(res.out).not.toContain(s.auth.credentialId.toString("base64url"));
+
+    const json = JSON.parse((await run(["audit", "--limit", "3", "--json", "--as", ops.handle])).out) as { action: string; staffId: string }[];
+    expect(json).toHaveLength(3);
+    expect(json[0]).toMatchObject({ action: "audit_view", staffId: ops.id });
+    const [row] = await sql<{ kind: string; channel: string; target_ref: string | null }[]>`
+      SELECT kind, channel, target_ref FROM staff_audit WHERE staff_id = ${ops.id} AND action = 'audit_view' ORDER BY id LIMIT 1`;
+    expect(row).toEqual({ kind: "read", channel: "cli", target_ref: s.id });
+
+    // Only an active admin may read it; bad arguments are refused before anything is read.
+    const mod = await makeStaff("moderator");
+    expect((await run(["audit", "--as", mod.handle])).out).toContain("not an active admin");
+    expect((await run(["audit", "--limit", "0", "--as", ops.handle])).code).toBe(1);
+    expect((await run(["audit", "--limit", "x", "--as", ops.handle])).code).toBe(1);
+    expect((await run(["audit", "no-such-" + uniq(), "--as", ops.handle])).out).toContain("No staff account");
+    expect((await run(["audit", "--role", "admin", "--as", ops.handle])).code).toBe(2);
+  });
+
   test("invites and role changes record the role granted, so privilege history can be read back", async () => {
     const s = await makeStaff("support");
     await makeStaff("admin", s.handle); // promoted
@@ -992,18 +1186,18 @@ describe("staff_audit is append-only", () => {
     expect(outcome).toContain("append-only");
   });
 
-  test("deleting a moderation action anonymizes the row's pointer to it and changes nothing else", async () => {
+  test("a moderation action the log points at can't be deleted, and the pointer can't be cleared", async () => {
     const s = await makeStaff("moderator");
     const [action] = await sql<{ id: string }[]>`
       INSERT INTO moderation_actions (actor, action) VALUES (${s.handle}, 'hide') RETURNING id`;
     const id = await staffAudit(sql, { kind: "action", action: "staff_list", channel: "console", staffId: s.id, moderationActionId: action!.id });
     const [before] = await sql`SELECT * FROM staff_audit WHERE id = ${id}`;
     expect(String(before!.moderation_action_id)).toBe(String(action!.id));
-    await sql`DELETE FROM moderation_actions WHERE id = ${action!.id}`;
+    // The application's own role could otherwise erase the decision and silently strip the audit row's pointer to it.
+    expect(await failure(sql`DELETE FROM moderation_actions WHERE id = ${action!.id}`)).toContain("foreign key");
+    expect(await sql`SELECT 1 FROM moderation_actions WHERE id = ${action!.id}`).toHaveLength(1);
     const [after] = await sql`SELECT * FROM staff_audit WHERE id = ${id}`;
-    expect(after!.moderation_action_id).toBeNull();
-    expect({ ...after, moderation_action_id: before!.moderation_action_id } as Record<string, unknown>).toEqual({ ...before! });
-    // A direct UPDATE of that column is still refused.
+    expect({ ...after }).toEqual({ ...before! });
     expect(await failure(sql`UPDATE staff_audit SET moderation_action_id = NULL WHERE id = ${id}`)).toContain("append-only");
   });
 
@@ -1012,6 +1206,10 @@ describe("staff_audit is append-only", () => {
     const oldRead = await backdatedAudit("13 months", { staffId: s.id, kind: "read", action: "staff_list" });
     const newRead = await backdatedAudit("11 months", { staffId: s.id, kind: "read", action: "staff_list" });
     const oldEvent = await backdatedAudit("13 months", { staffId: s.id, kind: "event", action: "login" });
+    // Failed logins: with an unknown passkey (no staff id, only a count) they go after 12 months; a known one is kept.
+    const oldUnknownFail = await backdatedAudit("13 months", { staffId: null, kind: "event", action: "login_failed" });
+    const newUnknownFail = await backdatedAudit("11 months", { staffId: null, kind: "event", action: "login_failed" });
+    const oldStaffFail = await backdatedAudit("13 months", { staffId: s.id, kind: "event", action: "login_failed" });
     const ended = await signInDirect(s.id);
     const live = await signInDirect(s.id);
     await sql`UPDATE staff_sessions SET revoked_at = now() - interval '8 days' WHERE id = ${ended.id}`;
@@ -1022,18 +1220,27 @@ describe("staff_audit is append-only", () => {
     await sql`UPDATE staff_challenges SET expires_at = now() - interval '1 second' WHERE challenge = ${o.challenge}`;
 
     const res = await purgeStaffConsole();
-    expect(res.auditReads).toBeGreaterThanOrEqual(1);
-    const audit = (await sql<{ id: string }[]>`SELECT id FROM staff_audit WHERE id IN ${sql([oldRead, newRead, oldEvent])}`).map((r) => r.id);
-    expect(audit.sort()).toEqual([newRead, oldEvent].sort());
+    expect(res.auditReads).toBeGreaterThanOrEqual(2);
+    const ids = [oldRead, newRead, oldEvent, oldUnknownFail, newUnknownFail, oldStaffFail];
+    const audit = (await sql<{ id: string }[]>`SELECT id FROM staff_audit WHERE id IN ${sql(ids)}`).map((r) => r.id);
+    expect(audit.sort()).toEqual([newRead, oldEvent, newUnknownFail, oldStaffFail].sort());
     const sessions = (await sql<{ id: string }[]>`SELECT id FROM staff_sessions WHERE id IN ${sql([ended.id, live.id])}`).map((r) => r.id);
     expect(sessions).toEqual([live.id]);
     const links = (await sql<{ staff_id: string }[]>`SELECT staff_id FROM staff_enrollments WHERE staff_id IN ${sql([pending.id, used.id])}`).map((r) => r.staff_id);
     expect(links).toEqual([pending.id]);
     expect(await sql`SELECT 1 FROM staff_challenges WHERE challenge = ${o.challenge}`).toHaveLength(0);
-    // A clock pushed into the future (as some retention tests do) never deletes a read row before the database's 12 months.
+
+    // A clock pushed into the future (as some retention tests do) deletes nothing the real clock would keep: no young
+    // read row, no live session, no pending link, no challenge in flight (the table is shared with concurrent runs).
+    const liveChallenge = (await (await adminPost("/login/options", { json: {} })).json()) as { challenge: string };
     const future = await purgeStaffConsole(new Date(Date.now() + 400 * 86_400_000));
     expect(future.auditReads).toBe(0);
-    expect(await sql`SELECT 1 FROM staff_audit WHERE id = ${newRead}`).toHaveLength(1);
+    expect(await sql`SELECT 1 FROM staff_audit WHERE id IN ${sql([newRead, newUnknownFail])}`).toHaveLength(2);
+    expect(await sql`SELECT 1 FROM staff_sessions WHERE id = ${live.id}`).toHaveLength(1);
+    expect(await sql`SELECT 1 FROM staff_enrollments WHERE staff_id = ${pending.id}`).toHaveLength(1);
+    expect(await sql`SELECT 1 FROM staff_challenges WHERE challenge = ${liveChallenge.challenge}`).toHaveLength(1);
+    expect((await adminGet("/", { cookie: live.cookie })).status).toBe(200);
+    expect((await adminGet(`/enroll/${pending.token}`)).status).toBe(200);
   });
 
   test("deleting the account anonymizes the row (ON DELETE SET NULL) and changes nothing else", async () => {

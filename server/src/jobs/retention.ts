@@ -395,12 +395,14 @@ export interface StaffPurgeResult {
 }
 
 /**
- * Staff console housekeeping: old staff_audit read rows (12 months, measured by the database clock like the trigger,
- * never by the injected `now`), console sessions that ended (revoked or expired) a week ago, enrollment links used or
- * expired a week ago, and expired WebAuthn challenges (never ahead of the real clock: a ceremony may be in flight).
- * Staff accounts and every other audit row are kept.
+ * Staff console housekeeping: old staff_audit read rows (12 months, measured by the database clock like the trigger),
+ * console sessions that ended (revoked or expired) a week ago, enrollment links used or expired a week ago, and
+ * expired WebAuthn challenges. Every cutoff is clamped to the database clock: a `now` ahead of it (tests move the clock
+ * forward) never deletes a live session, a pending link, an in-flight ceremony or a young read row. Staff accounts
+ * and every other audit row are kept.
  */
 export async function purgeStaffConsole(now: Date = new Date()): Promise<StaffPurgeResult> {
+  const graceSecs = STAFF_CREDENTIAL_GRACE_MS / 1000;
   const graceCutoff = new Date(now.getTime() - STAFF_CREDENTIAL_GRACE_MS);
   const auditReads = await inBatches(async () => {
     const r = await sql`
@@ -415,7 +417,8 @@ export async function purgeStaffConsole(now: Date = new Date()): Promise<StaffPu
     const r = await sql`
       DELETE FROM staff_sessions WHERE id IN (
         SELECT id FROM staff_sessions
-         WHERE LEAST(COALESCE(revoked_at, 'infinity'), idle_expires_at, absolute_expires_at) <= ${graceCutoff}
+         WHERE LEAST(COALESCE(revoked_at, 'infinity'), idle_expires_at, absolute_expires_at)
+               <= LEAST(${graceCutoff}::timestamptz, now() - make_interval(secs => ${graceSecs}))
          LIMIT ${BATCH})`;
     return r.count;
   });
@@ -423,7 +426,7 @@ export async function purgeStaffConsole(now: Date = new Date()): Promise<StaffPu
     const r = await sql`
       DELETE FROM staff_enrollments WHERE token_hash IN (
         SELECT token_hash FROM staff_enrollments
-         WHERE COALESCE(used_at, expires_at) <= ${graceCutoff}
+         WHERE COALESCE(used_at, expires_at) <= LEAST(${graceCutoff}::timestamptz, now() - make_interval(secs => ${graceSecs}))
          LIMIT ${BATCH})`;
     return r.count;
   });

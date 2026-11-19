@@ -1,5 +1,5 @@
 /**
- * The only writer of staff_audit (migration 124). Both the console (src/admin) and the command line
+ * The only writer (and the reader, readStaffAudit) of staff_audit (migration 124). Both the console (src/admin) and the command line
  * (src/moderation/staff-cli.ts) record through here, so the rules live in one place:
  *   - no free text: every field is an id, a closed-list value or an opaque ticket number;
  *   - never an email address, its HMAC, a transaction id typed into a lookup, a token or an IP address;
@@ -34,12 +34,14 @@ export type StaffAuditAction =
   | "logout"
   | "step_up"
   | "step_up_failed"
+  | "passkey_counter_regression"
   | "staff_invite"
   | "staff_role"
   | "staff_enroll"
   | "staff_disable"
   | "session_revoke"
   | "staff_list"
+  | "audit_view"
   | "dev_login";
 
 export interface StaffAuditEntry {
@@ -94,4 +96,78 @@ export async function staffAudit(db: Sql, entry: StaffAuditEntry): Promise<strin
 /** Outside a transaction: the record stands on its own (failed logins, reads). */
 export function staffAuditNow(entry: StaffAuditEntry): Promise<string> {
   return staffAudit(sql, entry);
+}
+
+export interface StaffAuditRow {
+  id: string;
+  at: Date;
+  channel: AuditChannel;
+  kind: AuditKind;
+  action: string;
+  staffId: string | null;
+  /** The acting staff member's handle (null for a failed login with an unknown passkey, or a bootstrap CLI row). */
+  staffHandle: string | null;
+  sessionId: string | null;
+  role: StaffRole | null;
+  targetKind: AuditTargetKind | null;
+  targetRef: string | null;
+  /** The handle of a staff target. */
+  targetHandle: string | null;
+  targetUserId: string | null;
+  purpose: AuditPurpose | null;
+  ticketRef: string | null;
+  moderationActionId: string | null;
+}
+
+/**
+ * The newest `limit` rows, newest first: everything, or only rows by or about one staff account (`staffId`). The
+ * caller records the read itself (an audit_view row, in the same transaction).
+ */
+export async function readStaffAudit(db: Sql, filter: { staffId?: string | null; limit: number }): Promise<StaffAuditRow[]> {
+  const staffId = filter.staffId ?? null;
+  const rows = await db<{
+    id: string;
+    at: Date;
+    channel: AuditChannel;
+    kind: AuditKind;
+    action: string;
+    staff_id: string | null;
+    staff_handle: string | null;
+    session_id: string | null;
+    role: StaffRole | null;
+    target_kind: AuditTargetKind | null;
+    target_ref: string | null;
+    target_handle: string | null;
+    target_user_id: string | null;
+    purpose: AuditPurpose | null;
+    ticket_ref: string | null;
+    moderation_action_id: string | null;
+  }[]>`
+    SELECT a.id, a.at, a.channel, a.kind, a.action, a.staff_id, s.handle AS staff_handle, a.session_id, a.role,
+           a.target_kind, a.target_ref, t.handle AS target_handle, a.target_user_id, a.purpose, a.ticket_ref,
+           a.moderation_action_id::text AS moderation_action_id
+      FROM staff_audit a
+      LEFT JOIN staff_accounts s ON s.id = a.staff_id
+      LEFT JOIN staff_accounts t ON a.target_kind = 'staff' AND t.id = a.target_ref
+     WHERE ${staffId}::text IS NULL OR a.staff_id = ${staffId} OR (a.target_kind = 'staff' AND a.target_ref = ${staffId})
+     ORDER BY a.id DESC
+     LIMIT ${filter.limit}`;
+  return rows.map((r) => ({
+    id: String(r.id),
+    at: r.at,
+    channel: r.channel,
+    kind: r.kind,
+    action: r.action,
+    staffId: r.staff_id,
+    staffHandle: r.staff_handle,
+    sessionId: r.session_id,
+    role: r.role,
+    targetKind: r.target_kind,
+    targetRef: r.target_ref,
+    targetHandle: r.target_handle,
+    targetUserId: r.target_user_id,
+    purpose: r.purpose,
+    ticketRef: r.ticket_ref,
+    moderationActionId: r.moderation_action_id,
+  }));
 }

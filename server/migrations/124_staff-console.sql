@@ -113,15 +113,17 @@ CREATE TABLE staff_audit (
   purpose               text CHECK (purpose IN ('report_review', 'spam_review', 'photo_review', 'support_ticket',
                                                 'appeal', 'data_request', 'legal', 'escalation')),
   ticket_ref            text CHECK (char_length(ticket_ref) BETWEEN 1 AND 64),
-  moderation_action_id  bigint REFERENCES moderation_actions(id) ON DELETE SET NULL
+  -- No ON DELETE action: a decision the audit log points at can't be deleted (nothing in the app deletes them; account
+  -- deletion and purge keep the row and clear its user and note).
+  moderation_action_id  bigint REFERENCES moderation_actions(id)
 );
 CREATE INDEX staff_audit_target_user_idx ON staff_audit (target_user_id, at);
 CREATE INDEX staff_audit_staff_idx ON staff_audit (staff_id, at);
 CREATE INDEX staff_audit_at_idx ON staff_audit (at);
 
--- Append-only. UPDATE is refused, except the foreign-key actions that anonymize a row: target_user_id or
--- moderation_action_id set to NULL because the row they pointed at was deleted (run by Postgres's referential
--- trigger, so one level below a statement, with every other column unchanged). DELETE is refused, except read rows
+-- Append-only. UPDATE is refused, except the foreign-key action that anonymizes a row: target_user_id set to NULL
+-- because the account it pointed at was deleted (run by Postgres's referential trigger, so one level below a
+-- statement, with every other column unchanged). DELETE is refused, except read rows
 -- and failed logins with an unknown passkey older than 12 months (the retention job; the trigger checks the row's
 -- age, not the caller). TRUNCATE is refused. INSERT always stamps `at` with now(), so a row can't be backdated (or
 -- made deletable at once).
@@ -130,9 +132,8 @@ CREATE FUNCTION staff_audit_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'UPDATE' THEN
     IF pg_trigger_depth() > 1
-       AND (to_jsonb(NEW) - 'target_user_id' - 'moderation_action_id') = (to_jsonb(OLD) - 'target_user_id' - 'moderation_action_id')
-       AND (NEW.target_user_id IS NULL OR NEW.target_user_id IS NOT DISTINCT FROM OLD.target_user_id)
-       AND (NEW.moderation_action_id IS NULL OR NEW.moderation_action_id IS NOT DISTINCT FROM OLD.moderation_action_id)
+       AND (to_jsonb(NEW) - 'target_user_id') = (to_jsonb(OLD) - 'target_user_id')
+       AND NEW.target_user_id IS NULL
     THEN
       RETURN NEW;
     END IF;

@@ -183,22 +183,9 @@ export function StaffPage(props: Signed & { items: StaffListItem[]; flash?: stri
               <td>{s.createdByHandle ?? "command line"}</td>
               <td>
                 {!s.disabledAt && s.id !== props.staff.id ? (
-                  <form
-                    method="post"
-                    action={`/staff/${s.id}/disable`}
-                    class="inline"
-                    data-step-up={s.role === "admin" ? "action" : "recent"}
-                    data-step-up-fresh={s.role !== "admin" && fresh ? "1" : undefined}
-                    data-step-up-action="staff_disable"
-                    data-step-up-target={s.id}
-                    data-confirm={`Disable ${s.handle}? They are signed out everywhere and can't sign in again.`}
-                  >
-                    <CsrfField session={props.session} />
-                    <input type="hidden" name="step_up" value="" />
-                    <button type="submit" class="danger">
-                      Disable
-                    </button>
-                  </form>
+                  <a href={`/staff/${s.id}/disable`} class="danger">
+                    Disable…
+                  </a>
                 ) : null}
               </td>
             </tr>
@@ -258,6 +245,41 @@ export function ReinviteConfirmPage(props: Signed & { target: StaffAccount; role
         <input type="hidden" name="step_up" value="" />
         <button type="submit" class="danger">
           Re-invite {t.handle}
+        </button>{" "}
+        <a href="/staff">Cancel</a>
+      </form>
+      <p id="passkey-error" class="error" role="alert" hidden></p>
+    </Layout>
+  );
+}
+
+/**
+ * Asked before disabling: the account (handle, role and id: a bound step-up is tied to the id) and the consequence,
+ * then the passkey check. Server-rendered, so it works the same whatever the browser does with dialogs.
+ */
+export function DisableConfirmPage(props: Signed & { target: StaffAccount }) {
+  const t = props.target;
+  const fresh = hasRecentStepUp(props.session.stepUpAt);
+  return (
+    <Layout title="Disable?" staff={props.staff} session={props.session}>
+      <p>
+        Disable <strong>{t.handle}</strong> ({t.role}, {t.id})? They are signed out everywhere at once, any pending invite
+        link stops working, and they can't sign in again. The account is kept (the audit log points at it); to bring the
+        person back, invite a new handle.
+        {t.role === "admin" ? " Disabling an admin needs a passkey check for this account." : ""}
+      </p>
+      <form
+        method="post"
+        action={`/staff/${t.id}/disable`}
+        data-step-up={t.role === "admin" ? "action" : "recent"}
+        data-step-up-fresh={t.role !== "admin" && fresh ? "1" : undefined}
+        data-step-up-action="staff_disable"
+        data-step-up-target={t.id}
+      >
+        <CsrfField session={props.session} />
+        <input type="hidden" name="step_up" value="" />
+        <button type="submit" class="danger">
+          Disable {t.handle}
         </button>{" "}
         <a href="/staff">Cancel</a>
       </form>

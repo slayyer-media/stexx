@@ -9,6 +9,8 @@
  *   staff list [<handle>] --as <handle> [--json]
  *   staff disable <handle> --as <handle> --yes [--json]
  *       signs it out everywhere; it can't sign in again. Allowed for the last admin here (break glass).
+ *   staff audit [<handle>] --as <handle> [--limit N] [--json]
+ *       the newest staff_audit rows (default 50), or only those by or about one account. Itself recorded (audit_view).
  *
  * `--as` (or STEXX_MODERATOR) names who is acting. Every command writes a staff_audit row (channel cli) pointing at
  * that account, so once an active admin exists `--as` must be one (cliActorRefusal). Only while there is none
@@ -28,7 +30,7 @@ import {
   type StaffAccount,
   type StaffActor,
 } from "../lib/staff/accounts.ts";
-import { staffAudit } from "../lib/staff/audit.ts";
+import { readStaffAudit, staffAudit, type StaffAuditRow } from "../lib/staff/audit.ts";
 import { checkActor, ModerationError } from "../lib/moderation.ts";
 import { isoDate } from "../lib/time.ts";
 
@@ -40,17 +42,25 @@ export const STAFF_USAGE = `Staff console accounts
                                                 and signs it out everywhere: needs --yes)
   staff list [<handle>] --as <handle> [--json]  every staff account (or one), its role and status
   staff disable <handle> --as <handle> --yes    sign it out everywhere; it can't sign in again
+  staff audit [<handle>] --as <handle> [--limit N] [--json]
+                                                the staff audit log, newest first (default 50 rows): everything, or
+                                                only rows by or about one account (sign-ins, failed ones, step-ups,
+                                                invites, disables, reads). Itself recorded.
 
 --as (or STEXX_MODERATOR) must be an active admin's handle; any handle only while no active admin exists (the first
 one). Handles are 1-64 letters, digits, dot, dash or underscore. Never a real name.`;
 
-const VALUE_FLAGS = new Set(["--as", "--role"]);
+const VALUE_FLAGS = new Set(["--as", "--role", "--limit"]);
 const BOOL_FLAGS = new Set(["--json", "--yes", "--help"]);
 const ALLOWED: Record<string, string[]> = {
   invite: ["--as", "--role", "--yes", "--json"],
   list: ["--as", "--json"],
   disable: ["--as", "--yes", "--json"],
+  audit: ["--as", "--limit", "--json"],
 };
+
+const AUDIT_DEFAULT_LIMIT = 50;
+const AUDIT_MAX_LIMIT = 1000;
 
 function parse(argv: string[]) {
   const [command = "help", ...rest] = argv;
@@ -109,6 +119,22 @@ async function actorOf(flags: Map<string, string | true>, env: Record<string, st
 
 const day = (d: Date | null) => (d ? isoDate(d).slice(0, 10) : "-");
 
+/** One audit row on one line: time, channel, kind, action, who, then whatever the row says about its target. */
+function auditLine(r: StaffAuditRow): string {
+  const who = r.staffHandle ? `${r.staffHandle} (${r.staffId})` : r.staffId ?? "-";
+  const parts = [isoDate(r.at), r.channel.padEnd(7), r.kind.padEnd(6), r.action.padEnd(27), `by ${who}`];
+  if (r.targetKind) {
+    parts.push(`target ${r.targetKind} ${r.targetHandle ? `${r.targetHandle} (${r.targetRef})` : (r.targetRef ?? "-")}`);
+  }
+  if (r.targetUserId) parts.push(`account ${r.targetUserId}`);
+  if (r.role) parts.push(`role ${r.role}`);
+  if (r.purpose) parts.push(`purpose ${r.purpose}`);
+  if (r.ticketRef) parts.push(`ticket ${r.ticketRef}`);
+  if (r.moderationActionId) parts.push(`decision #${r.moderationActionId}`);
+  if (r.sessionId) parts.push(`session ${r.sessionId}`);
+  return parts.join("  ");
+}
+
 /** Run `staff <command>`. Returns the exit code (0 ok, 1 refused, 2 usage). */
 export async function runStaffCli(
   argv: string[],
@@ -148,6 +174,34 @@ export async function runStaffCli(
           const status = s.disabledAt ? `disabled ${day(s.disabledAt)}` : s.passkeys > 0 ? "active" : s.invitePending ? "invited" : "no passkey";
           out(`${s.handle.padEnd(24)} ${s.role.padEnd(10)} ${status.padEnd(20)} ${s.passkeys} passkey(s)  last sign-in ${day(s.lastLoginAt)}  ${s.id}`);
         }
+        return 0;
+      }
+      case "audit": {
+        const actor = await actorOf(p.flags, env);
+        const limitFlag = p.flags.get("--limit");
+        const limit = typeof limitFlag === "string" ? Number(limitFlag) : AUDIT_DEFAULT_LIMIT;
+        if (!Number.isInteger(limit) || limit < 1 || limit > AUDIT_MAX_LIMIT) {
+          throw new StaffError(`--limit must be a whole number from 1 to ${AUDIT_MAX_LIMIT}.`);
+        }
+        const handle = p.positional[0];
+        const subject = handle ? await findStaff(handle) : null;
+        if (handle && !subject) throw new StaffError(`No staff account ${handle}.`);
+        const rows = await sql.begin(async (tx) => {
+          await staffAudit(tx, {
+            kind: "read",
+            action: "audit_view",
+            channel: "cli",
+            staffId: actor.staffId,
+            targetKind: subject ? "staff" : null,
+            targetRef: subject?.id ?? null,
+          });
+          return readStaffAudit(tx, { staffId: subject?.id ?? null, limit });
+        });
+        if (json) {
+          out(JSON.stringify(rows.map((r) => ({ ...r, at: isoDate(r.at) })), null, 2));
+          return 0;
+        }
+        for (const r of rows) out(auditLine(r));
         return 0;
       }
       case "invite": {

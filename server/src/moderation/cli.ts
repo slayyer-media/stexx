@@ -12,7 +12,7 @@
  *   bun scripts/moderate.ts log [<profileID>] [--limit N] [--json]
  *   bun scripts/moderate.ts photos list|show|clear|hide|blocklist|hide-account|ban …   (photos-cli.ts)
  *   bun scripts/moderate.ts alerts status|test                                         (photos-cli.ts)
- *   bun scripts/moderate.ts staff invite|list|disable …                                (staff-cli.ts)
+ *   bun scripts/moderate.ts staff invite|list|disable|audit …                          (staff-cli.ts)
  *
  * `--as` (or STEXX_MODERATOR) is the moderator's handle for the audit log; use a handle, never a real name.
  * The CLI never prints location data and never shows message threads: only what reporters chose to share.

@@ -6,13 +6,16 @@
  *                               removes that account's passkeys and hands this admin a link to enroll as it, so it
  *                               needs a step-up bound to the action and the account (field `step_up`), spent in the
  *                               same transaction as the re-invite. A reload of the result can't repeat it.
+ *   GET  /staff/:id/disable     the confirm page: the account (handle, role, id), the consequence, and the passkey
+ *                               check (audited as a read of that account)
  *   POST /staff/:id/disable     disable; needs a recent step-up, and for another admin a step-up bound to this
  *                               action and target (field `step_up`), spent in the same transaction as the disable
+ * A change whose acting admin was disabled (or demoted) while the request was in flight is refused (403).
  * The rules (handle format, last admin, never yourself) live in lib/staff/accounts.ts, shared with the CLI.
  */
 import { config } from "../../config.ts";
 import { sql } from "../../db/sql.ts";
-import { notFound } from "../../lib/errors.ts";
+import { forbidden, notFound } from "../../lib/errors.ts";
 import {
   checkStaffRole,
   disableStaff,
@@ -20,14 +23,16 @@ import {
   findStaff,
   inviteStaff,
   listStaff,
+  StaffActorError,
   StaffError,
   type StaffAccount,
+  type StaffListItem,
 } from "../../lib/staff/accounts.ts";
 import { staffAudit } from "../../lib/staff/audit.ts";
 import { spendActionStepUp } from "../auth/stepup.ts";
 import { stepUpRequired, type AdminRoutes } from "../guard.ts";
 import { render } from "../render.ts";
-import { InviteCreatedPage, ReinviteConfirmPage, StaffPage } from "../views/pages.tsx";
+import { DisableConfirmPage, InviteCreatedPage, ReinviteConfirmPage, StaffPage } from "../views/pages.tsx";
 import type { Context } from "hono";
 import type { AdminEnv } from "../env.ts";
 
@@ -41,6 +46,32 @@ async function staffPage(c: Context<AdminEnv>, opts: { flash?: string | null; er
     return listStaff(tx);
   });
   return render(c, StaffPage({ staff, session, items, flash: opts.flash ?? null, error: opts.error ?? null }), opts.status ?? 200);
+}
+
+/** One staff account's list entry, read in a transaction that records the read (staff_list, targeting that account). */
+async function readStaffAccount(c: Context<AdminEnv>, target: { id: string; handle: string }): Promise<StaffListItem | null> {
+  const staff = c.get("staff")!;
+  const session = c.get("session")!;
+  const [item] = await sql.begin(async (tx) => {
+    await staffAudit(tx, {
+      kind: "read",
+      action: "staff_list",
+      channel: "console",
+      staffId: staff.id,
+      sessionId: session.id,
+      targetKind: "staff",
+      targetRef: target.id,
+    });
+    return listStaff(tx, { handle: target.handle });
+  });
+  return item && item.id === target.id ? item : null;
+}
+
+/** A refusal from lib/staff/accounts.ts: the acting admin lost the right meanwhile (403), or a rule said no (400). */
+function staffRefusal(c: Context<AdminEnv>, err: unknown) {
+  if (err instanceof StaffActorError) throw forbidden(err.message);
+  if (err instanceof StaffError) return staffPage(c, { error: err.message, status: 400 });
+  throw err;
 }
 
 const formString = (v: unknown) => (typeof v === "string" ? v.trim() : "");
@@ -97,12 +128,26 @@ export function registerStaffRoutes(r: AdminRoutes): void {
     } catch (err) {
       if (err instanceof ReinviteNeedsConfirm) {
         checkStaffRole(role); // already checked by inviteStaff; narrows the type
-        const [item] = await listStaff(sql, { handle: err.target.handle });
+        // The invite's transaction rolled back, so this page's view of the account is recorded here.
+        const item = await readStaffAccount(c, err.target);
         return render(c, ReinviteConfirmPage({ staff, session, target: err.target, role, passkeys: item?.passkeys ?? 0 }));
       }
-      if (err instanceof StaffError) return staffPage(c, { error: err.message, status: 400 });
-      throw err;
+      return staffRefusal(c, err);
     }
+  });
+
+  r.get("/staff/:id/disable", "staff_manage", async (c) => {
+    const staff = c.get("staff")!;
+    const session = c.get("session")!;
+    const id = c.req.param("id") ?? "";
+    if (!STAFF_ID_RE.test(id)) throw notFound();
+    const found = await findStaff(id);
+    if (!found || found.id !== id) throw notFound();
+    if (found.id === staff.id) return staffPage(c, { error: "You can't disable yourself. Ask another admin.", status: 400 });
+    const target = await readStaffAccount(c, found);
+    if (!target) throw notFound();
+    if (target.disabledAt) return staffPage(c, { error: `${target.handle} is already disabled.`, status: 400 });
+    return render(c, DisableConfirmPage({ staff, session, target }));
   });
 
   r.post("/staff/:id/disable", "staff_manage", async (c) => {
@@ -134,8 +179,7 @@ export function registerStaffRoutes(r: AdminRoutes): void {
         },
       });
     } catch (err) {
-      if (err instanceof StaffError) return staffPage(c, { error: err.message, status: 400 });
-      throw err;
+      return staffRefusal(c, err);
     }
     return c.redirect("/staff?done=disabled", 303);
   });

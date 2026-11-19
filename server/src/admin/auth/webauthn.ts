@@ -8,6 +8,7 @@ import { z } from "zod";
 import { sql, type Sql } from "../../db/sql.ts";
 import { badRequest } from "../../lib/errors.ts";
 import { clientKey, consume } from "../../lib/ratelimit.ts";
+import { staffAudit } from "../../lib/staff/audit.ts";
 import { MINUTE } from "../../lib/time.ts";
 
 export const CHALLENGE_TTL_MS = 5 * MINUTE;
@@ -118,4 +119,40 @@ export async function takeChallenge(challenge: string, kind: ChallengeInput["kin
      WHERE challenge = ${challenge} AND kind = ${kind} AND expires_at > now() AND verified_at IS NULL
     RETURNING challenge, kind, staff_id, session_id, enrollment_hash, bound_action, bound_target`;
   return row ?? null;
+}
+
+// ---- Signature counter ---------------------------------------------------------------------------------------------
+
+/**
+ * WebAuthn's signature-counter rule: a counter that doesn't go up means the authenticator was copied (synced passkeys
+ * always send 0, so they never trip it). The ceremonies check it themselves, AFTER the signature verified: the library
+ * checks it before the signature, so its error can't tell a copy of the key from any forged assertion, and acting on
+ * that would let anyone who knows a credential id lock its owner out. They pass the library counter 0, which turns
+ * its own check off.
+ */
+export function counterWentBack(newCounter: number, storedCounter: number): boolean {
+  return (newCounter > 0 || storedCounter > 0) && newCounter <= storedCounter;
+}
+
+/**
+ * A verified assertion whose counter went backwards: someone else holds a copy of this passkey, and whoever used it
+ * first may already be signed in. In one transaction: remove the passkey (its owner needs a re-invite), sign the
+ * account out everywhere, void its pending step-up proofs, and record passkey_counter_regression (not an ordinary
+ * failed attempt, so an admin can see it). The caller then answers like any failed attempt.
+ */
+export async function lockOutCopiedPasskey(input: { staffId: string; credentialId: string; sessionId?: string | null }): Promise<void> {
+  await sql.begin(async (tx) => {
+    // The account row first, like sign-in and every staff change, so this never deadlocks with them.
+    await tx`SELECT id FROM staff_accounts WHERE id = ${input.staffId} FOR NO KEY UPDATE`;
+    await tx`DELETE FROM staff_passkeys WHERE id = ${input.credentialId} AND staff_id = ${input.staffId}`;
+    await tx`UPDATE staff_sessions SET revoked_at = now() WHERE staff_id = ${input.staffId} AND revoked_at IS NULL`;
+    await tx`DELETE FROM staff_challenges WHERE staff_id = ${input.staffId}`;
+    await staffAudit(tx, {
+      kind: "event",
+      action: "passkey_counter_regression",
+      channel: "console",
+      staffId: input.staffId,
+      sessionId: input.sessionId ?? null,
+    });
+  });
 }

@@ -91,7 +91,6 @@
     for (const form of document.querySelectorAll("form[data-step-up]")) {
       form.addEventListener("submit", guarded(async () => {
         const d = form.dataset;
-        if (d.confirm && !confirm(d.confirm)) return;
         if (d.stepUp === "recent" && d.stepUpFresh === "1") return form.submit();
         const bound = d.stepUp === "action" ? { action: d.stepUpAction, target: d.stepUpTarget } : {};
         const res = await post("/step-up/verify", await assertion(await post("/step-up/options", bound)));

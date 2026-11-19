@@ -778,6 +778,19 @@ function adminConfig(e: z.infer<typeof envSchema>, env: Record<string, string | 
     if (rpId === e.WEBAUTHN_RP_ID.toLowerCase()) {
       throw new ConfigError("ADMIN_RP_ID must differ from WEBAUTHN_RP_ID (staff passkeys must never work on the app, and the reverse)");
     }
+    // WebAuthn refuses an IP address (or a single-label name) as a relying party id: the console would boot, pass
+    // every check, and nobody could ever enroll or sign in.
+    if (parseIp(rpId) !== null || !rpId.includes(".")) {
+      throw new ConfigError("ADMIN_ORIGIN must use the console's private hostname (e.g. its tailnet name), not an IP address");
+    }
+    const publicHosts = [e.MEDIA_BASE_URL, e.APP_LINK_BASE, ...e.WEBAUTHN_ORIGINS.split(",")].map((u) => {
+      try {
+        return new URL(u.trim()).hostname.toLowerCase();
+      } catch {
+        return "";
+      }
+    });
+    if (publicHosts.includes(rpId)) throw new ConfigError("ADMIN_ORIGIN must not be one of the public hosts (the console is private)");
   }
   const cidrText = e.ADMIN_ALLOWED_CIDRS ?? (isProduction ? TAILSCALE_CIDRS : DEV_ADMIN_CIDRS);
   const allowedCidrs: Cidr[] = [];

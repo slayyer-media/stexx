@@ -4,7 +4,7 @@
  * headers on every page.
  */
 import { beforeAll, describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { config, ConfigError, loadConfig } from "../src/config.ts";
 import { ADMIN_CSP } from "../src/admin/headers.ts";
@@ -120,6 +120,26 @@ function filesUnder(dir: string): string[] {
   return out;
 }
 
+/** Never read by console code: location, message content, the social graph, email lookups, spam evidence. */
+const FORBIDDEN_TABLES =
+  /\b(locations|travel_locations|effective_locations|messages|conversations|conversation_members|favorites|taps|blocks|profile_views|email_hmac|spam_message_features|spam_contacts)\b/g;
+
+/**
+ * Forbidden table names used in SQL in `source`: inside a template literal with an upper-case SQL keyword (whole statement, so
+ * across lines and comma joins), as an identifier helper (`sql("t")`), or in `.unsafe("...")`. Comments are ignored.
+ */
+function forbiddenTableUses(source: string): string[] {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const sqlTexts: string[] = [];
+  for (const m of code.matchAll(/`(?:\\[\s\S]|[^`\\])*`/g)) {
+    if (/\b(SELECT|FROM|JOIN|INTO|UPDATE|DELETE|TABLE)\b/.test(m[0])) sqlTexts.push(m[0]);
+  }
+  for (const m of code.matchAll(/\b(?:sql|tx|db)(?:\.unsafe)?\s*\(\s*(["'`])([^"'`]*)\1/g)) sqlTexts.push(m[2]!);
+  const found = new Set<string>();
+  for (const text of sqlTexts) for (const m of text.matchAll(FORBIDDEN_TABLES)) found.add(m[1]!);
+  return [...found].sort();
+}
+
 describe("isolation from the public API", () => {
   test("createApp() (the public API) has none of the console's routes", async () => {
     const pub = await getApp();
@@ -153,16 +173,27 @@ describe("isolation from the public API", () => {
   });
 
   test("the console never queries location, messages or the social graph", () => {
-    const forbidden = /\b(locations|travel_locations|effective_locations|messages|conversations|conversation_members|favorites|taps|blocks|profile_views|email_hmac|spam_message_features|spam_contacts)\b/;
-    const hits = filesUnder(join(SERVER, "src", "admin"))
-      .filter((f) => !f.endsWith(".css"))
-      .flatMap((f) =>
-        readFileSync(f, "utf8")
-          .split("\n")
-          .filter((line) => /\b(FROM|JOIN|INTO|UPDATE)\b/.test(line) && forbidden.test(line))
-          .map((line) => `${relative(SERVER, f)}: ${line.trim()}`),
-      );
+    // Its own code, and the shared modules it imports (lib/staff; lib/support.ts once the lookup lands, which alone
+    // may use email_hmac).
+    const files = [...filesUnder(join(SERVER, "src", "admin")), ...filesUnder(join(SERVER, "src", "lib", "staff"))];
+    const support = join(SERVER, "src", "lib", "support.ts");
+    if (existsSync(support)) files.push(support);
+    const allowed: Record<string, string[]> = { [join("src", "lib", "support.ts")]: ["email_hmac"] };
+    const hits = files.flatMap((f) => {
+      const rel = relative(SERVER, f);
+      return forbiddenTableUses(readFileSync(f, "utf8"))
+        .filter((t) => !(allowed[rel] ?? []).includes(t))
+        .map((t) => `${rel}: ${t}`);
+    });
     expect(hits).toEqual([]);
+  });
+
+  test("that check sees a statement across lines, a comma join and an identifier helper (and not prose)", () => {
+    expect(forbiddenTableUses("await tx`SELECT r.id FROM reports r,\n  locations l WHERE l.user_id = r.user_id`;")).toEqual(["locations"]);
+    expect(forbiddenTableUses("await sql`SELECT 1 FROM reports r LEFT JOIN\n  messages m ON m.id = r.id`;")).toEqual(["messages"]);
+    expect(forbiddenTableUses('await sql`SELECT * FROM ${sql("taps")}`;')).toEqual(["taps"]);
+    expect(forbiddenTableUses("await sql.unsafe('select * from blocks');")).toEqual(["blocks"]);
+    expect(forbiddenTableUses("// SELECT * FROM messages\n/* JOIN favorites */ const t = `No messages yet`;")).toEqual([]);
   });
 });
 
@@ -206,6 +237,14 @@ describe("config", () => {
     expect(() => loadConfig({ ...prod, ...console_, ADMIN_RP_ID: "other.example" })).toThrow(/host of ADMIN_ORIGIN/);
     expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: "https://stexx.gay" })).toThrow(/differ from WEBAUTHN_RP_ID/);
     expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: "https://localhost" })).toThrow(ConfigError);
+    // WebAuthn can't use an IP address or a single-label name as the relying party: nobody could ever sign in.
+    for (const origin of ["https://100.64.1.2:8443", "https://[fd7a:115c:a1e0::1]:8443", "https://stexx-admin:8443"]) {
+      expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: origin })).toThrow(/hostname/);
+    }
+    // Nor one of the public hosts.
+    for (const origin of ["https://media.stexx.gay:8443", "https://app.stexx.gay"]) {
+      expect(() => loadConfig({ ...prod, WEBAUTHN_ORIGINS: "https://stexx.gay,https://app.stexx.gay", ADMIN_ORIGIN: origin })).toThrow(/public hosts/);
+    }
     expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: "https://stexx-admin.example.ts.net/console" })).toThrow(/origin only/);
     expect(() => loadConfig({ ...prod, ADMIN_RP_ID: "stexx-admin.example.ts.net" })).toThrow(/without ADMIN_ORIGIN/);
     expect(() => loadConfig({ ...prod, ...console_, ADMIN_ALLOWED_CIDRS: "100.64.0.0/33" })).toThrow(/CIDR/);
@@ -330,6 +369,18 @@ describe("headers", () => {
     expect(css.headers.get("Content-Type")).toBe("text/css; charset=utf-8");
     expect((await adminGet("/static/..%2Fapp.ts")).status).toBe(404);
     expect((await adminGet("/static/other.js")).status).toBe(404);
+    // Names of Object.prototype members are unknown files too (not an inherited value and a 500).
+    for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      expect({ name, status: (await adminGet(`/static/${name}`)).status }).toEqual({ name, status: 404 });
+    }
+  });
+
+  test("an unknown or inherited ?done= value on /login shows no flash", async () => {
+    for (const done of ["constructor", "__proto__", "toString", "nope"]) {
+      const html = await (await adminGet(`/login?done=${done}`)).text();
+      expect({ done, flash: html.includes('class="flash"') }).toEqual({ done, flash: false });
+    }
+    expect(await (await adminGet("/login?done=signed_out")).text()).toContain("Signed out.");
   });
 
   test("bodies over 64 KB are refused", async () => {

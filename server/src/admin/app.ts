@@ -30,10 +30,11 @@ import { ErrorPage } from "./views/pages.tsx";
 /** Forms and passkey JSON are small; nothing is uploaded to the console. */
 export const ADMIN_BODY_LIMIT = 64 * 1024;
 
-const STATIC: Record<string, { type: string; body: string }> = {
-  "passkey.js": { type: "text/javascript; charset=utf-8", body: readFileSync(new URL("./static/passkey.js", import.meta.url), "utf8") },
-  "console.css": { type: "text/css; charset=utf-8", body: readFileSync(new URL("./static/console.css", import.meta.url), "utf8") },
-};
+/** A Map, not an object literal: a name like `constructor` or `__proto__` must miss, not find an inherited value. */
+const STATIC = new Map<string, { type: string; body: string }>([
+  ["passkey.js", { type: "text/javascript; charset=utf-8", body: readFileSync(new URL("./static/passkey.js", import.meta.url), "utf8") }],
+  ["console.css", { type: "text/css; charset=utf-8", body: readFileSync(new URL("./static/console.css", import.meta.url), "utf8") }],
+]);
 
 async function errorOut(c: Context<AdminEnv>, status: ContentfulStatusCode, code: string, message: string): Promise<Response> {
   const wantsJson = c.get("json") ?? (c.req.header("Content-Type") ?? "").startsWith("application/json");
@@ -77,7 +78,7 @@ export async function createAdminApp(): Promise<AdminApp> {
 
   const r = new AdminRoutes(app);
   r.get("/static/:file", "public", (c) => {
-    const file = STATIC[c.req.param("file") ?? ""];
+    const file = STATIC.get(c.req.param("file") ?? "");
     if (!file) return errorOut(c, 404, "not_found", "Not found.");
     return c.body(file.body, 200, { "Content-Type": file.type });
   });
