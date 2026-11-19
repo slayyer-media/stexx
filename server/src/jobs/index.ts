@@ -1,4 +1,5 @@
 import { logError, logInfo } from "../lib/logger.ts";
+import { alertChannels, runModeratorAlerts } from "../lib/moderator-alerts.ts";
 import { runPhotoChecks } from "../lib/photocheck/index.ts";
 import { MINUTE } from "../lib/time.ts";
 import {
@@ -13,6 +14,7 @@ import {
 export * from "./retention.ts";
 
 export const PHOTO_CHECK_INTERVAL_MS = 1 * MINUTE;
+export const MODERATOR_ALERT_INTERVAL_MS = 1 * MINUTE;
 
 /** Flatten a job result (numbers, possibly nested) into counts for logging. */
 function flatten(value: unknown, prefix = "result", out: Record<string, number> = {}): Record<string, number> {
@@ -57,6 +59,11 @@ export function startJobs(): () => void {
   every("orphans", ORPHAN_INTERVAL_MS, () => sweepOrphanMedia(), 60_000);
   // Retries unchecked photos (model missing/busy at upload) and backfills hashes of older photos.
   every("photoChecks", PHOTO_CHECK_INTERVAL_MS, () => runPhotoChecks(), 20_000);
+  // Moderator alert digests (off unless MODERATOR_ALERT_EMAIL or MODERATOR_ALERT_WEBHOOK_URL is set). The task logs
+  // its own sent/failed events; the result counts are not logged.
+  if (alertChannels().length > 0) {
+    every("moderatorAlerts", MODERATOR_ALERT_INTERVAL_MS, async () => void (await runModeratorAlerts()), 30_000);
+  }
 
   return () => {
     stopped = true;

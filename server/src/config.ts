@@ -91,6 +91,16 @@ const envSchema = z.object({
   REPORT_EVIDENCE_RETENTION_DAYS: z.coerce.number().min(1).max(365).default(30),
   REPORT_EVIDENCE_MAX_DAYS: z.coerce.number().min(1).max(3650).default(180),
 
+  // Moderator alerts (src/lib/moderator-alerts.ts, docs/security.md section 5). Off unless one channel is set.
+  /** Address(es) for alert digests, comma-separated. Needs SMTP_URL. */
+  MODERATOR_ALERT_EMAIL: z.string().optional(),
+  /** Generic JSON POST target (e.g. a self-hosted ntfy topic or Matrix webhook bridge). */
+  MODERATOR_ALERT_WEBHOOK_URL: z.string().optional(),
+  /** At most one alert digest per channel per this many minutes. */
+  MODERATOR_ALERT_INTERVAL_MINUTES: z.coerce.number().int().min(1).max(1440).default(15),
+  /** Report reasons that are high priority (comma list). */
+  MODERATOR_ALERT_REASONS: z.string().optional(),
+
   // ---- Photo checks (docs/security.md "Photo checks") ----
   /** auto: use the NSFW model if its file is present (default; "off" in tests) · off: never classify. */
   PHOTO_CLASSIFIER: z.enum(["auto", "off"]).optional(),
@@ -153,6 +163,7 @@ export interface Config {
   antiSpam: AntiSpamConfig;
   moderation: ModerationConfig;
   photoChecks: PhotoChecksConfig;
+  moderatorAlerts: ModeratorAlertsConfig;
   e2e: E2eConfig;
   /** Dev-only auth shortcuts (/auth/register returns a Session, /v1/dev/* mounted). Never true in production. */
   devAuth: boolean;
@@ -174,6 +185,28 @@ export interface PhotoChecksConfig {
   blocklistPath: string | null;
   /** Parsed at load, so a malformed file fails the boot (and deploy's boot check). */
   blocklist: BlocklistEntry[];
+}
+
+/** Report reasons (same list as validation.ts reportReasonSchema; a test keeps them in sync). */
+export const REPORT_REASONS = [
+  "underage",
+  "harassment",
+  "spam",
+  "fakeProfile",
+  "threatsOrViolence",
+  "illegalContent",
+  "other",
+] as const;
+export const DEFAULT_ALERT_REASONS = ["underage", "threatsOrViolence", "illegalContent"] as const;
+
+export interface ModeratorAlertsConfig {
+  /** Recipients of the email digest (empty = email channel off). */
+  emails: string[];
+  /** JSON POST target, or null (webhook channel off). Never logged: it may carry a secret. */
+  webhookUrl: string | null;
+  intervalMinutes: number;
+  /** Open reports with one of these reasons are alerted. */
+  reasons: string[];
 }
 
 export type AttestationMode = "off" | "dev" | "enforce";
@@ -353,6 +386,39 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     }
   }
 
+  // ---- Moderator alerts ----
+  const alertEmails = (e.MODERATOR_ALERT_EMAIL ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const addr of alertEmails) {
+    if (!/^[^\s@,<>]+@[^\s@,<>]+\.[^\s@,<>]+$/.test(addr)) throw new ConfigError("MODERATOR_ALERT_EMAIL: not an email address");
+  }
+  if (alertEmails.length > 5) throw new ConfigError("MODERATOR_ALERT_EMAIL: at most 5 addresses");
+  if (alertEmails.length > 0 && !e.SMTP_URL) throw new ConfigError("MODERATOR_ALERT_EMAIL needs SMTP_URL");
+  let webhookUrl: string | null = null;
+  if (e.MODERATOR_ALERT_WEBHOOK_URL) {
+    let u: URL;
+    try {
+      u = new URL(e.MODERATOR_ALERT_WEBHOOK_URL);
+    } catch {
+      throw new ConfigError("MODERATOR_ALERT_WEBHOOK_URL: not a URL");
+    }
+    if (u.protocol !== "https:" && u.protocol !== "http:") throw new ConfigError("MODERATOR_ALERT_WEBHOOK_URL: http(s) only");
+    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname);
+    if (isProduction && u.protocol !== "https:" && !loopback) {
+      throw new ConfigError("MODERATOR_ALERT_WEBHOOK_URL must be https in production (or a loopback address)");
+    }
+    webhookUrl = u.toString();
+  }
+  const alertReasons = (e.MODERATOR_ALERT_REASONS ?? DEFAULT_ALERT_REASONS.join(","))
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const r of alertReasons) {
+    if (!(REPORT_REASONS as readonly string[]).includes(r)) throw new ConfigError(`MODERATOR_ALERT_REASONS: unknown reason ${r}`);
+  }
+
   let devDefaultLocation: Config["devDefaultLocation"] = null;
   if (!isProduction && e.STEXX_DEV_DEFAULT_LOCATION) {
     const loc = latLon.safeParse(e.STEXX_DEV_DEFAULT_LOCATION);
@@ -431,6 +497,12 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       duplicateMaxDistance: e.PHOTO_DUPLICATE_MAX_DISTANCE,
       blocklistPath: e.PHOTO_HASH_BLOCKLIST || null,
       blocklist,
+    },
+    moderatorAlerts: {
+      emails: alertEmails,
+      webhookUrl,
+      intervalMinutes: e.MODERATOR_ALERT_INTERVAL_MINUTES,
+      reasons: alertReasons,
     },
     e2e: {
       mode: e.E2E_MODE ?? (isProduction ? "off" : "optional"),

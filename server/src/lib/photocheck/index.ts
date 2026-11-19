@@ -114,7 +114,7 @@ export async function flagPhotoMatches(
   const h = phashToDb(photo.phash);
   // Serialize flagging across all accounts until commit: two accounts uploading the same photo at the same moment
   // would otherwise each miss the other's uncommitted row. Uploads only hold it for this scan and the commit.
-  await db`SELECT pg_advisory_xact_lock(${FLAG_LOCK_KEY})`;
+  await lockPhotoFlagging(db);
   // Linear scan with bit_count (Postgres 14+): at most 6 photos per account keeps this cheap for a long time.
   const dups = await db`
     INSERT INTO photo_flags (photo_id, owner_id, kind, distance, matched_photo_id, matched_owner_id)
@@ -137,7 +137,26 @@ export async function flagPhotoMatches(
       RETURNING id`;
     n += rows.length;
   }
-  return n;
+  // Hashes moderators added from the CLI (photo_hash_blocklist, migration 114). Same unique index as the file entries.
+  const listed = await db`
+    INSERT INTO photo_flags (photo_id, owner_id, kind, distance, blocklist_hash, blocklist_label)
+    SELECT ${photo.id}, ${photo.ownerId}, 'blocklist', b.distance, b.hash, b.label
+      FROM (SELECT hash, label, bit_count((hash # ${h}::bigint)::bit(64))::int AS distance
+              FROM photo_hash_blocklist) b
+     WHERE b.distance <= ${max}
+     ORDER BY b.distance
+    ON CONFLICT DO NOTHING
+    RETURNING id`;
+  return n + listed.length;
+}
+
+/**
+ * Take the lock that serializes photo flagging (uploads, the background job, and moderators adding a hash to the
+ * blocklist), so a new blocklist entry and a concurrent upload of the same photo can't miss each other.
+ * Transaction-scoped: call inside a transaction.
+ */
+export async function lockPhotoFlagging(db: Sql): Promise<void> {
+  await db`SELECT pg_advisory_xact_lock(${FLAG_LOCK_KEY})`;
 }
 
 export interface PhotoCheckRun {
