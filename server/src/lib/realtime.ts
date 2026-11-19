@@ -166,3 +166,19 @@ function safeClose(conn: Connection, code: number, reason: string) {
     // already closed
   }
 }
+
+/**
+ * Close every live socket, e.g. on shutdown with 1012 ("service restart"): clients reconnect with backoff and
+ * refetch, as after any drop. Returns how many sockets were closed.
+ */
+export function closeAllConnections(code = 1012, reason = "restarting"): number {
+  let closed = 0;
+  for (const set of [...byUser.values()]) {
+    for (const conn of [...set]) {
+      removeConnection(conn);
+      safeClose(conn, code, reason);
+      closed += 1;
+    }
+  }
+  return closed;
+}
