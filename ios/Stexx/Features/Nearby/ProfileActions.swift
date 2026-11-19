@@ -31,7 +31,7 @@ final class ProfileActions {
         } catch {
             // Only undo our own flip; a later tap may have changed it again.
             if profile.isFavorite == newValue { profile.isFavorite = !newValue }
-            toast = UserFacingError.message(
+            toast = Self.message(
                 for: error,
                 failedAction: newValue
                     ? String(localized: "Couldn't add to favorites.")
@@ -49,7 +49,7 @@ final class ProfileActions {
             try await api.sendTap(to: profile.id)
         } catch {
             didTap = false
-            toast = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't send the tap."))
+            toast = Self.message(for: error, failedAction: String(localized: "Couldn't send the tap."))
         }
     }
 
@@ -64,9 +64,19 @@ final class ProfileActions {
             try await api.block(profileID: profile.id)
             return true
         } catch {
-            blockFailure = UserFacingError.message(for: error)
+            blockFailure = Self.message(for: error)
                 ?? String(localized: "The block didn't go through.")
             return false
         }
+    }
+
+    /// `UserFacingError`, except that a 404 here means the profile itself
+    /// is gone (deleted, hidden, or it blocked you; the server doesn't say
+    /// which).
+    private static func message(for error: any Error, failedAction: String? = nil) -> String? {
+        if case APIError.notFound = error {
+            return String(localized: "This profile is no longer available.")
+        }
+        return UserFacingError.message(for: error, failedAction: failedAction)
     }
 }

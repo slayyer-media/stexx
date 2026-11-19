@@ -10,6 +10,8 @@ import SwiftUI
 /// - 403 (`account_under_review`, anti-spam limits): the server's own
 ///   message, which is written for people.
 /// - Offline or unreachable: asks to check the connection.
+/// - 404: a neutral "no longer exists" (screens that know what's gone, like
+///   a profile, word it themselves).
 /// - Anything else: a generic "Try again".
 ///
 /// Returns `nil` for cancellations (a screen closed mid-request), which
@@ -33,7 +35,10 @@ enum UserFacingError {
             case .unauthorized:
                 return String(localized: "Your session expired. Please sign in again.")
             case .notFound:
-                return String(localized: "This profile is no longer available.")
+                // Neutral on purpose: a 404 can come from any call. Profile
+                // screens say "This profile is no longer available" themselves.
+                return lead(failedAction, String(localized: "That no longer exists."),
+                            tail: String(localized: "It no longer exists."))
             case .server, .e2e, .invalidResponse:
                 return generic(failedAction)
             }

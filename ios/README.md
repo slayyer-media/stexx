@@ -214,7 +214,9 @@ with sample data.
   how long to wait from `Retry-After` ("Try again in 10 min."), 402 /
   `requires_plus` points at Stexx+, a 403 (`account_under_review`, anti-spam
   limits) shows the server's own message, offline or unreachable asks to check
-  the connection, and anything else gets a generic "Try again". Pass
+  the connection, a 404 gets a neutral "That no longer exists." (profile
+  screens say "This profile is no longer available." themselves), and
+  anything else gets a generic "Try again". Pass
   `failedAction` ("Couldn't send the tap.") to lead the offline and generic
   cases. It returns `nil` for cancellations, which should stay silent.
 - **Toast.** `.errorToast($message)` shows a small black-glass banner at the
@@ -232,9 +234,15 @@ with sample data.
   answers and an error with Retry if it fails. Edit stays disabled until the
   real profile has loaded, so sample data can never be saved over an account.
   `MockData` is for previews, tests and the Debug (mock) scheme only.
-- **Unsaved edits.** Edit profile is a sheet. With unsaved changes, swipe-down
-  is disabled and Cancel asks "Discard changes?"; a failed save keeps the sheet
-  open with the error in a toast. The filter sheet is the exception: a filter
+- **Unsaved edits.** Edit profile is a sheet. With unsaved changes, or a photo
+  still uploading, swipe-down is disabled (SwiftUI doesn't report the refused
+  swipe, so it can't prompt) and Cancel asks "Discard changes?"; Save waits for
+  uploads. A failed save keeps the sheet open with the error in a toast. Photos
+  go to the server as soon as they're picked, so discarding deletes this edit's
+  uploads, including one that lands after the sheet closed. If the details save
+  but the photo changes don't, the details count as saved from then on (the You
+  tab shows them) and the toast says "Your details were saved, but your photo
+  changes weren't." The filter sheet is the exception: a filter
   draft is cheap, so Cancel and swipe-down both discard it without asking.
 - **Trying failures in the mock.** `MockAPIClient.inject(_:for:)` makes one
   endpoint fail or hang in tests. In Debug builds the same works from a launch

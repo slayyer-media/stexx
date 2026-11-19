@@ -50,6 +50,15 @@ struct UserFacingErrorTests {
     }
 }
 
+extension UserFacingErrorTests {
+    @Test("A 404 is worded neutrally, since it can come from any call")
+    func notFoundIsNeutral() {
+        #expect(UserFacingError.message(for: APIError.notFound) == "That no longer exists.")
+        #expect(UserFacingError.message(for: APIError.notFound, failedAction: "Couldn't add that photo.")
+            == "Couldn't add that photo. It no longer exists.")
+    }
+}
+
 struct MyProfileLoadStateTests {
     @Test("Edit stays disabled until the real profile has loaded")
     func editDisabledUntilLoaded() {
@@ -101,6 +110,11 @@ struct EditProfileDirtyTests {
         #expect(EditProfileView.hasUnsavedChanges(initial: initial, draft: tags, pendingTag: ""))
 
         #expect(EditProfileView.hasUnsavedChanges(initial: initial, draft: initial, pendingTag: "Chess"))
+    }
+
+    @Test("A photo still uploading counts as unsaved, so the sheet can't be swiped or cancelled away silently")
+    func uploadInFlight() {
+        #expect(EditProfileView.hasUnsavedChanges(initial: initial, draft: initial, pendingTag: "", isUploading: true))
     }
 
     @Test("Toggling a looking-for item off and on again isn't a change")
@@ -165,6 +179,18 @@ struct ProfileActionsTests {
         #expect(actions.toast == text)
     }
 
+    @Test("A 404 on a profile action says the profile is gone")
+    func tapNotFound() async {
+        let api = makeAPI()
+        await api.inject(.fail(APIError.notFound), for: "sendTap")
+        let actions = ProfileActions(profile: profile)
+
+        await actions.sendTap(using: api)
+
+        #expect(!actions.didTap)
+        #expect(actions.toast == "This profile is no longer available.")
+    }
+
     @Test("A failed block never reports success, and the profile isn't blocked")
     func blockFailureIsNotSuccess() async throws {
         let api = makeAPI()
@@ -214,5 +240,110 @@ struct MockFailureInjectionTests {
         #expect(cleared.onlineOnly)
         #expect(!cleared.usesAdvancedFilters)
         #expect(cleared.lookingFor.isEmpty)
+    }
+}
+
+@MainActor
+struct EditProfileSaveTests {
+    private func makeAPI() -> MockAPIClient { MockAPIClient(latency: .zero) }
+
+    @Test("A photo that finishes uploading after the edit was discarded is deleted, not left on the profile")
+    func uploadLandingAfterDiscard() async throws {
+        let api = makeAPI()
+        let a = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        let sync = ProfilePhotoSync(photos: [a])
+
+        // The sheet closes while an upload is still running…
+        await sync.discardUnsavedUploads(using: api)
+        #expect(sync.isAbandoned)
+        // …and then the upload lands on the server.
+        let late = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        let kept = await sync.didUpload(late, using: api)
+
+        #expect(!kept)
+        #expect(sync.unsavedUploads.isEmpty)
+        #expect(try await api.fetchMe().photos.map(\.id) == [a.id])
+    }
+
+    @Test("Uploads during a live edit are still recorded")
+    func uploadDuringEdit() async throws {
+        let api = makeAPI()
+        let sync = ProfilePhotoSync(photos: [])
+        let x = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        #expect(await sync.didUpload(x, using: api))
+        #expect(sync.unsavedUploads == [x.id])
+        #expect(sync.committedPhotos.isEmpty)
+    }
+
+    @Test("Details and photos both saved")
+    func saved() async throws {
+        let api = makeAPI()
+        let a = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        let b = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        var draft = try await api.fetchMe()
+        let sync = ProfilePhotoSync(photos: draft.photos)
+        draft.headline = "New headline"
+        draft.photos = [b, a]
+
+        guard case .saved(let profile) = await EditProfileView.saveChanges(draft, photoSync: sync, using: api) else {
+            Issue.record("expected .saved")
+            return
+        }
+        #expect(profile.headline == "New headline")
+        #expect(profile.photos.map(\.id) == [b.id, a.id])
+    }
+
+    @Test("If the details save but the photos don't, the outcome says the details are live")
+    func detailsOnly() async throws {
+        let api = makeAPI()
+        let a = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        let b = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        var draft = try await api.fetchMe()
+        let sync = ProfilePhotoSync(photos: draft.photos)
+        let x = try await api.uploadPhoto(jpegData: Data([0xFF]))
+        _ = await sync.didUpload(x, using: api)
+        draft.headline = "Something I regret"
+        draft.photos = [x, b, a]
+        await api.inject(.fail(URLError(.notConnectedToInternet)), for: "reorderPhotos")
+
+        guard case .detailsOnly(let profile, let error) = await EditProfileView.saveChanges(draft, photoSync: sync, using: api) else {
+            Issue.record("expected .detailsOnly")
+            return
+        }
+        // The headline really is on the server, so the screen must treat it as saved.
+        #expect(try await api.fetchMe().headline == "Something I regret")
+        #expect(profile.headline == "Something I regret")
+        // The photos it reports are the ones from before this edit, not the unsaved upload.
+        #expect(profile.photos.map(\.id) == [a.id, b.id])
+        #expect(EditProfileView.detailsOnlyMessage(for: error)
+            == "Your details were saved, but your photo changes weren't. Check your connection and try again.")
+        // So discarding now would only lose the photo changes.
+        #expect(EditProfileView.hasUnsavedChanges(initial: profile, draft: draft, pendingTag: ""))
+        var detailsOnlyDraft = draft
+        detailsOnlyDraft.photos = profile.photos
+        #expect(!EditProfileView.hasUnsavedChanges(initial: profile, draft: detailsOnlyDraft, pendingTag: ""))
+    }
+
+    @Test("A self-explaining error still says the details were saved")
+    func detailsOnlyRateLimited() {
+        #expect(EditProfileView.detailsOnlyMessage(for: APIError.rateLimited(retryAfter: 120))
+            == "Your details were saved, but your photo changes weren't. You're doing that too often. Try again in 2 min.")
+    }
+
+    @Test("If the details fail, nothing was saved")
+    func failed() async throws {
+        let api = makeAPI()
+        var draft = try await api.fetchMe()
+        let before = draft.headline
+        let sync = ProfilePhotoSync(photos: draft.photos)
+        draft.headline = "Never saved"
+        await api.inject(.fail(APIError.server(status: 500, message: nil)), for: "updateMe")
+
+        guard case .failed = await EditProfileView.saveChanges(draft, photoSync: sync, using: api) else {
+            Issue.record("expected .failed")
+            return
+        }
+        await api.inject(nil, for: "updateMe")
+        #expect(try await api.fetchMe().headline == before)
     }
 }
