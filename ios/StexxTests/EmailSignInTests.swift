@@ -128,7 +128,7 @@ struct EmailSignInWireTests {
         await server.queue(linkPath, error(400, "disposable_email"))
         await server.queue(linkPath, error(429, "rate_limited", headers: ["Retry-After": "245"]))
         let api = client(for: server)
-        await #expect(throws: APIError.server(status: 400, message: "server says disposable_email")) {
+        await #expect(throws: APIError.server(status: 400, message: "server says disposable_email", code: "disposable_email")) {
             try await api.requestEmailLink(.signIn(email: "a@mailinator.com"))
         }
         await #expect(throws: APIError.rateLimited(retryAfter: 245)) {
