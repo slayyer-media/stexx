@@ -1,5 +1,5 @@
 /**
- * Defense in depth behind the private network (Tailscale ACLs, Caddy bound to the tailnet address, ufw): the console
+ * Defense in depth behind the private network (Tailscale ACLs, ufw on tailscale0 only, Caddy closing non-tailnet peers): the console
  * only answers requests that reach it over loopback (from Caddy), and whose forwarded client address is inside
  * ADMIN_ALLOWED_CIDRS (default: Tailscale's ranges). The address is checked and dropped: never stored or logged.
  *

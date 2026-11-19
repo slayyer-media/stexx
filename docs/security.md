@@ -13,6 +13,7 @@ Everything runs on the single VPS with what is already there: the Bun API and Po
 - The disposable-email list is a file bundled in the repo and loaded at boot; there are no lookups to an outside API.
 - App Attest is verified locally against Apple's root certificate (shipped in the repo). DeviceCheck calls go to Apple's free API, and only if a DeviceCheck key is configured: on signup, login and account deletion (the per-device bits), and on each protected request from the rare device that can't use App Attest (token validation).
 
+- The staff console is a second small process (no jobs) behind Caddy on the same box, reached over Tailscale. Tailscale is the one outside service it needs (free for a small team; its coordination server sees device names, not traffic). See [section 9](#9-staff-console).
 - The nudity classifier for profile photos is a 12 MB open-source model run in-process on the CPU (about 10 ms a photo); the file is downloaded once at deploy, pinned by checksum. See [section 6](#6-photo-checks-profile-photos).
 - `@signalapp/libsignal-client` is a native module pulled at deploy (about 44 MB unpacked on Linux). Signature checks run in-process; a built-in verifier is used if the module fails to load. See [section 7](#7-end-to-end-encrypted-chat).
 
@@ -164,12 +165,12 @@ The hidden account is told it is under review (the 403 message, and `hiddenPendi
 
 ### Moderator review (CLI)
 
-No web admin and no third-party tool: moderation is a command on the server, run over SSH as the service user with the service's environment. Every write is one transaction and adds a row to `moderation_actions` (actor handle, action, account, report ids, note, details).
+No third-party tool: moderation is a command on the server, run over SSH as the service user with the service's environment. (A private web console, [section 9](#9-staff-console), is being built next to it; today it only does staff sign-in and management, and this CLI stays as break-glass.) Every write is one transaction and adds a row to `moderation_actions` (actor handle, action, account, report ids, note, details).
 
 ```sh
 # on the VPS
 stexx-mod() {
-  sudo bash -c 'set -a; . /etc/stexx/stexx.env; set +a; export NODE_ENV=production HOST=127.0.0.1 PORT=8787 MEDIA_DIR=/srv/stexx/media
+  sudo bash -c 'set -a; . /etc/stexx/stexx.env; [ -r /etc/stexx/admin.env ] && . /etc/stexx/admin.env; set +a; export NODE_ENV=production HOST=127.0.0.1 PORT=8787 MEDIA_DIR=/srv/stexx/media
     cd /srv/stexx/current && HOME=/nonexistent exec setpriv --reuid=stexx --regid=stexx --clear-groups /usr/local/bin/bun scripts/moderate.ts "$@"' _ "$@"
 }
 stexx-mod list                                   # queue: underage first, then hidden accounts, oldest report first
@@ -181,6 +182,7 @@ stexx-mod photos blocklist 12 --as mod-a --label "stock set"
 stexx-mod alerts status                          # alert channels: last digest, failures, pending items
 stexx-mod purge p_abc… --as mod-a --yes          # banned only: delete it now instead of after the review window
 stexx-mod lift-email-ban --as mod-a --note "appeal upheld"   # then type the address and Ctrl-D (read from stdin)
+stexx-mod staff invite admin-1 --role admin --as admin-1   # staff console accounts, see section 9 (also: staff list, staff disable)
 ```
 
 Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show` and `log` for machine-readable output.
@@ -491,6 +493,127 @@ stexx-mod spam-clear p_abc… --as mod-a --note "busy night, real person"
 - Moderation records hold no message text from these rules: moderators see only what reporters attach (section 5).
 - The account's own data export doesn't list its spam state, like reports filed against it and photo flags.
 
+## 9. Staff console
+
+A small web console for the people who run Stexx: moderators, support and admins. This change lays the foundation: staff sign-in with passkeys, sessions, roles, step-up, the append-only audit log and staff management. Its pages today are sign-in, a dashboard of counts, "my sessions" and the staff list. Moderation still happens with the CLI (section 5) until the console's moderation pages land. Nothing here changes what the app or the public API does.
+
+### Why it reverses the SSH-only stance
+
+Earlier versions of this document said the CLI over SSH was deliberate, "no new network surface". The console reverses that, under conditions that keep the surface private:
+
+- **Private network only.** The console is reachable over Tailscale and nowhere else. It has no public DNS name, no Cloudflare record and no listener on the public interface.
+- **A separate process.** Its own systemd unit (`stexx-admin`), its own port on loopback. It runs no background jobs and no websocket. The public API has no `/admin` routes, and the public Caddy site answers `/admin` and `/admin/*` with 404.
+- **Passkeys only, no passwords.** Every staff member signs in with a passkey that needs a biometric or PIN on the device.
+- **Every sensitive read is logged**, not only writes, and the log can't be edited through the application.
+
+Why do it at all: SSH as the service user gives each moderator a shell on the production box with the service's secrets, and a shell can't be limited to "see the queue, nothing else", ask for a fresh passkey check before a destructive action, or record what was looked at. A console can. Support staff also shouldn't need a shell to answer a ticket. The CLI stays as break-glass: creating the first admin, and recovering when every admin is locked out.
+
+### Network path
+
+```
+staff laptop (Tailscale, ACL-allowed device)
+  -> https://<console name>.<tailnet>.ts.net:8443   Caddy, its own port, open on tailscale0 only; certificate from tailscaled
+  -> 127.0.0.1:8788                            stexx-admin (Bun + Hono)
+  -> Postgres on 127.0.0.1
+```
+
+- **Caddy.** The site lives in its own file, `server/deploy/Caddyfile.admin`, installed separately from the public `Caddyfile` so the public file never names the console's host. It has no `log` directive (no access log at all), sets the same security headers, closes any connection whose peer isn't a Tailscale address, and gets its certificate from tailscaled. The hostname comes from `/etc/stexx/caddy-admin.env`, not from the repo.
+- **Its own port, 8443, not 443.** The obvious design is a Caddy site bound to the server's Tailscale address on 443. Caddy can't do that next to the public sites: a bound site and the unbound `api` and `media` sites both claim 443 and 80 (the automatic redirect), and Caddy then fails to start with "address already in use". `caddy validate` doesn't catch it, a reload fails, and the next reboot would take the public API down. (Reproduced with Caddy 2.11.) So the console listens on its own port, and privacy comes from three layers instead of a bind: the firewall rule below, Caddy dropping non-tailnet peers, and the app's own address check.
+- **Firewall.** `ufw-cloudflare.sh --tailscale-admin` (opt-in) allows the console's port (8443; `STEXX_ADMIN_PORT`) on the `tailscale0` interface only. Without the flag nothing about the console is opened.
+- **Tailscale policy (done in the Tailscale admin, not in this repo).** Allow only tagged staff devices to reach the server's port 8443, and turn on tailnet lock. Tailscale's coordination service sees device names and addresses, not traffic. A plain WireGuard setup would avoid that third party at the cost of more setup (you would change `ADMIN_ALLOWED_CIDRS`, the `remote_ip` line and the certificate in `Caddyfile.admin`). Whatever the network, changing it later is cheap only if the hostname stays the same.
+- **Checked again in the app.** The console answers only requests that come over loopback (from Caddy), and whose forwarded client address is inside `ADMIN_ALLOWED_CIDRS` (default: Tailscale's ranges, `100.64.0.0/10` and `fd7a:115c:a1e0::/48`). The address is checked and dropped; it is never stored or logged. In production the process refuses to start with a non-loopback `ADMIN_HOST`.
+- **The hostname is a one-way door.** Passkeys are bound to it (`ADMIN_RP_ID`, which must differ from the app's `WEBAUTHN_RP_ID`, so a staff passkey never works on the app and the reverse). Renaming the host means every staff member enrolls again.
+
+### Sign-in and accounts
+
+- Staff accounts are separate from app accounts: their own table and ids (`st_...`), no link to `users`, no names, no email addresses, no phone numbers. Identity is a handle (letters, digits, `.`, `-`, `_`; never a real name), the same handle `moderation_actions.actor` already uses.
+- Sign-in is a discoverable passkey with user verification required. A wrong relying-party id is refused, and so is a signature counter that goes backwards. Login, enrollment and step-up attempts are rate limited (10 a minute per client).
+- **Enrollment.** An admin (or the CLI, for the first admin) invites a handle with a role. That creates a single-use link, valid for 30 minutes; only its hash is stored. The person opens it on their own device and creates a passkey. Inviting an existing handle again removes its passkeys and signs it out everywhere (lost passkeys, or a role change); there is no self-service recovery.
+- Disabling a staff account signs it out everywhere at once and it can't sign in again. Accounts are never deleted, because the audit log points at them.
+
+### Roles
+
+| What | Support | Moderator | Admin |
+| --- | :-: | :-: | :-: |
+| Dashboard counts, own sessions | yes | yes | yes |
+| Staff list | no | no | yes |
+| Invite, re-invite, disable staff | no | no | yes (fresh passkey check) |
+| Disable another admin | no | no | yes (passkey check bound to that action) |
+
+The permission matrix lives in `server/src/lib/staff/permissions.ts`. Every route declares a permission when it is registered, and a test walks every route for each role, so a route without one fails the build. Later changes add their rows (lookups, evidence, decisions, unban, purge) in the same file.
+
+### Sessions
+
+- Cookie `__Host-stexx_staff`: `HttpOnly`, `Secure`, `SameSite=Strict`, no expiry date (no "remember me"). Its value is a random token; only its SHA-256 is stored.
+- A session ends after **30 minutes idle** or **8 hours in total** (`ADMIN_SESSION_IDLE_MINUTES`, `ADMIN_SESSION_ABSOLUTE_HOURS`). Signing out, disabling the account or re-inviting it revokes the session on the server, so an old cookie stops working at once.
+- Each session keeps a short browser label ("Safari on macOS") so a person can spot one they don't recognise on "my sessions". Never the user agent string, never an IP address.
+
+### CSRF and page hardening
+
+- Every write must carry an `Origin` equal to `ADMIN_ORIGIN` (and `Sec-Fetch-Site: same-origin` when the browser sends it), and a synchronizer token bound to the session (a form field or the `X-CSRF-Token` header). The cookie's `SameSite=Strict` is a third layer.
+- Pages are server-rendered with plain forms. The Content-Security-Policy is `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`: no inline script or style, nothing from a CDN, one small vendored `passkey.js`. Every response has `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `X-Robots-Tag: noindex`.
+
+### Step-up
+
+Some actions need proof the person is still there, even inside a session:
+
+- **Recent:** a passkey assertion with user verification in this session within the last 5 minutes (`ADMIN_STEP_UP_MINUTES`). Today: inviting and disabling staff.
+- **Bound to the action:** an assertion whose challenge commits to the action name and the target id, usable once. Today: disabling another admin. Later: purge now, lifting an email ban.
+
+### Audit log
+
+Every staff event and, from the moderation pages on, every sensitive read and every action leaves one row in `staff_audit`.
+
+- **Recorded today:** login, failed login, logout, step-up (and failed), invite, enrollment, role change, disable, session revoke, and viewing the staff list. The CLI's `staff` commands write rows too, with channel `cli`.
+- **Each row:** time, staff id, session id, channel (`console` or `cli`), action name, target kind, target account (nullable), target reference (a report, flag, staff or session id), purpose, an opaque ticket reference (max 64 characters, never an email), and a pointer to the `moderation_actions` row when there is one.
+- **No free text.** There is no note field; notes stay in `moderation_actions.note`, which is cleared on purge. No IP address, user agent, email, email hash or typed search value is ever written.
+- **Purpose.** Opening an account outside a queue item will ask for a purpose (`report_review`, `spam_review`, `photo_review`, `support_ticket`, `appeal`, `data_request`, `legal`, `escalation`). The column and its check exist now.
+- **Append-only.** A database trigger rejects `UPDATE`, `DELETE` and `TRUNCATE` on `staff_audit`. Two exceptions: the foreign-key action that sets `target_user_id` (or the `moderation_actions` pointer) to NULL when that account or row is deleted, which anonymizes the row, and deleting a *read* row older than 12 months. The trigger checks the row's age, not who asks. This stops mistakes and the application's own code, not someone with database owner rights; a separate database role without `UPDATE`/`DELETE` and a daily hash-chain checkpoint are planned.
+- **Retention.**
+
+| Rows | Kept | Then |
+| --- | --- | --- |
+| Reads and lookups | 12 months | May be deleted (the trigger allows it) |
+| Actions and staff events | Like `moderation_actions` | Account reference anonymized when the account is deleted or purged |
+
+The job that deletes old read rows is not written yet (see "Not done yet"), so for now nothing is deleted. Console sessions, enrollment links and WebAuthn challenges are short-lived credentials: an expired or used one can't be used, and challenges are swept as new ones are made.
+
+- **Backups.** `staff_audit`, `staff_accounts` and `staff_passkeys` are in the nightly backup: the audit log is the accountability record, and a restore has to let staff sign in again. `staff_sessions`, `staff_challenges` and `staff_enrollments` are never in it (`ALWAYS_EXCLUDE` in `backup.sh`), and a real restore revokes every staff session and deletes pending invites, as it does for app sessions.
+
+### What it never shows
+
+Nothing in the console queries locations, message content, envelopes, chat photos or attachment keys, raw IPs (none are stored, staff included), email addresses or their HMACs, the social graph (favorites, taps, blocks, views), or other accounts on the same device. Sessions, token hashes and passkey credentials appear as counts and dates only. This change shows only counts of queue items and staff handles, roles and passkey counts. Later pages keep to the same rules, and a privacy render test will assert it.
+
+### Setting it up, and the first admin
+
+The console is optional and off until you install it; a box that never opts in deploys exactly as before. Full steps are in [`server/deploy/README.md`](../server/deploy/README.md#staff-console). In short:
+
+1. Install Tailscale on the server, enable HTTPS for the tailnet, and pick the console's name once. The console's address is then `https://<name>.<tailnet>.ts.net:8443`.
+2. `deploy.sh --sync-config --with-admin` installs the unit and the example settings files. Fill in `/etc/stexx/admin.env` (`ADMIN_ORIGIN`, ...) and `/etc/stexx/caddy-admin.env` (the tailnet name), and allow the port on `tailscale0` with `ufw-cloudflare.sh --apply --tailscale-admin`.
+3. Run `deploy.sh --sync-config --with-admin` again: it installs the private Caddy site. The next normal deploy restarts the console next to the API.
+4. On the server, create the first admin with the CLI. This is the one step that needs SSH, and it needs `ADMIN_ORIGIN` in the CLI's environment (the `stexx-mod` wrapper in section 5 reads `admin.env` too):
+
+```sh
+stexx-mod staff invite admin-1 --role admin --as admin-1     # prints a single-use link, valid 30 minutes
+```
+
+5. Open the link on the staff member's device, over the tailnet, and create a passkey. Sign in, and invite everyone else from the console. Create at least two admins and give each person a second passkey: there is no self-service recovery.
+
+Local development: `ADMIN_DEV_AUTH=1` mounts a login that skips the passkey (pick a seeded handle: `dev-support`, `dev-mod`, `dev-admin` from `bun run db:seed`). Production refuses to boot with it set, and `deploy.sh` doesn't upload the file that implements it.
+
+### Configuration
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `ADMIN_HOST`, `ADMIN_PORT` | `127.0.0.1`, `8788` | Loopback only in production (the process refuses otherwise). The unit pins both. |
+| `ADMIN_ORIGIN` | dev: `http://localhost:8788` | `https` origin (with the `:8443` port), no path. Required in production, or the console refuses to start (the API is unaffected). |
+| `ADMIN_RP_ID` | host of `ADMIN_ORIGIN` | Passkey relying party id. Must equal that host and differ from `WEBAUTHN_RP_ID`. |
+| `ADMIN_RP_NAME` | `Stexx staff` | Shown by the passkey prompt. |
+| `ADMIN_ALLOWED_CIDRS` | Tailscale ranges (dev adds loopback) | Forwarded client address must be inside. Checked, never stored. |
+| `ADMIN_SESSION_IDLE_MINUTES`, `ADMIN_SESSION_ABSOLUTE_HOURS` | `30`, `8` | 5-120 and 1-24; idle may not exceed absolute. |
+| `ADMIN_STEP_UP_MINUTES` | `5` | 1-15. How long a fresh passkey check counts. |
+| `ADMIN_DEV_AUTH` | off | Dev-only login without a passkey. Refused in production. |
+
 ## Error codes the app handles
 
 | Status | Code | Shown as |
@@ -597,6 +720,7 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Spam heuristics (section 8) store counters, signal names, and per plaintext message a keyed MinHash signature and which rule kinds matched, for 48 hours; never message text. They also keep who wrote in which conversation when (`spam_contacts`) for 7 days after the last message, even if the messages expired or the thread was cleared: metadata the server had anyway, kept a little longer so disappearing messages can't hide spam. Held messages are the sender's own messages, kept as they would be anyway, and deleted if the account is banned or nobody reviews them in 30 days.
 - Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read. Moderator blocklist entries (`photo_hash_blocklist`: hash, label, moderator handle) are kept after the source account is deleted, which is what a blocklist is for (section 6).
 - Taps (who tapped whom, and when) are deleted `TAP_RETENTION_DAYS` (30) after they were sent; before this they were kept forever. The taps inbox adds one timestamp per account, `users.taps_seen_at` (when you last opened your taps). Blocked, hidden, banned and incognito senders (unless they've messaged you) never appear in it.
+- The staff console (section 9) stores staff handles and passkey public keys (never names or emails), console sessions as hashes with a browser family label, and the staff audit log: who looked at or did what, and when, with no free text, IP address, user agent or email. Staff reads of an account are not yet listed in the person's data export.
 - App Store Server Notifications (Stexx+) add two things: each notification's UUID and arrival time (`apple_notifications`, for idempotency; the endpoint deletes rows older than 30 days each time a notification arrives, so if notifications stop, the last few can stay longer; they hold no user or transaction id), and the subscription's auto-renew flag (`subscriptions.auto_renew`, deleted with the account). Apple's signed payloads are verified and dropped, never stored; logs carry only the notification UUID, type, subtype and original transaction id.
 - Moderator alerts leave the server (by email or webhook) but carry only ids, reason codes, counts and commands: no names, profile text, report content, photos, reporter ids or locations. The alert tables store which items were alerted (kind and id) for a few days, and each channel's retry state.
 - Backups (details in [`server/deploy/README.md`](../server/deploy/README.md#what-is-in-a-nightly-backup)): nightly backups never contain sessions, sign-in links, challenges, rate-limit counters, one-time prekeys, report evidence, spam-detection records (48 h message features and the 7-day contact ledger of who first wrote to whom) or taps, and by default no messages, locations or profile views. So none of these outlive their own retention clocks in the 28 days of backups. Reports are backed up with their free text and reporter IP hash removed. A restore therefore signs everyone out, empties the taps inbox, and brings reports back without their text and evidence. The full snapshot taken before each migration stays on the server in a root-only directory, encrypted to a key the server doesn't have, and is deleted after 24 hours (at most two are kept, and one is refused if it would leave the disk under 15 % free). Every real restore revokes all sessions, including ones revoked after the backup was taken, and empties one-time prekeys, challenges and rate-limit counters. The runbook keeps the API away from traffic until the operator has re-applied deletions, blocks and bans made after the backup. Alerts from the watchdog carry check and unit names only.
@@ -619,7 +743,8 @@ In the app the JSON goes straight to the share sheet: it's written to its own fo
 - Spam heuristics (section 8): near-identical text is detected per sender, not across a ring of accounts sending the same text; released held messages are pushed over the websocket only to recipients connected at that moment (no APNs push); the CLI's `show` labels the system's spam report as `reporter automatic (spam heuristics)`; the thresholds are educated defaults that haven't met real traffic yet, so watch `stexx-mod spam` after launch and tune the `SPAM_*` values. A limited account can still guess from indirect hints: its cold messages never turn `read` (people often don't open them anyway), a held message to someone offline stays `sent` where a delivered one turns `delivered` when they open it, and its data export doesn't list taps that were dropped (they were never stored).
 
 - Report evidence photos are re-uploaded by the reporter's app, so the server can't prove a photo is the one that was in the chat (same as evidence text).
-- No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Alerts (section 5) say when to look; acting still means logging in.
+- Moderation is still the CLI over SSH. The staff console (section 9) is private-network only and covers sign-in, sessions, roles, the audit log and staff management so far; the moderation pages (queue, evidence, decisions, spam and photo flags), support lookup and the export line for staff access are not built yet. Alerts (section 5) say when to look; acting still means logging in over SSH.
+- Staff console gaps: no job deletes `staff_audit` read rows after 12 months or removes expired console sessions and used invite links (the database trigger allows the former; nothing calls it); the audit table's separate database role and daily hash-chain checkpoint are planned but not done (so someone with database owner rights could still change it); the console doesn't yet nag staff to enroll a second passkey; Tailscale ACLs and tailnet lock are configured by hand in Tailscale, and nothing in the repo checks them.
 - The "Report" and "Block" menus were checked by hand; there are no UI tests for them.
 - A way for a person to contest an "explicit" label or a moderator hide. Today a moderator fixes a wrong classifier label with SQL: `UPDATE photos SET is_explicit = false, nsfw_model = 'manual' WHERE id = …` (a moderator hide is undone with `photos clear`).
 - The app's footer under a hidden photo says hidden photos "look explicit"; a photo hidden by a moderator gets the same badge and footer. Separate wording needs an API field and an app change.

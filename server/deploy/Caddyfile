@@ -28,8 +28,9 @@ api.stexx.gay {
 	import security_headers
 
 	# Defense in depth: the dev media route and dev routes must never be reachable in production
-	# (the app does not mount them either).
-	@never path /media /media/* /v1/dev /v1/dev/*
+	# (the app does not mount them either). Same for /admin: the staff console is a separate process on a private
+	# network, and the public API has no such route.
+	@never path /media /media/* /v1/dev /v1/dev/* /admin /admin/*
 	respond @never 404
 
 	# Photos are capped at 10 MB by the app; leave a little headroom for multipart-free uploads.

@@ -1,0 +1,93 @@
+[Unit]
+Description=Stexx staff console (Bun + Hono, private network only)
+Documentation=https://github.com/stexx/stexx/blob/main/server/deploy/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+StartLimitIntervalSec=120
+StartLimitBurst=6
+# Same alert as the API (unit name only; a no-op until /etc/stexx/watch.env sets a destination).
+OnFailure=stexx-alert@%n.service
+
+[Service]
+Type=simple
+User=stexx
+Group=stexx
+# Same release symlink as the API (deploy.sh flips it), so the console and the API always run the same code.
+WorkingDirectory=/srv/stexx/current
+# Secrets and shared settings first (DATABASE_URL, EMAIL_PEPPER, ...), then the console's own settings
+# (ADMIN_ORIGIN, ADMIN_RP_ID, ...). Both root:root 0600; systemd reads them before dropping privileges.
+# '-' on the second: a missing file is fine for the unit file itself; the console then refuses to start with
+# "set ADMIN_ORIGIN" instead of running half configured.
+# NOTE: EnvironmentFile= values OVERRIDE Environment= below, so neither file may set NODE_ENV, HOST, PORT,
+# MEDIA_DIR, ADMIN_HOST or ADMIN_PORT. ExecStartPre refuses to start if one does.
+EnvironmentFile=/etc/stexx/stexx.env
+EnvironmentFile=-/etc/stexx/admin.env
+Environment=NODE_ENV=production
+# The API's settings, only so config.ts validates the same way. The console never listens on them.
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+# Loopback only: Caddy (the private site, Caddyfile.admin) is the one way in. config.ts refuses anything else in production.
+Environment=ADMIN_HOST=127.0.0.1
+Environment=ADMIN_PORT=8788
+Environment=MEDIA_DIR=/srv/stexx/media
+# '+' runs this one check as root (the env files are root:root 0600, unreadable to the service user), and '$$' is
+# systemd's escape for a literal '$'.
+ExecStartPre=+/bin/sh -c 'for f in /etc/stexx/stexx.env /etc/stexx/admin.env; do if [ -r "$$f" ] && grep -Eq "^[[:space:]]*(export[[:space:]]+)?(NODE_ENV|HOST|PORT|MEDIA_DIR|ADMIN_HOST|ADMIN_PORT)[[:space:]]*=" "$$f"; then echo "$$f must not set NODE_ENV, HOST, PORT, MEDIA_DIR, ADMIN_HOST or ADMIN_PORT (they would override the unit)" >&2; exit 1; fi; done'
+# The console process: no background jobs (retention and the rest stay in stexx-api), no websocket.
+ExecStart=/usr/local/bin/bun src/admin/index.ts
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+KillSignal=SIGTERM
+SyslogIdentifier=stexx-admin
+# Application logs go to journald only (7-day retention, see system/journald-stexx.conf). The console logs route
+# patterns and status codes, never paths with ids, addresses, handles or form values.
+StandardOutput=journal
+StandardError=journal
+UMask=0027
+
+# ---- Resource limits (the console is light: server-rendered pages, no image decoding) ----
+LimitNOFILE=4096
+TasksMax=128
+MemoryHigh=256M
+MemoryMax=512M
+
+# ---- Sandboxing (same as stexx-api; verify with: systemd-analyze security stexx-admin) ----
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+# A denied syscall fails with EPERM instead of killing the process.
+SystemCallErrorNumber=EPERM
+# Nothing is writable: code is read-only and this milestone writes only to Postgres. (The API's one writable path,
+# /srv/stexx/media, is deliberately not granted; a later change that has to delete photos adds it here, not before.)
+# '-' prefix: a missing file is fine. Without it systemd fails the start with 226/NAMESPACE whenever one is absent.
+InaccessiblePaths=-/etc/stexx/rclone.conf -/etc/stexx/migrate.env -/etc/stexx/backup-recipients.txt
+# Stricter than the API: the console needs only Postgres on loopback (the CLI and the API do their own mail and
+# alerts), so every other address is refused.
+IPAddressDeny=any
+IPAddressAllow=localhost
+# NOT set: MemoryDenyWriteExecute=. Bun (JavaScriptCore) JIT-compiles and needs W+X mappings.
+
+[Install]
+WantedBy=multi-user.target

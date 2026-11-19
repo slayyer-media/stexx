@@ -124,10 +124,12 @@ jobs:
           d="$(mktemp -d)"
           mkdir -p "$d/sites"
           cp server/deploy/Caddyfile "$d/sites/stexx.caddy"
+          # The optional private staff console site, with the value deploy/caddy-admin.env.example sets.
+          cp server/deploy/Caddyfile.admin "$d/sites/stexx-admin.caddy"
           sed "s#import /etc/caddy/sites/\*.caddy#import $d/sites/*.caddy#" server/deploy/Caddyfile.main > "$d/Caddyfile"
           grep -q "^import $d/sites/" "$d/Caddyfile" || { echo "Caddyfile.main no longer imports /etc/caddy/sites/*.caddy"; exit 1; }
-          docker run --rm -v "$d:$d:ro" caddy:2 caddy validate --adapter caddyfile --config "$d/Caddyfile"
-          docker run --rm -v "$PWD/server/deploy:/w:ro" caddy:2 sh -c 'caddy fmt /w/Caddyfile | diff -u /w/Caddyfile - && caddy fmt /w/Caddyfile.main | diff -u /w/Caddyfile.main -'
+          docker run --rm -e STEXX_ADMIN_HOST=stexx-admin.example.ts.net -v "$d:$d:ro" caddy:2 caddy validate --adapter caddyfile --config "$d/Caddyfile"
+          docker run --rm -v "$PWD/server/deploy:/w:ro" caddy:2 sh -c 'caddy fmt /w/Caddyfile | diff -u /w/Caddyfile - && caddy fmt /w/Caddyfile.main | diff -u /w/Caddyfile.main - && caddy fmt /w/Caddyfile.admin | diff -u /w/Caddyfile.admin -'
 
   ios-release-config:
     name: iOS Release config (advisory)

@@ -20,6 +20,8 @@
 #   6. grants.sql: applied for real when the role stexx_app exists on that server, otherwise checked inside a
 #      rolled-back transaction (role names swapped for PUBLIC), which proves every table/function it names exists
 #   7. --revoke-sessions (implied by --restore-into): revoke every session and drop pending sign-in links/challenges
+#      (staff console too: its sessions revoked, its challenges and invite tokens deleted; staff accounts, passkeys
+#      and the audit log are kept)
 #   8. with --restore-into or --revoke-sessions: delete the rows that are dangerous to bring back from any backup
 #      (one-time E2E prekeys that may already have been handed out, attestation challenges, rate-limit counters).
 #      Nightly backups never hold them; a pre-migrate snapshot does. Apps upload new prekeys on launch.
@@ -68,7 +70,7 @@ while [ $# -gt 0 ]; do
     --expect-migration) need_arg "$1" "${2:-}"; EXPECT_MIG="$2"; shift ;;
     --max-age-hours)    need_arg "$1" "${2:-}"; MAX_AGE_HOURS="$2"; shift ;;
     --grants)           need_arg "$1" "${2:-}"; GRANTS="$2"; shift ;;
-    -h|--help)          sed -n '2,47p' "$0"; exit 0 ;;
+    -h|--help)          sed -n '2,49p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -295,7 +297,8 @@ else pass migrations "max(schema_migrations)=$MAXMIG"; fi
 
 EXCL=""
 for t in sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys messages \
-         report_evidence spam_message_features spam_contacts taps media_trash locations travel_locations profile_views; do
+         report_evidence spam_message_features spam_contacts taps staff_sessions staff_challenges staff_enrollments \
+         media_trash locations travel_locations profile_views; do
   n="$(count "$t")"
   [ "$n" = "?" ] && continue    # table not in this schema version
   EXCL="$EXCL $t=$n"
@@ -308,6 +311,9 @@ else
 fi
 if [ "$(count sessions)" != 0 ] && [ "$(count sessions)" != "?" ] && [ "$REVOKE" = 0 ]; then
   warn sessions "this backup holds sessions; a REAL restore must use --revoke-sessions"
+fi
+if [ "$(count staff_sessions)" != 0 ] && [ "$(count staff_sessions)" != "?" ] && [ "$REVOKE" = 0 ]; then
+  warn staff "this backup holds staff console sessions; a REAL restore must use --revoke-sessions"
 fi
 
 # ---- 6. grants ---------------------------------------------------------------------------------------------------
@@ -338,6 +344,22 @@ SQL
     pass sessions "revoked $(printf '%s\n' "$OUT" | sed -n 1p) session(s); deleted $(printf '%s\n' "$OUT" | sed -n 2p) sign-in link(s), $(printf '%s\n' "$OUT" | sed -n 3p) challenge(s)"
   else
     fail sessions "$(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"
+  fi
+fi
+
+# Staff console credentials (migration 124; a pre-migrate snapshot holds them, a nightly never does): sessions revoked,
+# WebAuthn challenges and invite tokens deleted (a restored token may have been spent after the snapshot). Staff
+# accounts, passkeys and the audit log stay. Older schemas without the tables skip this.
+if [ "$REVOKE" = 1 ] && [ "$(count staff_sessions)" != "?" ]; then
+  if OUT="$(q -1 -f - 2>"$WORK/err" <<'SQL'
+WITH s AS (UPDATE staff_sessions SET revoked_at = now() WHERE revoked_at IS NULL RETURNING 1) SELECT count(*) FROM s;
+WITH c AS (DELETE FROM staff_challenges RETURNING 1) SELECT count(*) FROM c;
+WITH e AS (DELETE FROM staff_enrollments RETURNING 1) SELECT count(*) FROM e;
+SQL
+  )"; then
+    pass staff "revoked $(printf '%s\n' "$OUT" | sed -n 1p) staff session(s); deleted $(printf '%s\n' "$OUT" | sed -n 2p) challenge(s), $(printf '%s\n' "$OUT" | sed -n 3p) invite token(s)"
+  else
+    fail staff "$(grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err")"
   fi
 fi
 
