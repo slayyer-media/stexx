@@ -66,7 +66,10 @@ enum NearbyContent: Equatable {
     static let locatingTimeout: Duration = .seconds(20)
 
     /// The state machine. Order matters:
-    /// 1. Anything to show wins: the grid.
+    /// 1. Anything to show wins: the grid. So do more pages on the server
+    ///    when every loaded tile is hidden here (blocked since the page
+    ///    loaded): the grid's page cell keeps loading (or offers Retry)
+    ///    instead of claiming nobody is nearby.
     /// 2. Unless travel mode places you, an empty grid is explained by the
     ///    location first (off, or not uploaded yet). A request error in that
     ///    state would not be what the user can fix.
@@ -75,6 +78,7 @@ enum NearbyContent: Equatable {
     /// 5. Otherwise nobody matched: friendly empty, or "clear filters".
     static func resolve(
         hasProfiles: Bool,
+        hasMorePages: Bool = false,
         isLoading: Bool,
         failure: String?,
         location: NearbyLocationState,
@@ -82,7 +86,7 @@ enum NearbyContent: Equatable {
         isTravelActive: Bool,
         filtersActive: Bool
     ) -> NearbyContent {
-        if hasProfiles { return .grid }
+        if hasProfiles || (hasMorePages && !isLoading) { return .grid }
         if !isTravelActive {
             switch location {
             case .denied: return .locationOff(restricted: false)
@@ -200,6 +204,21 @@ final class NearbyFeedModel {
         } catch {
             guard generation == self.generation else { return }
             nextPage = .failed(Self.message(for: error))
+        }
+    }
+
+    /// Keeps loading pages while every profile loaded so far is hidden on
+    /// this phone (blocked after the page loaded). With no tile on screen
+    /// the last-tile trigger never fires, so without this a page of only
+    /// hidden people would stop paging. Stops at the first visible profile,
+    /// the last page, a failed page (the Retry cell takes over), a reload,
+    /// or cancellation.
+    func loadMoreWhileAllHidden(_ isHidden: (Profile) -> Bool, using fetch: NearbyFetch) async {
+        while let cursor = nextCursor, nextPage == .idle, !isLoading,
+              profiles.allSatisfy(isHidden), !Task.isCancelled {
+            await loadMore(using: fetch)
+            // No progress: cancelled, failed or replaced by a reload.
+            guard nextCursor != cursor else { return }
         }
     }
 

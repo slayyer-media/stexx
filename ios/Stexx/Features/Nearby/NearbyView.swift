@@ -122,6 +122,7 @@ struct NearbyView: View {
         let location = locationState
         let content = NearbyContent.resolve(
             hasProfiles: !visible.isEmpty,
+            hasMorePages: feed.nextCursor != nil,
             isLoading: feed.isPending,
             failure: feed.failure,
             location: location,
@@ -206,6 +207,14 @@ struct NearbyView: View {
             .onChange(of: location) { old, new in
                 guard new == .located, old != .located else { return }
                 Task { await feed.reload(loadKey, using: fetch) }
+            }
+            // Every loaded tile is hidden (blocked since it loaded): page on
+            // until someone shows, since no tile can trigger the next page.
+            // Keyed on the cursor so a page answered after Retry continues.
+            .task(id: visible.isEmpty ? feed.nextCursor : nil) {
+                guard visible.isEmpty, feed.nextCursor != nil else { return }
+                let blocked = appState.blockedIDs
+                await feed.loadMoreWhileAllHidden({ blocked.contains($0.id) }, using: fetch)
             }
             .task(id: location == .locating) {
                 locatingTimedOut = false

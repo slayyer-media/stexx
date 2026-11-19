@@ -246,7 +246,7 @@ coordinate):
 
 | State | When | Shows |
 | --- | --- | --- |
-| Grid | Any tiles | Tiles; a spinner cell at the end while the next page loads, or a **Retry** cell if it failed (no automatic retry loop) |
+| Grid | Any tiles, or more pages on the server | Tiles; a spinner cell at the end while the next page loads, or a **Retry** cell if it failed (no automatic retry loop) |
 | Finding you | Empty grid while the permission prompt is up, or before this session's first location upload (up to 20 s) | "Finding guys near you…". The grid reloads by itself once the first upload succeeds, and again when location is turned back on |
 | Location off | Empty grid and location denied, Location Services off, or restricted | Why, **Open Settings** (not for restricted), and travel mode, which works without device location (Stexx+; paywall otherwise) |
 | Error | The first page failed | A plain sentence ("You're offline…") and **Try again** |
@@ -261,7 +261,9 @@ approximate location; nothing here changes what is uploaded.
 
 `NearbyFeedModel` owns paging: a newer reload drops answers from older
 requests (including a page still loading), and repeats across pages are
-shown once.
+shown once. If every loaded tile is hidden (people blocked since the page
+loaded), the grid keeps fetching pages until someone shows or the last page
+arrives, rather than saying "Nobody here yet" while more people exist.
 
 Accessibility: tiles read "name, age, online, 200 m away, favorite" with an
 "Opens the profile" hint; tile text follows Dynamic Type up to XXXL (the

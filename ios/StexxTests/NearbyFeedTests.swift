@@ -318,6 +318,129 @@ struct NearbyFeedTests {
         #expect(!feed.showsFooter)
     }
 
+    @Test("A page of only hidden (blocked) people keeps paging instead of reading as nobody nearby")
+    func allHiddenPageKeepsPaging() async {
+        let feed = NearbyFeedModel()
+        let server = ScriptedNearbyFetch()
+        // Blocked on this phone after the pages were served.
+        let blocked = Set(profiles[0..<4].map(\.id))
+        let isHidden: (Profile) -> Bool = { blocked.contains($0.id) }
+        func shown() -> NearbyContent {
+            NearbyContent.resolve(
+                hasProfiles: feed.profiles.contains { !isHidden($0) },
+                hasMorePages: feed.nextCursor != nil,
+                isLoading: feed.isPending,
+                failure: feed.failure,
+                location: .located,
+                isTravelActive: false,
+                filtersActive: false
+            )
+        }
+
+        let load = Task { await feed.reload(key, using: server.fetch) }
+        await server.settle()
+        server.answer(with: page(0..<2, next: "2"))
+        await load.value
+        // Nothing visible, but the server has more: the grid with its page
+        // cell, not "Nobody here yet".
+        #expect(shown() == .grid)
+        #expect(feed.showsFooter)
+
+        // Two hidden-only pages in a row, then someone visible.
+        let paging = Task { await feed.loadMoreWhileAllHidden(isHidden, using: server.fetch) }
+        await server.settle()
+        #expect(server.requests.last?.cursor == "2")
+        server.answer(with: page(2..<4, next: "4"))
+        await server.settle()
+        #expect(server.requests.last?.cursor == "4")
+        server.answer(with: page(4..<5, next: "5"))
+        await paging.value
+        // Stops at the first visible profile; the last-tile trigger takes over.
+        #expect(server.requests.count == 3)
+        #expect(server.waiting == 0)
+        #expect(shown() == .grid)
+
+        // With nothing more on the server, hidden-only really is empty.
+        let empty = NearbyFeedModel()
+        let emptyLoad = Task { await empty.reload(key, using: server.fetch) }
+        await server.settle()
+        server.answer(with: page(0..<2))
+        await emptyLoad.value
+        await empty.loadMoreWhileAllHidden(isHidden, using: server.fetch)
+        #expect(server.waiting == 0)
+        #expect(NearbyContent.resolve(
+            hasProfiles: false,
+            hasMorePages: empty.nextCursor != nil,
+            isLoading: empty.isPending,
+            failure: empty.failure,
+            location: .located,
+            isTravelActive: false,
+            filtersActive: false
+        ) == .empty(filtersActive: false))
+    }
+
+    @Test("A failed page behind hidden-only tiles shows the Retry cell, and Retry continues paging")
+    func allHiddenPageFailure() async {
+        let feed = NearbyFeedModel()
+        let server = ScriptedNearbyFetch()
+        let blocked = Set(profiles[0..<4].map(\.id))
+        let isHidden: (Profile) -> Bool = { blocked.contains($0.id) }
+
+        let load = Task { await feed.reload(key, using: server.fetch) }
+        await server.settle()
+        server.answer(with: page(0..<2, next: "2"))
+        await load.value
+
+        let paging = Task { await feed.loadMoreWhileAllHidden(isHidden, using: server.fetch) }
+        await server.settle()
+        server.fail(with: URLError(.notConnectedToInternet))
+        await paging.value
+        guard case .failed = feed.nextPage else {
+            Issue.record("expected a failed page, got \(feed.nextPage)")
+            return
+        }
+        // No retry loop: one request, then the Retry cell in the grid.
+        #expect(server.requests.count == 2)
+        #expect(NearbyContent.resolve(
+            hasProfiles: false,
+            hasMorePages: true,
+            isLoading: false,
+            failure: nil,
+            location: .located,
+            isTravelActive: false,
+            filtersActive: false
+        ) == .grid)
+        await feed.loadMoreWhileAllHidden(isHidden, using: server.fetch)
+        #expect(server.waiting == 0)
+
+        // Retry answers another hidden-only page; the screen's task (keyed on
+        // the cursor) runs the loop again, which fetches on.
+        let retry = Task { await feed.retryNextPage(using: server.fetch) }
+        await server.settle()
+        server.answer(with: page(2..<4, next: "4"))
+        await retry.value
+        let again = Task { await feed.loadMoreWhileAllHidden(isHidden, using: server.fetch) }
+        await server.settle()
+        #expect(server.requests.last?.cursor == "4")
+        server.answer(with: page(4..<6))
+        await again.value
+        #expect(feed.profiles.count == 6)
+        #expect(feed.nextCursor == nil)
+    }
+
+    @Test("While a first page loads, more pages from the old grid don't hide the spinner")
+    func moreOldPagesDuringReload() {
+        #expect(NearbyContent.resolve(
+            hasProfiles: false,
+            hasMorePages: true,
+            isLoading: true,
+            failure: nil,
+            location: .located,
+            isTravelActive: false,
+            filtersActive: false
+        ) == .loading)
+    }
+
     @Test("A reload drops a page request that was still running")
     func reloadDuringPage() async {
         let feed = NearbyFeedModel()
