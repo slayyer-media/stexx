@@ -41,7 +41,8 @@ struct E2EStorageTests {
 
     @Test("History is sealed with a Keychain key; without the key it's unreadable")
     func encryptedHistory() throws {
-        let directory = FileManager.default.temporaryDirectory.appending(path: "e2e-history-\(UUID().uuidString)")
+        // A space in the path, like the real "Application Support".
+        let directory = FileManager.default.temporaryDirectory.appending(path: "e2e history \(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
         let secrets = InMemorySecretStorage()
         let persistence = EncryptedFileHistoryPersistence(secrets: secrets, directory: directory)
@@ -50,6 +51,8 @@ struct E2EStorageTests {
         try persistence.save(history, userID: "u1")
 
         #expect(try persistence.load(userID: "u1") == history)
+        // A new instance (next launch) reads the same file.
+        #expect(try EncryptedFileHistoryPersistence(secrets: secrets, directory: directory).load(userID: "u1") == history)
         let file = try #require(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
         let raw = try Data(contentsOf: file)
         #expect(raw.range(of: Data("secret words".utf8)) == nil)

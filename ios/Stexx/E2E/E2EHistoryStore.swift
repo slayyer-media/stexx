@@ -95,7 +95,7 @@ final class EncryptedFileHistoryPersistence: E2EHistoryPersistence, @unchecked S
 
     func load(userID: Profile.ID) throws -> E2EHistory? {
         let url = fileURL(userID)
-        guard FileManager.default.fileExists(atPath: url.path()) else { return nil }
+        guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) else { return nil }
         // No key (a reinstall that kept the file, or a wiped Keychain): the
         // file is unreadable by design. Start over.
         guard let key = try existingKey(userID) else { return nil }
@@ -125,7 +125,7 @@ final class EncryptedFileHistoryPersistence: E2EHistoryPersistence, @unchecked S
 
     func delete(userID: Profile.ID) throws {
         let url = fileURL(userID)
-        if FileManager.default.fileExists(atPath: url.path()) {
+        if FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) {
             try FileManager.default.removeItem(at: url)
         }
         try secrets.delete(keyName(userID))

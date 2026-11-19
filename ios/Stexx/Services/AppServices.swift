@@ -70,11 +70,16 @@ final class AppServices {
                 try await api.refreshSession(refreshToken: refreshToken)
             }
         }
+        var location: LocationService? = LocationService(api: api)
+        #if DEBUG
+        // Screenshot route on a live server: no location prompt over the chat.
+        if ScreenshotRoute.current == .liveChat { location = nil }
+        #endif
         let services = AppServices(
             appState: appState,
             chatStore: chatStore,
             purchases: PurchaseService(api: api, appState: appState),
-            location: LocationService(api: api),
+            location: location,
             realtime: realtime,
             e2e: e2e
         )

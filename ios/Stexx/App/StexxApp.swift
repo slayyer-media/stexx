@@ -13,10 +13,15 @@ struct StexxApp: App {
         // In memory for this launch, persisted to the Keychain best-effort,
         // so a failed Keychain write can't leave the app signed in without
         // a usable token.
-        let sessionStore = CachedSessionStore(backing: KeychainSessionStore())
         #if DEBUG
-        let appState = ScreenshotRoute.current == nil ? AppState(sessionStore: sessionStore) : AppState.preview()
+        // `liveChat` screenshots: a dev-server session kept in memory only;
+        // the stored (Keychain) session is never read or written.
+        let sessionStore = ScreenshotRoute.current == .liveChat
+            ? CachedSessionStore(backing: InMemorySessionStore(session: ScreenshotRoute.devSession))
+            : CachedSessionStore(backing: KeychainSessionStore())
+        let appState = ScreenshotRoute.current?.usesMockData == true ? AppState.preview() : AppState(sessionStore: sessionStore)
         #else
+        let sessionStore = CachedSessionStore(backing: KeychainSessionStore())
         let appState = AppState(sessionStore: sessionStore)
         #endif
 

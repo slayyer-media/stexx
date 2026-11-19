@@ -155,6 +155,11 @@ struct ChatThreadView: View {
             if let route = ScreenshotRoute.current, [.reportFromChat, .reportPicker, .reportSent].contains(route) {
                 isReporting = true
             }
+            // Screenshot-only: send a message from a live (dev server) chat.
+            if ScreenshotRoute.current == .liveChat, let text = ScreenshotRoute.draft, conversation != nil {
+                draft = text
+                send()
+            }
             #endif
         }
         .task(id: conversation?.id) {
@@ -614,7 +619,8 @@ struct MessageBubble: View {
     private var encryptedPlaceholder: String? {
         switch message.encryption {
         case .unavailable?:
-            return String(localized: "Encrypted message. It can't be shown on this phone, for example after reinstalling Stexx.")
+            // Typically a reinstall or a new phone: the plaintext was only ever on the old one.
+            return String(localized: "Encrypted message. Not available on this phone.")
         case .awaitingKeyConfirmation?:
             return String(localized: "Sent with \(senderName)'s new security key. Accept the key change at the top to read it.")
         case .unsupported?:
