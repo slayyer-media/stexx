@@ -12,7 +12,7 @@ private enum PasskeyFixtures {
 
     static let creationJSON = """
     {"challenge":"CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk","rp":{"name":"Stexx","id":"stexx.gay"},\
-    "user":{"id":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc","name":"QuantumOtter","displayName":""},\
+    "user":{"id":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc","name":"Stexx account","displayName":"Stexx account"},\
     "pubKeyCredParams":[{"alg":-8,"type":"public-key"},{"alg":-7,"type":"public-key"},{"alg":-257,"type":"public-key"}],\
     "timeout":60000,"attestation":"none","excludeCredentials":[],\
     "authenticatorSelection":{"residentKey":"required","userVerification":"required","requireResidentKey":true},\
@@ -96,7 +96,7 @@ struct PasskeyRequestBuildingTests {
         #expect(request.relyingPartyID == "stexx.gay")
         #expect(request.challenge == PasskeyFixtures.challenge)
         #expect(request.userID == PasskeyFixtures.userID)
-        #expect(request.userName == "QuantumOtter")
+        #expect(request.userName == "Stexx account")
         #expect(request.excludedCredentialIDs.isEmpty)
     }
 
@@ -481,6 +481,8 @@ struct PasskeyFlowTests {
     func mockReplay() async throws {
         let mock = MockAPIClient(latency: .zero)
         let options = try await mock.passkeyRegistrationOptions(displayName: "Q")
+        // like the server: the passkey's label is neutral, never the nickname
+        #expect(options.user.name == "Stexx account")
         let request = try PasskeyWire.registrationRequest(from: options, relyingPartyID: "stexx.gay")
         let created = try await SimulatedPasskeyAuthenticator().createPasskey(request)
         let credential = PasskeyWire.registrationCredential(from: created, confirmedAdult: true)

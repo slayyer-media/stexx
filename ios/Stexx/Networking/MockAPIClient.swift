@@ -87,7 +87,8 @@ actor MockAPIClient: APIClient {
         return PasskeyCreationOptions(
             challenge: challenge,
             rp: .init(id: PasskeyAvailability.defaultRelyingPartyID, name: "Stexx"),
-            user: .init(id: Self.randomBase64URL(32), name: displayName, displayName: ""),
+            // Like the server: a neutral label, never the nickname.
+            user: .init(id: Self.randomBase64URL(32), name: "Stexx account", displayName: "Stexx account"),
             timeout: 300_000,
             attestation: "none",
             excludeCredentials: [],

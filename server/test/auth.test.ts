@@ -4,6 +4,7 @@ import { isoCBOR } from "@simplewebauthn/server/helpers";
 import { config } from "../src/config.ts";
 import { emailHmac, hashToken } from "../src/lib/auth.ts";
 import { lastDevLinkFor } from "../src/lib/mailer.ts";
+import { PASSKEY_ACCOUNT_LABEL } from "../src/routes/auth.ts";
 import { as, createUser, expectError, expectJson, expectNoContent, post, sql, uniq } from "./helpers.ts";
 
 // ---- helpers ---------------------------------------------------------------
@@ -361,7 +362,10 @@ describe("passkeys", () => {
     const o = await passkeyOptions(dn);
     expect(o.rp.id).toBe(config.webauthn.rpId);
     expect(o.rp.name).toBe(config.webauthn.rpName);
-    expect(o.user.name).toBe(dn);
+    // the passkey is labelled neutrally, never with the nickname (it syncs to the password manager)
+    expect(o.user.name).toBe(PASSKEY_ACCOUNT_LABEL);
+    expect(o.user.displayName).toBe(PASSKEY_ACCOUNT_LABEL);
+    expect(JSON.stringify(o)).not.toContain(dn);
     expect(typeof o.challenge).toBe("string");
     expect(o.attestation).toBe("none");
     expect(o.authenticatorSelection.residentKey).toBe("required");

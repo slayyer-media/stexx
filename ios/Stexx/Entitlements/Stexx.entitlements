@@ -3,8 +3,8 @@
 <!--
   Entitlements for the Debug and Release configurations (CODE_SIGN_ENTITLEMENTS
   in project.yml). StexxLocal.entitlements is the Local configuration's copy:
-  keep both in sync, except for the passkey associated domain, which only this
-  file has.
+  keep both in sync, except for the associated domains (passkeys and email
+  links), which only this file has.
 -->
 <plist version="1.0">
 <dict>
@@ -13,11 +13,14 @@
 	<key>com.apple.developer.devicecheck.appattest-environment</key>
 	<string>$(STEXX_APP_ATTEST_ENVIRONMENT)</string>
 	<!-- Passkeys for the relying party (STEXX_PASSKEY_RP_ID, the server's
-	     WEBAUTHN_RP_ID). It must serve an apple-app-site-association that lists
-	     the app (server/deploy/README.md). Automatic signing adds the capability. -->
+	     WEBAUTHN_RP_ID), and email sign-in links (STEXX_APP_LINK_HOST, the
+	     host of the server's APP_LINK_BASE) as universal links. Each domain
+	     must serve an apple-app-site-association that lists the app
+	     (server/deploy/README.md). Automatic signing adds the capability. -->
 	<key>com.apple.developer.associated-domains</key>
 	<array>
 		<string>webcredentials:$(STEXX_PASSKEY_RP_ID)</string>
+		<string>applinks:$(STEXX_APP_LINK_HOST)</string>
 	</array>
 </dict>
 </plist>

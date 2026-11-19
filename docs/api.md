@@ -160,12 +160,12 @@ Non-2xx responses carry:
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
 | POST | `/auth/register` | `RegistrationRequest` → `Session` | `{ displayName, method: "passkey"\|"email", email?, confirmedAdult: true }`. No real name or phone number, ever. Birth dates are never sent. |
-| POST | `/auth/passkey/register/options` | `{ displayName, confirmedAdult? }` → WebAuthn creation options | RP ID `stexx.gay` (`WEBAUTHN_RP_ID`). SimpleWebAuthn `PublicKeyCredentialCreationOptionsJSON`: binary fields base64url, `user.id` is an opaque handle (not the user ID). Challenge single use, 5 min. |
+| POST | `/auth/passkey/register/options` | `{ displayName, confirmedAdult? }` → WebAuthn creation options | RP ID `stexx.gay` (`WEBAUTHN_RP_ID`). SimpleWebAuthn `PublicKeyCredentialCreationOptionsJSON`: binary fields base64url, `user.id` is an opaque handle (not the user ID); `user.name` and `user.displayName` are the fixed label `Stexx account`, never the nickname (the passkey syncs to the password manager, where others may see its label). Challenge single use, 5 min. |
 | POST | `/auth/passkey/register/finish` | `RegistrationResponseJSON` + `confirmedAdult?` → `Session` | `{ id, rawId, type: "public-key", authenticatorAttachment?, clientExtensionResults, response: { clientDataJSON, attestationObject, transports? } }`, all base64url. 18+ must be confirmed at options or here. Attested (`signup`). 400 `invalid_challenge` / `invalid_credential`, 409 `credential_exists`. |
 | POST | `/auth/passkey/login/options` | → WebAuthn request options | `{ rpId, challenge, timeout, userVerification }`; no `allowCredentials` (discoverable passkeys pick the account). Body ignored. |
 | POST | `/auth/passkey/login/finish` | `AuthenticationResponseJSON` → `Session` | `response: { clientDataJSON, authenticatorData, signature, userHandle? }`. Attested (`login`). 401 `invalid_credential` for an unknown passkey, a bad signature, a used or expired challenge. |
 | POST | `/auth/email/link` | `{ email }` → 204 | Sends a one-time sign-in link. Same response whether or not the address exists. |
-| POST | `/auth/email/verify` | `{ token }` → `Session` | Token from the link (universal link to the app). |
+| POST | `/auth/email/verify` | `{ token }` → `Session` | Token from the link (a universal link to the app through `applinks:stexx.gay` once `stexx.gay` serves the AASA file; otherwise it opens in the browser). |
 | POST | `/auth/refresh` | `{ refreshToken }` → `Session` | Rotates the refresh token. |
 | POST | `/auth/logout` | → 204 | Revokes the current session. |
 | DELETE | `/me` | → 204 | Deletes the account and all data. |

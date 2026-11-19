@@ -70,9 +70,14 @@ targets:
         # stexx.gay must serve an apple-app-site-association listing the app
         # (server/deploy/README.md). See ios/README.md#passkeys.
         STEXX_PASSKEY_RP_ID: stexx.gay
+        # Host of the server's APP_LINK_BASE: email sign-in links
+        # (https://<host>/auth/email?token=…) open the app as universal links
+        # through the `applinks:` associated domain (Stexx.entitlements only).
+        STEXX_APP_LINK_HOST: stexx.gay
         # Committed (not generated) so the Local configuration can use its
         # own file: XcodeGen's `entitlements:` applies one file to every
-        # configuration. App Attest + the webcredentials associated domain.
+        # configuration. App Attest + the webcredentials and applinks
+        # associated domains.
         CODE_SIGN_ENTITLEMENTS: Stexx/Entitlements/Stexx.entitlements
       configs:
         Debug:

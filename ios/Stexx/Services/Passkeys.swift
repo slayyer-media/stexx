@@ -155,7 +155,8 @@ enum PasskeyError: LocalizedError, Hashable, Sendable {
 struct PasskeyRegistrationRequest: Hashable, Sendable {
     var relyingPartyID: String
     var challenge: Data
-    /// Shown in the passkey list (the nickname).
+    /// The account label in the passkey list: the server's neutral
+    /// `Stexx account`, never the nickname (passkeys sync via iCloud Keychain).
     var userName: String
     var userID: Data
     var excludedCredentialIDs: [Data]

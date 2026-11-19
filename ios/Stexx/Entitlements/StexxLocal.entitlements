@@ -2,9 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Entitlements for the Local configuration (a dev server on 127.0.0.1). The same
-  as Stexx.entitlements minus the passkey associated domain: iOS only allows
-  passkeys for a real domain that serves an apple-app-site-association file, so
-  Local builds sign in with email (the passkey buttons explain why).
+  as Stexx.entitlements minus the associated domains: iOS only allows passkeys
+  and universal links for a real domain that serves an apple-app-site-association
+  file, so Local builds sign in with email (the passkey buttons explain why).
 -->
 <plist version="1.0">
 <dict>
