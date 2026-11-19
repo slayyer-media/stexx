@@ -18,7 +18,7 @@ import {
 } from "../src/lib/nearby.ts";
 import { ONLINE_WINDOW_MS, viewerCell } from "../src/lib/serialize.ts";
 import { notBlocked, notBlockedByViewer, col, val } from "../src/lib/visibility.ts";
-import { as, createUser, deleteUser, expectJson, randomCell, sql, uniq } from "./helpers.ts";
+import { as, createUser, deleteUser, expectJson, expectNoContent, randomCell, sql, uniq } from "./helpers.ts";
 import { referenceRows } from "./nearby-reference.ts";
 import type { Sql } from "../src/db/sql.ts";
 
@@ -447,5 +447,73 @@ describe("edge cases of the windows", () => {
       expect(wide.windows.at(-1)).toBeGreaterThan(40_000);
       expect(wide.windows).not.toContain(null);
     });
+  });
+});
+
+describe("migration 117", () => {
+  test("distance functions: inlined into queries, NULL in gives NULL out, windows are fixed points in SQL too", async () => {
+    const plan = async (q: ReturnType<typeof sql>) => (await q).map((r: any) => r["QUERY PLAN"]).join("\n");
+    // Inlined: the plan shows the formula, not a call. (Calls cost ~1-3 µs per row; see the migration.)
+    const hav = await plan(sql`EXPLAIN (VERBOSE) SELECT stexx_haversine_m(1, 2, l.cell_lat, l.cell_lon) FROM locations l`);
+    expect(hav).toContain("asin");
+    expect(hav).not.toContain("stexx_haversine_m");
+    const bucket = await plan(sql`EXPLAIN (VERBOSE) SELECT stexx_distance_bucket(l.cell_lat) FROM locations l`);
+    expect(bucket).toContain("ceil");
+    expect(bucket).not.toContain("stexx_distance_bucket");
+    const [n] = await sql<{ h: number | null; b: number | null; h2: number | null }[]>`
+      SELECT stexx_haversine_m(NULL, 1, 2, 3) AS h, stexx_distance_bucket(NULL) AS b, stexx_haversine_m(1, 2, 3, NULL) AS h2`;
+    expect(n).toEqual({ h: null, b: null, h2: null });
+    const rows = await sql<{ w: number; b: number }[]>`SELECT w, stexx_distance_bucket(w) AS b FROM unnest(${[...NEARBY_WINDOWS]}::float8[]) w`;
+    for (const r of rows) expect(r.b).toBe(r.w);
+    // Antipodes and identical points: the clamp in asin still holds.
+    const [e] = await sql<{ a: number; z: number }[]>`SELECT stexx_haversine_m(0, 0, 0, 180) AS a, stexx_haversine_m(10, 10, 10, 10) AS z`;
+    expect(e!.a).toBeCloseTo(haversineMeters(0, 0, 0, 180), 3);
+    expect(e!.z).toBe(0);
+  });
+
+  test("cell rows carry a copy of hide_distance that follows the user", async () => {
+    const home = randomCell();
+    const flags = async (id: string) => {
+      const [r] = await sql<{ home: boolean | null; travel: boolean | null }[]>`
+        SELECT (SELECT hide_distance FROM locations WHERE user_id = ${id}) AS home,
+               (SELECT hide_distance FROM travel_locations WHERE user_id = ${id}) AS travel`;
+      return r!;
+    };
+    const hidden = await user({ location: home, plusDays: 3, privacy: { hide_distance: true } });
+    expect(await flags(hidden.id)).toEqual({ home: true, travel: null });
+    await expectNoContent(await as(hidden).put("/v1/me/travel", { json: { latitude: home.latitude + 1, longitude: home.longitude } }));
+    expect(await flags(hidden.id)).toEqual({ home: true, travel: true });
+    // Turning it off (the real endpoint) rewrites both copies; a location update keeps it.
+    const privacy = { showOnlineStatus: true, sendReadReceipts: true, expiringPhotosByDefault: true, blurExplicitPhotos: true, incognito: false };
+    await expectJson(await as(hidden).put("/v1/me/privacy", { json: { ...privacy, hideDistance: false } }));
+    expect(await flags(hidden.id)).toEqual({ home: false, travel: false });
+    await expectNoContent(await as(hidden).put("/v1/me/location", { json: { latitude: home.latitude, longitude: home.longitude + 0.01 } }));
+    expect(await flags(hidden.id)).toEqual({ home: false, travel: false });
+    await expectJson(await as(hidden).put("/v1/me/privacy", { json: { ...privacy, hideDistance: true } }));
+    expect(await flags(hidden.id)).toEqual({ home: true, travel: true });
+    // Whatever a writer puts in the column, the owner's flag wins.
+    const plain = await user();
+    await sql`INSERT INTO locations (user_id, cell_lat, cell_lon, hide_distance) VALUES (${plain.id}, ${home.latitude}, ${home.longitude}, true)`;
+    expect((await flags(plain.id)).home).toBe(false);
+    await sql`UPDATE locations SET hide_distance = true WHERE user_id = ${plain.id}`;
+    expect((await flags(plain.id)).home).toBe(false);
+  });
+
+  test("toggling hideDistance moves a user between the two arms of the search", async () => {
+    const home = randomCell();
+    const me = await user({ location: home });
+    const other = await user({ location: cellAtDistance(home, 700, 1_200) });
+    const privacy = { showOnlineStatus: true, sendReadReceipts: true, expiringPhotosByDefault: true, blurExplicitPhotos: true, incognito: false };
+    const find = async () => {
+      const page: any = await expectJson(await as(me).get("/v1/nearby?limit=100"));
+      return page.items.find((p: any) => p.id === other.id);
+    };
+    expect((await find()).distanceMeters).toBeGreaterThan(0);
+    await expectJson(await as(other).put("/v1/me/privacy", { json: { ...privacy, hideDistance: true } }));
+    const hiddenNow = await find();
+    expect(hiddenNow).toBeDefined();
+    expect(hiddenNow.distanceMeters).toBeNull();
+    await expectJson(await as(other).put("/v1/me/privacy", { json: { ...privacy, hideDistance: false } }));
+    expect((await find()).distanceMeters).toBeGreaterThan(0);
   });
 });

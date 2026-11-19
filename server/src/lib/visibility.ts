@@ -56,6 +56,23 @@ export function visibleToViewer(viewer: Fragment, t: string): Fragment {
 }
 
 /**
+ * Same rule as `visibleToViewer(val(viewerId), t)`, shaped for scans over MANY rows (nearby). The people who have
+ * written to the viewer are read once, and only when the first incognito row needs them (an uncorrelated subquery
+ * is an init plan, run lazily), instead of a conversations/messages probe per incognito row. The probe form also
+ * makes the planner charge a subquery for EVERY row (it can't know the OR usually short-circuits), which on a full
+ * scan talks it out of hash joins; this one is charged once.
+ */
+export function visibleToViewerInScan(viewerId: string, t: string): Fragment {
+  return sql`(NOT ${isIncognito(t)} OR ${sql(t + ".id")} = ANY (ARRAY(
+    SELECT CASE WHEN cv.user_a = ${viewerId} THEN cv.user_b ELSE cv.user_a END
+      FROM conversations cv
+     WHERE (cv.user_a = ${viewerId} OR cv.user_b = ${viewerId})
+       AND EXISTS (SELECT 1 FROM messages ms
+                    WHERE ms.conversation_id = cv.id
+                      AND ms.sender_id = CASE WHEN cv.user_a = ${viewerId} THEN cv.user_b ELSE cv.user_a END))))`;
+}
+
+/**
  * Moderation gate for LISTS of other users (nearby grid, viewers): TRUE unless the target row `t` is hidden pending
  * review (auto-hidden after reports, or by a moderator) or banned. No exceptions: a hidden account disappears from
  * discovery for everyone.

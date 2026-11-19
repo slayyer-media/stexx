@@ -1,7 +1,8 @@
 import { sql, type Fragment, type Sql } from "../db/sql.ts";
 import { bucketDistance, boundingBox, lonRanges, type Cell, type LatLonBox } from "./distance.ts";
-import { profileColumns, type ProfileRow } from "./serialize.ts";
-import { notBlockedByViewer, notModerated, val, visibleToViewer } from "./visibility.ts";
+import { encodeCursor } from "./cursor.ts";
+import { ONLINE_WINDOW_MS, profileColumns, profilesFor, viewerCell, type ProfileJson, type ProfileRow } from "./serialize.ts";
+import { notBlockedByViewer, notModerated, visibleToViewerInScan } from "./visibility.ts";
 
 /**
  * The GET /nearby search: everyone visible to the viewer, ordered by (bucketed distance, id), one page at a time.
@@ -51,7 +52,7 @@ export function hiddenRegion(cell: Cell): { lat: number; lon: number } {
  * makes a window provably complete. 5 km fills a page in a town; 5,000 km is the last bounded step before one
  * unbounded query (a box that size already spans most longitudes).
  */
-export const NEARBY_WINDOWS: readonly number[] = [5_000, 20_000, 50_000, 200_000, 1_000_000, 5_000_000];
+export const NEARBY_WINDOWS: readonly number[] = [5_000, 20_000, 50_000, 100_000, 200_000, 500_000, 1_000_000, 2_000_000, 5_000_000];
 
 for (const w of NEARBY_WINDOWS) {
   if (bucketDistance(w) !== w) throw new Error(`NEARBY_WINDOWS: ${w} is not a bucket fixed point`);
@@ -99,11 +100,43 @@ function inBox(t: string, box: LatLonBox): Fragment {
   return sql`${lat} BETWEEN ${box.minLat}::float8 AND ${box.maxLat}::float8 ${lonCond}`;
 }
 
-/** Ids of users whose home or travel cell is in `box` (a superset of the users whose effective cell is). */
-function locatedIn(box: LatLonBox): Fragment {
-  return sql`(SELECT l.user_id FROM locations l WHERE ${inBox("l", box)}
+/**
+ * Users located in `box` (null: anywhere) as rows (user_id, cell_lat, cell_lon, travel, raw_m): one row for the
+ * home cell and one for the travel cell, each with its raw distance to the viewer in metres. Exactly one of a
+ * user's rows is their EFFECTIVE cell; join it with `effectiveCell("el", "u")`. This is the effective_locations
+ * view's rule re-expressed so that a box can use the cell indexes (the view hides them behind a CASE); the parity
+ * tests compare against the view. OFFSET 0 keeps it a separate subquery so raw_m is a plain column and
+ * Postgres inlines stexx_distance_bucket(raw_m) instead of calling it per row (migration 117).
+ */
+function located(s: NearbySearch, box: LatLonBox | null, hiddenOnly = false): Fragment {
+  const only = (t: string) => {
+    const conds = [
+      ...(box ? [inBox(t, box)] : []),
+      // Copy of users.hide_distance (migration 117) so the partial indexes find just the hidden users. A prefilter
+      // only: the arm still checks u.hide_distance.
+      ...(hiddenOnly ? [sql`${sql(t + ".hide_distance")}`] : []),
+      ...(s.favoritesOnly ? [sql`${sql(t + ".user_id")} IN (SELECT f.target_id FROM favorites f WHERE f.user_id = ${s.viewerId})`] : []),
+    ];
+    return conds.length ? sql`WHERE ${conds.reduce((acc, f) => sql`${acc} AND ${f}`)}` : EMPTY;
+  };
+  return sql`(
+      SELECT c.user_id, c.cell_lat, c.cell_lon, c.travel,
+             stexx_haversine_m(${s.cell.latitude}::float8, ${s.cell.longitude}::float8, c.cell_lat, c.cell_lon) AS raw_m
+        FROM (SELECT l.user_id, l.cell_lat, l.cell_lon, false AS travel FROM locations l ${only("l")}
               UNION ALL
-              SELECT t.user_id FROM travel_locations t WHERE ${inBox("t", box)})`;
+              SELECT t.user_id, t.cell_lat, t.cell_lon, true AS travel FROM travel_locations t ${only("t")}) c
+      OFFSET 0)`;
+}
+
+/**
+ * TRUE when row `el` of located() is user `u`'s effective cell: the travel cell while Stexx+ is active, else the
+ * home cell (the effective_locations rule, migration 001).
+ */
+function effectiveCell(el: string, u: string): Fragment {
+  const plusActive = sql`(${sql(u + ".plus_expires_at")} > now()) IS TRUE`;
+  return sql`(CASE WHEN ${sql(el + ".travel")} THEN ${plusActive}
+                   ELSE NOT ${plusActive} OR NOT EXISTS (SELECT 1 FROM travel_locations tl WHERE tl.user_id = ${sql(u + ".id")})
+              END)`;
 }
 
 /** The fixed 3×3 block of hidden-placement regions around the viewer's region, as a box. */
@@ -117,15 +150,17 @@ export function hiddenRegionBox(cell: Cell, marginDeg = 1e-6): LatLonBox {
   };
 }
 
-/** Gates and filters shared by both arms, for users row `u` (effective location `el` already joined). */
+/**
+ * Gates and filters shared by both arms, for users row `u`. (favoritesOnly is applied in located(), where it can use
+ * the favourites index.)
+ */
 function listConditions(s: NearbySearch): Fragment {
   const me = s.viewerId;
   return sql`u.id <> ${me}
      AND ${notBlockedByViewer(me, sql`u.id`)}
-     AND ${visibleToViewer(val(me), "u")}
+     AND ${visibleToViewerInScan(me, "u")}
      AND ${notModerated("u")}
      ${s.onlineOnly ? sql`AND u.show_online_status AND u.last_active_at > ${s.onlineCutoff}` : EMPTY}
-     ${s.favoritesOnly ? sql`AND EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = ${me} AND f.target_id = u.id)` : EMPTY}
      ${s.lookingFor.length > 0 ? sql`AND u.looking_for && ${s.lookingFor}::text[]` : EMPTY}
      ${s.minAge !== undefined ? sql`AND u.age >= ${s.minAge}::int` : EMPTY}
      ${s.maxAge !== undefined ? sql`AND u.age <= ${s.maxAge}::int` : EMPTY}
@@ -144,25 +179,25 @@ function hiddenArmNeeded(s: NearbySearch): boolean {
  */
 export function nearbyStatement(s: NearbySearch, window: number | null): Fragment {
   const me = s.viewerId;
-  const { latitude, longitude } = s.cell;
-  // Only the window decides membership; the box just lets the indexes skip everyone else.
-  const near = window === null || s.favoritesOnly ? EMPTY : sql`AND u.id IN ${locatedIn(boundingBox(s.cell, window))}`;
+  // Only the window decides membership; the box just lets the indexes skip everyone else, and raw_m < window
+  // (implied by sort_d < window, see the file comment) drops the box's corners before the users lookup.
   const visibleArm = sql`
-      SELECT ${profileColumns(me)}, false AS sort_h,
-             stexx_distance_bucket(stexx_haversine_m(${latitude}::float8, ${longitude}::float8, el.cell_lat, el.cell_lon)) AS sort_d
-        FROM users u
-        JOIN effective_locations el ON el.user_id = u.id
-       WHERE NOT u.hide_distance ${near}
+      SELECT ${profileColumns(me)}, false AS sort_h, stexx_distance_bucket(el.raw_m) AS sort_d
+        FROM ${located(s, window === null ? null : boundingBox(s.cell, window))} el
+        JOIN users u ON u.id = el.user_id
+       WHERE ${effectiveCell("el", "u")}
+         AND NOT u.hide_distance
+         ${window === null ? EMPTY : sql`AND el.raw_m < ${window}::float8`}
          AND ${listConditions(s)}`;
   const region = hiddenRegion(s.cell);
   const hiddenArm = sql`
       UNION ALL
       SELECT ${profileColumns(me)}, true AS sort_h,
              abs(hashtextextended(${me + ":" + "x"} || u.id, 0) % ${HIDDEN_SORT_SPAN})::int AS sort_d
-        FROM users u
-        JOIN effective_locations el ON el.user_id = u.id
-       WHERE u.hide_distance
-         ${s.favoritesOnly ? EMPTY : sql`AND u.id IN ${locatedIn(hiddenRegionBox(s.cell))}`}
+        FROM ${located(s, hiddenRegionBox(s.cell), true)} el
+        JOIN users u ON u.id = el.user_id
+       WHERE ${effectiveCell("el", "u")}
+         AND u.hide_distance
          AND abs(floor((el.cell_lat + 90) / ${HIDDEN_REGION_DEG}::float8)::int - ${region.lat}::int) <= 1
          AND (((floor((el.cell_lon + 180) / ${HIDDEN_REGION_DEG}::float8)::int - ${region.lon}::int)
                % ${LON_REGIONS}::int + ${LON_REGIONS}::int) % ${LON_REGIONS}::int) IN (0, 1, ${LON_REGIONS - 1}::int)
@@ -187,8 +222,10 @@ export async function nearbyRows(s: NearbySearch, db: Sql = sql): Promise<Nearby
   const windows: (number | null)[] = [];
   // favoritesOnly reads the viewer's favourites (a short list) directly; no windows needed.
   if (!s.favoritesOnly) {
-    // Windows at or below the cursor can't hold anything after it.
+    // Windows at or below the cursor can't hold anything after it; none past the first one beyond
+    // maxDistanceMeters is ever needed (that one already holds every match).
     let i = NEARBY_WINDOWS.findIndex((w) => w > (s.cursor?.d ?? -1));
+    const last = s.maxDistanceMeters === undefined ? -1 : NEARBY_WINDOWS.findIndex((w) => w > s.maxDistanceMeters!);
     while (i >= 0 && i < NEARBY_WINDOWS.length) {
       const w = NEARBY_WINDOWS[i]!;
       windows.push(w);
@@ -202,9 +239,37 @@ export async function nearbyRows(s: NearbySearch, db: Sql = sql): Promise<Nearby
       const guess = w * Math.sqrt(want / Math.max(rows.length, 1));
       const next = NEARBY_WINDOWS.findIndex((x) => x >= guess);
       i = next < 0 ? NEARBY_WINDOWS.length : Math.max(i + 1, next);
+      if (last >= 0) i = Math.min(i, last);
     }
   }
   windows.push(null);
   const rows = await db<NearbyRow[]>`${nearbyStatement(s, null)}`;
   return { rows, windows };
+}
+
+/** What GET /nearby asks for, once parsed and authorised (Stexx+ filters already checked). */
+export type NearbyQuery = Omit<NearbySearch, "viewerId" | "cell" | "onlineCutoff">;
+
+/**
+ * The GET /nearby response body for `viewerId`: their effective cell, the page, and the profiles as they see them.
+ * The route is a thin wrapper; the benchmark calls this directly with its own database.
+ */
+export async function nearbyPage(
+  viewerId: string,
+  q: NearbyQuery,
+  db: Sql = sql,
+): Promise<{ items: ProfileJson[]; nextCursor: string | null }> {
+  const cell = await viewerCell(viewerId, db);
+  // Without a known location of our own we can neither sort nor measure: nothing to show.
+  if (!cell) return { items: [], nextCursor: null };
+  const { rows } = await nearbyRows({ ...q, viewerId, cell, onlineCutoff: new Date(Date.now() - ONLINE_WINDOW_MS) }, db);
+  const page = rows.slice(0, q.limit);
+  const last = page[page.length - 1];
+  const nextCursor = rows.length > q.limit && last ? encodeCursor({ d: last.sort_d, id: last.id }) : null;
+  const items = await profilesFor(
+    viewerId,
+    page.map((r) => r.id),
+    { rows: page, cell, db },
+  );
+  return { items, nextCursor };
 }

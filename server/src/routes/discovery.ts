@@ -2,15 +2,15 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { sql, type Sql } from "../db/sql.ts";
 import { requireAuth, currentUserId } from "../lib/auth.ts";
-import { decodeCursor, encodeCursor } from "../lib/cursor.ts";
+import { decodeCursor } from "../lib/cursor.ts";
 import { badRequest, notFound } from "../lib/errors.ts";
 import { logError } from "../lib/logger.ts";
 import { isConnected, publishUnlessBlocked } from "../lib/realtime.ts";
 import { assertMayTap } from "../lib/moderation.ts";
 import { requirePlus } from "../lib/plus.ts";
 import { rateLimit } from "../lib/ratelimit.ts";
-import { nearbyRows } from "../lib/nearby.ts";
-import { ONLINE_WINDOW_MS, profilesFor, viewerCell } from "../lib/serialize.ts";
+import { nearbyPage } from "../lib/nearby.ts";
+import { profilesFor } from "../lib/serialize.ts";
 import {
   cleanText,
   idParam,
@@ -99,36 +99,20 @@ discoveryRoutes.get("/nearby", requireAuth, async (c) => {
   const cursor = decodeCursor(q.cursor, cursorSchema);
   const limit = q.limit ?? DEFAULT_LIMIT;
 
-  const cell = await viewerCell(me);
-  // Without a known location of our own we can neither sort nor measure: nothing to show.
-  if (!cell) return c.json({ items: [], nextCursor: null });
-
-  // Same rows, order and cursor as one query over everybody, without measuring everybody: see lib/nearby.ts.
-  const { rows } = await nearbyRows({
-    viewerId: me,
-    cell,
-    limit,
-    cursor,
-    onlineOnly: q.onlineOnly,
-    onlineCutoff: new Date(Date.now() - ONLINE_WINDOW_MS),
-    favoritesOnly: q.favoritesOnly,
-    lookingFor,
-    minAge: q.minAge,
-    maxAge: q.maxAge,
-    maxDistanceMeters: q.maxDistanceMeters,
-    positions,
-    tags,
-  });
-
-  const page = rows.slice(0, limit);
-  const last = page[page.length - 1];
-  const nextCursor = rows.length > limit && last ? encodeCursor({ d: last.sort_d, id: last.id }) : null;
-  const items = await profilesFor(
-    me,
-    page.map((r) => r.id),
-    { rows: page, cell },
+  return c.json(
+    await nearbyPage(me, {
+      limit,
+      cursor,
+      onlineOnly: q.onlineOnly,
+      favoritesOnly: q.favoritesOnly,
+      lookingFor,
+      minAge: q.minAge,
+      maxAge: q.maxAge,
+      maxDistanceMeters: q.maxDistanceMeters,
+      positions,
+      tags,
+    }),
   );
-  return c.json({ items, nextCursor });
 });
 
 discoveryRoutes.get("/profiles/:id", requireAuth, async (c) => {
