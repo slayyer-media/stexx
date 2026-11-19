@@ -87,10 +87,13 @@ CREATE INDEX staff_challenges_expires_idx ON staff_challenges (expires_at);
 -- The staff audit log: every staff event (login, failed login, logout, step-up, invite, enrollment, role change,
 -- disable, session revoke), every sensitive read and every action, with a purpose. Written only by
 -- staffAudit() (src/lib/staff/audit.ts). No free text: notes stay in moderation_actions.note.
+--   at:         set by the database on insert (a trigger overrides any value given), so rows can't be backdated.
 --   kind:       'read' (reads and lookups: deleted after 12 months), 'action' (a decision, with its
---               moderation_actions pointer when there is one) or 'event' (staff events). Actions and events are kept.
---   staff_id:   NULL only for a failed login with an unknown passkey, or a command-line change made before the
---               acting handle is a staff account.
+--               moderation_actions pointer when there is one) or 'event' (staff events). Actions and events are kept,
+--               except failed logins with an unknown passkey (no staff id: only a count), also deleted after 12 months.
+--   staff_id:   NULL only for a failed login with an unknown passkey, or a command-line change made while no active
+--               admin exists (bootstrapping the first one).
+--   role:       the role granted, on staff_invite and staff_role rows (so privilege history can be rebuilt).
 --   session_id: the console session (no foreign key: sessions are pruned, the record stays).
 --   target_user_id: the account concerned; anonymized (SET NULL) when the account is deleted or purged.
 --   target_ref: a report, photo flag, staff or session id (never an email, its HMAC, or a transaction id).
@@ -103,6 +106,7 @@ CREATE TABLE staff_audit (
   channel               text NOT NULL CHECK (channel IN ('console', 'cli')),
   kind                  text NOT NULL CHECK (kind IN ('read', 'action', 'event')),
   action                text NOT NULL CHECK (action ~ '^[a-z][a-z_]{0,31}$'),
+  role                  text CHECK (role IN ('support', 'moderator', 'admin')),
   target_kind           text CHECK (target_kind IN ('account', 'report', 'photo_flag', 'staff', 'session')),
   target_user_id        text REFERENCES users(id) ON DELETE SET NULL,
   target_ref            text CHECK (char_length(target_ref) <= 64),
@@ -118,7 +122,9 @@ CREATE INDEX staff_audit_at_idx ON staff_audit (at);
 -- Append-only. UPDATE is refused, except the foreign-key actions that anonymize a row: target_user_id or
 -- moderation_action_id set to NULL because the row they pointed at was deleted (run by Postgres's referential
 -- trigger, so one level below a statement, with every other column unchanged). DELETE is refused, except read rows
--- older than 12 months (the retention job; the trigger checks the row's age, not the caller). TRUNCATE is refused.
+-- and failed logins with an unknown passkey older than 12 months (the retention job; the trigger checks the row's
+-- age, not the caller). TRUNCATE is refused. INSERT always stamps `at` with now(), so a row can't be backdated (or
+-- made deletable at once).
 -- Phase 3 adds a database role without UPDATE/DELETE on this table and a daily hash-chain checkpoint.
 CREATE FUNCTION staff_audit_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -132,7 +138,8 @@ BEGIN
     END IF;
     RAISE EXCEPTION 'staff_audit is append-only' USING ERRCODE = 'insufficient_privilege';
   ELSIF TG_OP = 'DELETE' THEN
-    IF OLD.kind = 'read' AND OLD.at < now() - interval '12 months' THEN
+    IF (OLD.kind = 'read' OR (OLD.kind = 'event' AND OLD.action = 'login_failed' AND OLD.staff_id IS NULL))
+       AND OLD.at < now() - interval '12 months' THEN
       RETURN OLD;
     END IF;
     RAISE EXCEPTION 'staff_audit is append-only' USING ERRCODE = 'insufficient_privilege';
@@ -147,3 +154,14 @@ CREATE TRIGGER staff_audit_append_only_rows
 CREATE TRIGGER staff_audit_no_truncate
   BEFORE TRUNCATE ON staff_audit
   FOR EACH STATEMENT EXECUTE FUNCTION staff_audit_append_only();
+
+CREATE FUNCTION staff_audit_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.at := now();
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER staff_audit_stamp_at
+  BEFORE INSERT ON staff_audit
+  FOR EACH ROW EXECUTE FUNCTION staff_audit_stamp();

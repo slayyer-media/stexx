@@ -4,16 +4,31 @@
  *
  *   staff invite <handle> --role support|moderator|admin --as <handle> [--yes] [--json]
  *       prints a single-use enrollment link (ADMIN_ORIGIN/enroll/<token>, valid 30 minutes). Re-inviting an existing
- *       handle removes its passkeys and signs it out everywhere, so it needs --yes.
- *   staff list [--json]
+ *       handle removes its passkeys and signs it out everywhere, so it needs --yes. An admin may re-invite their own
+ *       handle here (a locked-out sole admin getting back in).
+ *   staff list [<handle>] --as <handle> [--json]
  *   staff disable <handle> --as <handle> --yes [--json]
  *       signs it out everywhere; it can't sign in again. Allowed for the last admin here (break glass).
  *
- * `--as` (or STEXX_MODERATOR) names who is acting, as for every write command. When it is an active staff handle the
- * staff_audit row points at that account; otherwise (bootstrapping the first admin) the row has no acting staff.
+ * `--as` (or STEXX_MODERATOR) names who is acting. Every command writes a staff_audit row (channel cli) pointing at
+ * that account, so once an active admin exists `--as` must be one (cliActorRefusal). Only while there is none
+ * (bootstrapping the first admin, or after the last one was disabled) may it be any handle, and then the row has no
+ * acting staff.
  */
 import { config } from "../config.ts";
-import { disableStaff, enrollmentUrl, findStaff, inviteStaff, listStaff, StaffError, type StaffActor } from "../lib/staff/accounts.ts";
+import { sql } from "../db/sql.ts";
+import {
+  countActiveAdmins,
+  disableStaff,
+  enrollmentUrl,
+  findStaff,
+  inviteStaff,
+  listStaff,
+  StaffError,
+  type StaffAccount,
+  type StaffActor,
+} from "../lib/staff/accounts.ts";
+import { staffAudit } from "../lib/staff/audit.ts";
 import { checkActor, ModerationError } from "../lib/moderation.ts";
 import { isoDate } from "../lib/time.ts";
 
@@ -23,16 +38,17 @@ export const STAFF_USAGE = `Staff console accounts
                                                 invite support, moderator or admin: prints a single-use enrollment
                                                 link valid for 30 minutes (re-inviting a handle removes its passkeys
                                                 and signs it out everywhere: needs --yes)
-  staff list [--json]                           every staff account, its role and status
+  staff list [<handle>] --as <handle> [--json]  every staff account (or one), its role and status
   staff disable <handle> --as <handle> --yes    sign it out everywhere; it can't sign in again
 
-Handles are 1-64 letters, digits, dot, dash or underscore. Never a real name.`;
+--as (or STEXX_MODERATOR) must be an active admin's handle; any handle only while no active admin exists (the first
+one). Handles are 1-64 letters, digits, dot, dash or underscore. Never a real name.`;
 
 const VALUE_FLAGS = new Set(["--as", "--role"]);
 const BOOL_FLAGS = new Set(["--json", "--yes", "--help"]);
 const ALLOWED: Record<string, string[]> = {
   invite: ["--as", "--role", "--yes", "--json"],
-  list: ["--json"],
+  list: ["--as", "--json"],
   disable: ["--as", "--yes", "--json"],
 };
 
@@ -58,13 +74,23 @@ function parse(argv: string[]) {
   const allowed = ALLOWED[command];
   if (allowed) {
     for (const f of flags.keys()) if (!allowed.includes(f)) throw new StaffError(`${f} doesn't apply to "staff ${command}".`);
-    const max = command === "list" ? 0 : 1;
-    if (positional.length > max) throw new StaffError(`Unexpected argument ${positional[max]}.`);
+    if (positional.length > 1) throw new StaffError(`Unexpected argument ${positional[1]}.`);
   }
   return { command, positional, flags };
 }
 
-/** The acting handle (--as or STEXX_MODERATOR), resolved to a staff account when it is an active one. */
+/**
+ * Why `--as` can't act (null when it can): once an active admin exists it must name one, so every staff_audit row from
+ * the command line points at a staff account. While none exists (bootstrap) any well-formed handle may act. Exported
+ * for tests (the shared test database always has active admins).
+ */
+export function cliActorRefusal(handle: string, staff: StaffAccount | null, activeAdmins: number): string | null {
+  if (staff && !staff.disabledAt && staff.role === "admin") return null;
+  if (activeAdmins === 0) return null;
+  return `--as ${handle} is not an active admin. Staff commands are recorded against the admin running them: pass --as <your admin handle>.`;
+}
+
+/** The acting handle (--as or STEXX_MODERATOR), checked by cliActorRefusal and resolved to its staff account. */
 async function actorOf(flags: Map<string, string | true>, env: Record<string, string | undefined>): Promise<StaffActor> {
   const v = flags.get("--as");
   const handle = typeof v === "string" ? v : env.STEXX_MODERATOR;
@@ -76,6 +102,8 @@ async function actorOf(flags: Map<string, string | true>, env: Record<string, st
     throw err;
   }
   const staff = await findStaff(handle);
+  const refusal = cliActorRefusal(handle, staff, await countActiveAdmins());
+  if (refusal) throw new StaffError(refusal);
   return { staffId: staff && !staff.disabledAt ? staff.id : null, channel: "cli" };
 }
 
@@ -103,12 +131,19 @@ export async function runStaffCli(
         out(STAFF_USAGE);
         return 0;
       case "list": {
-        const items = await listStaff();
+        const actor = await actorOf(p.flags, env);
+        const handle = p.positional[0];
+        const items = await sql.begin(async (tx) => {
+          await staffAudit(tx, { kind: "read", action: "staff_list", channel: "cli", staffId: actor.staffId });
+          return listStaff(tx, handle ? { handle } : {});
+        });
         if (json) {
           out(JSON.stringify(items, null, 2));
           return 0;
         }
-        if (items.length === 0) out("No staff accounts. Start with: staff invite <handle> --role admin --as <handle>");
+        if (items.length === 0) {
+          out(handle ? `No staff account ${handle}.` : "No staff accounts. Start with: staff invite <handle> --role admin --as <handle>");
+        }
         for (const s of items) {
           const status = s.disabledAt ? `disabled ${day(s.disabledAt)}` : s.passkeys > 0 ? "active" : s.invitePending ? "invited" : "no passkey";
           out(`${s.handle.padEnd(24)} ${s.role.padEnd(10)} ${status.padEnd(20)} ${s.passkeys} passkey(s)  last sign-in ${day(s.lastLoginAt)}  ${s.id}`);

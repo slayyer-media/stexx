@@ -307,7 +307,7 @@ export const DEV_STAFF = [
 
 /**
  * Create the dev staff accounts that don't exist yet (no passkeys: sign in with ADMIN_DEV_AUTH's dev login, or
- * `stexx-mod staff invite <handle> --role <role> --as dev --yes` for a passkey). Returns the handles created.
+ * `stexx-mod staff invite <handle> --role <role> --as dev-admin --yes` for a passkey). Returns the handles created.
  */
 export async function seedDevStaff(accounts: readonly { handle: string; role: StaffRole }[] = DEV_STAFF): Promise<string[]> {
   if (config.isProduction) throw new Error("Refusing to seed in production");

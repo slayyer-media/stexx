@@ -376,6 +376,67 @@ export async function sweepOrphanMedia(now: Date = new Date(), opts: OrphanSweep
 }
 
 // ---------------------------------------------------------------------------
+// Staff console (migration 124)
+// ---------------------------------------------------------------------------
+
+/**
+ * staff_audit read rows (and failed logins with an unknown passkey: a count, no staff id) are kept this long. The
+ * table's trigger refuses deleting anything younger, or any other row, whatever the caller.
+ */
+export const STAFF_AUDIT_READ_RETENTION = "12 months";
+/** Ended console sessions and used, expired or voided enrollment links are kept this long, then deleted. */
+export const STAFF_CREDENTIAL_GRACE_MS = 7 * DAY;
+
+export interface StaffPurgeResult {
+  auditReads: number;
+  sessions: number;
+  enrollments: number;
+  challenges: number;
+}
+
+/**
+ * Staff console housekeeping: old staff_audit read rows (12 months, measured by the database clock like the trigger,
+ * never by the injected `now`), console sessions that ended (revoked or expired) a week ago, enrollment links used or
+ * expired a week ago, and expired WebAuthn challenges (never ahead of the real clock: a ceremony may be in flight).
+ * Staff accounts and every other audit row are kept.
+ */
+export async function purgeStaffConsole(now: Date = new Date()): Promise<StaffPurgeResult> {
+  const graceCutoff = new Date(now.getTime() - STAFF_CREDENTIAL_GRACE_MS);
+  const auditReads = await inBatches(async () => {
+    const r = await sql`
+      DELETE FROM staff_audit WHERE id IN (
+        SELECT id FROM staff_audit
+         WHERE (kind = 'read' OR (kind = 'event' AND action = 'login_failed' AND staff_id IS NULL))
+           AND at < LEAST(${now}::timestamptz, now()) - ${STAFF_AUDIT_READ_RETENTION}::interval
+         ORDER BY id LIMIT ${BATCH})`;
+    return r.count;
+  });
+  const sessions = await inBatches(async () => {
+    const r = await sql`
+      DELETE FROM staff_sessions WHERE id IN (
+        SELECT id FROM staff_sessions
+         WHERE LEAST(COALESCE(revoked_at, 'infinity'), idle_expires_at, absolute_expires_at) <= ${graceCutoff}
+         LIMIT ${BATCH})`;
+    return r.count;
+  });
+  const enrollments = await inBatches(async () => {
+    const r = await sql`
+      DELETE FROM staff_enrollments WHERE token_hash IN (
+        SELECT token_hash FROM staff_enrollments
+         WHERE COALESCE(used_at, expires_at) <= ${graceCutoff}
+         LIMIT ${BATCH})`;
+    return r.count;
+  });
+  const challenges = await inBatches(async () => {
+    const r = await sql`
+      DELETE FROM staff_challenges WHERE challenge IN (
+        SELECT challenge FROM staff_challenges WHERE expires_at <= LEAST(${now}::timestamptz, now()) LIMIT ${BATCH})`;
+    return r.count;
+  });
+  return { auditReads, sessions, enrollments, challenges };
+}
+
+// ---------------------------------------------------------------------------
 // Schedules
 // ---------------------------------------------------------------------------
 
@@ -391,7 +452,7 @@ export async function runFastJobs(now: Date = new Date()) {
   return { expired, viewOnce, trashed };
 }
 
-/** Every 10 min: the caps (unread expiring messages after 14 days, unopened view-once photos after 3), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows, old report evidence, banned accounts past their review window. */
+/** Every 10 min: the caps (unread expiring messages after 14 days, unopened view-once photos after 3), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows, old report evidence, banned accounts past their review window, staff console reads (12 months) and ended staff credentials. */
 export async function runSlowJobs(now: Date = new Date()) {
   const unreadCapped = await purgeUnreadExpiringMessages(now);
   const unopenedViewOnce = await purgeUnopenedViewOnceAttachments(now);
@@ -407,6 +468,7 @@ export async function runSlowJobs(now: Date = new Date()) {
   const bannedPurged = await purgeBannedAccounts(now);
   // Debounce state of moderator alerts (ids only); also purged here in case alerts were switched off.
   const moderatorAlertsSent = await purgeModeratorAlertSent(now);
+  const staffConsole = await purgeStaffConsole(now);
   return {
     unreadCapped,
     unopenedViewOnce,
@@ -420,5 +482,6 @@ export async function runSlowJobs(now: Date = new Date()) {
     spam,
     moderatorAlertsSent,
     bannedPurged,
+    staffConsole,
   };
 }

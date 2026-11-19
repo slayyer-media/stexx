@@ -7,6 +7,7 @@
  * The table is append-only (a trigger refuses UPDATE/DELETE apart from anonymization and read-row retention).
  */
 import { sql, type Sql } from "../../db/sql.ts";
+import { isStaffRole, type StaffRole } from "./permissions.ts";
 
 export type AuditKind = "read" | "action" | "event";
 export type AuditChannel = "console" | "cli";
@@ -50,6 +51,8 @@ export interface StaffAuditEntry {
   targetKind?: AuditTargetKind | null;
   targetUserId?: string | null;
   targetRef?: string | null;
+  /** The role granted (staff_invite, staff_role), so privilege history can be rebuilt from the log. */
+  role?: StaffRole | null;
   purpose?: AuditPurpose | null;
   ticketRef?: string | null;
   moderationActionId?: string | number | null;
@@ -73,14 +76,15 @@ export async function staffAudit(db: Sql, entry: StaffAuditEntry): Promise<strin
   ] as const) {
     if (value != null && !REF_RE.test(value)) throw new StaffAuditError(`${name} must be a plain id or ticket number`);
   }
+  if (entry.role != null && !isStaffRole(entry.role)) throw new StaffAuditError(`unknown role ${entry.role}`);
   if (entry.purpose != null && !(AUDIT_PURPOSES as readonly string[]).includes(entry.purpose)) {
     throw new StaffAuditError(`unknown purpose ${entry.purpose}`);
   }
   const [row] = await db<{ id: string }[]>`
-    INSERT INTO staff_audit (staff_id, session_id, channel, kind, action, target_kind, target_user_id, target_ref,
+    INSERT INTO staff_audit (staff_id, session_id, channel, kind, action, role, target_kind, target_user_id, target_ref,
                              purpose, ticket_ref, moderation_action_id)
     VALUES (${entry.staffId}, ${entry.sessionId ?? null}, ${entry.channel}, ${entry.kind}, ${entry.action},
-            ${entry.targetKind ?? null}, ${entry.targetUserId ?? null}, ${entry.targetRef ?? null},
+            ${entry.role ?? null}, ${entry.targetKind ?? null}, ${entry.targetUserId ?? null}, ${entry.targetRef ?? null},
             ${entry.purpose ?? null}, ${entry.ticketRef ?? null},
             ${entry.moderationActionId == null ? null : String(entry.moderationActionId)})
     RETURNING id`;
