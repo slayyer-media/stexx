@@ -7,12 +7,12 @@ import { conflict, badRequest, notFound } from "../lib/errors.ts";
 import { isId, newId } from "../lib/ids.ts";
 import { logError } from "../lib/logger.ts";
 import { copyMedia, drainMediaTrash, unlinkMedia } from "../lib/media.ts";
-import { isConnected, publish } from "../lib/realtime.ts";
+import { isConnected, publish, publishUnlessBlocked } from "../lib/realtime.ts";
 import { consume, rateLimit } from "../lib/ratelimit.ts";
 import { attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import { contentPolicy, encryptedContentPolicy } from "../lib/abuse/content.ts";
-import { screenSentMessage } from "../lib/abuse/spam.ts";
+import { RELEASED_CHANNEL, screenSentMessage } from "../lib/abuse/spam.ts";
 import { assertMessageAllowed } from "../lib/abuse/trust.ts";
 import { decodeEnvelope, envelopeSchema } from "../lib/e2e/envelope.ts";
 import { e2eMode } from "../lib/e2e/keys.ts";
@@ -106,7 +106,12 @@ export async function loadConversations(viewerId: string, opts: { ids?: string[]
   const ids = opts.ids;
   if (ids && ids.length === 0) return [];
   const rows = await sql<ConvRow[]>`
-    SELECT c.id, c.updated_at, cm.muted,
+    SELECT c.id, cm.muted,
+           -- A held message never bumps c.updated_at (its recipient would see the thread jump with nothing new);
+           -- its sender's own list still re-sorts on it.
+           GREATEST(c.updated_at,
+                    (SELECT max(m.sent_at) FROM messages m
+                      WHERE m.conversation_id = c.id AND m.sender_id = ${viewerId} AND m.held_at IS NOT NULL)) AS updated_at,
            CASE WHEN c.user_a = ${viewerId} THEN c.user_b ELSE c.user_a END AS other_id,
            (SELECT count(*)::int FROM messages m
              WHERE m.conversation_id = c.id AND m.sender_id <> ${viewerId} AND m.read_at IS NULL
@@ -120,7 +125,7 @@ export async function loadConversations(viewerId: string, opts: { ids?: string[]
            ? sql`c.id = ANY(${ids})`
            : sql`NOT cm.hidden AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND ${visibleTo("cm")})`
        }
-     ORDER BY c.updated_at DESC, c.id DESC
+     ORDER BY updated_at DESC, c.id DESC
      LIMIT ${MAX_CONVERSATIONS}`;
   if (rows.length === 0) return [];
 
@@ -214,6 +219,57 @@ export async function publishStoredMessage(messageId: string, recipientId: strin
   } catch (err) {
     logError("chat.fanout", err);
   }
+}
+
+/**
+ * Push held messages that a moderator just released (lib/abuse/spam.ts deliverHeld) to their recipients, as if just
+ * sent; their senders already saw them. Messages since held again, deleted or blocked are skipped. Never throws.
+ */
+export async function publishReleasedMessages(messageIds: string[]): Promise<void> {
+  try {
+    if (messageIds.length === 0) return;
+    const rows = await sql<(MessageRow & { recipient_id: string })[]>`
+      SELECT ${MSG_COLS}, cm.user_id AS recipient_id
+        FROM messages m
+        JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id <> m.sender_id
+       WHERE m.id = ANY(${messageIds}) AND m.held_at IS NULL AND ${visibleTo("cm")}
+       ORDER BY m.sent_at, m.id`;
+    const updated = new Set<string>();
+    for (const row of rows) {
+      if (!isConnected(row.recipient_id)) continue;
+      const sent = await publishUnlessBlocked(row.sender_id, row.recipient_id, {
+        type: "message.created",
+        data: viewMessage(row, row.recipient_id, { redactViewOnce: true }),
+      });
+      if (sent > 0) updated.add(`${row.recipient_id} ${row.conversation_id}`);
+    }
+    await Promise.all(
+      [...updated].map((key) => {
+        const [userId, conversationId] = key.split(" ") as [string, string];
+        return pushConversationUpdated(userId, conversationId);
+      }),
+    );
+  } catch (err) {
+    logError("chat.released_fanout", err);
+  }
+}
+
+/**
+ * Listen for released held messages (RELEASED_CHANNEL), wherever the clear ran (usually the moderator CLI), and push
+ * them over the websocket. Started by the API process (index.ts); returns a stop function.
+ */
+export async function listenForReleasedMessages(): Promise<() => Promise<void>> {
+  const { unlisten } = await sql.listen(RELEASED_CHANNEL, (payload) => {
+    let ids: unknown;
+    try {
+      ids = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(ids)) return;
+    void publishReleasedMessages(ids.filter((id): id is string => typeof id === "string" && isId("message", id)));
+  });
+  return unlisten;
 }
 
 /**
@@ -480,7 +536,9 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
       // is never visible to the recipient, not even for a moment.
       held = (await screenSentMessage(tx, { messageId: inserted.id, senderId: me, conversationId, otherId, features })).held;
       if (held) inserted.delivered_at = null;
-      await tx`UPDATE conversations SET updated_at = now() WHERE id = ${conversationId}`;
+      // A held message leaves no trace for the recipient, not even a re-sorted list (loadConversations re-sorts the
+      // sender's own list from the held message itself; delivery on clear bumps updated_at).
+      if (!held) await tx`UPDATE conversations SET updated_at = now() WHERE id = ${conversationId}`;
       // A new message un-hides the thread for both people; a held one only for its sender.
       await tx`UPDATE conversation_members SET hidden = false
                 WHERE conversation_id = ${conversationId} AND hidden ${held ? tx`AND user_id = ${me}` : tx``}`;

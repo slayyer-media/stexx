@@ -14,10 +14,11 @@ import {
   type SpamFacts,
 } from "../src/lib/abuse/spam.ts";
 import { overrideTrustForTests, trustState } from "../src/lib/abuse/trust.ts";
-import { actionReports, banAccount, dismissReports, reviewQueue } from "../src/lib/moderation.ts";
+import { accountReview, actionReports, banAccount, dismissReports } from "../src/lib/moderation.ts";
 import { addConnection, removeConnection } from "../src/lib/realtime.ts";
 import { DAY, HOUR, MINUTE } from "../src/lib/time.ts";
 import { runModerationCli } from "../src/moderation/cli.ts";
+import { listenForReleasedMessages } from "../src/routes/chat.ts";
 import { captureRealtime } from "./e2e-helpers.ts";
 import { as, createUser, expectError, expectJson, expectNoContent, randomCell, sql, uniq, type TestUser } from "./helpers.ts";
 
@@ -193,6 +194,38 @@ describe("shadow limit in chat", () => {
     expect((await thread(people[0]!, convs[0]!)).map((m) => m.id)).toContain(ok.id);
   });
 
+  test("a held message doesn't re-sort the recipient's list or bump its updatedAt; the sender's list re-sorts", async () => {
+    const { s, people, convs } = await limitByFanOut();
+    const r = people[0]!; // got the first "hi" (before the limit), never answered
+    // Something newer in r's list, so a bump would visibly move the thread to the top.
+    const friend = await createUser();
+    const fconv = await open(friend, r);
+    await sendText(friend, fconv, "evening");
+    const listOf = async (u: TestUser) =>
+      (await expectJson(await as(u).get("/v1/conversations"))) as { id: string; updatedAt: string }[];
+    const dbUpdatedAt = async () =>
+      (await sql<{ t: Date }[]>`SELECT updated_at AS t FROM conversations WHERE id = ${convs[0]!}`)[0]!.t.getTime();
+    const before = (await listOf(r)).find((c) => c.id === convs[0]!)!;
+    const beforeDb = await dbUpdatedAt();
+    expect((await listOf(r))[0]!.id).toBe(fconv);
+
+    const follow = await sendText(s, convs[0]!, "still there?");
+    const after = await listOf(r);
+    expect(after[0]!.id).toBe(fconv);
+    expect(after.find((c) => c.id === convs[0]!)!.updatedAt).toBe(before.updatedAt);
+    expect(await dbUpdatedAt()).toBe(beforeDb);
+
+    // The sender sees their own send like any other: the thread moves to the top, dated by the held message.
+    const mine = await listOf(s);
+    expect(mine[0]!.id).toBe(convs[0]!);
+    expect(mine[0]!.updatedAt).toBe(follow.sentAt);
+
+    // Delivered on clear: now it is new for the recipient too.
+    await dismissReports({ actor: "mod-a", userId: s.id });
+    expect((await listOf(r))[0]!.id).toBe(convs[0]!);
+    expect(await dbUpdatedAt()).toBeGreaterThan(beforeDb);
+  });
+
   test("websocket: a held message is pushed to its sender only", async () => {
     const { s } = await limitByFanOut();
     const target = await createUser();
@@ -353,9 +386,12 @@ describe("signals through the API", () => {
 describe("moderation", () => {
   test("enters the existing queue as an automatic spam report naming the signals, with no message text", async () => {
     const { s } = await limitByFanOut();
-    const queue = await reviewQueue({ limit: 1000 });
-    const entry = queue.find((q) => q.userId === s.id);
-    expect(entry).toMatchObject({ state: "visible", openReports: 1, reporters: 0, reasons: { spam: 1 } });
+    // Looked up by account, not by position: the shared test DB's queue holds far more than one page.
+    const review = await accountReview(s.id);
+    expect(review.state).toBe("visible");
+    const openReports = review.reports.filter((r) => r.status === "open");
+    expect(openReports).toHaveLength(1);
+    expect(openReports[0]).toMatchObject({ reporterId: null, reason: "spam", priority: "normal", evidence: [] });
     const [rep] = await sql<{ reporter_id: string | null; source: string; details: string; reason: string }[]>`
       SELECT reporter_id, source, details, reason FROM reports WHERE reported_id = ${s.id}`;
     expect(rep).toMatchObject({ reporter_id: null, source: "spam", reason: "spam" });
@@ -378,6 +414,41 @@ describe("moderation", () => {
     const more = await strangers(s, 1);
     const next = await sendText(s, more.convs[0]!, "hello");
     expect((await thread(more.people[0]!, more.convs[0]!)).map((m) => m.id)).toEqual([next.id]);
+  });
+
+  test("websocket: messages released by a clear are pushed to connected recipients (via NOTIFY, as from the CLI)", async () => {
+    const stop = await listenForReleasedMessages();
+    const { s, people, convs, heldId } = await limitByFanOut();
+    const r = people[3]!;
+    const theirs = captureRealtime(r.id);
+    addConnection(theirs.conn);
+    try {
+      await dismissReports({ actor: "mod-a", userId: s.id });
+      for (let i = 0; i < 50 && !theirs.events.some((e) => e.type === "conversation.updated"); i++) await Bun.sleep(50);
+      const created = theirs.events.filter((e) => e.type === "message.created");
+      expect(created.map((e) => e.data.id)).toEqual([heldId]);
+      expect(created[0]!.data.text).toBe("hi there");
+      const updated = theirs.events.find((e) => e.type === "conversation.updated");
+      expect(updated?.data).toMatchObject({ id: convs[3]!, unreadCount: 1 });
+    } finally {
+      removeConnection(theirs.conn);
+      await stop();
+    }
+  });
+
+  test("a ban releases nothing over the websocket (held messages are dropped)", async () => {
+    const stop = await listenForReleasedMessages();
+    const { s, people } = await limitByFanOut();
+    const theirs = captureRealtime(people[3]!.id);
+    addConnection(theirs.conn);
+    try {
+      await banAccount({ actor: "mod-a", userId: s.id });
+      await Bun.sleep(300);
+      expect(theirs.events).toEqual([]);
+    } finally {
+      removeConnection(theirs.conn);
+      await stop();
+    }
   });
 
   test("dismissing just the spam report also clears; dismissing another report doesn't", async () => {
@@ -420,8 +491,15 @@ describe("moderation", () => {
     const lines: string[] = [];
     const run = (argv: string[]) => runModerationCli(argv, (l) => lines.push(l), {});
 
-    expect(await run(["spam", "--limit", "1000"])).toBe(0);
+    // The list is oldest first and the shared test DB keeps every run's limited accounts: date this one first.
+    await sql`UPDATE users SET spam_limited_at = '2001-01-01' WHERE id = ${s.id}`;
+    expect(await run(["spam", "--limit", "5"])).toBe(0);
     expect(lines.some((l) => l.startsWith(s.id) && l.includes("fan_out_no_replies"))).toBe(true);
+    lines.length = 0;
+    // `show` labels the system's report as automatic (it has no reporter), not as a deleted reporter.
+    expect(await run(["show", s.id])).toBe(0);
+    expect(lines.join("\n")).toContain("reporter automatic (spam heuristics)");
+    expect(lines.join("\n")).not.toContain("(deleted)");
     lines.length = 0;
     expect(await run(["spam", s.id])).toBe(0);
     const out = lines.join("\n");

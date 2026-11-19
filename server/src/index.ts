@@ -5,6 +5,7 @@ import { startJobs } from "./jobs/index.ts";
 import { logInfo } from "./lib/logger.ts";
 import { verifierName } from "./lib/e2e/crypto.ts";
 import { photoClassifier } from "./lib/photocheck/classifier.ts";
+import { listenForReleasedMessages } from "./routes/chat.ts";
 import { websocket } from "./routes/ws.ts";
 
 const app = await createApp();
@@ -19,6 +20,8 @@ const server = Bun.serve({
 });
 
 const stopJobs = startJobs();
+// Held messages a moderator releases (usually from the CLI's own process) are pushed to connected recipients.
+const stopReleasedListener = await listenForReleasedMessages();
 logInfo("listening", {
   host: config.host,
   port: server.port ?? config.port,
@@ -41,6 +44,7 @@ if (config.isProduction && config.antiSpam.attestation.mode === "off") {
 
 async function shutdown() {
   stopJobs();
+  await stopReleasedListener().catch(() => {});
   await server.stop();
   await sql.end({ timeout: 5 });
   process.exit(0);

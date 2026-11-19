@@ -158,6 +158,9 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   by `dismissReports` / `actionReports` / `banAccount`; `runSpamJobs` is in the slow jobs. Any query that shows messages
   to someone other than their sender must exclude held ones (`held_at IS NULL OR sender_id = viewer`; chat.ts
   `visibleTo` does it). `notModerated` also hides limited accounts. System reports have `reports.source = 'spam'`.
+  A held message doesn't bump `conversations.updated_at` (loadConversations dates the sender's own list from it). A clear
+  `pg_notify`s `RELEASED_CHANNEL` with the released message ids; index.ts runs `listenForReleasedMessages()` (chat.ts),
+  which pushes them to connected recipients.
   `handles.ts` loads the shared pattern table `content-rules.json` (copy it to `ios/Stexx/E2E/` after editing).
   Tests: `overrideSpamForTests`.
 ### photocheck/ (profile photo checks, see docs/security.md §6; migration 106)

@@ -340,7 +340,7 @@ When the score reaches the threshold the account is **shadow-limited** (`users.s
 
 | | Shadow-limited |
 | --- | --- |
-| Messages to people who haven't written to it (first messages and follow-ups to non-repliers) | **held**: stored and shown to the sender as sent (status `sent`, pushed to the sender's own sockets), never shown or pushed to the recipient: no conversation, no unread count, can't be read, left out of the recipient's data export. The message that tripped the limit is already held. |
+| Messages to people who haven't written to it (first messages and follow-ups to non-repliers) | **held**: stored and shown to the sender as sent (status `sent`, pushed to the sender's own sockets), never shown or pushed to the recipient: no conversation, no unread count, no re-sorted chat list (a held message doesn't move the thread's `updatedAt` for the recipient; the sender's own list re-sorts as usual), can't be read, left out of the recipient's data export. The message that tripped the limit is already held. |
 | Messages to people who have written to it | delivered as usual |
 | Taps | accepted (204) and dropped |
 | Nearby, viewers | left out for everyone (it still sees nearby itself) |
@@ -352,7 +352,7 @@ A system report (`reports.source = 'spam'`, no reporter, reason `spam`, details 
 
 | How | Limit | Held messages |
 | --- | --- | --- |
-| Moderator `dismiss <id>` (or `dismiss --report <the spam report>`, or `spam-clear <id>`) | lifted | **delivered**: the recipients see them (with their original time) the next time their app loads its chats; there is no realtime push because the CLI runs outside the API process |
+| Moderator `dismiss <id>` (or `dismiss --report <the spam report>`, or `spam-clear <id>`) | lifted | **delivered** (with their original time): recipients connected over the websocket get them pushed right away (the clear sends a Postgres `NOTIFY` of the message ids, never text, and the API process pushes them); everyone else sees them the next time their app loads its chats. No APNs push is sent for them |
 | Moderator `ban <id>` | ends (the ban hides the account everywhere) | **dropped** (deleted, with their files) |
 | Moderator `action <id>` | stays until the cooldown; `--unhide` lifts it | **dropped** |
 | Cooldown: no signal for `SPAM_COOLDOWN_HOURS` (72) and no open report from a person filed since the limit began | lifted automatically (slow job, every 10 minutes) | **stay held** for a moderator: an unreviewed burst is never delivered late. Dropped after `SPAM_HELD_MAX_DAYS` (30) if nobody decides |
@@ -470,7 +470,7 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 
 ## Not done yet
 
-- Spam heuristics (section 8): near-identical text is detected per sender, not across a ring of accounts sending the same text; released held messages reach recipients on their next refresh, not over the websocket (the CLI runs in its own process); the thresholds are educated defaults that haven't met real traffic yet, so watch `stexx-mod spam` after launch and tune the `SPAM_*` values.
+- Spam heuristics (section 8): near-identical text is detected per sender, not across a ring of accounts sending the same text; released held messages are pushed over the websocket only to recipients connected at that moment (no APNs push); the CLI's `show` labels the system's spam report as `reporter automatic (spam heuristics)`; the thresholds are educated defaults that haven't met real traffic yet, so watch `stexx-mod spam` after launch and tune the `SPAM_*` values.
 
 - Report evidence photos are re-uploaded by the reporter's app, so the server can't prove a photo is the one that was in the chat (same as evidence text).
 - No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Review turnaround depends on someone running `list`; there are no notifications for new high-priority reports yet.

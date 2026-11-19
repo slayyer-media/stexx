@@ -32,6 +32,15 @@ export interface SpamCliArgs {
   flags: Map<string, string | true>;
 }
 
+/** How `show` labels a report the spam heuristics filed (it has no reporter, like one whose reporter was deleted). */
+export const AUTOMATIC_REPORTER = "automatic (spam heuristics)";
+
+/** Ids of the reports about `userId` that the system filed (reports.source = 'spam'), for `show`. */
+export async function automaticReportIds(userId: string): Promise<Set<string>> {
+  const rows = await sql<{ id: string }[]>`SELECT id FROM reports WHERE reported_id = ${userId} AND source = 'spam'`;
+  return new Set(rows.map((r) => r.id));
+}
+
 const ACTOR_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const day = (d: Date | null | undefined) => (d ? isoDate(d) : "-");
 

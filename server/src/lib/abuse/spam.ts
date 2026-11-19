@@ -475,16 +475,34 @@ async function closeSpamReports(tx: Sql, userId: string, status: "dismissed" | "
   return rows.map((r) => r.id);
 }
 
-/** Deliver every held message of `userId`: the recipients see them on their next refresh. */
+/**
+ * Postgres NOTIFY channel announcing delivered held messages (payload: a JSON array of message ids). A clear usually
+ * runs in the moderator CLI's own process; the API process listens (routes/chat.ts listenForReleasedMessages) and
+ * pushes the messages to recipients connected over the websocket. Ids only, never text.
+ */
+export const RELEASED_CHANNEL = "stexx_held_released";
+/** Ids per NOTIFY (payloads must stay under Postgres's 8000-byte limit). */
+const RELEASE_NOTIFY_BATCH = 100;
+
+/**
+ * Deliver every held message of `userId`. Recipients connected over the websocket get them pushed (after commit, via
+ * RELEASED_CHANNEL); everyone else sees them on their next refresh.
+ */
 async function deliverHeld(tx: Sql, userId: string): Promise<number> {
-  const released = await tx<{ conversation_id: string }[]>`
-    UPDATE messages SET held_at = NULL WHERE sender_id = ${userId} AND held_at IS NOT NULL RETURNING conversation_id`;
+  const released = await tx<{ id: string; conversation_id: string }[]>`
+    UPDATE messages SET held_at = NULL WHERE sender_id = ${userId} AND held_at IS NOT NULL
+    RETURNING id, conversation_id`;
   if (released.length === 0) return 0;
   const convs = [...new Set(released.map((r) => r.conversation_id))];
   await tx`UPDATE conversations SET updated_at = now() WHERE id = ANY(${convs})`;
   await tx`
     UPDATE conversation_members SET hidden = false
      WHERE conversation_id = ANY(${convs}) AND user_id <> ${userId} AND hidden`;
+  // NOTIFY is transactional: listeners hear about it only if (and when) this commits.
+  for (let i = 0; i < released.length; i += RELEASE_NOTIFY_BATCH) {
+    const ids = released.slice(i, i + RELEASE_NOTIFY_BATCH).map((r) => r.id);
+    await tx`SELECT pg_notify(${RELEASED_CHANNEL}, ${JSON.stringify(ids)})`;
+  }
   return released.length;
 }
 
