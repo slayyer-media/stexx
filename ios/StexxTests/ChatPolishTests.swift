@@ -107,6 +107,23 @@ struct ThreadHistoryTests {
         #expect(history.olderCursor == nil)
     }
 
+    @Test("A thread that never loaded keeps its load error above a send that failed meanwhile; a loaded one doesn't show it")
+    func loadErrorSurvivesFailedSend() {
+        var history = ThreadHistory()
+        #expect(history.showsLoadError(hasError: true, isLoading: false))
+        #expect(!history.showsLoadError(hasError: true, isLoading: true))
+        #expect(!history.showsLoadError(hasError: false, isLoading: false))
+
+        // The server is down: my send fails and its bubble goes in. The error and Retry stay.
+        history.messages.append(message("local-k", at: 9, from: "me", status: .failed, clientID: "k"))
+        #expect(history.showsLoadError(hasError: true, isLoading: false))
+
+        // Retry loads the newest page: the error goes, the failed bubble stays at the end.
+        history.applyLatest(page([message("m1", at: 1), message("m2", at: 2)], next: nil), myID: "me")
+        #expect(history.messages.map(\.id) == ["m1", "m2", "local-k"])
+        #expect(!history.showsLoadError(hasError: true, isLoading: false))
+    }
+
     @Test("Near the top means within the threshold of the content's top inset")
     func nearTop() {
         #expect(ThreadHistory.isNearTop(contentOffsetY: -100, topInset: 100))

@@ -17,6 +17,9 @@ struct ThreadHistory: Equatable, Sendable {
     /// `before` for the next older page; `nil` once the start of the thread
     /// is on screen (or before the first page has loaded).
     private(set) var olderCursor: Message.ID?
+    /// The newest page has arrived at least once. Until then what's on
+    /// screen (a send that failed, a live event) isn't the thread's history.
+    private(set) var hasLoadedLatest = false
 
     init(messages: [Message] = [], olderCursor: Message.ID? = nil) {
         self.messages = messages
@@ -24,6 +27,14 @@ struct ThreadHistory: Equatable, Sendable {
     }
 
     var hasOlder: Bool { olderCursor != nil }
+
+    /// Whether the thread shows its load error with Retry: the load failed
+    /// and the newest page never arrived. Messages shown meanwhile (my own
+    /// failed send) don't hide it, or the thread would pass for a new chat.
+    /// A failed refetch of a thread that did load keeps what's there.
+    func showsLoadError(hasError: Bool, isLoading: Bool) -> Bool {
+        hasError && !isLoading && !hasLoadedLatest
+    }
 
     /// Whether `message` is already shown: the same server ID, or my own
     /// optimistic copy with the same client ID.
@@ -60,6 +71,7 @@ struct ThreadHistory: Equatable, Sendable {
         } ?? false
         if !showsOlder { olderCursor = page.nextCursor }
         messages = merged
+        hasLoadedLatest = true
         pruneExpired(now: now)
     }
 

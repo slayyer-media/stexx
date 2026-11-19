@@ -22,7 +22,8 @@ struct ChatThreadView: View {
     @State private var history = ThreadHistory()
     @State private var draft = ""
     @State private var isLoading = true
-    /// Why the thread couldn't load; shown with Retry while nothing is on screen.
+    /// Why the thread couldn't load; shown with Retry until the newest page
+    /// arrives, even above a send that failed meanwhile.
     @State private var loadError: String?
     @State private var olderState: OlderPageState = .idle
     /// The bubble to keep in place after older messages were prepended.
@@ -98,7 +99,7 @@ struct ChatThreadView: View {
                         }
                         .id(Self.olderRowID)
                     }
-                    if let loadError, messages.isEmpty, !isLoading {
+                    if let loadError, history.showsLoadError(hasError: true, isLoading: isLoading) {
                         ThreadLoadErrorView(message: loadError) {
                             Task { await load() }
                         }
