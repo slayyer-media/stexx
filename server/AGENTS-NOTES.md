@@ -93,6 +93,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   missing + blocked unless `includeBlocked` — only GET /blocks uses that). `profileFor(viewerId, id, opts) → ProfileJson|null`.
   Pass `rows` (from your own `profileColumns` query, e.g. nearby) to avoid a second users query.
 - `viewerCell(userId, db?) → Cell|null` (effective cell) · `photosFor(ownerIds, db?)`.
+- `OwnProfileJson` = Profile + `travel` (`travelJson(row)`: null | `{isActive}`), only for GET/PATCH /me (`ownProfile`
+  in me.ts); never put it on other people's profiles, and never add coordinates to it.
 - `messageJson(row, viewerId)` — status: recipient sees `read` when `read_at`; sender sees `read` only if
   `read_receipt`; else `delivered` (delivered_at or read_at) else `sent`. Attachment `{kind:"photo", url|null, isViewOnce}`.
 - `conversationJson({id, participant, lastMessage, unreadCount, updatedAt, isMuted})` · `privacyJson(row)`.
