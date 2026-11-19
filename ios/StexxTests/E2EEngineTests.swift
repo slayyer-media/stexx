@@ -293,12 +293,11 @@ struct E2EEngineTests {
         await bob.engine.syncKeys()
         _ = try await alice.send("hey")
         let e2e = E2EStatus(engine: alice.engine)
-        // The status object registers its handler asynchronously.
-        try await Task.sleep(for: .milliseconds(50))
 
-        // A new identity, but Alice missed the event: the next bundle fetch catches it.
+        // Bob gets a new identity; the event makes Alice re-check it (in the background).
         await FakeDevice("bob", peer: "alice", server: server).engine.syncKeys()
         _ = await e2e.process(.identityChanged(.init(userID: "bob", identityKeyChangedAt: .now)))
+        for _ in 0..<100 where !e2e.hasKeyChange(for: "bob") { try await Task.sleep(for: .milliseconds(20)) }
         #expect(await server.count("identity") == 1)
         #expect(e2e.hasKeyChange(for: "bob"))
         await #expect(throws: E2EError.identityChanged(peer: "bob")) {
@@ -420,5 +419,101 @@ struct E2EEngineTests {
         #expect(try alice.secrets.keys(withPrefix: "alice/").isEmpty)
         #expect(try alice.history.load(userID: "alice") == nil)
     }
-}
 
+    // MARK: Review fixes
+
+    @Test("A failed PUT /keys is re-sent with the same keys, not a new batch")
+    func failedRegistrationIsReused() async throws {
+        let server = FakeE2EServer()
+        let alice = FakeDevice("alice", peer: "bob", server: server)
+        await server.failNextRegister(.beforeApply)
+        await alice.engine.syncKeys()
+        #expect(await server.registrations["alice"] == nil)
+        await alice.engine.syncKeys()
+        let attempts = await server.registerAttempts
+        #expect(attempts.count == 2)
+        #expect(attempts[0] == attempts[1])
+        #expect(try alice.secrets.keys(withPrefix: "alice/prekey.").count == 100)
+        #expect(try alice.secrets.read("alice/upload.registration") == nil)
+    }
+
+    @Test("A PUT /keys whose response was lost is committed on the next sync, without registering again")
+    func lostRegistrationResponse() async throws {
+        let server = FakeE2EServer()
+        let alice = FakeDevice("alice", peer: "bob", server: server)
+        await server.failNextRegister(.afterApply)
+        await alice.engine.syncKeys()
+        #expect(try alice.secrets.read("alice/upload.registration") != nil)
+        await alice.engine.syncKeys()
+        #expect(await server.count("register") == 1)
+        #expect(try alice.secrets.read("alice/upload.registration") == nil)
+        // And it works: Bob can start a session with Alice's keys.
+        let bob = FakeDevice("bob", peer: "alice", server: server)
+        _ = try await bob.send("hi")
+        #expect(try await alice.thread().last?.text == "hi")
+    }
+
+    @Test("An old message under a key the user replaced doesn't bring the warning back")
+    func retiredKeyNoNewHold() async throws {
+        let server = FakeE2EServer()
+        let alice = FakeDevice("alice", peer: "bob", server: server)
+        let bob = FakeDevice("bob", peer: "alice", server: server)
+        await alice.engine.syncKeys()
+        await bob.engine.syncKeys()
+        _ = try await alice.send("hi")          // Alice trusts Bob's first key.
+        _ = try await bob.send("old message")   // A prekey message under that key, not read yet.
+        let old = try #require(await server.messages.last)
+
+        let newBob = FakeDevice("bob", peer: "alice", server: server)
+        await newBob.engine.syncKeys()
+        _ = try await newBob.send("new phone")
+        let new = try #require(await server.messages.last)
+        #expect(await alice.engine.reveal(new).encryption == .awaitingKeyConfirmation)
+        try await alice.engine.acceptIdentityChange(of: "bob")
+        #expect(await alice.engine.reveal(new).text == "new phone")
+
+        let stale = await alice.engine.reveal(old)
+        #expect(stale.text == nil)
+        #expect(await alice.engine.snapshot().keyChanges.isEmpty)
+        _ = try await alice.send("still fine")
+        #expect(try await newBob.thread().last?.text == "still fine")
+    }
+
+    @Test("A hold the server doesn't back (its key is still the trusted one) clears when the chat opens")
+    func unbackedHoldClears() async throws {
+        let server = FakeE2EServer()
+        let alice = FakeDevice("alice", peer: "bob", server: server)
+        let bob = FakeDevice("bob", peer: "alice", server: server)
+        await bob.engine.syncKeys()
+        _ = try await alice.send("hi")
+        // A forged key recorded as pending (e.g. from an injected prekey message).
+        let forged = E2EPendingIdentity(identityKey: IdentityKeyPair.generate().identityKey.serialize().base64EncodedString(), detectedAt: .now)
+        try alice.secrets.write(try JSONEncoder().encode(forged), for: "alice/pending.bob")
+        let aliceAgain = FakeDevice("alice", peer: "bob", server: server, secrets: alice.secrets, history: alice.history)
+        await aliceAgain.engine.threadOpened(with: "bob")
+        #expect(await aliceAgain.engine.snapshot().keyChanges.isEmpty)
+        _ = try await aliceAgain.send("hello again")
+        #expect(try await bob.thread().last?.text == "hello again")
+    }
+
+    @Test("An unreadable history file is set aside, never silently overwritten")
+    func unreadableHistory() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "e2e history \(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let server = FakeE2EServer()
+        let secrets = InMemorySecretStorage()
+        let persistence = EncryptedFileHistoryPersistence(secrets: secrets, directory: directory)
+        let alice = FakeDevice("alice", peer: "bob", server: server, secrets: secrets, history: persistence)
+        let bob = FakeDevice("bob", peer: "alice", server: server)
+        await bob.engine.syncKeys()
+        _ = try await alice.send("hi")
+        let file = try #require(try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
+        try Data("garbage".utf8).write(to: file)
+
+        let aliceAgain = FakeDevice("alice", peer: "bob", server: server, secrets: secrets, history: persistence)
+        _ = try await aliceAgain.send("again")
+        let aside = file.appendingPathExtension("unreadable")
+        #expect(try Data(contentsOf: aside) == Data("garbage".utf8))
+        #expect(try persistence.load(userID: "alice")?.sent.isEmpty == false || persistence.load(userID: "alice")?.messages.isEmpty == false)
+    }
+}

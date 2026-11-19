@@ -77,8 +77,17 @@ function load(): State {
   return JSON.parse(readFileSync(opts.state!, "utf8"));
 }
 function save(state: State) {
-  writeFileSync(opts.state!, JSON.stringify(state, null, 2));
+  // Created owner-only (tokens and private keys); chmod covers a file that already existed.
+  writeFileSync(opts.state!, JSON.stringify(state, null, 2), { mode: 0o600 });
   chmodSync(opts.state!, 0o600);
+}
+
+/** Dev servers only: refuse anything that isn't this machine. */
+function assertLocal(server: string) {
+  const host = new URL(server).hostname;
+  if (!["127.0.0.1", "localhost", "::1", "[::1]"].includes(host)) {
+    throw new Error(`e2e-peer is for local dev servers only, not ${host}`);
+  }
 }
 
 async function api(state: State, method: string, path: string, body?: unknown, retry = true): Promise<any> {
@@ -194,6 +203,7 @@ async function conversationWith(state: State, other: string): Promise<string> {
 async function main() {
   if (command === "init") {
     if (!opts.server) throw new Error("--server is required for init");
+    assertLocal(opts.server);
     const res = await fetch(`${opts.server}/v1/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Stexx-Attestation": "dev-bypass" },
@@ -207,6 +217,7 @@ async function main() {
     return;
   }
   const state = load();
+  assertLocal(state.server);
   const stores = new Stores(state);
   const me = address(state.session.userID);
   switch (command) {

@@ -41,6 +41,14 @@ struct E2ELocalKeyState: Codable, Hashable, Sendable {
     }
 }
 
+/// A `PUT /keys` upload saved before it's sent, so a failed attempt is
+/// re-sent with the same keys instead of generating new ones.
+struct E2EPendingRegistration: Codable, Hashable, Sendable {
+    var registration: KeyRegistration
+    /// The epoch its one-time keys belong to.
+    var epoch: Int
+}
+
 /// An identity key we saw that differs from the one the user trusts, waiting
 /// for the user to accept it.
 struct E2EPendingIdentity: Codable, Hashable, Sendable {
@@ -182,6 +190,9 @@ final class E2EProtocolStore: IdentityKeyStore, PreKeyStore, SignedPreKeyStore, 
     func isTrustedIdentity(_ identity: IdentityKey, for address: ProtocolAddress, direction: Direction, context: StoreContext) throws -> Bool {
         guard let trusted = try trustedIdentity(of: address.name) else { return true }
         if trusted == identity { return true }
+        // A key the user already moved on from (an old message from before a
+        // key change): refused, but no new warning for it.
+        if try retiredIdentities(of: address.name).contains(identity.serialize()) { return false }
         try recordPendingIdentity(identity, for: address.name)
         return false
     }
@@ -194,8 +205,36 @@ final class E2EProtocolStore: IdentityKeyStore, PreKeyStore, SignedPreKeyStore, 
         try get("trusted.\(peer)").map { try IdentityKey(bytes: $0) }
     }
 
+    /// Trusts `identity` for `peer`; the key it replaces is remembered as retired.
     func setTrustedIdentity(_ identity: IdentityKey, of peer: Profile.ID) throws {
+        if let old = try trustedIdentity(of: peer), old != identity {
+            var retired = try retiredIdentities(of: peer)
+            retired.append(old.serialize())
+            try put(try JSONEncoder().encode(Array(retired.suffix(10))), "retired.\(peer)")
+        }
         try put(identity.serialize(), "trusted.\(peer)")
+    }
+
+    func retiredIdentities(of peer: Profile.ID) throws -> [Data] {
+        try get("retired.\(peer)").map { try JSONDecoder().decode([Data].self, from: $0) } ?? []
+    }
+
+    // MARK: Uploads in flight
+
+    func pendingRegistration() throws -> E2EPendingRegistration? {
+        try get("upload.registration").map { try JSONDecoder().decode(E2EPendingRegistration.self, from: $0) }
+    }
+
+    func setPendingRegistration(_ upload: E2EPendingRegistration?) throws {
+        if let upload { try put(try JSONEncoder().encode(upload), "upload.registration") } else { try remove("upload.registration") }
+    }
+
+    func pendingRotation() throws -> SignedPreKeyRotation? {
+        try get("upload.rotation").map { try JSONDecoder().decode(SignedPreKeyRotation.self, from: $0) }
+    }
+
+    func setPendingRotation(_ rotation: SignedPreKeyRotation?) throws {
+        if let rotation { try put(try JSONEncoder().encode(rotation), "upload.rotation") } else { try remove("upload.rotation") }
     }
 
     // MARK: Pending identity changes

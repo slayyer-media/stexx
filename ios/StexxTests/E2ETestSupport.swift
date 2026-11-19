@@ -19,6 +19,12 @@ actor FakeE2EServer {
     private(set) var calls: [String] = []
     /// Overrides what `GET /keys/status` reports for someone (counts, dates).
     var statusOverride: [Profile.ID: KeyStatus] = [:]
+    /// How the next `PUT /keys` fails: before storing anything, or after
+    /// storing (the response is lost).
+    enum Failure { case beforeApply, afterApply }
+    var nextRegisterFailure: Failure?
+    /// Every `PUT /keys` body received, including failed ones.
+    private(set) var registerAttempts: [KeyRegistration] = []
     private var nextID = 1
 
     static let conversationID = "c-ab"
@@ -26,6 +32,7 @@ actor FakeE2EServer {
     func set(mode: E2EConfig.Mode) { self.mode = mode }
     func set(contentRules: E2EConfig.ContentRules) { self.contentRules = contentRules }
     func set(status: KeyStatus?, for user: Profile.ID) { statusOverride[user] = status }
+    func failNextRegister(_ failure: Failure) { nextRegisterFailure = failure }
     func count(_ call: String) -> Int { calls.filter { $0 == call }.count }
 
     var config: E2EConfig {
@@ -49,13 +56,20 @@ actor FakeE2EServer {
     func registerKeys(_ registration: KeyRegistration, as user: Profile.ID) throws -> KeyStatus {
         calls.append("register")
         guard mode != .off else { throw disabled() }
+        registerAttempts.append(registration)
+        let failure = nextRegisterFailure
+        nextRegisterFailure = nil
+        if failure == .beforeApply { throw URLError(.timedOut) }
+        defer { if failure == .afterApply { lostResponse = true } }
         registrations[user] = registration
         preKeys[user] = registration.preKeys
         pqPreKeys[user] = registration.pqPreKeys
         signedUpdatedAt[user] = .now
         lastResortUpdatedAt[user] = .now
+        if failure == .afterApply { throw URLError(.networkConnectionLost) }
         return status(of: user)
     }
+    private var lostResponse = false
 
     func keyStatus(as user: Profile.ID) throws -> KeyStatus {
         calls.append("status")
@@ -232,14 +246,14 @@ struct FakeDevice {
     let engine: E2EEngine
     let client: E2EAPIClient
     let secrets: InMemorySecretStorage
-    let history: InMemoryHistoryPersistence
+    let history: any E2EHistoryPersistence
 
     init(
         _ userID: Profile.ID,
         peer: Profile.ID,
         server: FakeE2EServer,
         secrets: InMemorySecretStorage = InMemorySecretStorage(),
-        history: InMemoryHistoryPersistence = InMemoryHistoryPersistence(),
+        history: any E2EHistoryPersistence = InMemoryHistoryPersistence(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.userID = userID

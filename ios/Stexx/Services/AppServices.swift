@@ -15,8 +15,10 @@ final class AppServices {
     @ObservationIgnored private let appState: AppState
     @ObservationIgnored private let chatStore: ChatStore
     @ObservationIgnored private var wasSignedIn = false
-    @ObservationIgnored private var events: AsyncStream<RealtimeEvent>.Continuation?
+    @ObservationIgnored private var events: AsyncStream<(Int, RealtimeEvent)>.Continuation?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
+    /// Bumped on sign-out: events queued by the previous session are dropped.
+    @ObservationIgnored private var sessionGeneration = 0
 
     init(
         appState: AppState,
@@ -36,13 +38,18 @@ final class AppServices {
             // One consumer, so events are decrypted and applied in the order
             // they arrived (a ratchet message decrypts only once, and a
             // conversation update must not overtake its message).
-            let (stream, continuation) = AsyncStream.makeStream(of: RealtimeEvent.self)
+            let (stream, continuation) = AsyncStream.makeStream(of: (Int, RealtimeEvent).self)
             events = continuation
-            realtime.onEvent = { event in continuation.yield(event) }
-            eventTask = Task { [weak appState, weak chatStore, e2e] in
-                for await event in stream {
+            realtime.onEvent = { [weak self] event in
+                guard let self else { return }
+                continuation.yield((sessionGeneration, event))
+            }
+            eventTask = Task { [weak self, weak appState, weak chatStore, e2e] in
+                for await (generation, event) in stream {
                     let revealed = await e2e.process(event)
-                    guard let appState, let chatStore else { return }
+                    guard let self, let appState, let chatStore else { return }
+                    // Signed out (or switched account) while it was queued.
+                    guard generation == sessionGeneration, appState.isSignedIn else { continue }
                     chatStore.apply(revealed, myID: appState.myID)
                 }
             }
@@ -105,6 +112,7 @@ final class AppServices {
             // Sign-up, sign-in and launch: generate / upload / top up keys.
             e2e.syncKeys()
         } else if !isSignedIn && wasSignedIn {
+            sessionGeneration += 1
             location?.reset()
             e2e.signedOut()
         }

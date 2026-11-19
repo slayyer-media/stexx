@@ -54,9 +54,14 @@ struct E2EHistory: Codable, Sendable, Equatable {
 
 /// Where `E2EHistory` is persisted.
 protocol E2EHistoryPersistence: Sendable {
+    /// `nil` when there's nothing to read (no file, or no key: a reinstall).
+    /// Throws when a history exists but can't be read right now.
     func load(userID: Profile.ID) throws -> E2EHistory?
     func save(_ history: E2EHistory, userID: Profile.ID) throws
     func delete(userID: Profile.ID) throws
+    /// Moves an unreadable history out of the way (kept, not deleted) so a
+    /// new one can be written without destroying it.
+    func setAside(userID: Profile.ID) throws
 }
 
 final class InMemoryHistoryPersistence: E2EHistoryPersistence, @unchecked Sendable {
@@ -65,9 +70,17 @@ final class InMemoryHistoryPersistence: E2EHistoryPersistence, @unchecked Sendab
 
     init() {}
 
-    func load(userID: Profile.ID) throws -> E2EHistory? { lock.withLock { histories[userID] } }
+    func load(userID: Profile.ID) throws -> E2EHistory? {
+        try lock.withLock {
+            if failLoads { throw CocoaError(.fileReadCorruptFile) }
+            return histories[userID]
+        }
+    }
     func save(_ history: E2EHistory, userID: Profile.ID) throws { lock.withLock { histories[userID] = history } }
     func delete(userID: Profile.ID) throws { lock.withLock { histories[userID] = nil } }
+    func setAside(userID: Profile.ID) throws { try delete(userID: userID) }
+    /// Tests: make the next loads fail.
+    var failLoads = false
 }
 
 /// The app's persistence: an encrypted file per account.
@@ -125,9 +138,21 @@ final class EncryptedFileHistoryPersistence: E2EHistoryPersistence, @unchecked S
 
     func delete(userID: Profile.ID) throws {
         let url = fileURL(userID)
-        if FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) {
-            try FileManager.default.removeItem(at: url)
+        for file in [url, url.appendingPathExtension("unreadable")]
+        where FileManager.default.fileExists(atPath: file.path(percentEncoded: false)) {
+            try FileManager.default.removeItem(at: file)
         }
         try secrets.delete(keyName(userID))
+    }
+
+    func setAside(userID: Profile.ID) throws {
+        let url = fileURL(userID)
+        let aside = url.appendingPathExtension("unreadable")
+        if FileManager.default.fileExists(atPath: aside.path(percentEncoded: false)) {
+            try FileManager.default.removeItem(at: aside)
+        }
+        if FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) {
+            try FileManager.default.moveItem(at: url, to: aside)
+        }
     }
 }

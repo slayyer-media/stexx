@@ -63,7 +63,9 @@ final class E2EStatus {
         guard let engine else { return true }
         do {
             try await engine.acceptIdentityChange(of: peer)
-            keyChanges[peer] = nil
+            // The engine's own view, not a local guess: another change may
+            // have been recorded meanwhile.
+            apply(await engine.snapshot())
             return true
         } catch {
             return false
@@ -77,7 +79,8 @@ final class E2EStatus {
         guard let engine else { return event }
         switch event {
         case .identityChanged(let change):
-            await engine.checkIdentity(of: change.userID, force: true)
+            // Off the ordered event path: it's a network round trip.
+            Task { await engine.checkIdentity(of: change.userID, maxAge: 0) }
             return event
         case .keysLow:
             Task { await engine.replenishKeys() }

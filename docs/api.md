@@ -419,6 +419,9 @@ When someone re-registers with a new identity key, each chat partner gets
 the safety-number warning. libsignal also refuses the new identity
 (`untrustedIdentity`) until the app saves it, so a missed event can't silently
 switch keys.
+The iOS app holds the change until the user accepts the new key: it sends
+nothing to that person and leaves their new-key messages undecrypted until then
+(see [`security.md`](security.md#the-ios-client)).
 
 ### Safety (always free)
 

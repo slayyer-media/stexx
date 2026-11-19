@@ -63,6 +63,7 @@ struct ChatThreadView: View {
                             message: message,
                             isMine: isMine,
                             senderName: participant.displayName,
+                            isKeyChangePending: e2e.hasKeyChange(for: participant.id),
                             showsTimestamp: showsTimestamp(at: index),
                             isFirstInGroup: !continues,
                             isLastInGroup: isLastInGroup(at: index),
@@ -502,9 +503,14 @@ struct ChatThreadView: View {
     private func acceptKeyChange() async {
         isAcceptingKeyChange = true
         defer { isAcceptingKeyChange = false }
-        guard await e2e.acceptKeyChange(of: participant.id) else { return }
+        guard await e2e.acceptKeyChange(of: participant.id) else {
+            sendNotice = String(localized: "Couldn't accept the new key. Try again in a moment.")
+            return
+        }
         sendNotice = nil
         if let id = conversation?.id { try? await refreshMessages(in: id) }
+        // The chat list's preview may have been a held message too.
+        await chatStore.load()
     }
 
     private func block() async {
@@ -525,6 +531,10 @@ struct MessageBubble: View {
     let isMine: Bool
     /// The other person's name, for the placeholder of a message held back by a key change.
     var senderName: String = ""
+    /// Whether the other person's key change is waiting for the user. A
+    /// message under an unknown key without one (stale or forged) can't be
+    /// shown at all.
+    var isKeyChangePending = true
     var showsTimestamp = false
     var isFirstInGroup = true
     var isLastInGroup = true
@@ -621,8 +631,10 @@ struct MessageBubble: View {
         case .unavailable?:
             // Typically a reinstall or a new phone: the plaintext was only ever on the old one.
             return String(localized: "Encrypted message. Not available on this phone.")
-        case .awaitingKeyConfirmation?:
+        case .awaitingKeyConfirmation? where isKeyChangePending:
             return String(localized: "Sent with \(senderName)'s new security key. Accept the key change at the top to read it.")
+        case .awaitingKeyConfirmation?:
+            return String(localized: "Encrypted message. Not available on this phone.")
         case .unsupported?:
             return String(localized: "This message needs a newer version of Stexx.")
         case .decrypted?, nil:
@@ -631,7 +643,7 @@ struct MessageBubble: View {
     }
 
     private var placeholderIcon: String {
-        message.encryption == .awaitingKeyConfirmation ? "key" : "lock.slash"
+        message.encryption == .awaitingKeyConfirmation && isKeyChangePending ? "key" : "lock.slash"
     }
 
     private var statusText: LocalizedStringKey? {
