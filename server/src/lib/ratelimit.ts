@@ -32,6 +32,12 @@ export const LIMITS = {
    * (3/15 min) refills slower than this, so draining it takes several distinct clients.
    */
   emailLinkAddress: { capacity: 8, windowMs: 15 * MINUTE },
+  /**
+   * One-time code attempts per address across ALL clients (POST /auth/email/code). With 8-digit codes, at most 5
+   * wrong guesses per live code (the code then stops working) and this cap, guessing stays hopeless. A stranger
+   * can use it up to block code entry for an address for a while; the emailed link still works.
+   */
+  emailCode: { capacity: 10, windowMs: HOUR },
   messages: { capacity: 60, windowMs: MINUTE },
   /** Photo attachments (each one is a new file on disk), per sender: uploads and sends of a profile-photo copy. */
   attachments: { capacity: 30, windowMs: HOUR },

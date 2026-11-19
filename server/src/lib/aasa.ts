@@ -14,7 +14,7 @@ export const EMAIL_LINK_PATH = "/auth/email";
 
 export interface AppSiteAssociation {
   webcredentials: { apps: string[] };
-  applinks: { details: { appIDs: string[]; components: { "/": string; comment: string }[] }[] };
+  applinks: { details: { appIDs: string[]; components: { "/": string; "?": Record<string, string>; comment: string }[] }[] };
 }
 
 /**
@@ -26,7 +26,11 @@ export function appSiteAssociation(appId: string | null): AppSiteAssociation | n
   return {
     webcredentials: { apps: [appId] },
     applinks: {
-      details: [{ appIDs: [appId], components: [{ "/": EMAIL_LINK_PATH, comment: "Email sign-in links" }] }],
+      // Only the exact sign-in path, and only with a token (`?*` = at least one character). Everything else on the
+      // domain stays in the browser.
+      details: [
+        { appIDs: [appId], components: [{ "/": EMAIL_LINK_PATH, "?": { token: "?*" }, comment: "Email sign-in links" }] },
+      ],
     },
   };
 }

@@ -1,7 +1,7 @@
 import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
-import { randomBytes } from "node:crypto";
-import { Hono } from "hono";
+import { randomBytes, randomInt } from "node:crypto";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { config } from "../config.ts";
 import { sql, type Sql } from "../db/sql.ts";
@@ -14,6 +14,7 @@ import {
   requireAuth,
   revokeSessionFamily,
   rotateSession,
+  type SessionJson,
 } from "../lib/auth.ts";
 import { snapToCell } from "../lib/distance.ts";
 import { badRequest, conflict, serviceUnavailable, unauthorized } from "../lib/errors.ts";
@@ -40,7 +41,7 @@ import type { AppEnv } from "../types.ts";
 /**
  * auth routes, mounted at /v1. Paths are written in full relative to /v1.
  * POST /auth/register, /auth/passkey/register/{options,finish}, /auth/passkey/login/{options,finish},
- * /auth/email/link, /auth/email/verify, /auth/refresh, /auth/logout.
+ * /auth/email/link, /auth/email/verify, /auth/email/code, /auth/refresh, /auth/logout.
  *
  * Every credential-bearing step is rate limited per client ("auth": 10/min). Challenges and link tokens are
  * single use (consumed atomically with DELETE/UPDATE ... RETURNING) and short lived.
@@ -49,6 +50,10 @@ export const authRoutes = new Hono<AppEnv>();
 
 const CHALLENGE_TTL_MS = 5 * MINUTE;
 const LINK_TTL_MS = 15 * MINUTE;
+/** Digits in the one-time code that travels with every sign-in link. */
+export const EMAIL_CODE_DIGITS = 8;
+/** Wrong codes for an address (counted on each of its live links) before a link's code stops working. */
+export const EMAIL_CODE_MAX_ATTEMPTS = 5;
 const UNIQUE_VIOLATION = "23505";
 /**
  * The account label a new passkey is saved under (WebAuthn `user.name` / `user.displayName`). Deliberately not
@@ -94,6 +99,10 @@ const emailLinkSchema = z
   });
 
 const emailVerifySchema = z.strictObject({ token: tokenString });
+const emailCodeSchema = z.strictObject({
+  email: emailSchema,
+  code: z.string().regex(new RegExp(`^[0-9]{${EMAIL_CODE_DIGITS}}$`), `must be ${EMAIL_CODE_DIGITS} digits`),
+});
 const refreshSchema = z.strictObject({ refreshToken: tokenString });
 
 const b64u = (max: number) => z.string().min(1).max(max).regex(/^[A-Za-z0-9_-]+$/, "must be base64url");
@@ -181,6 +190,16 @@ function challengeOf(clientDataJSON: string): string {
     // fall through
   }
   throw badRequest("Invalid credential response.", "invalid_credential");
+}
+
+/** A uniformly random code of EMAIL_CODE_DIGITS digits (leading zeros kept). */
+function newEmailCode(): string {
+  return randomInt(0, 10 ** EMAIL_CODE_DIGITS).toString().padStart(EMAIL_CODE_DIGITS, "0");
+}
+
+/** What is stored for a code: bound to the address, so equal codes for different addresses never match. */
+function emailCodeHash(hmac: Buffer, code: string): Buffer {
+  return hashToken(`${hmac.toString("base64url")}:${code}`);
 }
 
 interface ChallengeRow {
@@ -383,13 +402,15 @@ authRoutes.post("/auth/email/link", rateLimit("auth"), attest("login"), async (c
   await sweepExpired();
 
   const token = generateToken();
+  const code = newEmailCode();
   await sql`
-    INSERT INTO email_link_tokens (token_hash, email_hmac, display_name, confirmed_adult, expires_at)
-    VALUES (${hashToken(token)}, ${hmac}, ${body.displayName ?? null}, ${body.confirmedAdult ?? null}, ${inMs(LINK_TTL_MS)})`;
+    INSERT INTO email_link_tokens (token_hash, email_hmac, display_name, confirmed_adult, expires_at, code_hash)
+    VALUES (${hashToken(token)}, ${hmac}, ${body.displayName ?? null}, ${body.confirmedAdult ?? null}, ${inMs(LINK_TTL_MS)},
+            ${emailCodeHash(hmac, code)})`;
 
   // A link is sent for every address, known or not (no account enumeration).
   try {
-    await sendSignInLink(address, token);
+    await sendSignInLink(address, token, code);
   } catch (err) {
     await sql`DELETE FROM email_link_tokens WHERE token_hash = ${hashToken(token)}`;
     if (err && typeof err === "object" && "status" in err) throw err; // already an ApiError (503 email_unavailable)
@@ -401,22 +422,31 @@ authRoutes.post("/auth/email/link", rateLimit("auth"), attest("login"), async (c
 
 class NeedsRegistration extends Error {}
 
-authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async (c) => {
+interface LinkRow {
+  email_hmac: Buffer;
+  display_name: string | null;
+  confirmed_adult: boolean | null;
+}
+
+/**
+ * Turns a live sign-in (found and marked used by `claim`, inside the transaction) into a session: signs in the
+ * address's account, or creates it from the pending registration that travelled with the link. Shared by the link
+ * (`/auth/email/verify`) and the code (`/auth/email/code`). `claim` returns null when nothing matched; then
+ * `invalid` is thrown. Any throw rolls back, so a refused sign-up (or a missing registration) doesn't burn it.
+ */
+async function redeemEmailSignIn(
+  c: Context<AppEnv>,
+  claim: (tx: Sql) => Promise<LinkRow | null>,
+  invalid: () => Error,
+): Promise<SessionJson> {
   const device = deviceOf(c);
-  await hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
-  const { token } = await parseJson(c, emailVerifySchema);
   await assertLoginAllowed(device); // banned devices (DeviceCheck bit1) can neither sign in nor sign up
-  const invalid = () => badRequest("This sign-in link is invalid or has expired.", "invalid_link");
 
   let createdUserId: string | null = null;
   let signupCheck: SignupCheck | null = null;
   try {
     const session = await sql.begin(async (tx) => {
-      // Single use: only one concurrent verify can flip used_at.
-      const [link] = await tx<{ email_hmac: Buffer; display_name: string | null; confirmed_adult: boolean | null }[]>`
-        UPDATE email_link_tokens SET used_at = now()
-         WHERE token_hash = ${hashToken(token)} AND used_at IS NULL AND expires_at > now()
-        RETURNING email_hmac, display_name, confirmed_adult`;
+      const link = await claim(tx);
       if (!link) throw invalid();
 
       const [existing] = await tx<{ id: string }[]>`SELECT id FROM users WHERE email_hmac = ${link.email_hmac}`;
@@ -451,7 +481,7 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async 
       if (signupCheck) await afterSignup(device, signupCheck);
       await afterNewUser(createdUserId);
     }
-    return c.json(session, 200);
+    return session;
   } catch (err) {
     if (err instanceof NeedsRegistration) {
       // Transaction rolled back, so the link is not burnt.
@@ -459,6 +489,67 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async 
         "There is no account for this address yet. Start sign-up again and request a new link.",
         "registration_required",
       );
+    }
+    throw err;
+  }
+}
+
+authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async (c) => {
+  await hitAbuseLimits("login", subjectOf(c, { deviceId: deviceOf(c).deviceId }));
+  const { token } = await parseJson(c, emailVerifySchema);
+  const session = await redeemEmailSignIn(
+    c,
+    // Single use: only one concurrent verify can flip used_at. The code dies with the link.
+    async (tx) => {
+      const [link] = await tx<LinkRow[]>`
+        UPDATE email_link_tokens SET used_at = now(), code_hash = NULL
+         WHERE token_hash = ${hashToken(token)} AND used_at IS NULL AND expires_at > now()
+        RETURNING email_hmac, display_name, confirmed_adult`;
+      return link ?? null;
+    },
+    () => badRequest("This sign-in link is invalid or has expired.", "invalid_link"),
+  );
+  return c.json(session, 200);
+});
+
+/**
+ * The one-time code from the same email, typed into the app: for a link read on another device, or one a mail app
+ * won't hand to the app. 8 digits, single use, dies with its link (15 min). Brute force: each wrong code counts
+ * against every live code of that address (5 strikes and those codes stop working; the links still work), plus a
+ * per-address cap (emailCode, 10/h) and the per-client auth limit.
+ */
+authRoutes.post("/auth/email/code", rateLimit("auth"), attest("login"), async (c) => {
+  await hitAbuseLimits("login", subjectOf(c, { deviceId: deviceOf(c).deviceId }));
+  const body = await parseJson(c, emailCodeSchema);
+  const hmac = emailHmac(normalizeEmail(body.email));
+  consume("emailCode", hmac.toString("base64url"));
+  const codeHash = emailCodeHash(hmac, body.code);
+  const invalid = () => badRequest("That code is wrong or has expired. Check the latest email.", "invalid_code");
+
+  let wrongCode = false;
+  try {
+    const session = await redeemEmailSignIn(
+      c,
+      async (tx) => {
+        // Single use, like the link: using the code burns the link, and the other way round.
+        const [link] = await tx<LinkRow[]>`
+          UPDATE email_link_tokens SET used_at = now(), code_hash = NULL
+           WHERE email_hmac = ${hmac} AND code_hash = ${codeHash}
+             AND used_at IS NULL AND expires_at > now() AND code_attempts < ${EMAIL_CODE_MAX_ATTEMPTS}
+          RETURNING email_hmac, display_name, confirmed_adult`;
+        wrongCode = !link;
+        return link ?? null;
+      },
+      invalid,
+    );
+    return c.json(session, 200);
+  } catch (err) {
+    if (wrongCode) {
+      // A wrong guess (outside the rolled-back transaction, so it sticks): one strike on every live code.
+      await sql`
+        UPDATE email_link_tokens SET code_attempts = code_attempts + 1,
+               code_hash = CASE WHEN code_attempts + 1 >= ${EMAIL_CODE_MAX_ATTEMPTS} THEN NULL ELSE code_hash END
+         WHERE email_hmac = ${hmac} AND used_at IS NULL AND expires_at > now() AND code_hash IS NOT NULL`;
     }
     throw err;
   }

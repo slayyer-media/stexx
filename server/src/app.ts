@@ -2,7 +2,8 @@ import { Hono, type MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { config } from "./config.ts";
 import { sql } from "./db/sql.ts";
-import { AASA_PATH, appSiteAssociation } from "./lib/aasa.ts";
+import { AASA_PATH, EMAIL_LINK_PATH, appSiteAssociation } from "./lib/aasa.ts";
+import { EMAIL_LINK_PAGE, EMAIL_LINK_PAGE_CSP } from "./lib/emailLinkPage.ts";
 import { authenticateAccessToken, bearerToken } from "./lib/auth.ts";
 import { ApiError, onError, onNotFound, tooManyRequests } from "./lib/errors.ts";
 import { requestLogger } from "./lib/logger.ts";
@@ -27,7 +28,8 @@ const securityHeaders: MiddlewareHandler = async (c, next) => {
   await next();
   c.header("X-Content-Type-Options", "nosniff");
   c.header("Referrer-Policy", "no-referrer");
-  c.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  // A route may set a stricter-but-different policy (the email-link page needs inline styles); default otherwise.
+  if (!c.res.headers.has("Content-Security-Policy")) c.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
   c.header("X-Frame-Options", "DENY");
   c.header("Cross-Origin-Resource-Policy", "same-origin");
   if (!c.res.headers.has("Cache-Control")) c.header("Cache-Control", "no-store");
@@ -106,6 +108,14 @@ export async function createApp(): Promise<Hono<AppEnv>> {
     if (!body) return onNotFound(c);
     c.header("Cache-Control", "public, max-age=3600");
     return c.json(body, 200);
+  });
+
+  // Email sign-in links land here only when they did not open the app (another device, no app, universal links
+  // turned off). A static explanation: the token is never read or redeemed here (lib/emailLinkPage.ts).
+  app.get(EMAIL_LINK_PATH, (c) => {
+    c.header("Content-Security-Policy", EMAIL_LINK_PAGE_CSP);
+    c.header("X-Robots-Tag", "noindex, nofollow");
+    return c.html(EMAIL_LINK_PAGE, 200);
   });
 
   if (!config.isProduction) {
