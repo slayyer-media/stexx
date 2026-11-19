@@ -7,6 +7,7 @@ struct MyProfileView: View {
     }
 
     @Environment(AppState.self) private var appState
+    @Environment(PurchaseService.self) private var purchases
     @Environment(\.apiClient) private var api
 
     /// Why the last `fetchMe` failed, shown until a retry succeeds.
@@ -92,15 +93,37 @@ struct MyProfileView: View {
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
+        switch await Self.load(api: api, appState: appState, purchases: purchases) {
+        case .loaded:
+            loadError = nil
+        case .failed(let message):
+            loadError = message
+        case .unchanged:
+            break
+        }
+    }
+
+    enum LoadOutcome: Equatable {
+        case loaded
+        case failed(String)
+        /// Cancelled, or another fetch (the tab bar's) won meanwhile.
+        case unchanged
+    }
+
+    /// Fetches `me` and, once it arrives, re-checks Stexx+. `hasPlus` isn't
+    /// persisted and is otherwise only re-checked at sign-in and on
+    /// foreground, so after a launch while offline a subscriber would stay
+    /// "free" even once Retry brought the profile back.
+    static func load(api: any APIClient, appState: AppState, purchases: PurchaseService) async -> LoadOutcome {
         do {
             appState.me = try await api.fetchMe()
-            loadError = nil
         } catch {
             // The heading already says "Couldn't load your profile".
-            guard let message = UserFacingError.message(for: error) else { return }
-            // Another fetch (the tab bar's) may have won meanwhile.
-            if appState.me == nil { loadError = message }
+            guard let message = UserFacingError.message(for: error) else { return .unchanged }
+            return appState.me == nil ? .failed(message) : .unchanged
         }
+        await purchases.refreshEntitlement()
+        return .loaded
     }
 
     @ViewBuilder

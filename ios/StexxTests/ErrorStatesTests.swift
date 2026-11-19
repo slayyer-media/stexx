@@ -347,3 +347,33 @@ struct EditProfileSaveTests {
         #expect(try await api.fetchMe().headline == before)
     }
 }
+
+@MainActor
+struct MyProfileRetryTests {
+    @Test("Retry after an offline launch brings back Stexx+, not just the profile")
+    func retryRefreshesEntitlement() async {
+        let api = MockAPIClient(latency: .zero, plusActive: true)
+        let suite = "stexx.tests.\(UUID().uuidString)"
+        let appState = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: InMemorySessionStore())
+        appState.confirmAge()
+        appState.signIn(MockData.session)
+        let purchases = PurchaseService(api: api, appState: appState)
+
+        // Offline cold launch: neither the profile nor the entitlement load.
+        await api.inject(.fail(URLError(.notConnectedToInternet)), for: "fetchMe")
+        await api.inject(.fail(URLError(.notConnectedToInternet)), for: "subscriptionStatus")
+        await purchases.refreshEntitlement()
+        let offline = await MyProfileView.load(api: api, appState: appState, purchases: purchases)
+        #expect(offline == .failed("Couldn't connect. Check your connection and try again."))
+        #expect(appState.me == nil)
+        #expect(!appState.hasPlus)
+
+        // The server is back; the user taps Retry.
+        await api.inject(nil, for: "fetchMe")
+        await api.inject(nil, for: "subscriptionStatus")
+        let retried = await MyProfileView.load(api: api, appState: appState, purchases: purchases)
+        #expect(retried == .loaded)
+        #expect(appState.me != nil)
+        #expect(appState.hasPlus)
+    }
+}

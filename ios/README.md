@@ -233,7 +233,9 @@ with sample data.
 - **Loading your own profile.** The You tab shows a skeleton until `fetchMe`
   answers and an error with Retry if it fails. Edit stays disabled until the
   real profile has loaded, so sample data can never be saved over an account.
-  `MockData` is for previews, tests and the Debug (mock) scheme only.
+  Once the profile loads (including after Retry) the Stexx+ entitlement is
+  re-checked too, so a subscriber who launched offline isn't left showing as
+  free. `MockData` is for previews, tests and the Debug (mock) scheme only.
 - **Unsaved edits.** Edit profile is a sheet. With unsaved changes, or a photo
   still uploading, swipe-down is disabled (SwiftUI doesn't report the refused
   swipe, so it can't prompt) and Cancel asks "Discard changes?"; Save waits for
