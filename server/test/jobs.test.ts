@@ -313,7 +313,7 @@ describe("job runners", () => {
         await unlinkMedia(key);
       }
     } finally {
-      stop();
+      await stop();
     }
     // After stop() nothing runs any more.
     const id2 = await message(conv, { readAt: T0, expiresAfter: 1, expiresAt: at(T0, 1 * SEC) });

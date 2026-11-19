@@ -37,6 +37,10 @@ const envSchema = z.object({
 
   MEDIA_DIR: z.string().default("./media"),
   MEDIA_BASE_URL: z.string().url().default("http://127.0.0.1:8787/media"),
+  /** Uploads fail closed (503 storage_unavailable) below this share of free space on the media disk. Default 5 (0 in tests). */
+  MEDIA_MIN_FREE_PERCENT: z.coerce.number().min(0).max(50).optional(),
+  /** ... or below this many free megabytes. Default 500 (0 in tests). */
+  MEDIA_MIN_FREE_MB: z.coerce.number().int().min(0).max(1_000_000).optional(),
   APP_LINK_BASE: z.string().url().default("https://stexx.gay"),
 
   EMAIL_PEPPER: z.string().optional(),
@@ -132,6 +136,8 @@ export interface Config {
   databaseUrl: string;
   databasePoolMax: number;
   mediaDir: string;
+  /** Free-space floor for media writes (lib/media.ts). Either one being crossed refuses the write. */
+  mediaMinFree: { percent: number; mb: number };
   /** No trailing slash. Photo URLs are `${mediaBaseUrl}/${storageKey}`. */
   mediaBaseUrl: string;
   /** No trailing slash. Email link = `${appLinkBase}/auth/email?token=...`. */
@@ -372,6 +378,10 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     databaseUrl: e.DATABASE_URL,
     databasePoolMax: e.DATABASE_POOL_MAX,
     mediaDir: e.MEDIA_DIR,
+    mediaMinFree: {
+      percent: e.MEDIA_MIN_FREE_PERCENT ?? (e.NODE_ENV === "test" ? 0 : 5),
+      mb: e.MEDIA_MIN_FREE_MB ?? (e.NODE_ENV === "test" ? 0 : 500),
+    },
     mediaBaseUrl: e.MEDIA_BASE_URL.replace(/\/+$/, ""),
     appLinkBase: e.APP_LINK_BASE.replace(/\/+$/, ""),
     emailPepper: e.EMAIL_PEPPER || DEV_EMAIL_PEPPER,

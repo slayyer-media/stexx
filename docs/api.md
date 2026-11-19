@@ -64,6 +64,7 @@ Non-2xx responses carry:
 | 404 | Not found, or hidden because of a block |
 | 409 | Conflict (e.g. nickname taken, if we ever enforce uniqueness) |
 | 429 | Rate limited; `Retry-After` header set |
+| 503 | Temporarily unavailable; show `message` and let the user retry. `storage_unavailable`: the server's disk is full or below its free-space floor, so a photo upload or photo attachment wasn't saved (`Retry-After: 60`). Other 503 codes: `busy` (too many photos being processed, `Retry-After`), `email_unavailable`, `subscriptions_unavailable` |
 
 ## Models
 
@@ -217,6 +218,13 @@ events using the same JSON models. Each frame is `{ "type": "…", "data": … }
 `keys.low` → `{ preKeyCount, pqPreKeyCount }`. Control frames (`ready`, `pong`,
 `error`) carry no `data`; clients ignore unknown types. APNs pushes carry no message content,
 only a conversation ID, and the app fetches the rest.
+
+Close codes: 4401 unauthorized or session revoked (refresh, then reconnect), 4408 no auth frame
+within 5 s, 4009 too many sockets for the account, 1008 policy (frame flood), 1013 busy.
+When the server restarts (deploy, reboot) it closes every socket with **1012 `restarting`**
+before it stops: reconnect with the usual backoff and refetch what may have been missed,
+exactly as after a dropped connection. Expect the first attempts to fail for a few seconds
+while the new process starts.
 
 ### End-to-end encryption
 
