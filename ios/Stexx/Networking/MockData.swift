@@ -93,7 +93,7 @@ enum MockData {
             (false, "Haha same. Museum this weekend? The new physics exhibit looks fun.", 12),
             (false, "No pressure, I just want an excuse to explain interferometry", 11),
         ]),
-        ("p04", [
+        ("p04", homelabHistory + [
             (true, "Ok your homelab photo is incredible", 60 * 5),
             (false, "Thank you, it's mostly Raspberry Pis held together with hope", 60 * 4.8),
         ]),
@@ -106,6 +106,30 @@ enum MockData {
             (true, "Respect", 60 * 70),
         ]),
     ]
+
+    /// A long earlier history for one seed thread (more than one 50-message
+    /// page), so older pages load as you scroll up.
+    static let homelabHistory: [(Bool, String, Double)] = {
+        let lines: [(Bool, String)] = [
+            (false, "Did the new switch arrive?"),
+            (true, "It did. Eight ports, zero instructions."),
+            (false, "Classic."),
+            (true, "Rack is now officially a shelf with ambitions"),
+            (false, "Mine is a bookcase. The books moved out."),
+            (true, "Respect the sacrifice"),
+            (false, "How's the DNS saga?"),
+            (true, "It was DNS. It's always DNS."),
+            (false, "Ha"),
+            (true, "Anyway, coffee sometime?"),
+            (false, "Yes. Somewhere with good wifi, obviously."),
+            (true, "Obviously"),
+        ]
+        // Oldest first: 72 messages, 12 hours ago up to about 6 hours ago.
+        return (0..<72).map { index in
+            let line = lines[index % lines.count]
+            return (line.0, line.1, 60 * 12 - Double(index) * 5)
+        }
+    }()
 
     private static func make(
         _ id: Profile.ID,
@@ -140,4 +164,24 @@ enum MockData {
             isFavorite: id == "p04" || id == "p09"
         )
     }
+}
+
+// MARK: - Taps
+
+extension MockData {
+    /// Seed taps you received: (sender, minutes ago). Senders tapped within
+    /// `tapsSeenMinutesAgo` show as new.
+    static let seedTaps: [(Profile.ID, Double)] = [
+        ("p06", 4),
+        ("p02", 38),
+        ("p15", 60 * 3),
+        ("p09", 60 * 9),
+        ("p05", 60 * 26),
+        ("p17", 60 * 24 * 3),
+        ("p12", 60 * 24 * 6),
+        ("p20", 60 * 24 * 12),
+    ]
+
+    /// When the mock user last opened their taps.
+    static let tapsSeenMinutesAgo: Double = 60 * 4
 }

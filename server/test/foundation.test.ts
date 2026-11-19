@@ -254,6 +254,7 @@ describe("serialize & visibility", () => {
       id: "m_1", conversation_id: "c_1", sender_id: "p_a", client_id: "cid", text: "hi",
       envelope_type: null, envelope_body: null,
       attachment_kind: "photo", attachment_key: null, attachment_view_once: true, attachment_encrypted: false,
+      attachment_opened_at: null as Date | null, attachment_open_receipt: false,
       sent_at: new Date("2026-11-17T20:30:00.250Z"), delivered_at: new Date(), read_at: new Date(), read_receipt: false,
       expires_at: null,
     };
@@ -263,10 +264,33 @@ describe("serialize & visibility", () => {
     expect(messageJson({ ...m, delivered_at: null, read_at: null }, "p_a").status).toBe("sent");
     const j = messageJson(m, "p_b");
     expect(j.sentAt).toBe("2026-11-17T20:30:00Z");
-    expect(j.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
+    expect(j.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false, openedAt: null });
     expect(messageJson({ ...m, attachment_encrypted: true }, "p_b").attachment?.isEncrypted).toBe(true);
     expect(j.clientID).toBeNull(); // the idempotency key is only echoed to its sender
     expect(messageJson(m, "p_a").clientID).toBe("cid");
+  });
+
+  test("messageJson view-once: openedAt for the recipient always, for the sender only with a receipt; no sender url", () => {
+    const opened = new Date("2026-11-17T21:00:00.900Z");
+    const m = {
+      id: "m_1", conversation_id: "c_1", sender_id: "p_a", client_id: "cid", text: null,
+      envelope_type: null, envelope_body: null,
+      attachment_kind: "photo", attachment_key: "0123456789abcdef0123456789abcdef.jpg", attachment_view_once: true,
+      attachment_encrypted: false, attachment_opened_at: opened as Date | null, attachment_open_receipt: false,
+      sent_at: new Date("2026-11-17T20:30:00Z"), delivered_at: null, read_at: null, read_receipt: false, expires_at: null,
+    };
+    // Recipient: their own open time (no fractional seconds) and the URL while the file exists.
+    expect(messageJson(m, "p_b").attachment).toMatchObject({ openedAt: "2026-11-17T21:00:00Z" });
+    expect(messageJson(m, "p_b").attachment?.url).toEndWith(m.attachment_key);
+    // Sender: never the URL of a view-once photo; openedAt only when the opener sent a receipt.
+    expect(messageJson(m, "p_a").attachment).toMatchObject({ url: null, openedAt: null });
+    expect(messageJson({ ...m, attachment_open_receipt: true }, "p_a").attachment?.openedAt).toBe("2026-11-17T21:00:00Z");
+    // Not opened yet.
+    expect(messageJson({ ...m, attachment_opened_at: null }, "p_b").attachment?.openedAt).toBeNull();
+    // A normal photo: the sender keeps the URL, openedAt is always null (even if a stray stamp exists).
+    const plain = { ...m, attachment_view_once: false, attachment_open_receipt: true };
+    expect(messageJson(plain, "p_a").attachment).toMatchObject({ openedAt: null });
+    expect(messageJson(plain, "p_a").attachment?.url).toEndWith(m.attachment_key);
   });
 
   test("profileFor: distance from DB cells, blocks hide, includeBlocked shows", async () => {

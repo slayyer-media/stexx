@@ -137,6 +137,13 @@ actor E2EEngine {
     private var configUserID: Profile.ID?
     /// Accounts deleted in this run: nothing may write their keys again.
     private var wipedUsers: Set<Profile.ID> = []
+    /// Every protocol store opened per account (weakly), so erasing an
+    /// account's keys also stops stores still held by running operations.
+    private var openStores: [Profile.ID: [WeakStore]] = [:]
+    private final class WeakStore {
+        weak var store: E2EProtocolStore?
+        init(_ store: E2EProtocolStore) { self.store = store }
+    }
     /// After a 429 on `PUT /keys` (10 a day), don't try again before this.
     private var registerBlockedUntil: [Profile.ID: Date] = [:]
     private var sessionSetups: [Profile.ID: Task<Void, any Error>] = [:]
@@ -213,6 +220,7 @@ actor E2EEngine {
             guard let existing = try E2EProtocolStore.load(storage: secrets, userID: userID) else { return nil }
             store = existing
         }
+        openStores[userID] = (openStores[userID] ?? []).filter { $0.store != nil } + [WeakStore(store)]
         let loaded = Account(userID: userID, store: store, history: loadHistory(userID: userID))
         account = loaded
         // Expired text and photo keys leave the file now, not with the next change.
@@ -272,7 +280,8 @@ actor E2EEngine {
     private func isCurrent(_ candidate: Account) -> Bool { account === candidate }
 
     private func flushHistory(_ account: Account) {
-        guard account.historyDirty else { return }
+        // An erased account's history must not be written back.
+        guard account.historyDirty, !account.store.isRevoked else { return }
         do {
             try historyPersistence.save(account.history, userID: account.userID)
             account.historyDirty = false
@@ -281,8 +290,10 @@ actor E2EEngine {
         }
     }
 
-    /// Signed out: drop in-memory state. Keys and history stay on the device
-    /// for the next sign-in to this account.
+    /// The session ended without the user signing out (it expired or was
+    /// revoked): drop in-memory state. Keys and history stay on the device
+    /// for the next sign-in to this account. An explicit sign-out also calls
+    /// `erase(userID:)`.
     func signedOut() async {
         if let account { flushHistory(account) }
         account = nil
@@ -298,18 +309,41 @@ actor E2EEngine {
         await publish()
     }
 
-    /// The account was deleted: remove its keys, sessions and history.
+    /// The account was deleted: remove its keys, sessions and history, and
+    /// never write them again in this run.
     func wipe(userID: Profile.ID) async {
         wipedUsers.insert(userID)
-        if account?.userID == userID {
+        await erase(userID: userID)
+    }
+
+    /// The user signed out: remove the account's keys, sessions and decrypted
+    /// history from this device (docs/security.md, "The iOS client"). Signing
+    /// in again here later starts a new identity (chat partners see the
+    /// key-change notice) and earlier messages show the "not available on
+    /// this phone" placeholder. Operations still running for the account
+    /// can't write anything back (`E2EProtocolStore.revoke`). If another
+    /// account is already signed in, its in-memory state is left alone.
+    func erase(userID: Profile.ID) async {
+        for opened in openStores.removeValue(forKey: userID) ?? [] { opened.store?.revoke() }
+        let wasCurrent = account?.userID == userID
+        if wasCurrent {
             account = nil
             syncTask?.cancel()
             syncTask = nil
         }
         try? E2EProtocolStore.wipe(storage: secrets, userID: userID)
         try? historyPersistence.delete(userID: userID)
-        encryptedPeers = []
-        outgoingMedia = [:]
+        if configUserID == userID {
+            config = nil
+            configFetchedAt = nil
+            configUserID = nil
+        }
+        if wasCurrent || account == nil {
+            encryptedPeers = []
+            identityCheckedAt = [:]
+            sessionSetups = [:]
+            outgoingMedia = [:]
+        }
         await publish()
     }
 
@@ -478,16 +512,16 @@ actor E2EEngine {
             try discard(upload, from: store)
             throw error
         }
-        // The keys are this account's even if it signed out meanwhile; only a
-        // deleted account's must not come back.
-        guard !wipedUsers.contains(account.userID) else { return }
+        // The keys are this account's even if its session ended meanwhile; only
+        // a deleted or signed-out (erased) account's must not come back.
+        guard !wipedUsers.contains(account.userID), !account.store.isRevoked else { return }
         try commit(upload, to: store)
     }
 
     /// A 4xx other than 429: re-sending the same body can't succeed.
     private static func isPermanentRejection(_ error: APIError) -> Bool {
         switch error {
-        case .server(let status, _): (400..<500).contains(status) && status != 429
+        case .server(let status, _, _): (400..<500).contains(status) && status != 429
         case .e2e(let code, _): code != E2EErrorCode.disabled
         default: false
         }
@@ -618,7 +652,7 @@ actor E2EEngine {
             try store.setPendingRotation(rotation)
         }
         _ = try await api.rotateSignedPreKeys(rotation)
-        guard !wipedUsers.contains(account.userID) else { return }
+        guard !wipedUsers.contains(account.userID), !account.store.isRevoked else { return }
         try commit(rotation, to: store)
     }
 
@@ -885,7 +919,8 @@ actor E2EEngine {
         return encrypted
     }
 
-    /// The photo sent as `clientID` reached the server: forget its blob.
+    /// The photo sent as `clientID` reached the server, or the user
+    /// removed the failed send: forget its blob and key.
     func didSendPhoto(clientID: String) {
         outgoingMedia[clientID] = nil
     }
@@ -1035,6 +1070,8 @@ actor E2EEngine {
         switch event {
         case .messageCreated(let message):
             return .messageCreated(await reveal(message))
+        case .messageUpdated(let message):
+            return .messageUpdated(await reveal(message))
         case .conversationUpdated(var conversation):
             if let last = conversation.lastMessage { conversation.lastMessage = await reveal(last) }
             return .conversationUpdated(conversation)

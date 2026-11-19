@@ -1,3 +1,4 @@
+import StoreKit
 import SwiftUI
 
 struct SettingsView: View {
@@ -9,7 +10,15 @@ struct SettingsView: View {
     @State private var isDeleting = false
     @State private var errorMessage: String?
     @State private var isShowingViewers = false
+    @State private var isShowingTravel = false
+    @State private var isTurningOffTravel = false
     @State private var boostEndsAt: Date?
+    /// Local to this phone (`PrivacyCover`), never sent to the server.
+    @AppStorage(PrivacyCover.enabledKey) private var coversAppSwitcher = true
+    @State private var isExporting = false
+    @State private var exportFile: DataExportFile?
+    @State private var exportError: String?
+    @State private var isManagingSubscription = false
 
     private var version: String {
         let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
@@ -18,27 +27,81 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        @Bindable var bindable = appState
-
         Form {
             Section {
-                Toggle("Hide my distance", isOn: $bindable.privacy.hideDistance)
-                Toggle("Show when I'm online", isOn: $bindable.privacy.showOnlineStatus)
-                Toggle("Send read receipts", isOn: $bindable.privacy.sendReadReceipts)
+                Group {
+                    Toggle("Hide my distance", isOn: appState.privacyBinding(\.hideDistance))
+                    Toggle("Show when I'm online", isOn: appState.privacyBinding(\.showOnlineStatus))
+                    Toggle("Send read receipts", isOn: appState.privacyBinding(\.sendReadReceipts))
+                }
+                .disabled(!appState.isPrivacyEditable)
+                // Local to this phone, so it works before the server's settings load.
+                Toggle("Hide Stexx in the app switcher", isOn: $coversAppSwitcher)
+                if appState.privacyStatus == .unavailable {
+                    Button {
+                        Task { await appState.loadMe(from: api) }
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Couldn't load your settings")
+                                Text("Tap to try again")
+                                    .font(.stexxSub)
+                                    .foregroundStyle(Theme.slate)
+                            }
+                        } icon: {
+                            Image(systemName: "arrow.clockwise").foregroundStyle(Theme.steel)
+                        }
+                    }
+                }
                 LabeledContent("Location precision") {
                     Text("About \(StexxFormat.distance(LocationFuzzer.defaultCellMeters))")
                         .stexxLabelStyle()
                 }
+                Button {
+                    Task { await downloadData() }
+                } label: {
+                    HStack {
+                        Label {
+                            Text("Download my data")
+                        } icon: {
+                            Image(systemName: "arrow.down.doc").foregroundStyle(Theme.steel)
+                        }
+                        Spacer()
+                        if isExporting { ProgressView() }
+                    }
+                }
+                .disabled(isExporting)
             } header: {
-                SectionLabel("Privacy")
+                HStack(spacing: Theme.Spacing.s) {
+                    SectionLabel("Privacy")
+                        .fixedSize()
+                    if appState.privacyStatus == .loading {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("Loading")
+                            .stexxLabelStyle(.micro, color: Theme.slate)
+                    }
+                    Spacer(minLength: 0)
+                }
             } footer: {
-                SettingsFooter("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map.")
+                VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                    if let exportError {
+                        Text(exportError)
+                            .font(.footnote)
+                            .foregroundStyle(Theme.danger)
+                    }
+                    SettingsFooter("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map. Read receipts also tell people when you open their view-once photos. Hiding Stexx in the app switcher covers the screen with the logo whenever you leave the app; this setting stays on this phone.")
+                    SettingsFooter("Download my data saves what Stexx keeps about your account as a JSON file. Encrypted chat text isn't in it: only the phones in a chat can read it.")
+                }
             }
             .settingsRows()
 
             Section {
-                Toggle("Expiring photos by default", isOn: $bindable.privacy.expiringPhotosByDefault)
-                Toggle("Blur explicit photos", isOn: $bindable.privacy.blurExplicitPhotos)
+                Group {
+                    Toggle("Expiring photos by default", isOn: appState.privacyBinding(\.expiringPhotosByDefault))
+                    Toggle("Blur explicit photos", isOn: appState.privacyBinding(\.blurExplicitPhotos))
+                }
+                .disabled(!appState.isPrivacyEditable)
                 NavigationLink("Blocked members") {
                     BlockedProfilesView()
                 }
@@ -57,8 +120,21 @@ struct SettingsView: View {
             .settingsRows()
 
             Section {
-                PlusToggle("Incognito", isOn: $bindable.privacy.incognito)
-                PlusRow("Travel mode", systemImage: "airplane")
+                PlusToggle("Incognito", isOn: appState.privacyBinding(\.incognito))
+                    .disabled(!appState.isPrivacyEditable)
+                PlusRow("Travel mode", systemImage: "airplane", value: travelValue) { isShowingTravel = true }
+                if appState.isTravelPaused {
+                    Button {
+                        Task { await turnOffTravel() }
+                    } label: {
+                        Label {
+                            Text("Turn off travel mode")
+                        } icon: {
+                            Image(systemName: "airplane.arrival").foregroundStyle(Theme.steel)
+                        }
+                    }
+                    .disabled(isTurningOffTravel)
+                }
                 PlusRow("Who viewed you", systemImage: "eyes") { isShowingViewers = true }
                 PlusRow("Boosts", systemImage: "bolt.fill") { Task { await boost() } }
             } header: {
@@ -70,6 +146,10 @@ struct SettingsView: View {
                             .stexxLabelStyle(.micro, color: Theme.ice)
                     }
                     Spacer(minLength: 0)
+                }
+            } footer: {
+                if appState.isTravelPaused {
+                    SettingsFooter("Travel mode is paused while you don't have Stexx+: others see you near your real location again. It resumes if you renew, or turn it off here.")
                 }
             }
             .settingsRows()
@@ -130,19 +210,100 @@ struct SettingsView: View {
         }
         .toolbarVisibility(.hidden, for: .tabBar)
         .navigationDestination(isPresented: $isShowingViewers) { ViewersView() }
+        .navigationDestination(isPresented: $isShowingTravel) { TravelModeView() }
         .alert("Boosted", isPresented: Binding(get: { boostEndsAt != nil }, set: { if !$0 { boostEndsAt = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text("You're shown first nearby until \((boostEndsAt ?? .now).formatted(date: .omitted, time: .shortened)).")
         }
+        .alert(
+            "Couldn't save",
+            isPresented: Binding(get: { appState.privacyError != nil }, set: { if !$0 { appState.clearPrivacyError() } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(appState.privacyError ?? "")
+        }
+        .sheet(item: $exportFile, onDismiss: { DataExportFile.removeAll() }) { file in
+            ShareSheet(items: [file.url]) { exportFile = nil }
+                .presentationDetents([.medium, .large])
+                .ignoresSafeArea()
+        }
         .confirmationDialog("Sign out of Stexx?", isPresented: $isConfirmingSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { appState.signOut() }
+        } message: {
+            Text("Your encryption keys and decrypted messages are removed from this phone. When you sign back in, earlier encrypted messages, and any sent to you while you're signed out, show as not available here.")
         }
         .confirmationDialog("Delete your account?", isPresented: $isConfirmingDelete, titleVisibility: .visible) {
             Button("Delete everything", role: .destructive) { Task { await deleteAccount() } }
+            if appState.hasPlus {
+                Button("Manage Stexx+ subscription") { isManagingSubscription = true }
+            }
         } message: {
-            Text("Your profile, photos, messages and location history are permanently deleted from our servers. This can't be undone.")
+            Text(Self.deleteAccountMessage)
         }
+        .manageSubscriptionsSheet(isPresented: $isManagingSubscription)
+        .task {
+            if appState.privacyStatus != .loaded { await appState.loadMe(from: api) }
+        }
+        #if DEBUG
+        .task { await runScreenshotAction() }
+        #endif
+    }
+
+    #if DEBUG
+    /// `-StexxScreenshotAction` (see `ScreenshotRoute`), once the settings
+    /// have loaded.
+    private func runScreenshotAction() async {
+        guard ScreenshotRoute.current != nil, let action = ScreenshotRoute.action else { return }
+        while appState.privacyStatus == .loading, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        try? await Task.sleep(for: .seconds(1))
+        guard !Task.isCancelled else { return }
+        switch action {
+        case .hideDistance: appState.setPrivacy(\.hideDistance, to: !appState.privacy.hideDistance)
+        case .export: await downloadData()
+        case .signOut: isConfirmingSignOut = true
+        case .delete: isConfirmingDelete = true
+        }
+    }
+    #endif
+
+    /// What account deletion does, accurately: no location history exists,
+    /// encrypted backups keep data up to 28 days (`server/deploy/backup.sh`),
+    /// and the App Store subscription is separate.
+    static let deleteAccountMessage = String(localized: "Your profile, photos, chats and approximate location are deleted from our servers right away, and from our encrypted backups within 28 days. Reports and moderation records are kept without a link to you. Deleting doesn't cancel Stexx+: cancel it in your App Store subscriptions. This can't be undone.")
+
+    /// Fetches the export and opens the share sheet with it as a file.
+    private func downloadData() async {
+        isExporting = true
+        exportError = nil
+        defer { isExporting = false }
+        do {
+            let data = try await api.exportData()
+            exportFile = try DataExportFile.write(data)
+        } catch let error as APIError {
+            exportError = error.localizedDescription
+        } catch is CocoaError {
+            exportError = String(localized: "Couldn't prepare the file. Check there's space on your phone and try again.")
+        } catch {
+            exportError = String(localized: "Couldn't download your data. Check your connection and try again.")
+        }
+    }
+
+    /// Trailing value of the travel row: where you browse from, when on.
+    private var travelValue: Text? {
+        guard appState.isTravelActive else { return nil }
+        return Text(appState.travel?.name ?? String(localized: "On"))
+    }
+
+    /// Turning travel mode off is free, so a lapsed subscriber can do it.
+    private func turnOffTravel() async {
+        isTurningOffTravel = true
+        defer { isTurningOffTravel = false }
+        let model = TravelModeModel(appState: appState, api: api)
+        if await !model.turnOff() { errorMessage = model.errorMessage }
     }
 
     private func boost() async {
@@ -167,24 +328,26 @@ struct SettingsView: View {
     }
 }
 
-/// A Stexx+ feature row that opens the paywall (or the feature, later).
+/// A Stexx+ feature row: opens the feature with Stexx+, the paywall without.
 private struct PlusRow: View {
     let title: LocalizedStringKey
     let systemImage: String
+    /// Trailing mono-caps value (e.g. where travel mode is), Stexx+ only.
+    var value: Text?
     /// Runs when the user has Stexx+ (otherwise the paywall opens).
     var action: (() -> Void)?
     @Environment(AppState.self) private var appState
 
-    init(_ title: LocalizedStringKey, systemImage: String, action: (() -> Void)? = nil) {
+    init(_ title: LocalizedStringKey, systemImage: String, value: Text? = nil, action: (() -> Void)? = nil) {
         self.title = title
         self.systemImage = systemImage
+        self.value = value
         self.action = action
     }
 
     var body: some View {
         Button {
             if appState.requirePlus() { action?() }
-            // TODO: Travel mode UI (API: `setTravelLocation`).
         } label: {
             HStack {
                 Label {
@@ -193,7 +356,13 @@ private struct PlusRow: View {
                     Image(systemName: systemImage).foregroundStyle(Theme.steel)
                 }
                 Spacer()
-                if !appState.hasPlus { PlusBadge() }
+                if !appState.hasPlus {
+                    PlusBadge()
+                } else if let value {
+                    value
+                        .stexxLabelStyle(color: Theme.ice)
+                        .lineLimit(1)
+                }
             }
         }
     }

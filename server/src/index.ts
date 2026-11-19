@@ -3,6 +3,8 @@ import { config } from "./config.ts";
 import { sql } from "./db/sql.ts";
 import { startJobs } from "./jobs/index.ts";
 import { logInfo } from "./lib/logger.ts";
+import { closeAllConnections } from "./lib/realtime.ts";
+import { createShutdown } from "./lib/shutdown.ts";
 import { verifierName } from "./lib/e2e/crypto.ts";
 import { photoClassifier } from "./lib/photocheck/classifier.ts";
 import { listenForReleasedMessages } from "./routes/chat.ts";
@@ -31,6 +33,11 @@ logInfo("listening", {
   deviceCheck: config.antiSpam.deviceCheck !== null,
   photoClassifier: config.photoChecks.classifier,
   photoBlocklist: config.photoChecks.blocklist.length,
+  // Channel names only: never the addresses or the webhook URL.
+  moderatorAlerts: [
+    config.moderatorAlerts.emails.length > 0 ? "email" : null,
+    config.moderatorAlerts.webhookUrl ? "webhook" : null,
+  ].filter(Boolean).join(",") || "off",
   e2e: config.e2e.mode,
   // libsignal, or the built-in fallback if the native module can't load on this host (docs/security.md).
   e2eVerifier: config.e2e.mode === "off" ? "unused" : await verifierName(),
@@ -42,12 +49,18 @@ if (config.isProduction && config.antiSpam.attestation.mode === "off") {
   logInfo("attestation_disabled", { reason: "APPLE_TEAM_ID unset or ATTESTATION_MODE=off" });
 }
 
-async function shutdown() {
-  stopJobs();
-  await stopReleasedListener().catch(() => {});
-  await server.stop();
-  await sql.end({ timeout: 5 });
-  process.exit(0);
-}
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+// Graceful stop (lib/shutdown.ts): stop listening, close websockets with 1012, await the jobs, close lingering
+// requests after a short grace, close the pool, and exit before systemd's TimeoutStopSec=20 SIGKILL.
+const shutdown = createShutdown({
+  server,
+  stopJobs,
+  closeSockets: () => closeAllConnections(1012, "restarting"),
+  // The LISTEN for released messages holds a pool connection: unlisten before closing the pool.
+  endDb: async () => {
+    await stopReleasedListener().catch(() => {});
+    await sql.end({ timeout: 5 });
+  },
+  exit: (code) => process.exit(code),
+});
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

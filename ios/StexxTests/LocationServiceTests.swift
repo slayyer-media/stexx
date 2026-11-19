@@ -156,4 +156,28 @@ struct LocationServiceTests {
         await service.handle(reading(52.60, 13.405))
         #expect(await recorder.uploads.count == 1)
     }
+
+    @Test("A failed upload is flagged until the next successful one or sign-out")
+    func uploadFailureFlag() async {
+        let service = makeService(FakeLocationManager(status: .authorizedWhenInUse))
+        service.start()
+        #expect(!service.lastUploadFailed)
+
+        await recorder.fail(next: URLError(.notConnectedToInternet))
+        await service.handle(reading(52.52, 13.405))
+        #expect(service.lastUploadFailed)
+        #expect(service.lastUploadedCell == nil)
+
+        clock.advance(61)
+        await service.handle(reading(52.52, 13.405))
+        #expect(!service.lastUploadFailed)
+        #expect(service.lastUploadedCell != nil)
+
+        clock.advance(61)
+        await recorder.fail(next: URLError(.notConnectedToInternet))
+        await service.handle(reading(52.60, 13.405))
+        #expect(service.lastUploadFailed)
+        service.reset()
+        #expect(!service.lastUploadFailed)
+    }
 }

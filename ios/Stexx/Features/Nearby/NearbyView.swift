@@ -6,6 +6,11 @@ import SwiftUI
 /// profile gets the same tile; nobody is featured or given extra weight.
 /// The tab header's compact row holds the quick filters and the filters
 /// button, under the centered xx logo row.
+///
+/// When there's nothing to show, `NearbyContent.resolve` picks the state:
+/// first run (no location uploaded yet), location off, nobody nearby (with
+/// a filter reset), or a load error with Retry. A failed page shows a Retry
+/// cell at the end of the grid.
 struct NearbyView: View {
     enum QuickFilter: Hashable, CaseIterable {
         case all, online, rightNow, favorites
@@ -27,31 +32,61 @@ struct NearbyView: View {
             case .favorites: "star.fill"
             }
         }
+
+        /// What the chip does, for VoiceOver.
+        var accessibilityHint: LocalizedStringKey {
+            switch self {
+            case .all: "Shows everyone nearby"
+            case .online: "Shows only people online now"
+            case .rightNow: "Shows only people looking right now"
+            case .favorites: "Shows only your favorites"
+            }
+        }
     }
 
     @Environment(AppState.self) private var appState
+    @Environment(AppServices.self) private var services
     @Environment(\.apiClient) private var api
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    @State private var profiles: [Profile] = []
-    @State private var nextCursor: String?
-    @State private var quickFilter: QuickFilter = .all
+    @State private var feed = NearbyFeedModel()
+    @State private var quickFilter: QuickFilter
     /// Stexx+ filters edited in `FilterSheet`.
     @State private var advanced = NearbyQuery()
-    @State private var isLoading = false
-    @State private var errorMessage: String?
     @State private var isShowingFilters = false
-    @State private var loadedQuery: NearbyQuery?
     @State private var path = NavigationPath()
+    @State private var isTurningOffTravel = false
+    @State private var travelError: String?
+    /// The first location upload is taking long: stop waiting for it and
+    /// show what the grid has.
+    @State private var locatingTimedOut = false
 
     @Namespace private var zoomNamespace
 
+    init() {
+        #if DEBUG
+        _quickFilter = State(initialValue: NearbyDebugScenario.current?.startsWithOnlineFilter == true ? .online : .all)
+        #else
+        _quickFilter = State(initialValue: .all)
+        #endif
+    }
+
     private var visibleProfiles: [Profile] {
-        profiles.filter { !appState.blockedIDs.contains($0.id) }
+        feed.profiles.filter { !appState.blockedIDs.contains($0.id) }
     }
 
     private var hasActiveAdvancedFilters: Bool {
         appState.hasPlus && advanced.usesAdvancedFilters
+    }
+
+    /// Any filter that can hide people: a quick filter other than All, or
+    /// Stexx+ filters.
+    private var hasActiveFilters: Bool {
+        quickFilter != .all || hasActiveAdvancedFilters
+    }
+
+    private var loadKey: NearbyLoadKey {
+        NearbyLoadKey(query: query, travelRevision: appState.travelRevision, isTravelActive: appState.isTravelActive)
     }
 
     private var query: NearbyQuery {
@@ -63,38 +98,96 @@ struct NearbyView: View {
         return query
     }
 
+    /// The phone's location as far as the grid cares (never a coordinate).
+    private var locationState: NearbyLocationState {
+        #if DEBUG
+        if let scenario = NearbyDebugScenario.current { return scenario.location }
+        #endif
+        let location = services.location
+        return NearbyLocationState(status: location?.status, hasUploaded: location?.lastUploadedCell != nil)
+    }
+
+    private var fetch: NearbyFetch {
+        let api = api
+        let live: NearbyFetch = { query in try await api.nearby(query) }
+        #if DEBUG
+        if let scenario = NearbyDebugScenario.current { return scenario.fetch(live) }
+        #endif
+        return live
+    }
+
     var body: some View {
         let visible = visibleProfiles
         let lastID = visible.last?.id
+        let location = locationState
+        let content = NearbyContent.resolve(
+            hasProfiles: !visible.isEmpty,
+            hasMorePages: feed.nextCursor != nil,
+            isLoading: feed.isPending,
+            failure: feed.failure,
+            location: location,
+            locatingTimedOut: locatingTimedOut,
+            locationUploadFailed: services.location?.lastUploadFailed == true,
+            isTravelActive: appState.isTravelActive,
+            filtersActive: hasActiveFilters
+        )
 
         NavigationStack(path: $path) {
             ScrollView {
+                if appState.isTravelActive || appState.isTravelPaused {
+                    // Paused: Stexx+ lapsed and the server shows you near
+                    // home again; say so here, where it matters most.
+                    TravelBanner(
+                        placeName: appState.travel?.name,
+                        isPaused: appState.isTravelPaused,
+                        isBusy: isTurningOffTravel,
+                        onOpen: {
+                            if appState.requirePlus() { path.append(TravelRoute()) }
+                        },
+                        onTurnOff: { Task { await turnOffTravel() } }
+                    )
+                    .padding(.horizontal, NearbyGridMetrics.spacing)
+                    .padding(.top, NearbyGridMetrics.spacing)
+                    .transition(.opacity)
+                }
+                if content == .grid {
+                    notices(location: location)
+                }
                 LazyVGrid(columns: NearbyGridMetrics.gridColumns, spacing: NearbyGridMetrics.spacing) {
-                    ForEach(visible) { profile in
-                        tileLink(profile)
-                            .aspectRatio(NearbyGridMetrics.tileAspect, contentMode: .fit)
-                            .onAppear {
-                                if profile.id == lastID { Task { await loadMore() } }
+                    Section {
+                        ForEach(visible) { profile in
+                            tileLink(profile)
+                                .aspectRatio(NearbyGridMetrics.tileAspect, contentMode: .fit)
+                                .onAppear {
+                                    if profile.id == lastID { Task { await feed.loadMore(using: fetch) } }
+                                }
+                        }
+                    } footer: {
+                        if content == .grid, feed.showsFooter {
+                            NearbyPageFooter(state: feed.nextPage) {
+                                Task { await feed.retryNextPage(using: fetch) }
                             }
+                            .onAppear { Task { await feed.loadMore(using: fetch) } }
+                        }
                     }
                 }
                 .padding(.horizontal, NearbyGridMetrics.spacing)
                 .padding(.top, NearbyGridMetrics.spacing)
                 .padding(.bottom, Theme.Spacing.xl)
-
-                if isLoading && profiles.isEmpty {
-                    ProgressView()
-                        .controlSize(.regular)
-                        .tint(Theme.steel)
-                        .padding(.top, 80)
-                }
             }
             .collapsesTabHeaderLogo()
             .overlay {
-                if !isLoading && visible.isEmpty {
-                    emptyState
+                if content != .grid {
+                    NearbyStateView(
+                        content: content,
+                        onRetry: { Task { await feed.reload(loadKey, using: fetch) } },
+                        onClearFilters: clearFilters,
+                        onTravelMode: openTravelMode
+                    )
+                    .transition(.opacity)
                 }
             }
+            .animation(Motion.animation(Motion.standard, reduceMotion: reduceMotion), value: content)
             .tabHeader {
                 filterBar(onlineCount: visible.filter(\.isOnline).count)
             } trailing: {
@@ -102,12 +195,50 @@ struct NearbyView: View {
             }
             .sensoryFeedback(.selection, trigger: quickFilter)
             .stexxBackground()
-            .refreshable { await reload() }
-            .task(id: query) {
-                // Runs on first appearance and whenever a filter changes;
-                // skips reloading when popping back from a profile.
-                guard query != loadedQuery || profiles.isEmpty else { return }
-                await reload()
+            .refreshable { await feed.reload(loadKey, using: fetch) }
+            .task(id: loadKey) {
+                // Runs on first appearance, whenever a filter or travel mode
+                // changes; skips reloading when popping back from a profile.
+                guard feed.needsReload(for: loadKey) else { return }
+                await feed.reload(loadKey, using: fetch)
+            }
+            // First run: the grid usually loads before the first location
+            // upload, so load it again once the phone is placed (also after
+            // location is turned back on in Settings).
+            .onChange(of: location) { old, new in
+                guard new == .located, old != .located else { return }
+                Task { await feed.reload(loadKey, using: fetch) }
+            }
+            // Every loaded tile is hidden (blocked since it loaded): page on
+            // until someone shows, since no tile can trigger the next page.
+            // Keyed on the cursor so a page answered after Retry continues.
+            .task(id: visible.isEmpty ? feed.nextCursor : nil) {
+                guard visible.isEmpty, feed.nextCursor != nil else { return }
+                let blocked = appState.blockedIDs
+                await feed.loadMoreWhileAllHidden({ blocked.contains($0.id) }, using: fetch)
+            }
+            .task(id: location == .locating) {
+                locatingTimedOut = false
+                guard location == .locating else { return }
+                #if DEBUG
+                if NearbyDebugScenario.current == .firstRun { return }
+                #endif
+                try? await Task.sleep(for: NearbyContent.locatingTimeout)
+                if !Task.isCancelled { locatingTimedOut = true }
+            }
+            .onChange(of: feed.nextPage) { _, new in
+                if case .failed = new {
+                    AccessibilityNotification.Announcement(String(localized: "Couldn't load more people")).post()
+                }
+            }
+            .animation(Motion.animation(Motion.standard, reduceMotion: reduceMotion), value: appState.travel != nil)
+            .alert(
+                "Couldn't turn off travel mode",
+                isPresented: Binding(get: { travelError != nil }, set: { if !$0 { travelError = nil } })
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(travelError ?? "")
             }
             .navigationTitle("Nearby")
             .navigationDestination(for: Profile.self) { profile in
@@ -116,6 +247,9 @@ struct NearbyView: View {
             }
             .navigationDestination(for: ChatRoute.self) { route in
                 ChatThreadView(route: route)
+            }
+            .navigationDestination(for: TravelRoute.self) { _ in
+                TravelModeView()
             }
             .sheet(isPresented: $isShowingFilters) {
                 FilterSheet(query: $advanced)
@@ -130,7 +264,7 @@ struct NearbyView: View {
     // MARK: Header
 
     /// Quick filters inline in the header row. The Online chip carries the
-    /// live online count ("ONLINE 18") when there is one.
+    /// online count of the tiles loaded so far ("ONLINE 18") when there is one.
     private func filterBar(onlineCount: Int) -> some View {
         ScrollView(.horizontal) {
             GlassEffectContainer(spacing: 6) {
@@ -139,15 +273,22 @@ struct NearbyView: View {
                         GlassChip(chipTitle(filter, onlineCount: onlineCount), systemImage: filter.systemImage, isSelected: quickFilter == filter) {
                             selectQuickFilter(filter)
                         }
+                        .accessibilityLabel(Text(filter.title))
+                        .accessibilityValue(chipAccessibilityValue(filter, onlineCount: onlineCount))
+                        .accessibilityHint(Text(filter.accessibilityHint))
                     }
                     GlassChip("More filters", isSelected: hasActiveAdvancedFilters, isLocked: !appState.hasPlus) {
                         openAdvancedFilters()
                     }
+                    .accessibilityValue(hasActiveAdvancedFilters ? Text("On") : Text(verbatim: ""))
+                    .accessibilityHint(appState.hasPlus ? Text("Age, distance, position and tags") : Text("Stexx+. Opens the Stexx+ offer"))
                 }
                 .padding(.vertical, 2)
             }
         }
         .scrollIndicators(.hidden)
+        // Chips stay one row; very large sizes would push the grid away.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
     }
 
     private func selectQuickFilter(_ filter: QuickFilter) {
@@ -167,6 +308,15 @@ struct NearbyView: View {
         return Text(filter.title)
     }
 
+    /// The Online count is only for the tiles loaded so far, so VoiceOver
+    /// says so rather than reading it as everyone online.
+    private func chipAccessibilityValue(_ filter: QuickFilter, onlineCount: Int) -> Text {
+        if filter == .online, onlineCount > 0 {
+            return Text("\(onlineCount) in the grid")
+        }
+        return Text(verbatim: "")
+    }
+
     private var filtersButton: some View {
         Button {
             openAdvancedFilters()
@@ -180,6 +330,7 @@ struct NearbyView: View {
         .buttonStyle(.pressable)
         .padding(.trailing, -Theme.Spacing.s)
         .accessibilityValue(hasActiveAdvancedFilters ? Text("On") : Text(verbatim: ""))
+        .accessibilityHint(appState.hasPlus ? Text("Age, distance, position and tags") : Text("Stexx+. Opens the Stexx+ offer"))
     }
 
     // MARK: Grid
@@ -192,75 +343,54 @@ struct NearbyView: View {
         .buttonStyle(NearbyTilePressStyle())
     }
 
-    // MARK: States
-
+    /// Slim notices above a grid that does have tiles.
     @ViewBuilder
-    private var emptyState: some View {
-        if let errorMessage {
-            ContentUnavailableView {
-                Label("Couldn't load the grid", systemImage: "wifi.exclamationmark")
-            } description: {
-                Text(errorMessage)
-                    .font(.stexxSub)
-                    .foregroundStyle(Theme.steel)
-            } actions: {
-                Button("Try again") { Task { await reload() } }
-                    .stexxSecondaryButton()
+    private func notices(location: NearbyLocationState) -> some View {
+        VStack(spacing: NearbyGridMetrics.spacing) {
+            if let refreshFailure = feed.refreshFailure {
+                NearbyNotice(
+                    systemImage: "wifi.exclamationmark",
+                    text: Text("Couldn't refresh. \(refreshFailure)"),
+                    actionTitle: "Retry",
+                    action: { Task { await feed.reload(loadKey, using: fetch) } },
+                    onDismiss: { feed.dismissRefreshFailure() }
+                )
             }
-        } else {
-            ContentUnavailableView {
-                Label {
-                    Text("Nobody here yet")
-                        .stexxTitleStyle(.title)
-                } icon: {
-                    StexxMark(size: 40, glows: false)
-                        .padding(Theme.Spacing.m)
-                        .cellCorners()
-                        .padding(.bottom, Theme.Spacing.s)
-                        .accessibilityHidden(true)
-                }
-            } description: {
-                Text("Try fewer filters, or check back in a bit.")
-                    .font(.stexxSub)
-                    .foregroundStyle(Theme.steel)
+            // Denied after an earlier upload: the server still places you
+            // where you last were. Travel mode places you itself.
+            if location.isOff, !appState.isTravelActive {
+                NearbyNotice(
+                    systemImage: "location.slash",
+                    text: Text("Location is off. You're seeing people near your last known area."),
+                    actionTitle: location == .denied ? "Settings" : nil,
+                    action: NearbyStateView.openSettings
+                )
             }
+        }
+        .padding(.horizontal, NearbyGridMetrics.spacing)
+        .padding(.top, NearbyGridMetrics.spacing)
+    }
+
+    // MARK: Actions
+
+    private func clearFilters() {
+        withAnimation(Motion.animation(Motion.quick, reduceMotion: reduceMotion)) {
+            quickFilter = .all
+            advanced = NearbyQuery()
         }
     }
 
-    // MARK: Loading
-
-    private func reload() async {
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            let requested = query
-            let page = try await api.nearby(requested)
-            // A newer reload (filter change) superseded this one.
-            guard !Task.isCancelled else { return }
-            profiles = page.items
-            loadedQuery = requested
-            nextCursor = page.nextCursor
-            errorMessage = nil
-        } catch is CancellationError {
-            // A newer reload replaced this one.
-        } catch let error as URLError where error.code == .cancelled {
-            // Same, from the live HTTP client.
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+    /// Travel mode works without device location (Stexx+; the paywall
+    /// otherwise).
+    private func openTravelMode() {
+        if appState.requirePlus() { path.append(TravelRoute()) }
     }
 
-    private func loadMore() async {
-        guard let cursor = nextCursor, !isLoading else { return }
-        isLoading = true
-        defer { isLoading = false }
-        var next = query
-        next.cursor = cursor
-        if let page = try? await api.nearby(next) {
-            let known = Set(profiles.map(\.id))
-            profiles += page.items.filter { !known.contains($0.id) }
-            nextCursor = page.nextCursor
-        }
+    private func turnOffTravel() async {
+        isTurningOffTravel = true
+        defer { isTurningOffTravel = false }
+        let model = TravelModeModel(appState: appState, api: api)
+        if await !model.turnOff() { travelError = model.errorMessage }
     }
 }
 
@@ -269,6 +399,10 @@ struct NearbyView: View {
 /// A photo tile in the grid: photo, name, mono distance, a static online
 /// dot and the favourite star. Every tile is identical: radius 4, no rim
 /// light, no cell corners.
+///
+/// Text scales with Dynamic Type up to XXXL; past that the tile (a fixed
+/// 3:4 cell a third of the screen wide) would be all caption, and VoiceOver
+/// reads the whole label anyway.
 struct ProfileTile: View {
     let profile: Profile
 
@@ -281,10 +415,12 @@ struct ProfileTile: View {
             .overlay { ProfilePhotoView(profile: profile) }
             .overlay(alignment: .bottom) { caption }
             .overlay(alignment: .topTrailing) { favoriteMark }
+            .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
             .clipShape(shape)
             .contentShape(shape)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(accessibilityText)
+            .accessibilityHint("Opens the profile")
             .accessibilityAddTraits(.isButton)
     }
 
@@ -318,7 +454,9 @@ struct ProfileTile: View {
     private var favoriteMark: some View {
         if profile.isFavorite {
             Image(systemName: "star.fill")
-                .font(.system(size: 9, weight: .semibold))
+                // A text style, so the tile's Dynamic Type cap applies.
+                .font(.caption2.weight(.semibold))
+                .imageScale(.small)
                 .foregroundStyle(Theme.frost)
                 .shadow(color: .black.opacity(0.45), radius: 2)
                 .padding(6)
@@ -326,11 +464,20 @@ struct ProfileTile: View {
     }
 
     private var accessibilityText: Text {
+        Text(Self.accessibilityLabel(for: profile))
+    }
+
+    /// "Eigenbro, 29, online, 200 m away, favorite": name, age, online, the
+    /// server's distance bucket and the star, in the order they're seen.
+    static func accessibilityLabel(for profile: Profile, locale: Locale = .current) -> String {
         var parts = [profile.nameAndAge]
         if profile.isOnline { parts.append(String(localized: "online")) }
-        if let distance = profile.distanceMeters { parts.append(StexxFormat.distance(distance)) }
+        if let distance = profile.distanceMeters {
+            let formatted = StexxFormat.distance(distance, locale: locale)
+            parts.append(String(localized: "\(formatted) away"))
+        }
         if profile.isFavorite { parts.append(String(localized: "favorite")) }
-        return Text(parts.joined(separator: ", "))
+        return parts.joined(separator: ", ")
     }
 }
 

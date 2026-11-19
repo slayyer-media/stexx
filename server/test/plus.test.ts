@@ -65,7 +65,12 @@ describe("POST /subscriptions/apple", () => {
 
   test("status for a user who never subscribed", async () => {
     const u = await createUser();
-    expect(await expectJson(await as(u).get("/v1/subscriptions/status"))).toEqual({ isActive: false, expiresAt: null });
+    expect(await expectJson(await as(u).get("/v1/subscriptions/status"))).toEqual({
+      isActive: false,
+      expiresAt: null,
+      willRenew: null,
+      boostEndsAt: null,
+    });
   });
 
   test("an already expired transaction is recorded but not active", async () => {
@@ -105,6 +110,27 @@ describe("POST /subscriptions/apple", () => {
       await as(u).post("/v1/subscriptions/apple", { json: { signedTransaction: jws({ originalTransactionId: id }) } }),
     );
     expect(replay.isActive).toBe(false);
+  });
+
+  test("a revoked subscription comes back only for a period purchased after the revocation", async () => {
+    const u = await createUser();
+    const id = otid();
+    const revokedAt = Date.now() - HOUR;
+    await as(u).post("/v1/subscriptions/apple", {
+      json: { signedTransaction: jws({ originalTransactionId: id, purchaseDate: revokedAt - DAY, revocationDate: revokedAt }) },
+    });
+    const stale = await expectJson<{ isActive: boolean }>(
+      await as(u).post("/v1/subscriptions/apple", {
+        json: { signedTransaction: jws({ originalTransactionId: id, purchaseDate: revokedAt - DAY }) },
+      }),
+    );
+    expect(stale.isActive).toBe(false);
+    const renewed = await expectJson<{ isActive: boolean }>(
+      await as(u).post("/v1/subscriptions/apple", {
+        json: { signedTransaction: jws({ originalTransactionId: id, purchaseDate: Date.now() - 60_000 }) },
+      }),
+    );
+    expect(renewed.isActive).toBe(true);
   });
 
   test("the subscription follows the latest claimant; the previous holder loses Plus", async () => {

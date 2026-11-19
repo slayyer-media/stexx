@@ -23,6 +23,8 @@ import {
   privacyJson,
   profileColumns,
   profilesFor,
+  travelJson,
+  type OwnProfileJson,
   type PhotoRow,
   type PrivacyRow,
   type ProfileRow,
@@ -32,7 +34,9 @@ import { cleanText, idParam, locationSchema, lookingForSchema, multilineText, pa
 import { col, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
 import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { deleteAccountRows, forgetDeletedAccount } from "../lib/account.ts";
-import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { accountCounters, hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
+import { trustState } from "../lib/abuse/trust.ts";
+import { SYSTEM_ACTOR } from "../lib/moderation.ts";
 import { envelopeJson } from "../lib/e2e/envelope.ts";
 import { e2eMode, keyStatus } from "../lib/e2e/keys.ts";
 import { checkColumns, checkPhoto, flagPhotoMatches, storedPhash } from "../lib/photocheck/index.ts";
@@ -54,11 +58,28 @@ const VIEWERS_LIMIT = 200;
 
 // ---- GET /me ---------------------------------------------------------------------
 
+/**
+ * The own profile: a Profile plus `travel`, so the app learns after a relaunch whether travel mode is on
+ * (and whether it is paused because Stexx+ lapsed), and `privacy`, the stored privacy settings (the app's source
+ * of truth for its toggles). No coordinates, as everywhere else on /me.
+ */
+async function ownProfile(me: string): Promise<OwnProfileJson> {
+  const [[profile], [own]] = await Promise.all([
+    profilesFor(me, [me]),
+    sql<(PrivacyRow & { travel_active: boolean | null })[]>`
+      SELECT u.hide_distance, u.show_online_status, u.send_read_receipts, u.expiring_photos_by_default,
+             u.blur_explicit_photos, u.incognito,
+             CASE WHEN t.user_id IS NULL THEN NULL ELSE COALESCE(u.plus_expires_at > now(), false) END AS travel_active
+        FROM users u LEFT JOIN travel_locations t ON t.user_id = u.id
+       WHERE u.id = ${me}`,
+  ]);
+  if (!profile || !own) throw notFound();
+  const travel = own.travel_active === null ? undefined : { is_active: own.travel_active };
+  return { ...profile, travel: travelJson(travel), privacy: privacyJson(own) };
+}
+
 meRoutes.get("/me", async (c) => {
-  const me = c.get("userId");
-  const [profile] = await profilesFor(me, [me]);
-  if (!profile) throw notFound();
-  return c.json(profile);
+  return c.json(await ownProfile(c.get("userId")));
 });
 
 // ---- PATCH /me -------------------------------------------------------------------
@@ -127,9 +148,7 @@ meRoutes.patch("/me", async (c) => {
        WHERE id = ${me}`;
   });
 
-  const [profile] = await profilesFor(me, [me]);
-  if (!profile) throw notFound();
-  return c.json(profile);
+  return c.json(await ownProfile(me));
 });
 
 // ---- DELETE /me ------------------------------------------------------------------
@@ -388,11 +407,19 @@ meRoutes.get("/me/viewers", async (c) => {
 // ---- Export ----------------------------------------------------------------------
 
 /**
- * GDPR-style archive of everything we hold about the caller. Other people appear only as opaque ids; no
+ * GDPR-style archive of what we hold about the caller. Other people appear only as opaque ids; no
  * other user's profile, location, blocks-against-you, views-of-you or reports-about-you are included, nor
- * when they read your messages unless they send read receipts. Expired messages are left out, and incoming
- * view-once photos carry no URL (as everywhere outside the messages listing).
- * Secrets (token hashes, passkey public keys) are never included.
+ * when they read your messages (or opened your view-once photos) unless they send read receipts. Expired messages
+ * are left out, and view-once photos carry no URL (as everywhere outside the recipient's messages listing).
+ * Secrets (token hashes, passkey and App Attest public keys) are never included.
+ *
+ * Also listed: the attested devices the account is linked to (`devices`), moderation decisions about the account
+ * (`moderation`: what and when, never which moderator, their notes, or the reports behind them), the abuse-limit
+ * counters kept for the account, and whether the new-account limits apply. Left out on purpose
+ * (docs/security.md "Data export"): reports filed by others, photo flags (duplicate / blocklist matches, which name
+ * other accounts' photos), IP-keyed counters (stored only as a keyed hash, not linked to the account), and anything
+ * stored per app install that every account on it shares (device-keyed counters, the install's last-seen day, its
+ * ban flag and when it first attested), because on a shared phone that would show one account another's activity.
  */
 meRoutes.get("/me/export", async (c) => {
   const me = c.get("userId");
@@ -408,16 +435,19 @@ meRoutes.get("/me/export", async (c) => {
         last_active_at: Date;
         created_at: Date;
         hidden_at: Date | null;
+        hidden_reason: string | null;
+        reviewed_at: Date | null;
       })[]
   >`
     SELECT id, display_name, age, pronouns, headline, about, height_cm, position, looking_for, tags,
            confirmed_adult, (email_hmac IS NOT NULL) AS has_email,
            hide_distance, show_online_status, send_read_receipts, expiring_photos_by_default,
-           blur_explicit_photos, incognito, plus_expires_at, boost_ends_at, last_active_at, created_at, hidden_at
+           blur_explicit_photos, incognito, plus_expires_at, boost_ends_at, last_active_at, created_at, hidden_at,
+           hidden_reason, reviewed_at
       FROM users WHERE id = ${me}`;
   if (!user) throw notFound();
 
-  const [photos, uploads, home, travel, favorites, tapsSent, tapsReceived, blocks, views, reports, sessions, passkeys, subs, convs] =
+  const [photos, uploads, home, travel, favorites, tapsSent, tapsReceived, blocks, views, reports, sessions, passkeys, subs, convs, devices, moderation, trust] =
     await Promise.all([
       ownPhotos(me),
       sql<{ id: string; storage_key: string; encrypted: boolean; created_at: Date }[]>`
@@ -436,22 +466,37 @@ meRoutes.get("/me/export", async (c) => {
         SELECT created_at, access_expires_at, refresh_expires_at, revoked_at FROM sessions WHERE user_id = ${me} ORDER BY created_at`,
       sql<{ id: string; transports: string[]; created_at: Date; last_used_at: Date | null }[]>`
         SELECT id, transports, created_at, last_used_at FROM passkey_credentials WHERE user_id = ${me} ORDER BY created_at`,
-      sql<{ product_id: string; expires_at: Date; environment: string }[]>`
-        SELECT product_id, expires_at, environment FROM subscriptions WHERE user_id = ${me} ORDER BY expires_at`,
+      sql<{ product_id: string; expires_at: Date; environment: string; revoked_at: Date | null }[]>`
+        SELECT product_id, expires_at, environment, revoked_at FROM subscriptions WHERE user_id = ${me} ORDER BY expires_at`,
       sql<{ id: string; other_id: string; created_at: Date; updated_at: Date; muted: boolean; hidden: boolean; cleared_before: Date | null; last_read_at: Date | null }[]>`
         SELECT c.id, CASE WHEN c.user_a = ${me} THEN c.user_b ELSE c.user_a END AS other_id,
                c.created_at, c.updated_at, cm.muted, cm.hidden, cm.cleared_before, cm.last_read_at
           FROM conversations c JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = ${me}
          WHERE c.user_a = ${me} OR c.user_b = ${me} ORDER BY c.created_at`,
+      // Attested app installs this account was created or signed in on (docs/security.md section 1).
+      // Only what this account did: the link itself. Never the App Attest key, the other accounts linked to the same
+      // device, or the per-install fields every account on it shares (last-seen day, ban flag, first attestation),
+      // which would tell someone sharing the phone how it is used by others.
+      sql<{ id: string; environment: string; linked_at: Date }[]>`
+        SELECT d.id, d.environment, da.created_at AS linked_at
+          FROM device_accounts da JOIN devices d ON d.id = da.device_id
+         WHERE da.user_id = ${me} ORDER BY da.created_at, d.id`,
+      // Moderation decisions about this account: what and when, never who (the moderator's handle), the note or
+      // the reports behind it.
+      sql<{ action: string; created_at: Date; automatic: boolean }[]>`
+        SELECT action, created_at, actor = ${SYSTEM_ACTOR} AS automatic
+          FROM moderation_actions WHERE user_id = ${me} ORDER BY created_at, id`,
+      trustState(me),
     ]);
+  const counters = await accountCounters(me);
 
   // What the photo checks stored about each photo (docs/security.md "Photo checks"). Moderation flags are not
   // included, like reports filed against the account.
   const checks = new Map(
     (
       await sql<
-        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null }[]
-      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels FROM photos WHERE owner_id = ${me}`
+        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null; hidden_at: Date | null }[]
+      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels, hidden_at FROM photos WHERE owner_id = ${me}`
     ).map((r) => [r.id, r]),
   );
 
@@ -469,6 +514,8 @@ meRoutes.get("/me/export", async (c) => {
           attachment_key: string | null;
           attachment_view_once: boolean;
           attachment_encrypted: boolean;
+          attachment_opened_at: Date | null;
+          attachment_open_receipt: boolean;
           sent_at: Date;
           read_at: Date | null;
           read_receipt: boolean;
@@ -477,7 +524,8 @@ meRoutes.get("/me/export", async (c) => {
       >`
         SELECT m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
                m.attachment_kind, m.attachment_key,
-               m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.read_at, m.read_receipt, m.expires_at
+               m.attachment_view_once, m.attachment_encrypted, m.attachment_opened_at, m.attachment_open_receipt,
+               m.sent_at, m.read_at, m.read_receipt, m.expires_at
           FROM messages m
           JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
          WHERE m.conversation_id = ANY(${convs.map((x) => x.id)})
@@ -512,9 +560,11 @@ meRoutes.get("/me/export", async (c) => {
   const archive = {
     exportedAt: isoDate(new Date()),
     notes: [
-      "This is everything Stexx stores about your account.",
+      "This is the data Stexx stores about your account. Reports other members filed about you, and automatic photo-match flags, are left out to protect the people and checks involved; moderation decisions about your account are listed.",
       "Other members appear only as opaque ids. Your email address is never stored, only a one-way hash, so it is not part of this archive.",
       "Locations are the 500 m grid cell centre we keep, never a precise position. We keep no location history.",
+      "End-to-end encrypted messages appear as ciphertext (envelope): their text is only on the phones in the chat.",
+      "Devices lists the app installs your account was created on and when. Anti-spam data kept per app install (its rate-limit counters, last-seen day and ban flag) is shared by every account that uses that install, so it is not included: on a shared phone it would show you someone else's activity.",
     ],
     account: {
       id: user.id,
@@ -526,6 +576,11 @@ meRoutes.get("/me/export", async (c) => {
       boostEndsAt: isoDate(user.boost_ends_at),
       // Set while the account is hidden pending a moderator's review (never who reported it).
       hiddenPendingReviewSince: isoDate(user.hidden_at),
+      hiddenReason: user.hidden_reason,
+      lastModeratorReviewAt: isoDate(user.reviewed_at),
+      // The new-account limits (docs/security.md section 4): worked out from the account's age and
+      // replies when asked, not stored.
+      newAccountLimitsApply: trust.restricted,
     },
     profile: {
       displayName: user.display_name,
@@ -551,6 +606,7 @@ meRoutes.get("/me/export", async (c) => {
           model: ck?.nsfw_model ?? null,
           explicitScore: ck?.nsfw_score ?? null,
           labels: ck?.nsfw_labels ?? null,
+          hiddenByModeratorAt: isoDate(ck?.hidden_at ?? null),
         },
       };
     }),
@@ -598,10 +654,12 @@ meRoutes.get("/me/export", async (c) => {
       lastReadAt: isoDate(cv.last_read_at),
       messages: (byConv.get(cv.id) ?? []).map((m) => {
         const mine = m.sender_id === me;
-        // Same rules as the chat views: the other person's read time (and the expiry it starts) is theirs, not
-        // ours, unless they send read receipts; a view-once photo is only released (and marked opened) by
-        // GET /conversations/:id/messages, never by the archive.
+        // Same rules as the chat views: the other person's read time (and the expiry it starts) and when they
+        // opened a view-once photo are theirs, not ours, unless they send read receipts; a view-once photo's URL is
+        // only released to its recipient by GET /conversations/:id/messages (and the open route), never by the
+        // archive, and never to its sender.
         const hideRead = mine && m.read_at !== null && !m.read_receipt;
+        const showOpened = m.attachment_view_once && (!mine || m.attachment_open_receipt);
         return {
           id: m.id,
           senderID: m.sender_id,
@@ -612,10 +670,11 @@ meRoutes.get("/me/export", async (c) => {
           attachment: m.attachment_kind
             ? {
                 kind: m.attachment_kind,
-                url: !mine && m.attachment_view_once ? null : mediaUrl(m.attachment_key),
+                url: m.attachment_view_once ? null : mediaUrl(m.attachment_key),
                 isViewOnce: m.attachment_view_once,
                 // The key to an encrypted photo is inside `envelope`; the archive holds only the opaque blob's URL.
                 isEncrypted: m.attachment_encrypted,
+                openedAt: showOpened ? isoDate(m.attachment_opened_at) : null,
               }
             : null,
           sentAt: isoDate(m.sent_at),
@@ -625,7 +684,30 @@ meRoutes.get("/me/export", async (c) => {
       }),
     })),
     encryptionKeys,
-    subscriptions: subs.map((s) => ({ productID: s.product_id, expiresAt: isoDate(s.expires_at), environment: s.environment })),
+    subscriptions: subs.map((s) => ({
+      productID: s.product_id,
+      expiresAt: isoDate(s.expires_at),
+      environment: s.environment,
+      revokedAt: isoDate(s.revoked_at),
+    })),
+    devices: devices.map((d) => ({
+      id: d.id,
+      environment: d.environment,
+      linkedToAccountAt: isoDate(d.linked_at),
+    })),
+    moderation: moderation.map((m) => ({
+      action: m.action,
+      by: m.automatic ? "automatic" : "moderator",
+      createdAt: isoDate(m.created_at),
+    })),
+    rateLimitCounters: counters.map((r) => ({
+      limit: r.limit,
+      windowSeconds: Math.round(r.windowMs / 1000),
+      windowStartedAt: isoDate(new Date(r.windowStart)),
+      countThisWindow: r.current,
+      countPreviousWindow: r.previous,
+      deletedAfter: isoDate(r.expiresAt),
+    })),
     signIn: {
       passkeys: passkeys.map((p) => ({
         credentialID: p.id,

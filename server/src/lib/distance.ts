@@ -53,3 +53,52 @@ export function bucketedDistanceBetween(a: Cell | null | undefined, b: Cell | nu
   if (!a || !b) return null;
   return bucketDistance(haversineMeters(a.latitude, a.longitude, b.latitude, b.longitude));
 }
+
+/**
+ * Latitude/longitude ranges (degrees) on the same sphere as haversineMeters. Longitude is one range, or two when
+ * the box crosses the antimeridian. Used as an index prefilter only: the exact distance is always rechecked.
+ */
+export interface LatLonBox {
+  minLat: number;
+  maxLat: number;
+  /** Disjoint inclusive [min, max] ranges within [-180, 180]; [[-180, 180]] when every longitude is in range. */
+  lonRanges: [number, number][];
+}
+
+/** Every longitude. */
+const ALL_LONGITUDES: [number, number][] = [[-180, 180]];
+
+/**
+ * Normalize an inclusive longitude interval that may extend past ±180 (by less than 360 degrees in total) into
+ * ranges within [-180, 180]. -180 and 180 are the same meridian, so an interval that reaches either one includes
+ * both (a cell can be stored at exactly 180).
+ */
+export function lonRanges(lo: number, hi: number): [number, number][] {
+  if (hi - lo >= 360) return ALL_LONGITUDES;
+  if (lo <= -180) return [[lo + 360, 180], [-180, hi]];
+  if (hi >= 180) return [[lo, 180], [-180, hi - 360]];
+  return [[lo, hi]];
+}
+
+/**
+ * The smallest latitude/longitude box containing every point within `radiusMeters` (great-circle) of `center`,
+ * widened by `marginDeg` on each side against floating-point error. Near a pole, or when the circle is too big for
+ * a meaningful longitude bound, the box spans all longitudes. (Bounding coordinates on a sphere: the widest
+ * longitude offset of a circle of angular radius r around latitude φ that doesn't contain a pole is
+ * asin(sin r / cos φ).)
+ */
+export function boundingBox(center: Cell, radiusMeters: number, marginDeg = 1e-6): LatLonBox {
+  const deg = 180 / Math.PI;
+  const r = Math.max(0, radiusMeters) / EARTH_RADIUS_M; // angular radius
+  const minLat = center.latitude - r * deg - marginDeg;
+  const maxLat = center.latitude + r * deg + marginDeg;
+  const clamp = (lat: number) => Math.min(90, Math.max(-90, lat));
+  // Circle reaches a pole (or wraps the whole sphere): every longitude is within reach.
+  if (r >= Math.PI / 2 || minLat <= -90 || maxLat >= 90) {
+    return { minLat: clamp(minLat), maxLat: clamp(maxLat), lonRanges: ALL_LONGITUDES };
+  }
+  const s = Math.sin(r) / Math.cos((center.latitude * Math.PI) / 180);
+  if (s >= 1) return { minLat, maxLat, lonRanges: ALL_LONGITUDES };
+  const dLon = Math.asin(s) * deg + marginDeg;
+  return { minLat, maxLat, lonRanges: lonRanges(center.longitude - dLon, center.longitude + dLon) };
+}

@@ -11,12 +11,30 @@ final class ChatStore {
     private(set) var isLoading = false
     private(set) var hasLoaded = false
     var errorMessage: String?
-    /// The most recent tap someone sent you (from `tap.received`).
-    private(set) var latestTap: RealtimeEvent.Tap?
+
+    /// Taps you received (`GET /me/taps`), newest first, one per sender.
+    /// Live `tap.received` events land here too.
+    private(set) var taps: [ReceivedTap] = []
+    /// How many senders tapped you since you last opened your taps. Part
+    /// of `unreadTotal`, so the Chats tab badge counts them.
+    private(set) var tapsUnseen = 0
+    private(set) var tapsNextCursor: String?
+    private(set) var isLoadingTaps = false
+    private(set) var hasLoadedTaps = false
+    /// The last failed taps fetch; separate from `errorMessage` so a taps
+    /// failure never replaces the chat list.
+    private(set) var tapsErrorMessage: String?
+    /// View-once photos opened on this phone, with when: shown as "Opened"
+    /// right away, and never shown again, even if telling the server failed.
+    /// Kept across launches in `defaults` (message IDs and dates only, never
+    /// content), forgotten after `viewOnceMemory` and at sign-out.
+    private(set) var openedViewOnce: [Message.ID: Date] = [:]
 
     /// Change to a thread pushed to its open view.
     enum ThreadUpdate: Hashable, Sendable {
         case created(Message)
+        /// A message already in the thread changed (`message.updated`).
+        case updated(Message)
         case read(RealtimeEvent.ReadReceipt)
         /// Live events may have been missed (the socket was down): refetch
         /// the thread and reconcile it with `reconcile(snapshot:with:myID:)`.
@@ -25,28 +43,76 @@ final class ChatStore {
 
     @ObservationIgnored private let api: any APIClient
     @ObservationIgnored private var threadContinuations: [Conversation.ID: [UUID: AsyncStream<ThreadUpdate>.Continuation]] = [:]
-    /// Sanitized JPEGs of photo messages that haven't been sent yet, by
-    /// client ID, so a failed send can be retried.
-    @ObservationIgnored private var pendingPhotos: [String: Data] = [:]
+    /// Sanitized JPEGs of photo messages that haven't been sent yet, with
+    /// the timer chosen when they were sent, by client ID, so a failed send
+    /// is retried exactly as it was first sent.
+    @ObservationIgnored private var pendingPhotos: [String: PendingPhoto] = [:]
+
+    private struct PendingPhoto {
+        let jpeg: Data
+        let timer: PhotoTimer
+    }
     /// Bumped by every `load()` and by `reset()`: only the newest load may
     /// apply its result, and nothing started before a sign-out lands after it.
     @ObservationIgnored private var loadGeneration = 0
     /// Bumped by `reset()` (sign-out).
     @ObservationIgnored private var epoch = 0
+    /// Like `loadGeneration`, for the taps list: bumped by every first-page
+    /// load and by `reset()`. A newer first page (or a sign-out) drops any
+    /// older first-page or next-page result.
+    @ObservationIgnored private var tapsGeneration = 0
+    /// Bumped by `markTapsSeen()`. A first-page load that started before it
+    /// is dropped (its "new" flags and count are stale); a next-page load is
+    /// kept, with its "new" flags cleared, so infinite scroll never stalls.
+    @ObservationIgnored private var tapsSeenEpoch = 0
+    /// Live taps that arrived while a first-page load was in flight; the
+    /// load's snapshot may predate them.
+    @ObservationIgnored private var tapsDuringLoad: [ReceivedTap] = []
     @ObservationIgnored private let defaults: UserDefaults
+    /// View-once opens the server hasn't confirmed yet (offline, an error,
+    /// the app quit before the call finished), retried on the next resync or
+    /// list load, including after a relaunch (kept in `defaults`, IDs only).
+    @ObservationIgnored private var pendingViewOnceOpens: [Message.ID: Conversation.ID] = [:]
 
-    init(api: any APIClient, defaults: UserDefaults = .standard) {
+    /// How long this phone remembers a view-once open: past the server's cap
+    /// on unopened photos (3 days; 14 on servers from before that), plus a
+    /// day of margin, the server has deleted the photo anyway.
+    static let viewOnceMemory: TimeInterval = 15 * 24 * 3600
+
+    private enum Keys {
+        static let openedViewOnce = "chat.viewOnce.opened"
+        static let pendingViewOnceOpens = "chat.viewOnce.pendingOpens"
+    }
+
+    init(api: any APIClient, defaults: UserDefaults = .standard, now: Date = .now) {
         self.api = api
         self.defaults = defaults
+        let opened = defaults.dictionary(forKey: Keys.openedViewOnce) as? [Message.ID: Date] ?? [:]
+        openedViewOnce = opened.filter { now.timeIntervalSince($0.value) < Self.viewOnceMemory }
+        let pending = defaults.dictionary(forKey: Keys.pendingViewOnceOpens) as? [Message.ID: Conversation.ID] ?? [:]
+        pendingViewOnceOpens = pending.filter { openedViewOnce[$0.key] != nil }
+        if openedViewOnce.count != opened.count || pendingViewOnceOpens.count != pending.count {
+            persistViewOnce()
+        }
     }
 
+    /// The Chats tab badge: unread messages in unmuted chats plus new taps.
     var unreadTotal: Int {
-        conversations.reduce(0) { $0 + ($1.isMuted ? 0 : $1.unreadCount) }
+        conversations.reduce(0) { $0 + ($1.isMuted ? 0 : $1.unreadCount) } + tapsUnseen
     }
 
+    /// Launch: the conversation list and the first page of taps.
     func loadIfNeeded() async {
-        guard !hasLoaded else { return }
-        await load()
+        async let conversations: Void = hasLoaded ? () : load()
+        async let taps: Void = hasLoadedTaps ? () : loadTaps()
+        _ = await (conversations, taps)
+    }
+
+    /// Pull to refresh: conversations and the first page of taps.
+    func refresh() async {
+        async let conversations: Void = load()
+        async let taps: Void = loadTaps()
+        _ = await (conversations, taps)
     }
 
     /// Fetches the conversation list. Concurrent loads are fine: only the
@@ -64,6 +130,7 @@ final class ChatStore {
             hasLoaded = true
             errorMessage = nil
             markOpenThreadsRead()
+            retryPendingViewOnceOpens()
         } catch {
             guard generation == loadGeneration else { return }
             errorMessage = error.localizedDescription
@@ -77,6 +144,7 @@ final class ChatStore {
             broadcast(.resync, to: conversationID)
         }
         Task { await load() }
+        Task { await loadTaps() }
     }
 
     /// Open threads show everything, so the server's unread counts for them
@@ -121,9 +189,13 @@ final class ChatStore {
         }
     }
 
-    /// Drops every conversation with a blocked member.
+    /// Drops every conversation with a blocked member, and their tap.
     func removeConversations(with profileID: Profile.ID) {
         conversations.removeAll { $0.participant.id == profileID }
+        if let index = taps.firstIndex(where: { $0.id == profileID }) {
+            if taps[index].isNew { tapsUnseen = max(0, tapsUnseen - 1) }
+            taps.remove(at: index)
+        }
     }
 
     func reset() {
@@ -133,8 +205,177 @@ final class ChatStore {
         hasLoaded = false
         isLoading = false
         errorMessage = nil
-        latestTap = nil
+        tapsGeneration += 1
+        taps = []
+        tapsDuringLoad = []
+        tapsUnseen = 0
+        tapsNextCursor = nil
+        isLoadingTaps = false
+        hasLoadedTaps = false
+        tapsErrorMessage = nil
         pendingPhotos = [:]
+        openedViewOnce = [:]
+        pendingViewOnceOpens = [:]
+        defaults.removeObject(forKey: Keys.openedViewOnce)
+        defaults.removeObject(forKey: Keys.pendingViewOnceOpens)
+    }
+
+    // MARK: View-once photos
+
+    /// The recipient is looking at a view-once photo: tell the server
+    /// (`POST …/open`, which deletes it about 30 s later and, if they send
+    /// read receipts, tells the sender). Returns the server's copy, or nil
+    /// if that didn't work; a network failure is retried later
+    /// (`retryPendingViewOnceOpens`, also after a relaunch), a 404 (gone,
+    /// blocked) never. The open is recorded on this phone before the call,
+    /// so a plaintext photo isn't shown again even if the call never lands.
+    @discardableResult
+    func openViewOnce(_ messageID: Message.ID, in conversationID: Conversation.ID) async -> Message? {
+        if openedViewOnce[messageID] == nil { openedViewOnce[messageID] = .now }
+        pendingViewOnceOpens[messageID] = conversationID
+        persistViewOnce()
+        return await sendViewOnceOpen(messageID, in: conversationID)
+    }
+
+    func hasOpenedViewOnce(_ messageID: Message.ID) -> Bool {
+        openedViewOnce[messageID] != nil
+    }
+
+    private func persistViewOnce() {
+        defaults.set(openedViewOnce, forKey: Keys.openedViewOnce)
+        defaults.set(pendingViewOnceOpens, forKey: Keys.pendingViewOnceOpens)
+    }
+
+    private func sendViewOnceOpen(_ messageID: Message.ID, in conversationID: Conversation.ID) async -> Message? {
+        let epoch = self.epoch
+        do {
+            let opened = try await api.openViewOnce(messageID: messageID, in: conversationID)
+            guard epoch == self.epoch else { return nil }
+            pendingViewOnceOpens[messageID] = nil
+            persistViewOnce()
+            if let index = conversations.firstIndex(where: { $0.id == conversationID }),
+               let last = conversations[index].lastMessage, last.id == messageID {
+                conversations[index].lastMessage = Self.updating(last, with: opened)
+            }
+            return opened
+        } catch APIError.notFound {
+            guard epoch == self.epoch else { return nil }
+            pendingViewOnceOpens[messageID] = nil
+            persistViewOnce()
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    /// Opens that couldn't reach the server, tried again.
+    func retryPendingViewOnceOpens() {
+        for (messageID, conversationID) in pendingViewOnceOpens {
+            Task { await sendViewOnceOpen(messageID, in: conversationID) }
+        }
+    }
+
+    // MARK: Taps
+
+    /// Fetches the first page of taps (launch, resync, pull to refresh).
+    /// Only the newest load applies its result. Live taps that arrived
+    /// while it was in flight and aren't in it yet are kept on top.
+    func loadTaps() async {
+        tapsGeneration += 1
+        let generation = tapsGeneration
+        let seenEpoch = tapsSeenEpoch
+        tapsDuringLoad = []
+        isLoadingTaps = true
+        defer { if generation == tapsGeneration { isLoadingTaps = false } }
+        do {
+            let page = try await api.taps(before: nil)
+            guard generation == tapsGeneration, seenEpoch == tapsSeenEpoch else { return }
+            apply(firstTapsPage: page)
+            hasLoadedTaps = true
+            tapsErrorMessage = nil
+        } catch {
+            guard generation == tapsGeneration else { return }
+            tapsErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// The next page, for infinite scroll. Senders already listed (they may
+    /// have tapped again and moved up meanwhile) are skipped. If the taps
+    /// were marked seen while it was in flight, the page still lands (only a
+    /// new first page or a sign-out drops it), with its "new" flags cleared.
+    func loadMoreTaps() async {
+        guard let cursor = tapsNextCursor, !isLoadingTaps else { return }
+        let generation = tapsGeneration
+        let seenEpoch = tapsSeenEpoch
+        isLoadingTaps = true
+        defer { if generation == tapsGeneration { isLoadingTaps = false } }
+        do {
+            let page = try await api.taps(before: cursor)
+            guard generation == tapsGeneration else { return }
+            let known = Set(taps.map(\.id))
+            var older = page.items.filter { !known.contains($0.id) }
+            if seenEpoch != tapsSeenEpoch {
+                for index in older.indices { older[index].isNew = false }
+            }
+            taps.append(contentsOf: older)
+            tapsNextCursor = page.nextCursor
+        } catch {
+            guard generation == tapsGeneration else { return }
+            tapsErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func apply(firstTapsPage page: TapsPage) {
+        var merged = page.items
+        var unseen = page.unseenCount
+        for tap in tapsDuringLoad {
+            if let index = merged.firstIndex(where: { $0.id == tap.id }) {
+                guard tap.sentAt > merged[index].sentAt else { continue }
+                if !merged[index].isNew { unseen += 1 }
+                merged.remove(at: index)
+            } else {
+                unseen += 1
+            }
+            merged.append(tap)
+        }
+        tapsDuringLoad = []
+        // Newest first, like the server (stable for equal times).
+        taps = merged.enumerated()
+            .sorted { $0.element.sentAt != $1.element.sentAt ? $0.element.sentAt > $1.element.sentAt : $0.offset < $1.offset }
+            .map(\.element)
+        tapsUnseen = unseen
+        tapsNextCursor = page.nextCursor
+    }
+
+    /// Opening the taps screen: the badge drops to zero now, then the
+    /// server's watermark moves (`POST /me/taps/seen`). A first-page load
+    /// still in flight is dropped, since it would bring back stale "new"
+    /// flags; a next-page load still lands (see `loadMoreTaps()`).
+    func markTapsSeen() async {
+        tapsSeenEpoch += 1
+        tapsDuringLoad = []
+        tapsUnseen = 0
+        for index in taps.indices where taps[index].isNew {
+            taps[index].isNew = false
+        }
+        try? await api.markTapsSeen()
+    }
+
+    /// A live `tap.received`: the sender moves to the top as new. Counts
+    /// once per sender until the taps are seen.
+    func receive(_ tap: ReceivedTap) {
+        var wasNew = false
+        if let index = taps.firstIndex(where: { $0.id == tap.id }) {
+            wasNew = taps[index].isNew
+            // A replay (same or older tap) changes nothing.
+            guard tap.sentAt > taps[index].sentAt else { return }
+            taps.remove(at: index)
+        }
+        var received = tap
+        received.isNew = true
+        taps.insert(received, at: 0)
+        if !wasNew { tapsUnseen += 1 }
+        if isLoadingTaps { tapsDuringLoad.append(received) }
     }
 
     // MARK: Photo messages
@@ -142,33 +383,29 @@ final class ChatStore {
     /// Sends a photo message (`APIClient.sendPhoto`): the (already
     /// sanitized) JPEG goes up as a private chat attachment
     /// (`POST /me/attachments`, never on the public profile), end-to-end
-    /// encrypted when the chat is, and is sent as `attachmentPhotoID`.
+    /// encrypted when the chat is, and is sent as `attachmentPhotoID` with
+    /// the sender's `timer` (`PhotoTimer`: keep, view once, or expire a set
+    /// time after it's read).
     ///
-    /// `expiresAfterSeconds == nil` sends the photo explicitly as not
-    /// view-once (`isViewOnce: false`); otherwise the server would apply the
-    /// sender's "expiring photos by default" setting.
-    ///
-    /// Re-sending the same `clientID` after a failure is safe: the server
-    /// deduplicates by client ID, an unsent upload expires on its own, and an
-    /// encrypted photo is re-sent with the same key.
+    /// A retry passes no `jpegData` (and no timer): the photo and timer from
+    /// the first attempt are reused. Re-sending the same `clientID` after a
+    /// failure is safe: the server deduplicates by client ID, an unsent
+    /// upload expires on its own, and an encrypted photo is re-sent with the
+    /// same key.
     func sendPhoto(
         jpegData: Data? = nil,
         clientID: String,
         text: String? = nil,
-        expiresAfterSeconds: Int?,
+        timer: PhotoTimer? = nil,
         in conversation: Conversation
     ) async throws -> Message {
-        if let jpegData { pendingPhotos[clientID] = jpegData }
-        guard let jpeg = pendingPhotos[clientID] else { throw APIError.invalidResponse }
+        if let jpegData { pendingPhotos[clientID] = PendingPhoto(jpeg: jpegData, timer: timer ?? .keep) }
+        guard let pending = pendingPhotos[clientID] else { throw APIError.invalidResponse }
         let epoch = self.epoch
 
-        let draft = MessageDraft(
-            clientID: clientID,
-            text: text,
-            expiresAfterSeconds: expiresAfterSeconds,
-            isViewOnce: expiresAfterSeconds == nil ? false : nil
-        )
-        let sent = try await api.sendPhoto(jpegData: jpeg, draft: draft, in: conversation.id)
+        var draft = MessageDraft(clientID: clientID, text: text)
+        pending.timer.apply(to: &draft)
+        let sent = try await api.sendPhoto(jpegData: pending.jpeg, draft: draft, in: conversation.id)
         guard epoch == self.epoch else { return sent }
         pendingPhotos[clientID] = nil
         didSend(sent, in: conversation)
@@ -177,6 +414,44 @@ final class ChatStore {
 
     func hasPendingPhoto(clientID: String) -> Bool {
         pendingPhotos[clientID] != nil
+    }
+
+    /// The timer a pending (failed) photo will be retried with.
+    func pendingPhotoTimer(clientID: String) -> PhotoTimer? {
+        pendingPhotos[clientID]?.timer
+    }
+
+    /// The user deleted a failed photo message: forget its JPEG, and (for
+    /// an encrypted chat) the encrypted blob and key kept to retry it.
+    func discardPendingPhoto(clientID: String) {
+        pendingPhotos[clientID] = nil
+        let api = self.api
+        Task { await api.discardUnsentPhoto(clientID: clientID) }
+    }
+
+    // MARK: Mute
+
+    /// Mutes or unmutes a conversation for this user (`PUT`/`DELETE
+    /// /conversations/{id}/mute`). Shown at once; put back if the server
+    /// refuses. A muted chat still shows its unread count in the list but
+    /// is left out of the tab badge (`unreadTotal`).
+    @discardableResult
+    func setMuted(_ isMuted: Bool, conversationID: Conversation.ID) async -> Bool {
+        let epoch = self.epoch
+        let index = conversations.firstIndex { $0.id == conversationID }
+        let previous = index.map { conversations[$0].isMuted }
+        if let index { conversations[index].isMuted = isMuted }
+        do {
+            try await api.setMuted(isMuted, conversationID: conversationID)
+            return true
+        } catch {
+            guard epoch == self.epoch else { return false }
+            if let previous, let index = conversations.firstIndex(where: { $0.id == conversationID }) {
+                conversations[index].isMuted = previous
+            }
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     // MARK: Realtime
@@ -231,6 +506,13 @@ final class ChatStore {
                 Task { try? await api.markRead(conversationID: message.conversationID) }
             }
 
+        case .messageUpdated(let message):
+            if let index = conversations.firstIndex(where: { $0.id == message.conversationID }),
+               let last = conversations[index].lastMessage, last.id == message.id {
+                conversations[index].lastMessage = Self.updating(last, with: message)
+            }
+            broadcast(.updated(message), to: message.conversationID)
+
         case .messageRead(let receipt):
             if let index = conversations.firstIndex(where: { $0.id == receipt.conversationID }),
                var last = conversations[index].lastMessage,
@@ -249,7 +531,7 @@ final class ChatStore {
             conversations.insert(updated, at: index)
 
         case .tapReceived(let tap):
-            latestTap = tap
+            receive(ReceivedTap(tap))
 
         case .identityChanged, .keysLow, .unknown:
             // Encryption events are handled by `E2EStatus`.
@@ -266,7 +548,7 @@ final class ChatStore {
 
     /// Merges a live update into a thread's messages (oldest first).
     /// Replaces the optimistic copy of my own message by client ID.
-    static func merge(_ update: ThreadUpdate, into messages: inout [Message], myID: Profile.ID) {
+    nonisolated static func merge(_ update: ThreadUpdate, into messages: inout [Message], myID: Profile.ID) {
         switch update {
         case .created(let message):
             if let index = messages.firstIndex(where: {
@@ -279,6 +561,12 @@ final class ChatStore {
             } else {
                 let index = messages.lastIndex { $0.sentAt <= message.sentAt }.map { $0 + 1 } ?? 0
                 messages.insert(message, at: index)
+            }
+        case .updated(let message):
+            // Only ever replaces: an update for a message this thread doesn't
+            // show (an older page) isn't inserted.
+            if let index = messages.firstIndex(where: { $0.id == message.id }) {
+                messages[index] = updating(messages[index], with: message)
             }
         case .read(let receipt):
             for index in messages.indices where messages[index].senderID == myID {
@@ -298,26 +586,39 @@ final class ChatStore {
     /// Keeps local messages the snapshot doesn't have yet: optimistic ones
     /// still sending or failed, and live events at least as new as the
     /// snapshot's newest message (they arrived while the fetch was in
-    /// flight). Older local messages missing from the snapshot are gone on
-    /// the server (expired, deleted) and are dropped.
-    static func reconcile(snapshot: [Message], with local: [Message], myID: Profile.ID) -> [Message] {
+    /// flight). With `keepsOlder` (the snapshot is the newest page and the
+    /// server has older ones), local messages older than the snapshot are
+    /// older pages already loaded and are kept in front of it. Other local
+    /// messages missing from the snapshot are gone on the server (expired,
+    /// deleted) and are dropped.
+    nonisolated static func reconcile(snapshot: [Message], with local: [Message], myID: Profile.ID, keepsOlder: Bool = false) -> [Message] {
         var result = snapshot
         let newest = snapshot.map(\.sentAt).max()
+        let oldest = snapshot.map(\.sentAt).min()
+        var olderPages: [Message] = []
         for message in local {
-            let isInSnapshot = snapshot.contains {
-                $0.id == message.id
-                    || (message.clientID != nil && $0.clientID == message.clientID && $0.senderID == message.senderID)
-            }
-            guard !isInSnapshot else { continue }
+            guard !ThreadHistory.contains(message, in: snapshot) else { continue }
             let isUnsent = message.status == .sending || message.status == .failed
+            if !isUnsent, keepsOlder, let oldest, message.sentAt < oldest {
+                olderPages.append(message)
+                continue
+            }
             let isNewer = newest.map { message.sentAt >= $0 } ?? true
             guard isUnsent || isNewer else { continue }
             merge(.created(message), into: &result, myID: myID)
         }
-        return result
+        return olderPages + result
     }
 
-    private static func readReceipt(_ receipt: RealtimeEvent.ReadReceipt, covers message: Message) -> Bool {
+    /// `current` replaced by a newer server copy, keeping a locally newer
+    /// `read` status.
+    nonisolated static func updating(_ current: Message, with update: Message) -> Message {
+        var merged = update
+        if current.status == .read && update.status != .read { merged.status = .read }
+        return merged
+    }
+
+    nonisolated private static func readReceipt(_ receipt: RealtimeEvent.ReadReceipt, covers message: Message) -> Bool {
         if let ids = receipt.messageIDs { return ids.contains(message.id) }
         if let readAt = receipt.readAt { return message.sentAt <= readAt }
         return true

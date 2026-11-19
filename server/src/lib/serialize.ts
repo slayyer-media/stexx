@@ -35,12 +35,38 @@ export interface ProfileJson {
   isFavorite: boolean;
 }
 
+/**
+ * Travel mode as its owner sees it: only on the user's OWN profile (GET/PATCH /me), never on anyone else's.
+ * Deliberately carries no coordinates (/me never returns any): the app keeps the place it picked on the device.
+ * `isActive` is false while Stexx+ has lapsed: the travel cell is kept but ignored (effective_locations) until
+ * Plus is active again or the user clears it.
+ */
+export interface TravelJson {
+  isActive: boolean;
+}
+
+/**
+ * The own profile (GET/PATCH /me): a Profile plus `travel` (null = travel mode off) and `privacy`, the six stored
+ * privacy settings, so the app shows what the server applies instead of a local copy (after a reinstall, on a new
+ * phone, or after signing in to another account). `privacy.incognito` is the stored choice; it only applies while
+ * Stexx+ is active.
+ */
+export interface OwnProfileJson extends ProfileJson {
+  travel: TravelJson | null;
+  privacy: PrivacyJson;
+}
+
 export interface AttachmentJson {
   kind: "photo";
   url: string | null;
   isViewOnce: boolean;
   /** End-to-end encrypted photo: `url` is an opaque blob whose key and digest are inside the message's envelope. */
   isEncrypted: boolean;
+  /**
+   * View-once photos: when the recipient opened it (POST .../messages/{id}/open). The recipient always sees their own;
+   * the sender only if the recipient's read receipts were on when they opened it. Null otherwise and for other photos.
+   */
+  openedAt: string | null;
 }
 
 export interface MessageJson {
@@ -109,10 +135,13 @@ export interface PhotoRow {
   is_explicit: boolean;
   /** The NSFW classifier has labelled it (nsfw_checked_at IS NOT NULL). */
   is_checked: boolean;
+  /** A moderator hid it from others (photos.hidden_at, from a photo flag). Optional for hand-built rows. */
+  is_hidden?: boolean;
 }
 
 /** Select list producing a PhotoRow from `photos`. */
-export const photoColumns = sql`id, owner_id, storage_key, position, is_explicit, (nsfw_checked_at IS NOT NULL) AS is_checked`;
+export const photoColumns = sql`id, owner_id, storage_key, position, is_explicit, (nsfw_checked_at IS NOT NULL) AS is_checked,
+  (hidden_at IS NOT NULL) AS is_hidden`;
 
 export interface MessageRow {
   id: string;
@@ -126,6 +155,10 @@ export interface MessageRow {
   attachment_key: string | null;
   attachment_view_once: boolean;
   attachment_encrypted: boolean;
+  /** View-once: when the recipient opened it (open endpoint). */
+  attachment_opened_at: Date | null;
+  /** View-once: the opener's sendReadReceipts at open time (decides whether the sender sees openedAt). */
+  attachment_open_receipt: boolean;
   sent_at: Date;
   delivered_at: Date | null;
   read_at: Date | null;
@@ -152,8 +185,12 @@ export function profileColumns(viewerId: string) {
 
 // ---- Pure builders ------------------------------------------------------------
 
+/**
+ * `isExplicit` is true whenever the photo is kept from everyone but its owner: labelled explicit, or hidden by a
+ * moderator. Only the owner ever receives such a photo, and the app badges it "Hidden".
+ */
 export function photoJson(p: PhotoRow): PhotoJson {
-  return { id: p.id, url: mediaUrl(p.storage_key), isExplicit: p.is_explicit };
+  return { id: p.id, url: mediaUrl(p.storage_key), isExplicit: p.is_explicit || p.is_hidden === true };
 }
 
 export interface ViewerContext {
@@ -204,11 +241,15 @@ export function profileJson(row: ProfileRow, photos: readonly PhotoRow[], ctx: V
  * status: recipient sees `read` once read_at is set; the SENDER sees `read` only if the reader allowed
  * receipts (read_receipt); else `delivered` if delivered_at, else `sent`.
  * Attachment url is null once the file is gone (view-once consumed / expired), kind stays.
+ * View-once photos, seen by the SENDER: `url` is always null (their app never shows it, and the file disappearing
+ * would otherwise tell them it was opened), and `openedAt` only follows the opener's read-receipt setting.
  */
 export function messageJson(m: MessageRow, viewerId: string): MessageJson {
   const isSender = m.sender_id === viewerId;
   const read = isSender ? m.read_at !== null && m.read_receipt : m.read_at !== null;
   const status = read ? "read" : m.delivered_at || m.read_at ? "delivered" : "sent";
+  const viewOnce = m.attachment_view_once;
+  const openedAt = viewOnce && (!isSender || m.attachment_open_receipt) ? isoDate(m.attachment_opened_at) : null;
   return {
     id: m.id,
     conversationID: m.conversation_id,
@@ -219,9 +260,10 @@ export function messageJson(m: MessageRow, viewerId: string): MessageJson {
       m.attachment_kind === "photo"
         ? {
             kind: "photo",
-            url: mediaUrl(m.attachment_key),
-            isViewOnce: m.attachment_view_once,
+            url: viewOnce && isSender ? null : mediaUrl(m.attachment_key),
+            isViewOnce: viewOnce,
             isEncrypted: m.attachment_encrypted,
+            openedAt,
           }
         : null,
     sentAt: isoDate(m.sent_at),
@@ -248,6 +290,11 @@ export function conversationJson(input: {
     updatedAt: isoDate(input.updatedAt),
     isMuted: input.isMuted,
   };
+}
+
+/** `travel` for the own profile: null without a travel row, else whether it applies right now. */
+export function travelJson(row: { is_active: boolean } | undefined): TravelJson | null {
+  return row ? { isActive: row.is_active } : null;
 }
 
 export function privacyJson(r: PrivacyRow): PrivacyJson {

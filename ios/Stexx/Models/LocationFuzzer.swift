@@ -26,4 +26,20 @@ enum LocationFuzzer {
 
         return FuzzedLocation(latitude: snappedLat, longitude: snappedLon, precisionMeters: cellMeters)
     }
+
+    /// The four corners of the grid cell whose center is `cell` (a result of
+    /// `fuzz`), for drawing it: the area the server will place you in.
+    static func corners(of cell: FuzzedLocation) -> [(latitude: Double, longitude: Double)] {
+        let halfLat = cell.precisionMeters / metersPerDegreeLatitude / 2
+        let metersPerDegreeLongitude = metersPerDegreeLatitude * max(cos(cell.latitude * .pi / 180), 0.01)
+        let halfLon = cell.precisionMeters / metersPerDegreeLongitude / 2
+        let south = max(-90, cell.latitude - halfLat)
+        let north = min(90, cell.latitude + halfLat)
+        return [
+            (north, cell.longitude - halfLon),
+            (north, cell.longitude + halfLon),
+            (south, cell.longitude + halfLon),
+            (south, cell.longitude - halfLon),
+        ]
+    }
 }

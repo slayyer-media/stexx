@@ -2,6 +2,11 @@ import SwiftUI
 
 /// Stexx+ advanced filters. The server enforces the entitlement too; this
 /// sheet is only reachable with Stexx+.
+///
+/// Edits a draft: Apply applies it, Cancel discards it, and "Reset filters"
+/// clears the draft without closing. Swipe-down is the same as Cancel (it
+/// discards without asking): a filter draft is quick to redo, so a prompt
+/// would cost more than it saves.
 struct FilterSheet: View {
     @Binding var query: NearbyQuery
     @Environment(\.dismiss) private var dismiss
@@ -25,9 +30,13 @@ struct FilterSheet: View {
                             .accessibilityLabel(Text("Ages \(Int(ageRange.lowerBound)) to \(Int(ageRange.upperBound))"))
                         LabeledContent("From") {
                             Stepper("\(Int(ageRange.lowerBound))", value: lowerAge, in: 18...Double(Int(ageRange.upperBound)))
+                                .accessibilityLabel("Minimum age")
+                                .accessibilityValue(Text("\(Int(ageRange.lowerBound))"))
                         }
                         LabeledContent("To") {
                             Stepper("\(Int(ageRange.upperBound))", value: upperAge, in: ageRange.lowerBound...99)
+                                .accessibilityLabel("Maximum age")
+                                .accessibilityValue(Text("\(Int(ageRange.upperBound))"))
                         }
                     }
                 } header: {
@@ -42,7 +51,10 @@ struct FilterSheet: View {
                             Text(StexxFormat.distance(maxDistanceKm * 1000))
                                 .stexxTitleStyle(.title)
                                 .monospacedDigit()
+                                .accessibilityHidden(true)
                             Slider(value: $maxDistanceKm, in: 1...100, step: 1)
+                                .accessibilityLabel("Maximum distance")
+                                .accessibilityValue(Text(StexxFormat.distance(maxDistanceKm * 1000)))
                         }
                     }
                 } header: {
@@ -85,6 +97,8 @@ struct FilterSheet: View {
                 Section {
                     TextField("Add a tag, e.g. Physics", text: $tagText)
                         .textInputAutocapitalization(.words)
+                        .accessibilityLabel("Add a tag")
+                        .accessibilityHint("Type a tag and press Return. Up to 10.")
                         .onSubmit(addTag)
                     if !draft.tags.isEmpty {
                         FlowLayout {
@@ -95,12 +109,24 @@ struct FilterSheet: View {
                                     TagChip(text: tag, systemImage: "xmark")
                                 }
                                 .buttonStyle(.plain)
+                                .accessibilityLabel(Text("Remove tag \(tag)"))
                             }
                         }
                         .padding(.vertical, 4)
                     }
                 } header: {
                     SectionLabel("Tags")
+                }
+                .listRowBackground(Theme.ink1)
+
+                Section {
+                    Button("Reset filters", systemImage: "arrow.counterclockwise", role: .destructive, action: resetDraft)
+                        .frame(maxWidth: .infinity)
+                        .disabled(!hasFiltersInDraft)
+                } footer: {
+                    Text("Clears these filters. Nothing changes until you tap Apply.")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.slate)
                 }
                 .listRowBackground(Theme.ink1)
             }
@@ -115,8 +141,8 @@ struct FilterSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Reset", role: .destructive) {
-                        query = NearbyQuery()
+                    Button("Cancel", role: .cancel) {
+                        // Discards the draft; the applied filters stay as they were.
                         dismiss()
                     }
                 }
@@ -163,6 +189,31 @@ struct FilterSheet: View {
             limitsDistance = true
             maxDistanceKm = meters / 1000
         }
+    }
+
+    /// Whether anything in the draft would filter the grid.
+    private var hasFiltersInDraft: Bool {
+        limitsAge || limitsDistance || !draft.positions.isEmpty || !draft.lookingFor.isEmpty
+            || !draft.tags.isEmpty || !tagText.isEmpty
+    }
+
+    private func resetDraft() {
+        draft = Self.cleared(draft)
+        limitsAge = false
+        ageRange = 18...99
+        limitsDistance = false
+        maxDistanceKm = 25
+        tagText = ""
+    }
+
+    /// The query with every filter this sheet shows cleared; the quick
+    /// filters it doesn't show (online, favorites) are kept.
+    nonisolated static func cleared(_ query: NearbyQuery) -> NearbyQuery {
+        var cleared = NearbyQuery()
+        cleared.onlineOnly = query.onlineOnly
+        cleared.favoritesOnly = query.favoritesOnly
+        cleared.limit = query.limit
+        return cleared
     }
 
     private func apply() {

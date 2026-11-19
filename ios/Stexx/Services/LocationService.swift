@@ -40,13 +40,19 @@ final class LocationService {
     enum Status: Equatable {
         case idle
         case waitingForPermission
+        /// The user said no, or Location Services are off.
         case denied
+        /// Screen Time or a device profile doesn't allow location for Stexx.
+        case restricted
         case active
     }
 
     private(set) var status: Status = .idle
     /// The last cell that was successfully uploaded.
     private(set) var lastUploadedCell: FuzzedLocation?
+    /// The latest upload attempt failed (offline, server error, rate limit).
+    /// Cleared by the next successful upload.
+    private(set) var lastUploadFailed = false
 
     @ObservationIgnored private let manager: any LocationManaging
     @ObservationIgnored private let upload: @Sendable (FuzzedLocation) async throws -> Void
@@ -111,6 +117,7 @@ final class LocationService {
         generation += 1
         isUploading = false
         lastUploadedCell = nil
+        lastUploadFailed = false
         lastUploadAt = nil
         notBefore = nil
     }
@@ -131,19 +138,23 @@ final class LocationService {
             startHeartbeat()
         case .notDetermined:
             status = .waitingForPermission
+            // The permission alert deactivates the app: not the app switcher.
+            PrivacyCover.shared.expectSystemPrompt()
             manager.requestWhenInUseAuthorization()
-        case .denied, .restricted:
-            deny()
+        case .denied:
+            deny(.denied)
+        case .restricted:
+            deny(.restricted)
         @unknown default:
-            deny()
+            deny(.denied)
         }
     }
 
-    private func deny() {
+    private func deny(_ reason: Status) {
         manager.stopUpdates()
         heartbeat?.cancel()
         heartbeat = nil
-        status = .denied
+        status = reason
     }
 
     /// Asks for a fresh reading every `refreshInterval` so a stationary user
@@ -196,9 +207,11 @@ final class LocationService {
         switch result {
         case .success:
             lastUploadedCell = cell
+            lastUploadFailed = false
             lastUploadAt = now()
             notBefore = nil
         case .failure(let error):
+            lastUploadFailed = true
             if case .rateLimited(let retryAfter)? = error as? APIError {
                 notBefore = now().addingTimeInterval(retryAfter ?? failureBackoff)
             } else {

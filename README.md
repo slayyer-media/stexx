@@ -21,10 +21,10 @@ An open-source, ad-free, privacy-first gay dating and hookup app. A Grindr alter
 ## Planned features
 
 - Grid of nearby guys, filters, and tags
-- End-to-end encrypted chat with photos and expiring media (Signal Protocol via libsignal; the server's key distribution is in place, the app side is next; see [`docs/roadmap.md`](docs/roadmap.md))
+- End-to-end encrypted chat with photos and expiring media (Signal Protocol via libsignal). The app and server both support it; it switches on in production once a build with it is out. See [`docs/security.md`](docs/security.md#7-end-to-end-encrypted-chat) and [`docs/roadmap.md`](docs/roadmap.md)
 - Taps, favorites, and blocking that actually works
 - Dark, glassy, minimalist UI
-- Premium: more filters, incognito browsing, travel mode, and other extras (exact features TBD)
+- Premium: more filters, incognito browsing, travel mode (browse from a city you pick, still rounded to a 500 m cell on the phone), and other extras
 - Anti-spam without giving up anonymity: device attestation, per-device limits, new-account limits, and spam heuristics on messages that shadow-limit spammers pending review (see [`docs/roadmap.md`](docs/roadmap.md) and [`docs/security.md`](docs/security.md))
 
 ## Status
@@ -35,7 +35,9 @@ Very early. The native iOS app (SwiftUI, iOS 26, Liquid Glass) is in [`ios/`](io
 
 The API server lives in [`server/`](server/) (Bun + TypeScript + Hono + Postgres 18). It implements [`docs/api.md`](docs/api.md) and enforces the privacy rules above in code and tests.
 Run it locally with `cd server && cp .env.example .env && bun install && bun run db:up && bun run db:migrate && bun run dev`; see [`server/README.md`](server/README.md) for the architecture,
-where each privacy guarantee is enforced, and the environment reference. Production is a single VPS behind Cloudflare, with no access logs and 30-day encrypted backups: see [`server/deploy/`](server/deploy/README.md).
+where each privacy guarantee is enforced, and the environment reference. Production is a single VPS behind Cloudflare (which terminates TLS), with no access logs and encrypted backups kept 28 days: see [`server/deploy/`](server/deploy/README.md).
+
+Launch prep (App Store privacy label, review notes, export compliance) is tracked in [`docs/app-store.md`](docs/app-store.md); draft Terms, Privacy Policy and Community Guidelines are in [`docs/legal/`](docs/legal/).
 
 ## Contributing
 

@@ -2,6 +2,11 @@ import PhotosUI
 import SwiftUI
 
 /// A single conversation with a black-glass composer.
+///
+/// History: the newest page loads with the thread; older pages load as you
+/// scroll near the top (`ThreadHistory`), keeping the message you were
+/// looking at in place. A failed send stays in the thread as a failed bubble
+/// with the reason, Retry and Delete.
 struct ChatThreadView: View {
     let route: ChatRoute
 
@@ -14,13 +19,25 @@ struct ChatThreadView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     @State private var conversation: Conversation?
-    @State private var messages: [Message] = []
+    @State private var history = ThreadHistory()
     @State private var draft = ""
     @State private var isLoading = true
-    @State private var errorMessage: String?
-    /// Why the last send was refused (rate limit or new-account limit), shown above the composer.
+    /// Why the thread couldn't load; shown with Retry until the newest page
+    /// arrives, even above a send that failed meanwhile.
+    @State private var loadError: String?
+    @State private var olderState: OlderPageState = .idle
+    /// The bubble to keep in place after older messages were prepended.
+    @State private var scrollAnchorKey: String?
+    /// The user has scrolled the thread themselves. Older pages only load on
+    /// their own after that: the first layout (and lazy rows measuring
+    /// themselves) can pass near the top without anyone scrolling.
+    @State private var hasUserScrolled = false
+    /// One quiet line above the composer (key change and mute problems).
     @State private var sendNotice: String?
-    @State private var expiresPhotos = true
+    /// What happens to photos sent now (`PhotoTimer`).
+    @State private var photoTimer: PhotoTimer = .keep
+    /// Why each failed message wasn't sent, by `bubbleKey`.
+    @State private var failures: [String: SendFailure] = [:]
     @State private var isConfirmingBlock = false
     @State private var isReporting = false
     @State private var isPickingPhoto = false
@@ -34,16 +51,34 @@ struct ChatThreadView: View {
     @State private var isAcceptingKeyChange = false
     /// Blurred incoming photos the user tapped to see, while this thread is open.
     @State private var revealedPhotoIDs: Set<Message.ID> = []
-    /// The encrypted view-once photo open in the full-screen viewer.
+    /// The view-once photo open in the full-screen viewer.
     @State private var viewOnceMessage: Message?
     /// Plaintext view-once photos `GET …/messages` listed without a URL: spent.
     @State private var spentViewOnceIDs: Set<Message.ID> = []
     @FocusState private var isComposerFocused: Bool
 
+    private static let olderRowID = "older-messages"
+
+    enum OlderPageState: Hashable {
+        case idle, loading, failed
+    }
+
     private var participant: Profile { route.participant }
+
+    /// The thread's messages, oldest first.
+    private var messages: [Message] {
+        get { history.messages }
+        nonmutating set { history.messages = newValue }
+    }
 
     private var canSend: Bool {
         conversation != nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The list's copy wins (it follows realtime updates from other devices).
+    private var isMuted: Bool {
+        guard let id = conversation?.id else { return false }
+        return chatStore.conversations.first { $0.id == id }?.isMuted ?? conversation?.isMuted ?? false
     }
 
     var body: some View {
@@ -58,7 +93,17 @@ struct ChatThreadView: View {
                         EncryptedThreadLabel()
                             .padding(.bottom, Theme.Spacing.s)
                     }
-                    if !isLoading && messages.isEmpty {
+                    if history.hasOlder {
+                        OlderMessagesRow(state: olderState) {
+                            Task { await loadOlder(userInitiated: true) }
+                        }
+                        .id(Self.olderRowID)
+                    }
+                    if let loadError, history.showsLoadError(hasError: true, isLoading: isLoading) {
+                        ThreadLoadErrorView(message: loadError) {
+                            Task { await load() }
+                        }
+                    } else if !isLoading && messages.isEmpty {
                         emptyThread
                     }
                     ForEach(Array(messages.enumerated()), id: \.element.bubbleKey) { index, message in
@@ -76,9 +121,14 @@ struct ChatThreadView: View {
                             isLastInGroup: isLastInGroup(at: index),
                             showsReadReceipt: index == lastReadIndex,
                             isViewOnceSpent: spentViewOnceIDs.contains(message.id),
+                            isViewOnceOpenedHere: chatStore.hasOpenedViewOnce(message.id),
                             isPhotoRevealed: revealedPhotoIDs.contains(message.id),
+                            failure: message.status == .failed ? failure(for: message) : nil,
+                            canRetry: canRetry(message),
                             onRevealPhoto: { revealedPhotoIDs.insert(message.id) },
-                            onOpenViewOnce: { Task { await openViewOnce(message) } }
+                            onOpenViewOnce: { Task { await openViewOnce(message) } },
+                            onRetry: { retry(message) },
+                            onDelete: { deleteFailed(message) }
                         )
                         .id(key)
                         .padding(.top, continues ? 2 : Theme.Spacing.s)
@@ -88,9 +138,6 @@ struct ChatThreadView: View {
                             reduceMotion: reduceMotion,
                             onLanded: { landingKeys.remove(key) }
                         ))
-                        .onTapGesture {
-                            if message.status == .failed { retry(message) }
-                        }
                     }
                 }
                 .padding(.horizontal, Theme.Spacing.m)
@@ -98,15 +145,54 @@ struct ChatThreadView: View {
             }
             .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
+            // Older history: fetch the page before when the top comes near.
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                ThreadHistory.isNearTop(contentOffsetY: geometry.contentOffset.y, topInset: geometry.contentInsets.top)
+            } action: { _, isNearTop in
+                if isNearTop && hasUserScrolled { Task { await loadOlder(userInitiated: false) } }
+            }
+            .onScrollPhaseChange { _, phase in
+                if phase == .interacting { hasUserScrolled = true }
+            }
             .onChange(of: messages.last?.bubbleKey) { _, lastKey in
                 guard let lastKey else { return }
                 withAnimation(Motion.animation(Motion.standard, reduceMotion: reduceMotion)) {
                     proxy.scrollTo(lastKey, anchor: .bottom)
                 }
             }
+            .onChange(of: failures) { _, failures in
+                // The newest message just failed: its reason and buttons appear under it, keep them in view.
+                guard let last = messages.last, failures[last.bubbleKey] != nil else { return }
+                withAnimation(Motion.animation(Motion.standard, reduceMotion: reduceMotion)) {
+                    proxy.scrollTo(last.bubbleKey, anchor: .bottom)
+                }
+            }
+            .onChange(of: scrollAnchorKey) { _, key in
+                // Older messages went in above: keep the one that was on top where it was.
+                guard let key else { return }
+                scrollAnchorKey = nil
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { proxy.scrollTo(key, anchor: .top) }
+                // Once more after the lazy stack has measured the new rows
+                // (the first jump lands on estimated heights).
+                Task { @MainActor in
+                    await Task.yield()
+                    withTransaction(transaction) { proxy.scrollTo(key, anchor: .top) }
+                }
+            }
+            #if DEBUG
+            .task(id: messages.first?.bubbleKey) {
+                // Screenshot-only: jump to the top, to show older pages loading.
+                guard ScreenshotRoute.scrollsToTop, !isLoading, messages.first != nil, history.hasOlder else { return }
+                try? await Task.sleep(for: .milliseconds(600))
+                proxy.scrollTo(Self.olderRowID, anchor: .top)
+                await loadOlder(userInitiated: false)
+            }
+            #endif
         }
         .overlay {
-            if isLoading { ProgressView().tint(Theme.steel) }
+            if isLoading && messages.isEmpty { ProgressView().tint(Theme.steel) }
         }
         .stexxBackground()
         .safeAreaInset(edge: .top, spacing: 0) {
@@ -127,20 +213,34 @@ struct ChatThreadView: View {
                     HStack(spacing: Theme.Spacing.s) {
                         AvatarView(profile: participant, size: 30)
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(participant.displayName)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(Theme.frost)
+                            HStack(spacing: 4) {
+                                Text(participant.displayName)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(Theme.frost)
+                                    .lineLimit(1)
+                                if isMuted {
+                                    Image(systemName: "bell.slash.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(Theme.slate)
+                                        .accessibilityLabel("Muted")
+                                }
+                            }
                             Text(StexxFormat.lastSeen(participant.lastActiveAt, isOnline: participant.isOnline))
                                 .stexxLabelStyle(.micro, color: participant.isOnline ? Theme.online : Theme.slate)
+                                .lineLimit(1)
                         }
                     }
                 }
                 .buttonStyle(.plain)
+                .accessibilityElement(children: .combine)
                 .accessibilityHint("Opens profile")
             }
             ToolbarItem(placement: .topBarTrailing) {
-                SafetyMenu(
+                ThreadMenu(
                     profile: participant,
+                    isMuted: isMuted,
+                    canMute: conversation != nil,
+                    onToggleMute: { Task { await toggleMute() } },
                     onBlock: { isConfirmingBlock = true },
                     onReport: { isReporting = true }
                 )
@@ -163,15 +263,7 @@ struct ChatThreadView: View {
         .task {
             await load()
             #if DEBUG
-            // Screenshot-only: open the report sheet from a chat.
-            if let route = ScreenshotRoute.current, [.reportFromChat, .reportPicker, .reportSent].contains(route) {
-                isReporting = true
-            }
-            // Screenshot-only: send a message from a live (dev server) chat.
-            if ScreenshotRoute.current == .liveChat, let text = ScreenshotRoute.draft, conversation != nil {
-                draft = text
-                send()
-            }
+            await runScreenshotHooks()
             #endif
         }
         .task(id: conversation?.id) {
@@ -184,17 +276,24 @@ struct ChatThreadView: View {
                     // The socket was down: refetch what was missed.
                     try? await refreshMessages(in: id)
                 } else {
-                    if case .created(let message) = update,
-                       !messages.contains(where: { $0.id == message.id || $0.bubbleKey == message.bubbleKey }) {
+                    if case .created(let message) = update, !ThreadHistory.contains(message, in: messages) {
                         landingKeys.insert(message.bubbleKey)
                     }
                     ChatStore.merge(update, into: &messages, myID: appState.myID)
                 }
             }
         }
+        .task(id: history.nextExpiry()) {
+            // Timed messages go when their timer runs out, as the server
+            // deletes them, without waiting for a refetch.
+            guard let expiry = history.nextExpiry() else { return }
+            try? await Task.sleep(for: .seconds(max(0, expiry.timeIntervalSinceNow)))
+            guard !Task.isCancelled else { return }
+            await pruneExpired()
+        }
         .fullScreenCover(item: $viewOnceMessage) { message in
-            ViewOnceViewer(message: message) { outcome in
-                Task { await closeViewOnce(message, outcome: outcome) }
+            ViewOnceViewer(message: message, onOpened: { markViewOnceOpened(message) }) { outcome, opened in
+                Task { await closeViewOnce(message, outcome: outcome, opened: opened) }
             }
         }
         .photosPicker(isPresented: $isPickingPhoto, selection: $photoItem, matching: .images)
@@ -247,6 +346,8 @@ struct ChatThreadView: View {
         .ignoresSafeArea(edges: .bottom)
     }
 
+    /// "+": send a photo, and the photo timer (keep, view once, or expire a
+    /// set time after it's read). The badge shows a timer that's on.
     private var attachmentMenu: some View {
         let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
         return Menu {
@@ -255,29 +356,38 @@ struct ChatThreadView: View {
             } label: {
                 Label("Photo", systemImage: "photo")
             }
-            Toggle(isOn: $expiresPhotos) {
-                Label("Expiring photos", systemImage: "timer")
+            .disabled(conversation == nil)
+            Picker(selection: $photoTimer) {
+                ForEach(PhotoTimer.allCases) { timer in
+                    Label(timer.title, systemImage: timer.systemImage).tag(timer)
+                }
+            } label: {
+                Label("Photo timer", systemImage: "timer")
+                Text(photoTimer.title)
             }
+            .pickerStyle(.menu)
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 16, weight: .medium))
+                .font(.body.weight(.medium))
                 .foregroundStyle(Theme.steel)
                 .frame(width: 44, height: 44)
                 .background(Theme.ink1, in: shape)
                 .hairlineBorder(shape)
                 .contentShape(shape)
                 .overlay(alignment: .topTrailing) {
-                    // Small timer: photos sent now will expire.
-                    if expiresPhotos {
-                        Image(systemName: "timer")
-                            .font(.system(size: 8, weight: .semibold))
+                    // Small badge: photos sent now are view-once, or will expire.
+                    if let short = photoTimer.shortTitle {
+                        Text(verbatim: short)
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
                             .foregroundStyle(Theme.ice)
-                            .offset(x: -5, y: 5)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .offset(x: -4, y: 4)
                     }
                 }
         }
-        .accessibilityLabel("Attachments")
-        .accessibilityValue(expiresPhotos ? Text("Expiring photos on") : Text(verbatim: ""))
+        .accessibilityLabel("Attachments and photo timer")
+        .accessibilityValue(Text(photoTimer.accessibilityDescription))
     }
 
     private var messageField: some View {
@@ -290,6 +400,7 @@ struct ChatThreadView: View {
                 .focused($isComposerFocused)
                 .tint(Theme.ice)
                 .padding(.vertical, 11)
+                .accessibilityLabel("Message to \(participant.displayName)")
 
             if draft.isEmpty {
                 Button {
@@ -298,13 +409,14 @@ struct ChatThreadView: View {
                     Image(systemName: "photo.on.rectangle.angled")
                         .font(.body)
                         .foregroundStyle(Theme.steel)
-                        .frame(width: 36, height: 44)
+                        .frame(minWidth: 36, minHeight: 44)
                         .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
                 .disabled(conversation == nil)
                 .transition(.opacity)
                 .accessibilityLabel("Send a photo")
+                .accessibilityValue(Text(photoTimer.accessibilityDescription))
             }
         }
         .padding(.leading, Theme.Spacing.m + 2)
@@ -320,7 +432,7 @@ struct ChatThreadView: View {
         let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
         return Button(action: send) {
             Image(systemName: "arrow.up")
-                .font(.system(size: 17, weight: .semibold))
+                .font(.body.weight(.semibold))
                 .foregroundStyle(Theme.ink)
                 .frame(width: 44, height: 44)
                 .background(Theme.frost, in: shape)
@@ -328,7 +440,7 @@ struct ChatThreadView: View {
         }
         // The send itself gives the light impact haptic.
         .buttonStyle(PressableButtonStyle(haptics: false))
-        .accessibilityLabel("Send")
+        .accessibilityLabel("Send message")
     }
 
     private var emptyThread: some View {
@@ -337,6 +449,7 @@ struct ChatThreadView: View {
                 .rimLight(cornerRadius: Theme.Radius.avatar)
                 .cellCorners()
                 .padding(.bottom, Theme.Spacing.l)
+                .accessibilityHidden(true)
             Text("Say hi to \(participant.displayName)")
                 .stexxTitleStyle(.title)
                 .multilineTextAlignment(.center)
@@ -378,12 +491,18 @@ struct ChatThreadView: View {
     }
 
     private func load() async {
-        expiresPhotos = appState.privacy.expiringPhotosByDefault
+        if conversation == nil {
+            photoTimer = .default(expiringByDefault: appState.privacy.expiringPhotosByDefault)
+        }
+        isLoading = true
+        loadError = nil
         defer { isLoading = false }
         do {
             let resolved: Conversation
-            if let id = route.conversationID,
-               let existing = chatStore.conversations.first(where: { $0.id == id }) {
+            if let current = conversation {
+                resolved = current
+            } else if let id = route.conversationID,
+                      let existing = chatStore.conversations.first(where: { $0.id == id }) {
                 resolved = existing
             } else {
                 resolved = try await api.openConversation(with: participant.id)
@@ -392,51 +511,189 @@ struct ChatThreadView: View {
             try await refreshMessages(in: resolved.id)
             await chatStore.markRead(resolved.id)
         } catch is CancellationError {
+        } catch APIError.notFound {
+            loadError = String(localized: "This chat isn't available any more.")
         } catch {
-            errorMessage = error.localizedDescription
+            // Nothing on screen yet: say so, with Retry. A failed refetch of a
+            // thread that's already showing keeps what's there.
+            loadError = String(localized: "Couldn't load messages. Check your connection and try again.")
         }
     }
 
-    /// Fetches the latest page and reconciles it with what's shown, keeping
-    /// live events that arrived while the request was in flight.
+    /// Fetches the newest page and reconciles it with what's shown, keeping
+    /// live events that arrived while the request was in flight and older
+    /// pages already loaded.
     private func refreshMessages(in conversationID: Conversation.ID) async throws {
-        let snapshot = try await api.messages(in: conversationID, before: nil).items
-        let myID = appState.myID
-        // Only this listing gives the recipient a view-once URL: none here means it's spent.
-        spentViewOnceIDs.formUnion(snapshot.filter {
-            $0.senderID != myID && $0.attachment?.isViewOnce == true && $0.attachment?.url == nil
-        }.map(\.id))
-        messages = ChatStore.reconcile(snapshot: snapshot, with: messages, myID: myID)
+        let page = try await api.messages(in: conversationID, before: nil)
+        noteSpentViewOnce(in: page.items)
+        let now = Date.now
+        let expired = messages.filter { ThreadHistory.hasExpired($0, at: now) }
+        history.applyLatest(page, myID: appState.myID, now: now)
+        await evictPhotos(of: expired)
     }
 
-    /// An encrypted view-once photo was tapped. Realtime events don't carry
-    /// its URL, so the thread is refetched first if needed; if the server no
-    /// longer has it, the bubble turns into "no longer available" instead.
+    /// Loads the page before the oldest message shown. Runs when the top
+    /// comes near (`userInitiated: false`, never after a failure) or from
+    /// the row's Load / Retry button.
+    private func loadOlder(userInitiated: Bool) async {
+        guard let id = conversation?.id, let cursor = history.olderCursor, !isLoading,
+              olderState == .idle || (userInitiated && olderState == .failed)
+        else { return }
+        olderState = .loading
+        do {
+            let page = try await api.messages(in: id, before: cursor)
+            // A refetch moved the window meanwhile: this page is stale.
+            guard history.olderCursor == cursor else {
+                olderState = .idle
+                return
+            }
+            noteSpentViewOnce(in: page.items)
+            let previousFirst = history.applyOlder(page)
+            olderState = .idle
+            scrollAnchorKey = ThreadHistory.scrollAnchor(previousFirst: previousFirst, in: messages)
+        } catch APIError.server(400, _, "invalid_cursor") {
+            // The message the cursor points at is gone (expired, deleted): start over from the newest page.
+            history.restart()
+            olderState = .idle
+            try? await refreshMessages(in: id)
+        } catch {
+            olderState = .failed
+        }
+    }
+
+    /// Removes messages whose timer ran out, and their decoded photos.
+    private func pruneExpired() async {
+        let now = Date.now
+        let expired = messages.filter { ThreadHistory.hasExpired($0, at: now) }
+        history.pruneExpired(now: now)
+        await evictPhotos(of: expired)
+    }
+
+    private func evictPhotos(of removed: [Message]) async {
+        for message in removed where message.attachment != nil {
+            await ChatMediaLoader.shared.evict(message.id)
+        }
+    }
+
+    /// Only the listing gives the recipient a view-once URL: none means it's spent.
+    private func noteSpentViewOnce(in items: [Message]) {
+        let myID = appState.myID
+        spentViewOnceIDs.formUnion(items.filter {
+            $0.senderID != myID && $0.attachment?.isViewOnce == true && $0.attachment?.url == nil
+        }.map(\.id))
+    }
+
+    private func toggleMute() async {
+        guard let id = conversation?.id else { return }
+        let target = !isMuted
+        conversation?.isMuted = target
+        if await chatStore.setMuted(target, conversationID: id) {
+            sendNotice = nil
+        } else {
+            conversation?.isMuted = !target
+            sendNotice = target
+                ? String(localized: "Couldn't mute this chat. Try again in a moment.")
+                : String(localized: "Couldn't unmute this chat. Try again in a moment.")
+        }
+    }
+
+    /// A view-once photo (encrypted or plaintext) was tapped. Realtime
+    /// events don't carry its URL, so the thread is refetched first if
+    /// needed; if the server no longer has it, the bubble turns into "no
+    /// longer available" instead. Listing doesn't open it: the viewer does,
+    /// once the photo is on screen (`markViewOnceOpened`).
     private func openViewOnce(_ message: Message) async {
+        guard !chatStore.hasOpenedViewOnce(message.id), !message.isViewOnceOpened else { return }
         var target = message
         if target.attachment?.url == nil, let id = conversation?.id {
             try? await refreshMessages(in: id)
             target = messages.first { $0.id == message.id } ?? target
         }
-        guard target.e2eAttachment != nil, target.attachment?.url != nil else { return }
+        guard target.attachment?.url != nil, !target.isViewOnceOpened else { return }
+        if target.attachment?.isEncrypted == true, target.e2eAttachment == nil { return }
         viewOnceMessage = target
     }
 
-    /// The viewer closed: the photo is done on this phone. Its key is
-    /// forgotten (unless a network error kept it from showing at all) and
-    /// the bubble says "Opened" (or "no longer available").
-    private func closeViewOnce(_ message: Message, outcome: ChatMediaLoader.Outcome?) async {
+    #if DEBUG
+    /// Screenshot-only (`ScreenshotRoute`).
+    private func runScreenshotHooks() async {
+        // Open the report sheet from a chat.
+        if let route = ScreenshotRoute.current, [.reportFromChat, .reportPicker, .reportSent].contains(route) {
+            isReporting = true
+        }
+        guard conversation != nil else { return }
+        // Send a message (a live dev-server chat, or the mock with a forced failure).
+        if let text = ScreenshotRoute.draft {
+            draft = text
+            send()
+        }
+        if let timer = ScreenshotRoute.photoTimer {
+            photoTimer = timer
+        }
+        if ScreenshotRoute.current == .liveChat {
+            await runViewOnceScreenshotHooks()
+        }
+    }
+
+    /// Screenshot-only: send a generated view-once photo, or open the
+    /// newest incoming one the way a tap would.
+    private func runViewOnceScreenshotHooks() async {
+        if ScreenshotRoute.sendsViewOncePhoto, let conversation, let jpeg = ScreenshotRoute.samplePhotoJPEG() {
+            photoTimer = .viewOnce
+            var pending = Message.pending(from: MessageDraft(clientID: UUID().uuidString), conversationID: conversation.id, senderID: appState.myID)
+            pending.attachment = Message.Attachment(kind: .photo, url: nil, isViewOnce: true)
+            messages.append(pending)
+            deliverPhoto(jpeg, clientID: pending.clientID ?? pending.id, pendingID: pending.id, timer: .viewOnce, in: conversation)
+        }
+        guard let action = ScreenshotRoute.viewOnceAction,
+              let target = messages.last(where: { $0.senderID != appState.myID && $0.attachment?.isViewOnce == true })
+        else { return }
+        await openViewOnce(target)
+        guard action == .openAndClose else { return }
+        for _ in 0..<50 where !chatStore.hasOpenedViewOnce(target.id) {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        try? await Task.sleep(for: .seconds(1))
+        viewOnceMessage = nil
+    }
+    #endif
+
+    /// The viewer shows the photo: it's opened. The server is told (and
+    /// deletes it shortly); for an encrypted photo the key goes as soon as
+    /// the server confirms. The bubble says "Opened" from now on.
+    private func markViewOnceOpened(_ message: Message) {
+        guard let conversationID = conversation?.id else { return }
+        Task {
+            guard let opened = await chatStore.openViewOnce(message.id, in: conversationID),
+                  let index = messages.firstIndex(where: { $0.id == opened.id })
+            else { return }
+            messages[index] = ChatStore.updating(messages[index], with: opened)
+        }
+    }
+
+    /// The viewer closed: if the photo was opened, it's done on this phone.
+    /// An encrypted photo's key is forgotten (also when the server call
+    /// failed) and the bubble says "Opened"; a photo the server no longer
+    /// has says "no longer available". A network error or a photo still
+    /// blurred leaves it unopened, to try again.
+    private func closeViewOnce(_ message: Message, outcome: ChatMediaLoader.Outcome?, opened: Bool) async {
         let removal: Message.AttachmentRemoval
-        switch outcome {
-        case .image?, .tampered?, .unreadable?: removal = .opened
-        case .gone?: removal = .gone
-        case .failed?, nil: return
+        if opened {
+            removal = .opened
+        } else if case .gone? = outcome {
+            removal = .gone
+        } else {
+            return
         }
         await ChatMediaLoader.shared.evict(message.id)
-        await e2e.forgetAttachmentKey(messageID: message.id, gone: removal == .gone)
-        if let index = messages.firstIndex(where: { $0.id == message.id }) {
+        guard let index = messages.firstIndex(where: { $0.id == message.id }) else { return }
+        if messages[index].attachment?.isEncrypted == true {
+            await e2e.forgetAttachmentKey(messageID: message.id, gone: removal == .gone)
+            guard let index = messages.firstIndex(where: { $0.id == message.id }) else { return }
             messages[index].e2eAttachment = nil
             messages[index].e2eAttachmentRemoval = removal
+        } else if removal == .gone {
+            spentViewOnceIDs.insert(message.id)
         }
     }
 
@@ -453,102 +710,131 @@ struct ChatThreadView: View {
         deliver(messageDraft, pendingID: pending.id, in: conversation)
     }
 
+    private func failure(for message: Message) -> SendFailure {
+        failures[message.bubbleKey] ?? SendFailure(kind: .other, reason: String(localized: "Not sent."))
+    }
+
+    /// A failed photo can only be retried while its JPEG is still in memory.
+    private func canRetry(_ message: Message) -> Bool {
+        guard message.status == .failed, failure(for: message).canRetry else { return false }
+        if message.attachment != nil {
+            return message.clientID.map { chatStore.hasPendingPhoto(clientID: $0) } ?? false
+        }
+        return true
+    }
+
     /// Re-sends a failed message with the same client ID, so the server can
-    /// deduplicate if the first attempt actually arrived.
+    /// deduplicate if the first attempt actually arrived. A photo goes again
+    /// with the timer it was first sent with.
     private func retry(_ message: Message) {
-        guard let conversation, let clientID = message.clientID,
+        guard message.status == .failed, let conversation, let clientID = message.clientID,
               let index = messages.firstIndex(where: { $0.id == message.id })
         else { return }
+        failures[message.bubbleKey] = nil
         messages[index].status = .sending
         if message.attachment != nil {
-            deliverPhoto(nil, clientID: clientID, pendingID: message.id, in: conversation)
+            deliverPhoto(nil, clientID: clientID, pendingID: message.id, timer: nil, in: conversation)
             return
         }
         deliver(MessageDraft(clientID: clientID, text: message.text), pendingID: message.id, in: conversation)
     }
 
+    /// Removes a failed message from this phone and forgets its photo.
+    ///
+    /// When the send may have arrived anyway (a timeout, a dropped
+    /// connection: `SendFailure.mayHaveSent`), the newest page is checked
+    /// first. If the server has it (same client ID), the bubble turns into
+    /// the sent message and stays, with a note: removing it here wouldn't
+    /// unsend it. If the check can't reach the server either, it's removed
+    /// from this phone, which is all the button promises.
+    private func deleteFailed(_ message: Message) {
+        guard message.status == .failed else { return }
+        guard failure(for: message).mayHaveSent, let id = conversation?.id else {
+            removeFailed(message)
+            return
+        }
+        Task {
+            try? await refreshMessages(in: id)
+            if ThreadHistory.deliveredCopy(of: message, in: messages) != nil {
+                failures[message.bubbleKey] = nil
+                if let clientID = message.clientID { chatStore.discardPendingPhoto(clientID: clientID) }
+                sendNotice = String(localized: "That message was sent after all, so it stays in the chat.")
+            } else if messages.contains(where: { $0.id == message.id && $0.status == .failed }) {
+                removeFailed(message)
+            }
+        }
+    }
+
+    private func removeFailed(_ message: Message) {
+        failures[message.bubbleKey] = nil
+        messages.removeAll { $0.id == message.id }
+        if let clientID = message.clientID { chatStore.discardPendingPhoto(clientID: clientID) }
+    }
+
     /// Photo messages: metadata is stripped on device (`ImageSanitizer`),
-    /// then the photo is uploaded and sent as `attachmentPhotoID`.
+    /// then the photo is uploaded and sent as `attachmentPhotoID`, with the
+    /// timer chosen now.
     private func sendPhoto(_ item: PhotosPickerItem) async {
         guard let conversation,
               let data = try? await item.loadTransferable(type: Data.self),
               let jpeg = ImageSanitizer.strippedJPEG(from: data)
         else { return }
+        let timer = photoTimer
         var pending = Message.pending(
             from: MessageDraft(clientID: UUID().uuidString),
             conversationID: conversation.id,
             senderID: appState.myID
         )
-        pending.attachment = Message.Attachment(kind: .photo, url: nil)
+        pending.attachment = Message.Attachment(kind: .photo, url: nil, isViewOnce: timer.isViewOnce)
         landingKeys.insert(pending.bubbleKey)
         sendCount += 1
         messages.append(pending)
-        deliverPhoto(jpeg, clientID: pending.clientID ?? pending.id, pendingID: pending.id, in: conversation)
+        deliverPhoto(jpeg, clientID: pending.clientID ?? pending.id, pendingID: pending.id, timer: timer, in: conversation)
     }
 
-    private func deliverPhoto(_ jpeg: Data?, clientID: String, pendingID: Message.ID, in conversation: Conversation) {
-        let expiresAfter = expiresPhotos ? Self.expiringPhotoSeconds : nil
+    /// `timer` is nil on a retry: the store reuses the first attempt's.
+    private func deliverPhoto(_ jpeg: Data?, clientID: String, pendingID: Message.ID, timer: PhotoTimer?, in conversation: Conversation) {
         Task {
             do {
                 let sent = try await chatStore.sendPhoto(
                     jpegData: jpeg,
                     clientID: clientID,
-                    expiresAfterSeconds: expiresAfter,
+                    timer: timer,
                     in: conversation
                 )
                 if let index = messages.firstIndex(where: { $0.id == pendingID }) {
+                    failures[messages[index].bubbleKey] = nil
                     messages[index] = sent
                 }
             } catch {
-                if let index = messages.firstIndex(where: { $0.id == pendingID }) {
-                    messages[index].status = .failed
-                }
-                sendNotice = Self.notice(for: error)
+                markFailed(pendingID, error: error)
             }
         }
     }
-
-    /// How long an expiring photo stays after it's been read.
-    private static let expiringPhotoSeconds = 60
 
     private func deliver(_ messageDraft: MessageDraft, pendingID: Message.ID, in conversation: Conversation) {
         Task {
             do {
                 let sent = try await api.send(messageDraft, in: conversation.id)
                 if let index = messages.firstIndex(where: { $0.id == pendingID }) {
+                    failures[messages[index].bubbleKey] = nil
                     messages[index] = sent
                 } else if let index = messages.firstIndex(where: { $0.id == sent.id }) {
                     // The realtime echo arrived first and replaced the pending copy.
                     messages[index] = sent
                 }
                 chatStore.didSend(sent, in: conversation)
-                sendNotice = nil
             } catch {
-                if let index = messages.firstIndex(where: { $0.id == pendingID }) {
-                    messages[index].status = .failed
-                }
-                sendNotice = Self.notice(for: error)
+                markFailed(pendingID, error: error)
             }
         }
     }
 
-    /// The server's explanation for a refused send (429 or a 403 anti-spam
-    /// limit), the app's own for encryption and the in-app text rules, or nil
-    /// for plain failures, which the bubble already shows.
-    static func notice(for error: any Error) -> String? {
-        if error is E2EError || error is E2EContentRules.Violation {
-            return error.localizedDescription
-        }
-        switch error as? APIError {
-        case .rateLimited?:
-            return error.localizedDescription
-        case .server(let status, let message?)? where status == 403 || status == 400:
-            return message
-        case .e2e(let code, _)? where code == E2EErrorCode.encryptionRequired:
-            return error.localizedDescription
-        default:
-            return nil
-        }
+    /// The bubble turns into a failed one with the reason, Retry and Delete.
+    private func markFailed(_ pendingID: Message.ID, error: any Error) {
+        guard let index = messages.firstIndex(where: { $0.id == pendingID }) else { return }
+        messages[index].status = .failed
+        failures[messages[index].bubbleKey] = SendFailure(error)
     }
 
     /// The user accepted the new key: messages held back by it decrypt on the refetch.
@@ -581,9 +867,114 @@ struct ChatThreadView: View {
     }
 }
 
+/// The thread's "•••" menu: mute (just for you), then the safety actions.
+private struct ThreadMenu: View {
+    let profile: Profile
+    let isMuted: Bool
+    let canMute: Bool
+    var onToggleMute: () -> Void
+    var onBlock: () -> Void
+    var onReport: () -> Void
+
+    var body: some View {
+        Menu {
+            Button(action: onToggleMute) {
+                if isMuted {
+                    Label("Unmute", systemImage: "bell")
+                } else {
+                    Label("Mute", systemImage: "bell.slash")
+                }
+            }
+            .disabled(!canMute)
+            Divider()
+            Button(role: .destructive, action: onBlock) {
+                Label("Block \(profile.displayName)", systemImage: "hand.raised.fill")
+            }
+            Button(action: onReport) {
+                Label("Report", systemImage: "exclamationmark.bubble.fill")
+            }
+        } label: {
+            Label("Chat options", systemImage: "ellipsis")
+        }
+        .accessibilityValue(isMuted ? Text("Muted") : Text(verbatim: ""))
+    }
+}
+
+/// The top of a thread with older history: loads on its own as you scroll
+/// near it; the button is for VoiceOver and Switch Control, and Retry after
+/// a failure.
+private struct OlderMessagesRow: View {
+    let state: ChatThreadView.OlderPageState
+    let load: () -> Void
+
+    var body: some View {
+        Group {
+            switch state {
+            case .loading:
+                HStack(spacing: Theme.Spacing.s) {
+                    ProgressView().tint(Theme.steel)
+                    Text("Loading earlier messages")
+                        .stexxLabelStyle(.micro, color: Theme.slate)
+                }
+                .accessibilityElement(children: .combine)
+            case .failed:
+                VStack(spacing: Theme.Spacing.xs) {
+                    Text("Couldn't load earlier messages.")
+                        .font(.stexxSub)
+                        .foregroundStyle(Theme.steel)
+                        .multilineTextAlignment(.center)
+                    Button("Retry", action: load)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.ice)
+                        .frame(minHeight: 44)
+                        .accessibilityLabel("Retry loading earlier messages")
+                }
+            case .idle:
+                Button(action: load) {
+                    Label("Earlier messages", systemImage: "arrow.up")
+                        .stexxLabelStyle(.micro, color: Theme.slate)
+                        .frame(minHeight: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Load earlier messages")
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, Theme.Spacing.s)
+    }
+}
+
+/// The thread couldn't load: why, and Retry.
+private struct ThreadLoadErrorView: View {
+    let message: String
+    let retry: () -> Void
+
+    var body: some View {
+        VStack(spacing: Theme.Spacing.m) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.title2.weight(.light))
+                .foregroundStyle(Theme.steel)
+                .accessibilityHidden(true)
+            Text(message)
+                .font(.stexxSub)
+                .foregroundStyle(Theme.frost)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            GlassChip("Retry", systemImage: "arrow.clockwise", isSelected: true, action: retry)
+                .accessibilityRemoveTraits(.isSelected)
+        }
+        .padding(.top, 80)
+        .padding(.horizontal, Theme.Spacing.xl)
+        .frame(maxWidth: .infinity)
+    }
+}
+
 /// A chat bubble. Own messages are frost with ink text; theirs are flat
 /// ink1 with a 0.5pt line. Radius 14, with a 4pt tail corner on the last
 /// bubble of a run; bubbles in a run tuck their inner corners together.
+///
+/// VoiceOver reads one element per bubble (`MessageAccessibility`): sender,
+/// content or photo kind and timer, time, and for my own messages the status.
 struct MessageBubble: View {
     let message: Message
     let isMine: Bool
@@ -600,10 +991,17 @@ struct MessageBubble: View {
     var showsReadReceipt = true
     /// A plaintext view-once photo the server no longer gives a URL for.
     var isViewOnceSpent = false
+    /// A view-once photo opened on this phone (before the server confirms).
+    var isViewOnceOpenedHere = false
     /// A blurred incoming photo the user tapped to see.
     var isPhotoRevealed = false
+    /// Why a failed message wasn't sent (`status == .failed`).
+    var failure: SendFailure?
+    var canRetry = true
     var onRevealPhoto: () -> Void = {}
     var onOpenViewOnce: () -> Void = {}
+    var onRetry: () -> Void = {}
+    var onDelete: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 4) {
@@ -612,6 +1010,8 @@ struct MessageBubble: View {
                     .stexxLabelStyle(.micro, color: Theme.slate)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, Theme.Spacing.m)
+                    // Each bubble reads its own time.
+                    .accessibilityHidden(true)
             }
 
             HStack(alignment: .bottom, spacing: 6) {
@@ -626,20 +1026,18 @@ struct MessageBubble: View {
                         Text(text)
                             .font(.stexxBody)
                             .foregroundStyle(isMine ? Theme.ink : Theme.frost)
+                            .fixedSize(horizontal: false, vertical: true)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
                             .background { bubbleBackground }
-                            .opacity(message.status == .sending ? 0.7 : 1)
+                            .opacity(message.status == .sending || message.status == .failed ? 0.7 : 1)
                     } else if let placeholder = encryptedPlaceholder {
                         UnreadableMessageBubble(text: placeholder, systemImage: placeholderIcon, shape: bubbleShape)
                     }
-                    if isMine, let status = statusText {
+                    if isMine, message.status != .failed, let status = statusText {
                         HStack(spacing: 4) {
                             if message.status == .read {
                                 Image(systemName: "checkmark")
-                                    .accessibilityHidden(true)
-                            } else if message.status == .failed {
-                                Image(systemName: "exclamationmark.circle")
                                     .accessibilityHidden(true)
                             }
                             Text(status)
@@ -649,11 +1047,60 @@ struct MessageBubble: View {
                         .padding(.top, 2)
                     }
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(accessibilityLabel))
+                .accessibilityActions {
+                    if message.status == .failed {
+                        if canRetry { Button("Retry", action: onRetry) }
+                        Button(FailedSendRow.removeLabel(mayHaveSent: failure?.mayHaveSent == true), action: onDelete)
+                    }
+                }
 
                 if !isMine { Spacer(minLength: 56) }
             }
+
+            if isMine, message.status == .failed {
+                FailedSendRow(
+                    reason: failure?.reason ?? String(localized: "Not sent."),
+                    mayHaveSent: failure?.mayHaveSent == true,
+                    canRetry: canRetry,
+                    onRetry: onRetry,
+                    onDelete: onDelete
+                )
+            }
         }
-        .accessibilityElement(children: .combine)
+    }
+
+    private var accessibilityLabel: String {
+        MessageAccessibility.label(
+            for: message,
+            isMine: isMine,
+            senderName: senderName,
+            photo: message.attachment == nil ? nil : photoState,
+            placeholder: encryptedPlaceholder
+        )
+    }
+
+    /// What the photo tile shows, for VoiceOver.
+    private var photoState: MessageAccessibility.PhotoState {
+        guard let attachment = message.attachment else { return .visible }
+        if attachment.isEncrypted {
+            switch EncryptedPhotoContent.of(message, isMine: isMine) {
+            case .load: return .visible
+            case .viewOnce: return .viewOnceClosed
+            case .opened: return .viewOnceOpened
+            case .gone: return .gone
+            case .unavailable, .awaitingKey, .unsupported: return .unavailable
+            }
+        }
+        if attachment.isViewOnce {
+            switch viewOnceTile(attachment) {
+            case .closed: return .viewOnceClosed
+            case .opened: return .viewOnceOpened
+            case .gone: return .gone
+            }
+        }
+        return attachment.url == nil && message.status != .sending && message.status != .failed ? .gone : .visible
     }
 
     private var bubbleShape: UnevenRoundedRectangle {
@@ -717,7 +1164,7 @@ struct MessageBubble: View {
     private var statusText: LocalizedStringKey? {
         switch message.status {
         case .sending: return "Sending…"
-        case .failed: return "Not sent. Tap to retry."
+        case .failed: return nil
         case .read: return showsReadReceipt ? "Read" : nil
         case .sent, .delivered: return nil
         }
@@ -747,21 +1194,74 @@ struct MessageBubble: View {
         }
     }
 
+    /// What a plaintext view-once photo's tile says.
+    private enum ViewOnceTile {
+        case closed(canOpen: Bool), opened, gone
+    }
+
+    private func viewOnceTile(_ attachment: Message.Attachment) -> ViewOnceTile {
+        // The sender learns of the open only if the recipient sends read receipts.
+        if isMine { return attachment.openedAt != nil ? .opened : .closed(canOpen: false) }
+        if attachment.openedAt != nil || isViewOnceOpenedHere { return .opened }
+        if isViewOnceSpent { return .gone }
+        return .closed(canOpen: message.status != .sending)
+    }
+
+    @ViewBuilder
     private func plaintextAttachmentView(_ attachment: Message.Attachment) -> some View {
+        if attachment.isViewOnce {
+            plaintextViewOnceTile(viewOnceTile(attachment))
+        } else {
+            plaintextPhotoTile(attachment)
+        }
+    }
+
+    /// A plaintext view-once photo is never fetched in the bubble: only the
+    /// full-screen viewer loads it, and showing it there opens it.
+    private func plaintextViewOnceTile(_ tile: ViewOnceTile) -> some View {
         let shape = RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
-        let isOpened = !isMine && attachment.isViewOnce && isViewOnceSpent
+        return ZStack {
+            Theme.ink1
+            switch tile {
+            case .closed(let canOpen):
+                PhotoTileNotice(systemImage: "eye.slash", title: "View once", detail: canOpen ? "Tap to open" : nil)
+                    .accessibilityAddTraits(canOpen ? .isButton : [])
+            case .opened:
+                PhotoTileNotice(systemImage: "checkmark.circle", title: "Opened")
+            case .gone:
+                PhotoTileNotice(systemImage: "hourglass", detail: "Photo no longer available")
+            }
+            if message.status == .sending {
+                ProgressView()
+                    .tint(Theme.frost)
+            }
+        }
+        .frame(width: 180, height: 220)
+        .clipShape(shape)
+        .hairlineBorder(shape)
+        .contentShape(shape)
+        .onTapGesture {
+            if case .closed(canOpen: true) = tile { onOpenViewOnce() }
+        }
+        .accessibilityActions {
+            if case .closed(canOpen: true) = tile {
+                Button("Open view-once photo", action: onOpenViewOnce)
+            }
+        }
+    }
+
+    private func plaintextPhotoTile(_ attachment: Message.Attachment) -> some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
         return ZStack {
             Theme.ink1
             VStack(spacing: 6) {
-                Image(systemName: isOpened ? "checkmark.circle" : attachment.isViewOnce ? "eye.slash" : "photo")
+                Image(systemName: "photo")
                     .font(.title2.weight(.light))
-                Text(isOpened ? "Opened" : attachment.isViewOnce ? "View once" : "Photo")
+                Text("Photo")
                     .stexxLabelStyle(.micro, color: Theme.steel)
             }
             .foregroundStyle(Theme.steel)
-            // View-once photos aren't fetched automatically: the first fetch
-            // counts as opening them.
-            if let url = attachment.url, !attachment.isViewOnce {
+            if let url = attachment.url {
                 // Never through the shared URL cache: no copy on disk.
                 PrivateAsyncImage(url: url) { image in
                     image.resizable().scaledToFill()
@@ -777,6 +1277,71 @@ struct MessageBubble: View {
         .frame(width: 180, height: 220)
         .clipShape(shape)
         .hairlineBorder(shape)
+    }
+}
+
+/// Under a failed bubble of mine: why it wasn't sent, then Retry and
+/// Delete. When the send may have arrived anyway (`SendFailure.mayHaveSent`)
+/// Delete says "Remove": it can't unsend anything, only clear this phone.
+private struct FailedSendRow: View {
+    let reason: String
+    let mayHaveSent: Bool
+    let canRetry: Bool
+    let onRetry: () -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(Theme.danger)
+                    .accessibilityHidden(true)
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(Theme.steel)
+                    .multilineTextAlignment(.trailing)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(Text(mayHaveSent ? reason : String(localized: "Not sent. \(reason)")))
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: Theme.Spacing.m) { buttons }
+                VStack(alignment: .trailing, spacing: 0) { buttons }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.leading, 56)
+        .padding(.trailing, 2)
+    }
+
+    @ViewBuilder
+    private var buttons: some View {
+        if canRetry {
+            Button(action: onRetry) {
+                Text("Retry")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.ice)
+                    .frame(minHeight: 44)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Retry sending")
+        }
+        Button(role: .destructive, action: onDelete) {
+            Text(mayHaveSent ? "Remove" : "Delete")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.danger)
+                .frame(minHeight: 44)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Self.removeLabel(mayHaveSent: mayHaveSent))
+    }
+
+    /// VoiceOver's name for Delete / Remove.
+    static func removeLabel(mayHaveSent: Bool) -> String {
+        mayHaveSent ? String(localized: "Remove from this phone") : String(localized: "Delete unsent message")
     }
 }
 
@@ -810,11 +1375,6 @@ private struct BubbleLanding: ViewModifier {
     }
 }
 
-fileprivate extension Message {
-    /// Stable identity across the optimistic → sent swap (the server's copy
-    /// gets a new `id` but keeps the client ID).
-    var bubbleKey: String { "\(senderID)|\(clientID ?? id)" }
-}
 
 #Preview {
     NavigationStack {
