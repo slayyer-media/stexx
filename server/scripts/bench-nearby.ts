@@ -37,7 +37,9 @@ const PAGES = Math.max(1, num("pages", 1));
 const LIMIT = Math.min(100, Math.max(1, num("limit", 50)));
 
 const url = process.env.TEST_DATABASE_URL ?? "postgres://stexx:stexx@127.0.0.1:55433/stexx_test";
-if (!/_test\b/.test(url)) throw new Error("TEST_DATABASE_URL must point at a *_test database");
+// Check the database name itself, not the whole URL (a "_test" in a host, user or query must not pass).
+const dbName = (() => { try { return decodeURIComponent(new URL(url).pathname.replace(/^\//, "")); } catch { return ""; } })();
+if (!/_test$/.test(dbName)) throw new Error("TEST_DATABASE_URL must point at a *_test database");
 // src/config.ts reads DATABASE_URL at import time; the app's shared client is only used for nothing here.
 process.env.DATABASE_URL = url;
 
