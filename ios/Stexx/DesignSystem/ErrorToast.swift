@@ -26,11 +26,11 @@ enum UserFacingError {
             switch apiError {
             case .rateLimited(let retryAfter):
                 return rateLimitedMessage(retryAfter: retryAfter)
-            case .requiresPlus, .server(status: 402, message: _):
+            case .requiresPlus, .server(status: 402, message: _, code: _):
                 return String(localized: "This is part of Stexx+.")
-            case .server(status: 403, message: let message?) where !message.isEmpty:
+            case .server(status: 403, message: let message?, code: _) where !message.isEmpty:
                 return message
-            case .server(status: 403, message: _):
+            case .server(status: 403, message: _, code: _):
                 return String(localized: "You can't do that right now.")
             case .unauthorized:
                 return String(localized: "Your session expired. Please sign in again.")

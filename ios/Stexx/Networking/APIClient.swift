@@ -74,6 +74,10 @@ protocol APIClient: PasskeyAPI {
     /// default uploads it as a plaintext attachment; `E2EAPIClient` encrypts
     /// it when the chat is end-to-end encrypted.
     func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message
+    /// The user removed a failed photo send (`clientID`) for good: drop
+    /// anything kept to retry it. Only `E2EAPIClient` keeps something (the
+    /// encrypted blob and its key).
+    func discardUnsentPhoto(clientID: String) async
     func markRead(conversationID: Conversation.ID) async throws
     /// `POST /conversations/{id}/messages/{messageID}/open`: the recipient
     /// is looking at a view-once photo. The server deletes it about 30 s
@@ -81,6 +85,9 @@ protocol APIClient: PasskeyAPI {
     /// (and the URL while the file still exists). 404 for anyone but the
     /// recipient.
     func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message
+    /// `PUT` (mute) or `DELETE` (unmute) `/conversations/{id}/mute`: for
+    /// this user only; the other person is never told. Idempotent.
+    func setMuted(_ isMuted: Bool, conversationID: Conversation.ID) async throws
     func deleteConversation(_ conversationID: Conversation.ID) async throws
 
     // MARK: End-to-end encryption (`docs/api.md`)
@@ -138,6 +145,9 @@ extension APIClient {
         wire.attachmentPhotoID = upload.id
         return try await send(wire, in: conversationID)
     }
+
+    /// Nothing is kept for a plaintext photo outside `ChatStore`.
+    func discardUnsentPhoto(clientID: String) async {}
 }
 
 enum APIError: LocalizedError, Equatable, Sendable {
@@ -146,7 +156,9 @@ enum APIError: LocalizedError, Equatable, Sendable {
     case requiresPlus
     /// 429. `retryAfter` is the server's `Retry-After`, in seconds, when sent.
     case rateLimited(retryAfter: TimeInterval?)
-    case server(status: Int, message: String?)
+    /// Any other refusal. `code` is the server's error code
+    /// (`new_account_limit`, `links_not_allowed`, …) when it sent one.
+    case server(status: Int, message: String?, code: String? = nil)
     /// An end-to-end encryption answer the app acts on (`E2EErrorCode`):
     /// `e2e_disabled`, `keys_unavailable`, `encryption_required`, ….
     case e2e(code: String, message: String?)
@@ -158,7 +170,7 @@ enum APIError: LocalizedError, Equatable, Sendable {
         case .notFound: String(localized: "That profile or conversation no longer exists.")
         case .requiresPlus: String(localized: "This feature is part of Stexx+.")
         case .rateLimited(let retryAfter): Self.rateLimitedMessage(retryAfter: retryAfter)
-        case .server(_, let message): message ?? String(localized: "Something went wrong on our side.")
+        case .server(_, let message, _): message ?? String(localized: "Something went wrong on our side.")
         case .e2e(let code, let message):
             code == E2EErrorCode.encryptionRequired
                 ? String(localized: "Update Stexx to keep chatting.")

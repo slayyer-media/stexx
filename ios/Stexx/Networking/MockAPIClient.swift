@@ -446,6 +446,11 @@ actor MockAPIClient: APIClient {
 
     func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message> {
         try await pause()
+        #if DEBUG
+        if before != nil, ScreenshotRoute.mockOlderPageDelay > 0 {
+            try await Task.sleep(for: .seconds(ScreenshotRoute.mockOlderPageDelay))
+        }
+        #endif
         guard let all = messageStore[conversationID] else { throw APIError.notFound }
         let upper = before.flatMap { id in all.firstIndex { $0.id == id } } ?? all.count
         let lower = max(0, upper - 50)
@@ -457,6 +462,9 @@ actor MockAPIClient: APIClient {
         guard var conversation = conversationStore[conversationID] else { throw APIError.notFound }
         if blocked.contains(conversation.participant.id) { throw APIError.notFound }
 
+        #if DEBUG
+        if let failure = ScreenshotRoute.mockSendFailure { throw Self.screenshotSendFailure(failure) }
+        #endif
         // Idempotency: resending the same draft returns the original message.
         if let existing = messageStore[conversationID]?.first(where: { $0.clientID == draft.clientID }) {
             return existing
@@ -496,6 +504,15 @@ actor MockAPIClient: APIClient {
 
     func markRead(conversationID: Conversation.ID) async throws {
         conversationStore[conversationID]?.unreadCount = 0
+    }
+
+    /// Like the server: idempotent, 404 for an unknown or blocked thread.
+    func setMuted(_ isMuted: Bool, conversationID: Conversation.ID) async throws {
+        try await pause()
+        guard let conversation = conversationStore[conversationID],
+              !blocked.contains(conversation.participant.id)
+        else { throw APIError.notFound }
+        conversationStore[conversationID]?.isMuted = isMuted
     }
 
     /// Like the server: only the recipient of a view-once photo, idempotent,
@@ -626,6 +643,22 @@ actor MockAPIClient: APIClient {
     }
 
     // MARK: Helpers
+
+    #if DEBUG
+    /// The refusals a real server sends (`docs/api.md`), for screenshots.
+    private static func screenshotSendFailure(_ kind: String) -> any Error {
+        switch kind {
+        case "rateLimited": APIError.rateLimited(retryAfter: 120)
+        case "newAccountLimit":
+            APIError.server(status: 403, message: "New accounts can start 3 new chats a day. You can keep chatting with people who've replied.", code: "new_account_limit")
+        case "linksNotAllowed":
+            APIError.server(status: 403, message: "New accounts can't send links yet. Try again in a day or so.", code: "links_not_allowed")
+        case "underReview":
+            APIError.server(status: 403, message: "Your account is being reviewed by our moderators. Until then you can keep chatting with people who've written to you, but you can't start new chats.", code: "account_under_review")
+        default: URLError(.notConnectedToInternet)
+        }
+    }
+    #endif
 
     private func pause(_ function: String = #function) async throws {
         try await Task.sleep(for: latency)

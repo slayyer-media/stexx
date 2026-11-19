@@ -106,6 +106,20 @@ struct ChatStoreTapsTests {
         #expect(store.unreadTotal == messages)
     }
 
+    @Test("The Chats badge is unmuted chats' unread plus new taps; muting a chat keeps its sender's tap counted")
+    func badgeWithMutedChat() async throws {
+        let store = await loadedStore()
+        let chat = try #require(store.conversations.first { $0.unreadCount > 0 && !$0.isMuted })
+        let before = store.unreadTotal
+        #expect(await store.setMuted(true, conversationID: chat.id))
+        #expect(store.unreadTotal == before - chat.unreadCount)
+        store.apply(.tapReceived(RealtimeEvent.Tap(from: chat.participant, sentAt: .now)), myID: MockData.myID)
+        let expected = store.conversations.reduce(0) { $0 + ($1.isMuted ? 0 : $1.unreadCount) } + store.tapsUnseen
+        #expect(store.unreadTotal == expected)
+        #expect(store.taps.contains { $0.id == chat.participant.id && $0.isNew })
+        #expect(store.tapsUnseen > 0)
+    }
+
     @Test("A live tap from someone new goes on top and raises the count")
     func liveTapFromNewSender() async throws {
         let store = await loadedStore()

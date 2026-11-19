@@ -154,7 +154,7 @@ private extension APIError {
     var isRejectedCredential: Bool {
         switch self {
         case .unauthorized, .notFound: true
-        case .server(let status, _): status == 400 || status == 403
+        case .server(let status, _, _): status == 400 || status == 403
         default: false
         }
     }

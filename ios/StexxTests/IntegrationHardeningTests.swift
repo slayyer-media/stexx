@@ -389,7 +389,7 @@ struct ChatStoreHardeningTests {
         }, defaults: defaults)
         let conversation = Conversation(id: "c1", participant: MockData.profiles[0], lastMessage: nil, unreadCount: 0, updatedAt: .now)
 
-        let message = try await store.sendPhoto(jpegData: Data([0xFF, 0xD8]), clientID: "client-1", expiresAfterSeconds: nil, in: conversation)
+        let message = try await store.sendPhoto(jpegData: Data([0xFF, 0xD8]), clientID: "client-1", timer: .keep, in: conversation)
         #expect(message.id == "m1")
         #expect(await log.count("POST /v1/me/photos") == 0)
         #expect(await log.count("DELETE /v1/me/photos/ph1") == 0)
@@ -403,7 +403,7 @@ struct ChatStoreHardeningTests {
         let conversation = try await api.openConversation(with: "p03")
         let before = try await api.fetchMe().photos
 
-        let message = try await store.sendPhoto(jpegData: Data([0xFF, 0xD8, 0xFF]), clientID: "photo-x", expiresAfterSeconds: 60, in: conversation)
+        let message = try await store.sendPhoto(jpegData: Data([0xFF, 0xD8, 0xFF]), clientID: "photo-x", timer: .oneMinute, in: conversation)
         #expect(message.attachment?.kind == .photo)
         #expect(try await api.fetchMe().photos == before)
     }

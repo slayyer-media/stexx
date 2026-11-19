@@ -157,6 +157,55 @@ Tests: `StexxTests/EmailSignInTests.swift` (wire format, error mapping, the
 send/resend/code state machine with a test clock, link handling, the mock)
 and `EmailSignInLinkTests.swift` (URL parsing).
 
+## Chat
+
+- **History.** A thread opens on its newest 50 messages
+  (`GET …/messages`). Scrolling near the top loads the page before
+  (`before` = the oldest message shown), and the message you were reading
+  stays where it was (`ThreadHistory`). Only a scroll you make starts that,
+  never the first layout; the "Earlier messages" button at the top does the
+  same for VoiceOver and Switch Control, and turns into Retry if a page
+  fails. Loaded pages survive a resync (the socket reconnecting refetches
+  only the newest page), minus anything whose timer has run out: an open
+  thread drops a timed message at its `expiresAt` (when the server deletes
+  it), with its decoded photo, without waiting for a refetch. Encrypted messages need nothing extra: every page
+  goes through `E2EAPIClient`, so messages decrypted or sent on this phone
+  come from its local history and older ones (before a reinstall) show the
+  usual "not available on this phone" placeholder. If the thread can't load
+  at all, it says so with Retry.
+- **Mute.** Mute / Unmute in the thread's ••• menu and the chat list's swipe
+  actions (`PUT`/`DELETE /conversations/{id}/mute`). It's yours alone: the
+  other person never knows. A muted chat keeps its unread count in the
+  list (an outlined badge, a bell-slash after the name) but stays out of the
+  tab badge and the list's "new" total. The Chats tab badge
+  (`ChatStore.unreadTotal`) is the unread messages of unmuted chats plus
+  new taps; muting a chat never hides taps from its person.
+- **Photo timer.** The + menu picks what happens to photos you send: Keep,
+  View once, or gone 10 seconds / 1 minute / 1 hour / 1 day after they're
+  read (`PhotoTimer`). It starts at 1 minute if "expiring photos by default"
+  is on, otherwise Keep, and works the same for plaintext and encrypted
+  photos. A retry reuses the timer the photo was first sent with.
+- **Failed sends.** A message or photo that doesn't go out stays in the
+  thread as a failed bubble with the reason underneath and Retry / Delete
+  (`SendFailure`): too many messages (429, with the wait from `Retry-After`),
+  `new_account_limit`, `links_not_allowed`, `duplicate_message`,
+  `account_under_review`, a pending key change, or no connection. Retry
+  re-sends with the same client ID, so a send that did arrive isn't
+  duplicated. Delete only removes it from this phone (and forgets the photo,
+  including an encrypted photo's blob and key). When the outcome is unknown
+  (a timeout, a dropped connection, a 5xx) the reason says "May not have
+  been sent" and the button says Remove ("Remove from this phone"):
+  tapping it first refetches the newest page, and if the message did
+  arrive the bubble becomes the sent one and stays, with a note. Failed
+  bubbles live only in memory: closing the thread forgets them.
+- **Accessibility.** Each bubble is one VoiceOver element that reads the
+  sender, the text or the photo's kind, state and timer, the time and, for
+  your own messages, Sending / Sent / Delivered / Read / Send failed
+  (`MessageAccessibility`); a failed bubble has Retry and Delete (or
+  Remove) actions.
+  The composer's buttons are labelled (the + button also reads the photo
+  timer), and text and icons follow Dynamic Type.
+
 ## End-to-end encryption
 
 Chat text and photos are end-to-end encrypted with the Signal Protocol (PQXDH, then the
@@ -351,7 +400,15 @@ More debug-only screenshot switches: `-StexxScreenshotSendPhoto viewOnce`
 open|openAndClose` (liveChat: opens the newest incoming view-once photo, as a
 tap would), `-StexxShowPrivacyCover YES` (keeps the app-switcher cover up, since
 the real app switcher can't be captured with `simctl`), and
-`-StexxScreenshotRoute settings`. Pair with `e2e-peer.ts read --open` to open
+`-StexxScreenshotRoute settings`. For chat screenshots on the mock (Debug
+build): `-StexxScreenshotRoute chats` opens the chat list,
+`-StexxScreenshotRoute chat -StexxScreenshotPeer p04` a thread with more than
+one page of history, `-StexxScreenshotScrollToTop YES` jumps to its top so
+the older page loads, `-StexxMockOlderPageDelay <seconds>` holds that page
+back, `-StexxScreenshotPhotoTimer <keep|viewOnce|tenSeconds|oneMinute|oneHour|oneDay>`
+sets the photo timer, and `-StexxMockSendFailure <rateLimited|newAccountLimit|linksNotAllowed|underReview|offline>`
+makes the mock refuse sends the way the server would (with
+`-StexxScreenshotDraft` to send something). Pair with `e2e-peer.ts read --open` to open
 the app's view-once photo from the other side.
 
 Settings has two screenshot routes: `-StexxScreenshotRoute settings` (mock
@@ -393,6 +450,47 @@ own position, and won't pick while zoomed out past ~60 km.
 
 Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
 signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.
+
+## Nearby states
+
+`NearbyView` picks what to show with `NearbyContent.resolve`
+(`Features/Nearby/NearbyFeed.swift`), from the loaded tiles, the first
+page's state and the location state read from `LocationService` (never a
+coordinate):
+
+| State | When | Shows |
+| --- | --- | --- |
+| Grid | Any tiles, or more pages on the server | Tiles; a spinner cell at the end while the next page loads, or a **Retry** cell if it failed (no automatic retry loop) |
+| Finding you | Empty grid while the permission prompt is up, or before this session's first location upload (up to 20 s; ends early if that upload or the first page fails, so offline shows Error) | "Finding guys near you…". The grid reloads by itself once the first upload succeeds, and again when location is turned back on |
+| Location off | Empty grid and location denied, Location Services off, or restricted | Why, **Open Settings** (not for restricted), and travel mode, which works without device location (Stexx+; paywall otherwise) |
+| Error | The first page failed | A plain sentence ("You're offline…") and **Try again** |
+| Nobody nearby | Loaded and empty | "Nobody here yet", or with filters on "Nobody matches your filters" and **Clear filters** |
+
+Travel mode places you itself, so it skips the location states. If location
+is off but the server still has your last cell, the tiles show with a slim
+"Location is off" notice. A failed pull-to-refresh keeps the tiles and shows
+a notice with Retry; a failed filter change clears them (they were for other
+filters). The app only asks for when-in-use permission and works with
+approximate location; nothing here changes what is uploaded.
+
+`NearbyFeedModel` owns paging: a newer reload drops answers from older
+requests (including a page still loading), and repeats across pages are
+shown once. If every loaded tile is hidden (people blocked since the page
+loaded), the grid keeps fetching pages until someone shows or the last page
+arrives, rather than saying "Nobody here yet" while more people exist.
+
+Accessibility: tiles read "name, age, online, 200 m away, favorite" with an
+"Opens the profile" hint; tile text follows Dynamic Type up to XXXL (the
+3:4 tile is capped there), the quick-filter row up to AX2. Quick filters,
+More filters and the filter sheet's steppers, slider and tag buttons have
+labels, values and hints. The Online chip's count is read as "N in the
+grid", since it only counts loaded tiles.
+
+Screenshots on the mock backend (Debug only): `-StexxScreenshotRoute app
+-StexxDebugNearby <state>` with `firstRun`, `denied`, `restricted`,
+`deniedWithGrid`, `empty`, `emptyFiltered` (starts on Online), `error`,
+`pageError` (pages of 9, the second fails once) or `grid`. The location
+service is left out while a state is forced, so no system prompt appears.
 
 ## Error handling
 
@@ -458,47 +556,6 @@ until" while the server doesn't know yet) and a **Manage subscription** button
 that opens StoreKit's manage-subscriptions sheet; the status is fetched again
 when the sheet closes. `GET /subscriptions/status` also returns `boostEndsAt`,
 kept in `AppState.boostEndsAt` so a running boost survives a relaunch.
-
-## Nearby states
-
-`NearbyView` picks what to show with `NearbyContent.resolve`
-(`Features/Nearby/NearbyFeed.swift`), from the loaded tiles, the first
-page's state and the location state read from `LocationService` (never a
-coordinate):
-
-| State | When | Shows |
-| --- | --- | --- |
-| Grid | Any tiles, or more pages on the server | Tiles; a spinner cell at the end while the next page loads, or a **Retry** cell if it failed (no automatic retry loop) |
-| Finding you | Empty grid while the permission prompt is up, or before this session's first location upload (up to 20 s; ends early if that upload or the first page fails, so offline shows Error) | "Finding guys near you…". The grid reloads by itself once the first upload succeeds, and again when location is turned back on |
-| Location off | Empty grid and location denied, Location Services off, or restricted | Why, **Open Settings** (not for restricted), and travel mode, which works without device location (Stexx+; paywall otherwise) |
-| Error | The first page failed | A plain sentence ("You're offline…") and **Try again** |
-| Nobody nearby | Loaded and empty | "Nobody here yet", or with filters on "Nobody matches your filters" and **Clear filters** |
-
-Travel mode places you itself, so it skips the location states. If location
-is off but the server still has your last cell, the tiles show with a slim
-"Location is off" notice. A failed pull-to-refresh keeps the tiles and shows
-a notice with Retry; a failed filter change clears them (they were for other
-filters). The app only asks for when-in-use permission and works with
-approximate location; nothing here changes what is uploaded.
-
-`NearbyFeedModel` owns paging: a newer reload drops answers from older
-requests (including a page still loading), and repeats across pages are
-shown once. If every loaded tile is hidden (people blocked since the page
-loaded), the grid keeps fetching pages until someone shows or the last page
-arrives, rather than saying "Nobody here yet" while more people exist.
-
-Accessibility: tiles read "name, age, online, 200 m away, favorite" with an
-"Opens the profile" hint; tile text follows Dynamic Type up to XXXL (the
-3:4 tile is capped there), the quick-filter row up to AX2. Quick filters,
-More filters and the filter sheet's steppers, slider and tag buttons have
-labels, values and hints. The Online chip's count is read as "N in the
-grid", since it only counts loaded tiles.
-
-Screenshots on the mock backend (Debug only): `-StexxScreenshotRoute app
--StexxDebugNearby <state>` with `firstRun`, `denied`, `restricted`,
-`deniedWithGrid`, `empty`, `emptyFiltered` (starts on Online), `error`,
-`pageError` (pages of 9, the second fails once) or `grid`. The location
-service is left out while a state is forced, so no system prompt appears.
 
 ## Configuration
 
@@ -572,6 +629,20 @@ ios/
   upload.
 - Photos are re-encoded on device (`ImageSanitizer`), which drops
   EXIF/GPS metadata.
+- No photo of a person is written to the app's disk cache. Profile photos
+  (grid, avatars, profiles, the user's own photos including "Hidden" ones)
+  load through `ProfilePhotoLoader` (`ProfilePhotoImage` in views) over the
+  ephemeral `PrivateMedia.session`, and decoded copies stay **in memory
+  only** (capped at 300 photos / 80 MB decoded, dropped on sign-out and
+  account deletion, and when the owner deletes a photo in the editor).
+  Plaintext chat photos use `PrivateAsyncImage`, encrypted ones
+  `ChatMediaLoader`. Don't use `AsyncImage`: it goes through
+  `URLSession.shared`, whose `URLCache` keeps anything the media host marks
+  cacheable (a year, for photos) in `Library/Caches`. A unit test fails the
+  build's tests if `AsyncImage(` appears in the app sources.
+- At launch the app deletes whatever older builds left in the shared URL
+  cache and replaces it with a memory-only one (`SharedURLCacheHygiene`),
+  and purges it again on sign-out.
 - The session token is kept in the Keychain (`ThisDeviceOnly`, never synced).
 - End-to-end encryption keys and sessions live in the Keychain the same way
   (`gay.stexx.app.e2e`); decrypted chat text is kept only in an encrypted,

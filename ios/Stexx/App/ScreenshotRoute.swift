@@ -39,6 +39,9 @@ import UIKit
 /// `PUT /me/privacy` fail (the rollback).
 enum ScreenshotRoute: String {
     case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, app, settings, liveSettings
+    /// Chats tab alone on the shared mock backend (chat-polish screenshots:
+    /// muted rows and the badge).
+    case chats
     /// Taps inbox: the tab bar (Chats badge counts new taps), the chat list
     /// with its Taps row, the list failing with nothing cached / with cached
     /// chats, and the taps screen with and without taps. Each gets its own
@@ -81,6 +84,20 @@ enum ScreenshotRoute: String {
     }
 
     static var peerID: Profile.ID? { UserDefaults.standard.string(forKey: "StexxScreenshotPeer") }
+    /// `-StexxScreenshotScrollToTop YES`: a thread jumps to its oldest loaded
+    /// message once loaded, so the next older page starts loading.
+    static var scrollsToTop: Bool { UserDefaults.standard.bool(forKey: "StexxScreenshotScrollToTop") }
+    /// `-StexxScreenshotPhotoTimer <PhotoTimer raw value>`: the thread's photo timer.
+    static var photoTimer: PhotoTimer? {
+        UserDefaults.standard.string(forKey: "StexxScreenshotPhotoTimer").flatMap(PhotoTimer.init(rawValue:))
+    }
+    /// `-StexxMockSendFailure <kind>`: the mock refuses every send the way the
+    /// server would (`rateLimited`, `newAccountLimit`, `linksNotAllowed`,
+    /// `underReview`, `offline`), so failed bubbles can be captured.
+    static var mockSendFailure: String? { UserDefaults.standard.string(forKey: "StexxMockSendFailure") }
+    /// `-StexxMockOlderPageDelay <seconds>`: the mock takes this long for an
+    /// older page, so the loading row can be captured.
+    static var mockOlderPageDelay: Double { UserDefaults.standard.double(forKey: "StexxMockOlderPageDelay") }
     static var draft: String? { UserDefaults.standard.string(forKey: "StexxScreenshotDraft") }
     /// `viewOnce`: send a generated photo as view-once once the thread loads.
     static var sendsViewOncePhoto: Bool { UserDefaults.standard.string(forKey: "StexxScreenshotSendPhoto") == "viewOnce" }
@@ -121,7 +138,10 @@ enum ScreenshotRoute: String {
 
 struct ScreenshotRouteView: View {
     let route: ScreenshotRoute
-    private let profile = MockData.profiles[0]
+    /// `-StexxScreenshotPeer` picks the mock profile for mock routes too.
+    private var profile: Profile {
+        ScreenshotRoute.peerID.flatMap { id in MockData.profiles.first { $0.id == id } } ?? MockData.profiles[0]
+    }
 
     var body: some View {
         switch route {
@@ -152,6 +172,9 @@ struct ScreenshotRouteView: View {
                 }
                 .tint(Theme.ice)
             }
+        case .chats:
+            // The Chats tab has its own NavigationStack.
+            ChatListView().tint(Theme.ice)
         case .me:
             // Has its own NavigationStack.
             MyProfileView().tint(Theme.ice)
@@ -181,6 +204,25 @@ struct ScreenshotRouteView: View {
     }
 }
 
+/// The filter sheet over Nearby, with ages 21–35 and Vers applied.
+private struct FiltersRoute: View {
+    @State private var query: NearbyQuery = {
+        var query = NearbyQuery()
+        query.minAge = 21
+        query.maxAge = 35
+        query.positions = [.versatile]
+        return query
+    }()
+    @State private var isPresented = true
+
+    var body: some View {
+        NearbyView()
+            .sheet(isPresented: $isPresented) {
+                FilterSheet(query: $query)
+            }
+    }
+}
+
 /// The app with the paywall sheet up; `plus` grants mock Stexx+ first.
 private struct PaywallRoute: View {
     let plus: Bool
@@ -199,25 +241,6 @@ private struct PaywallRoute: View {
                     await purchases.refreshEntitlement()
                 }
                 appState.isPaywallPresented = true
-            }
-    }
-}
-
-/// The filter sheet over Nearby, with ages 21–35 and Vers applied.
-private struct FiltersRoute: View {
-    @State private var query: NearbyQuery = {
-        var query = NearbyQuery()
-        query.minAge = 21
-        query.maxAge = 35
-        query.positions = [.versatile]
-        return query
-    }()
-    @State private var isPresented = true
-
-    var body: some View {
-        NearbyView()
-            .sheet(isPresented: $isPresented) {
-                FilterSheet(query: $query)
             }
     }
 }
