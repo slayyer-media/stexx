@@ -24,6 +24,18 @@ export function notBlocked(a: Fragment, b: Fragment): Fragment {
         OR (bl.blocker_id = ${b} AND bl.blocked_id = ${a}))`;
 }
 
+/**
+ * Same rule as `notBlocked(val(viewerId), target)`, shaped for scans over MANY targets (nearby): the subquery doesn't
+ * depend on the row, so Postgres reads the viewer's blocks (both directions) once into a hashed set instead of
+ * probing `blocks` for every candidate. `target` must be non-null (an id column).
+ */
+export function notBlockedByViewer(viewerId: string, target: Fragment): Fragment {
+  return sql`${target} NOT IN (
+    SELECT bl.blocked_id FROM blocks bl WHERE bl.blocker_id = ${viewerId}
+    UNION ALL
+    SELECT bl.blocker_id FROM blocks bl WHERE bl.blocked_id = ${viewerId})`;
+}
+
 /** TRUE when the user `u` is effectively incognito (flag on AND Stexx+ active). `u` = users-row alias. */
 export function isIncognito(u: string): Fragment {
   return sql`(${sql(u + ".incognito")} AND ${sql(u + ".plus_expires_at")} > now())`;
