@@ -7,6 +7,7 @@ import { config } from "../config.ts";
 import { sql, type Sql } from "../db/sql.ts";
 import {
   createSession,
+  emailCodeHash,
   emailHmac,
   generateToken,
   hashToken,
@@ -195,11 +196,6 @@ function challengeOf(clientDataJSON: string): string {
 /** A uniformly random code of EMAIL_CODE_DIGITS digits (leading zeros kept). */
 function newEmailCode(): string {
   return randomInt(0, 10 ** EMAIL_CODE_DIGITS).toString().padStart(EMAIL_CODE_DIGITS, "0");
-}
-
-/** What is stored for a code: bound to the address, so equal codes for different addresses never match. */
-function emailCodeHash(hmac: Buffer, code: string): Buffer {
-  return hashToken(`${hmac.toString("base64url")}:${code}`);
 }
 
 interface ChallengeRow {

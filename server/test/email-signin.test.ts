@@ -3,8 +3,9 @@
  * brute-force limits, and the production sign-up path (no dev shortcut).
  */
 import { describe, expect, test } from "bun:test";
+import { createHmac } from "node:crypto";
 import { config } from "../src/config.ts";
-import { emailHmac, hashToken } from "../src/lib/auth.ts";
+import { emailCodeHash, emailHmac, hashToken } from "../src/lib/auth.ts";
 import { lastDevLinkFor, signInMailText } from "../src/lib/mailer.ts";
 import { EMAIL_CODE_DIGITS, EMAIL_CODE_MAX_ATTEMPTS } from "../src/routes/auth.ts";
 import { useFixtureAttestation } from "./attest-helpers.ts";
@@ -36,13 +37,28 @@ describe("one-time code with every sign-in link", () => {
     expect(b.code).toMatch(/^[0-9]{8}$/);
     const [row] = await sql`SELECT code_hash, code_attempts FROM email_link_tokens WHERE token_hash = ${hashToken(a.token)}`;
     expect(row!.code_attempts).toBe(0);
-    expect(Buffer.from(row!.code_hash).equals(hashToken(`${emailHmac(addr).toString("base64url")}:${a.code}`))).toBe(true);
-    expect(Buffer.from(row!.code_hash).toString("utf8")).not.toContain(a.code);
+    const stored = Buffer.from(row!.code_hash);
+    expect(stored.equals(emailCodeHash(emailHmac(addr), a.code))).toBe(true);
+    expect(stored.toString("utf8")).not.toContain(a.code);
 
     const text = signInMailText(a.url, a.code);
     expect(text).toContain(a.url);
     expect(text).toContain(`Or enter this code in the Stexx app: ${a.code}`);
     expect(text).toContain("15 minutes");
+  });
+
+  test("the stored code hash is keyed with a secret that isn't in the database, so a DB reader can't test codes offline", async () => {
+    const addr = email();
+    const a = await requestLink(addr);
+    const [row] = await sql`SELECT email_hmac, code_hash FROM email_link_tokens WHERE token_hash = ${hashToken(a.token)}`;
+    const stored = Buffer.from(row!.code_hash);
+    const rowHmac = Buffer.from(row!.email_hmac).toString("base64url");
+    // Everything a DB reader has (the row's own email_hmac plus a guessed code) doesn't reproduce the stored value.
+    expect(stored.equals(hashToken(`${rowHmac}:${a.code}`))).toBe(false);
+    expect(stored.equals(createHmac("sha256", Buffer.from(row!.email_hmac)).update(a.code).digest())).toBe(false);
+    // It is an HMAC under a key derived from EMAIL_PEPPER.
+    const key = createHmac("sha256", config.emailPepper).update("stexx email sign-in codes v1").digest();
+    expect(stored.equals(createHmac("sha256", key).update(`${rowHmac}:${a.code}`).digest())).toBe(true);
   });
 
   test("sign-up by code: creates the account from the pending registration, then link and code are both used up", async () => {
