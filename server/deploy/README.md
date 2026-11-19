@@ -131,7 +131,7 @@ staff laptop (Tailscale) -> https://<name>.<tailnet>.ts.net:8443 -> Caddy (cert 
 4. **Firewall and Caddy site.** `sudo ./ufw-cloudflare.sh --apply --tailscale-admin` on the server adds one rule: the console's port in on `tailscale0`; nothing opens on the public interface. Then run `deploy.sh --sync-config --with-admin` again: now it installs the private Caddy site and a systemd drop-in that gives Caddy `caddy-admin.env`, validates, and reloads, restoring the previous site files if either step fails.
 5. **Start it.** `DEPLOY_HOST=you@host ./deploy/deploy.sh` restarts the console next to the API and checks that it answers on loopback; it also boot-checks the console's settings first (a problem is a warning there and a failed start later, never a failed API). After that, `--status`, `--rollback` and every deploy include it.
 6. **First admin** (the one step that needs SSH). On the server, with the `stexx-mod` wrapper from docs/security.md (it reads `admin.env` too):
-   `stexx-mod staff invite admin-1 --role admin --as admin-1` prints a single-use link valid for 30 minutes. Open it on that person's own device over the tailnet and create a passkey. Invite everyone else from the console, and give every person a second passkey: there is no self-service recovery.
+   `stexx-mod staff invite admin-1 --role admin --as admin-1` prints a single-use link valid for 30 minutes. Open it on that person's own device over the tailnet and create a passkey. Invite everyone else from the console, and keep at least two admins: each person has one passkey today, and there is no self-service recovery. After this first admin exists, the CLI's `--as` must be an active admin's handle.
 
 **Check it** (from a tailnet device, then from outside):
 
@@ -293,7 +293,7 @@ access, and this repo.
      used the app.
    - **blocks:** a block placed after the backup is gone, so the two people can see and message each other again. Re-block.
    - **moderation bans:** a ban placed after the backup is gone and the account is live again. Re-run the ban through the moderation CLI (`bun run moderate`, on the box).
-   - **staff changes** (if the console is installed): a staff member disabled after the backup can sign in again, and one invited after it is missing. Check `stexx-mod staff list` and re-run the disables and invites.
+   - **staff changes** (if the console is installed): a staff member disabled after the backup can sign in again, and one invited after it is missing. Check `stexx-mod staff list --as <your admin handle>` and re-run the disables and invites.
 
    If the old database is still reachable (undoing a migration, or a box that is broken but readable), compare before dropping it:
    `SELECT * FROM blocks WHERE created_at > '<backup time>'` and `SELECT * FROM moderation_actions WHERE created_at > '<backup time>'`, then re-apply them and re-run deletions
@@ -391,7 +391,7 @@ loading a missing model every 5 minutes) or restart. A malformed `PHOTO_HASH_BLO
 - Suspected key leak: rotate the B2 key and age recipient (new `backup-recipients.txt`; old dumps stay readable only with the old private key until they age out in 30 days),
   rotate `stexx_app`/`stexx_owner` passwords, revoke all sessions (`UPDATE sessions SET revoked_at = now()` as `stexx_owner`, and `UPDATE staff_sessions SET revoked_at = now()` if the console is installed).
 - Report handling lives in the `reports` table (`priority = 'high'` for under-18 reports). Moderators use the CLI over SSH; the staff console (optional, below) covers sign-in and staff management so far, not moderation pages yet.
-- A staff member lost their device, or you suspect a console session: `stexx-mod staff disable <handle> --as <handle> --yes` signs them out everywhere at once, or re-invite them (`staff invite`) to replace their passkeys. If every admin is locked out, the CLI is the way back in.
+- A staff member lost their device, or you suspect a console session: `stexx-mod staff disable <handle> --as <your admin handle> --yes` signs them out everywhere at once, or re-invite them to replace their passkey (another admin from the console, or `stexx-mod staff invite <handle> --role <role> --as <your admin handle> --yes`). If every admin is locked out, the CLI is the way back in: an admin re-invites their own handle, `stexx-mod staff invite admin-1 --role admin --as admin-1 --yes`, and opens the new link.
 
 ## App Store Server Notifications (Stexx+)
 

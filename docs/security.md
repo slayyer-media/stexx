@@ -528,7 +528,9 @@ staff laptop (Tailscale, ACL-allowed device)
 
 - Staff accounts are separate from app accounts: their own table and ids (`st_...`), no link to `users`, no names, no email addresses, no phone numbers. Identity is a handle (letters, digits, `.`, `-`, `_`; never a real name), the same handle `moderation_actions.actor` already uses.
 - Sign-in is a discoverable passkey with user verification required. A wrong relying-party id is refused, and so is a signature counter that goes backwards. Login, enrollment and step-up attempts are rate limited (10 a minute per client).
-- **Enrollment.** An admin (or the CLI, for the first admin) invites a handle with a role. That creates a single-use link, valid for 30 minutes; only its hash is stored. The person opens it on their own device and creates a passkey. Inviting an existing handle again removes its passkeys and signs it out everywhere (lost passkeys, or a role change); there is no self-service recovery.
+- **Enrollment.** An admin (or the CLI, for the first admin) invites a handle with a role. That creates a single-use link, valid for 30 minutes; only its hash is stored. The person opens it on their own device and creates a passkey. A handle can't look like an id (`st_...`).
+- **Re-invite (lost passkey, or a role change).** Inviting an existing handle again removes its passkeys, signs it out everywhere and voids earlier links; there is no self-service recovery. Whoever opens the new link signs in as that account, so in the console it is never one click: the invite form shows a confirm page that names the account and the consequence, and going ahead needs a passkey check bound to "re-invite" and that account, spent once in the same transaction (a reload of the result can't repeat it). You can't re-invite yourself in the console. Over SSH (`stexx-mod staff invite <handle> --yes`) an admin can, which is how a sole admin who lost their passkey gets back in.
+- **One passkey per person today.** A link enrolls one passkey, and re-inviting replaces it, so there is no way yet to add a second one. Keep at least two admins so a lost device never needs SSH. Adding a passkey from a signed-in session is planned (see "Not done yet").
 - Disabling a staff account signs it out everywhere at once and it can't sign in again. Accounts are never deleted, because the audit log points at them.
 
 ### Roles
@@ -537,8 +539,8 @@ staff laptop (Tailscale, ACL-allowed device)
 | --- | :-: | :-: | :-: |
 | Dashboard counts, own sessions | yes | yes | yes |
 | Staff list | no | no | yes |
-| Invite, re-invite, disable staff | no | no | yes (fresh passkey check) |
-| Disable another admin | no | no | yes (passkey check bound to that action) |
+| Invite, disable staff | no | no | yes (fresh passkey check) |
+| Re-invite an existing handle, disable another admin | no | no | yes (passkey check bound to that action and account) |
 
 The permission matrix lives in `server/src/lib/staff/permissions.ts`. Every route declares a permission when it is registered, and a test walks every route for each role, so a route without one fails the build. Later changes add their rows (lookups, evidence, decisions, unban, purge) in the same file.
 
@@ -550,33 +552,34 @@ The permission matrix lives in `server/src/lib/staff/permissions.ts`. Every rout
 
 ### CSRF and page hardening
 
-- Every write must carry an `Origin` equal to `ADMIN_ORIGIN` (and `Sec-Fetch-Site: same-origin` when the browser sends it), and a synchronizer token bound to the session (a form field or the `X-CSRF-Token` header). The cookie's `SameSite=Strict` is a third layer.
-- Pages are server-rendered with plain forms. The Content-Security-Policy is `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`: no inline script or style, nothing from a CDN, one small vendored `passkey.js`. Every response has `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `X-Robots-Tag: noindex`.
+- Every write must carry an `Origin` equal to `ADMIN_ORIGIN` (and `Sec-Fetch-Site: same-origin` when the browser sends it), and a synchronizer token bound to the session (a form field or the `X-CSRF-Token` header). `Origin: null`, which browsers send on a form post when a referrer policy hides the origin, is accepted only together with `Sec-Fetch-Site: same-origin`. The cookie's `SameSite=Strict` is a third layer.
+- Pages are server-rendered with plain forms. The Content-Security-Policy is `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`: no inline script or style, nothing from a CDN, one small vendored `passkey.js`. Every response has `Cache-Control: no-store`, `Referrer-Policy: same-origin` and `X-Robots-Tag: noindex`. (Not `no-referrer`: under it browsers send `Origin: null` on the console's own form posts. `same-origin` still sends nothing to any other site.)
 
 ### Step-up
 
 Some actions need proof the person is still there, even inside a session:
 
 - **Recent:** a passkey assertion with user verification in this session within the last 5 minutes (`ADMIN_STEP_UP_MINUTES`). Today: inviting and disabling staff.
-- **Bound to the action:** an assertion whose challenge commits to the action name and the target id, usable once. Today: disabling another admin. Later: purge now, lifting an email ban.
+- **Bound to the action:** an assertion whose challenge commits to the action name and the target id, usable once, and spent in the same transaction as the action (a refused action keeps it). Today: re-inviting an existing handle and disabling another admin (the role is checked on the locked row, so an account raised to admin meanwhile still needs it). Later: purge now, lifting an email ban. A bound assertion also counts as a recent one, so these forms need one passkey prompt, not two.
+- Every assertion's signature counter only moves forward, at sign-in and at step-up alike.
 
 ### Audit log
 
 Every staff event and, from the moderation pages on, every sensitive read and every action leaves one row in `staff_audit`.
 
-- **Recorded today:** login, failed login, logout, step-up (and failed), invite, enrollment, role change, disable, session revoke, and viewing the staff list. The CLI's `staff` commands write rows too, with channel `cli`.
-- **Each row:** time, staff id, session id, channel (`console` or `cli`), action name, target kind, target account (nullable), target reference (a report, flag, staff or session id), purpose, an opaque ticket reference (max 64 characters, never an email), and a pointer to the `moderation_actions` row when there is one.
+- **Recorded today:** login, failed login, logout, step-up (and failed), invite, enrollment, role change, disable, session revoke, and viewing the staff list. The CLI's `staff` commands (`invite`, `disable` and `list`) write rows too, with channel `cli`. Once an active admin exists, the CLI's `--as` must be an active admin's handle, so every row names who ran it; only while there is none (bootstrapping the first admin) may it be any handle, and that row has no staff id.
+- **Each row:** time (stamped by the database on insert, so a row can't be backdated), staff id, session id, channel (`console` or `cli`), action name, the role granted (on invite and role-change rows, so privilege history can be rebuilt), target kind, target account (nullable), target reference (a report, flag, staff or session id), purpose, an opaque ticket reference (max 64 characters, never an email), and a pointer to the `moderation_actions` row when there is one.
 - **No free text.** There is no note field; notes stay in `moderation_actions.note`, which is cleared on purge. No IP address, user agent, email, email hash or typed search value is ever written.
 - **Purpose.** Opening an account outside a queue item will ask for a purpose (`report_review`, `spam_review`, `photo_review`, `support_ticket`, `appeal`, `data_request`, `legal`, `escalation`). The column and its check exist now.
-- **Append-only.** A database trigger rejects `UPDATE`, `DELETE` and `TRUNCATE` on `staff_audit`. Two exceptions: the foreign-key action that sets `target_user_id` (or the `moderation_actions` pointer) to NULL when that account or row is deleted, which anonymizes the row, and deleting a *read* row older than 12 months. The trigger checks the row's age, not who asks. This stops mistakes and the application's own code, not someone with database owner rights; a separate database role without `UPDATE`/`DELETE` and a daily hash-chain checkpoint are planned.
+- **Append-only.** A database trigger rejects `UPDATE`, `DELETE` and `TRUNCATE` on `staff_audit`. Two exceptions: the foreign-key action that sets `target_user_id` (or the `moderation_actions` pointer) to NULL when that account or row is deleted, which anonymizes the row, and deleting a *read* row (or a failed login with an unknown passkey, which carries no staff id and is only a count) older than 12 months. The trigger checks the row's age, not who asks. This stops mistakes and the application's own code, not someone with database owner rights; a separate database role without `UPDATE`/`DELETE` and a daily hash-chain checkpoint are planned.
 - **Retention.**
 
 | Rows | Kept | Then |
 | --- | --- | --- |
-| Reads and lookups | 12 months | May be deleted (the trigger allows it) |
+| Reads and lookups, failed logins with an unknown passkey | 12 months | Deleted by the slow retention job (every 10 minutes) |
 | Actions and staff events | Like `moderation_actions` | Account reference anonymized when the account is deleted or purged |
 
-The job that deletes old read rows is not written yet (see "Not done yet"), so for now nothing is deleted. Console sessions, enrollment links and WebAuthn challenges are short-lived credentials: an expired or used one can't be used, and challenges are swept as new ones are made.
+The same job deletes console sessions a week after they ended (signed out, revoked or expired), enrollment links a week after they were used or expired, and expired WebAuthn challenges. Staff accounts are never deleted.
 
 - **Backups.** `staff_audit`, `staff_accounts` and `staff_passkeys` are in the nightly backup: the audit log is the accountability record, and a restore has to let staff sign in again. `staff_sessions`, `staff_challenges` and `staff_enrollments` are never in it (`ALWAYS_EXCLUDE` in `backup.sh`), and a real restore revokes every staff session and deletes pending invites, as it does for app sessions.
 
@@ -597,7 +600,9 @@ The console is optional and off until you install it; a box that never opts in d
 stexx-mod staff invite admin-1 --role admin --as admin-1     # prints a single-use link, valid 30 minutes
 ```
 
-5. Open the link on the staff member's device, over the tailnet, and create a passkey. Sign in, and invite everyone else from the console. Create at least two admins and give each person a second passkey: there is no self-service recovery.
+5. Open the link on the staff member's device, over the tailnet, and create a passkey. Sign in, and invite everyone else from the console. Create at least two admins: each person has one passkey today, and there is no self-service recovery.
+
+If an admin loses their passkey, another admin re-invites them from the console. If every admin is locked out, re-invite one over SSH with an admin's own handle as `--as`: `stexx-mod staff invite admin-1 --role admin --as admin-1 --yes`.
 
 Local development: `ADMIN_DEV_AUTH=1` mounts a login that skips the passkey (pick a seeded handle: `dev-support`, `dev-mod`, `dev-admin` from `bun run db:seed`). Production refuses to boot with it set, and `deploy.sh` doesn't upload the file that implements it.
 
@@ -744,7 +749,7 @@ In the app the JSON goes straight to the share sheet: it's written to its own fo
 
 - Report evidence photos are re-uploaded by the reporter's app, so the server can't prove a photo is the one that was in the chat (same as evidence text).
 - Moderation is still the CLI over SSH. The staff console (section 9) is private-network only and covers sign-in, sessions, roles, the audit log and staff management so far; the moderation pages (queue, evidence, decisions, spam and photo flags), support lookup and the export line for staff access are not built yet. Alerts (section 5) say when to look; acting still means logging in over SSH.
-- Staff console gaps: no job deletes `staff_audit` read rows after 12 months or removes expired console sessions and used invite links (the database trigger allows the former; nothing calls it); the audit table's separate database role and daily hash-chain checkpoint are planned but not done (so someone with database owner rights could still change it); the console doesn't yet nag staff to enroll a second passkey; Tailscale ACLs and tailnet lock are configured by hand in Tailscale, and nothing in the repo checks them.
+- Staff console gaps: the audit table's separate database role and daily hash-chain checkpoint are planned but not done (so someone with database owner rights could still change it); a staff member can't yet add a second passkey from a signed-in session (a link enrolls one, and re-inviting replaces it), so the console doesn't ask for two; Tailscale ACLs and tailnet lock are configured by hand in Tailscale, and nothing in the repo checks them.
 - The "Report" and "Block" menus were checked by hand; there are no UI tests for them.
 - A way for a person to contest an "explicit" label or a moderator hide. Today a moderator fixes a wrong classifier label with SQL: `UPDATE photos SET is_explicit = false, nsfw_model = 'manual' WHERE id = …` (a moderator hide is undone with `photos clear`).
 - The app's footer under a hidden photo says hidden photos "look explicit"; a photo hidden by a moderator gets the same badge and footer. Separate wording needs an API field and an app change.

@@ -257,15 +257,20 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   (loopback peer + forwarded address in `ADMIN_ALLOWED_CIDRS`, never stored), body limit, Origin check, session, route guard.
 - Every route is registered through `AdminRoutes` (`guard.ts`) as `"public"`, `"signed_in"` or a permission name from
   `lib/staff/permissions.ts`. Add roles and step-up there, never an inline role check. Writes get the Origin and CSRF
-  checks for free; `stepUp: "recent"` is enforced for writes; an `"action"` step-up is spent in the route
-  (`spendActionStepUp`, `auth/stepup.ts`). The matrix test walks every route for every role.
+  checks for free; `stepUp: "recent"` is enforced for writes (a verified bound step-up also counts as recent); an
+  `"action"` step-up (`ACTION_STEP_UPS`, `auth/stepup.ts`) is spent with `spendActionStepUp(tx, ...)` inside the change's
+  own transaction, on the locked row (the `authorize`/`authorizeReinvite` hooks of `disableStaff`/`inviteStaff`), so a
+  refused change keeps the proof. The matrix test walks every route for every role.
 - Pages are `hono/jsx` in `views/`: no inline script or style (the CSP forbids both), no CDN, one vendored `static/passkey.js`.
   Plain forms with a redirect after each write.
 - `lib/staff/accounts.ts` (invite, re-invite, disable, list; the rules for last admin and never yourself) is shared by the
   console and `stexx-mod staff ...` (`src/moderation/staff-cli.ts`). `lib/staff/audit.ts` `staffAudit(tx, entry)` is the only
   writer of `staff_audit`: no free text, refs are short ids, new action names go in `StaffAuditAction`. Write it in the same
   transaction as the change it records. The table is append-only by trigger, so tests can't clean up: give staff in tests
-  unique handles and never truncate.
+  unique handles and never truncate. A second trigger stamps `at` on insert; to backdate a row in a test, insert it with
+  `SET LOCAL session_replication_role = replica` (tests run as a superuser; production can't). The CLI's `--as` must be
+  an active admin once one exists (`cliActorRefusal`); the shared test database always has admins, so CLI tests act as a
+  `makeStaff("admin")` handle. `purgeStaffConsole` (jobs/retention.ts) is the staff retention job.
 - Config is `config.admin` (`ADMIN_*`, docs/security.md section 9); `test/setup.ts` strips `ADMIN_*` from the environment.
   Test helpers: `test/admin-helpers.ts` (`adminGet`/`adminPost`, `makeStaff(role)`, `signInDirect`, `enrolledStaff`, `auditActions`), `test/soft-authenticator.ts` (software passkey).
 - Production runs it as `stexx-admin.service` with settings in `/etc/stexx/admin.env`; `deploy.sh` leaves `src/admin/dev.ts`
