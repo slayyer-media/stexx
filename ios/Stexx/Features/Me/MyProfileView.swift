@@ -96,7 +96,8 @@ struct MyProfileView: View {
             appState.me = try await api.fetchMe()
             loadError = nil
         } catch {
-            guard let message = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't load your profile.")) else { return }
+            // The heading already says "Couldn't load your profile".
+            guard let message = UserFacingError.message(for: error) else { return }
             // Another fetch (the tab bar's) may have won meanwhile.
             if appState.me == nil { loadError = message }
         }

@@ -4,9 +4,9 @@ import UIKit
 
 /// Edit your public profile. Everything except the nickname is optional.
 ///
-/// Shown in a sheet. With unsaved changes, Cancel and swipe-down ask
-/// "Discard changes?" first; a failed save keeps the sheet open with the
-/// error in a toast.
+/// Shown in a sheet. With unsaved changes swipe-down is disabled and Cancel
+/// asks "Discard changes?" first; a failed save keeps the sheet open with
+/// the error in a toast.
 struct EditProfileView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
@@ -154,15 +154,11 @@ struct EditProfileView: View {
         .navigationTitle("Edit profile")
         .navigationBarTitleDisplayMode(.inline)
         .errorToast($errorMessage)
-        // Swipe-down only closes a sheet with nothing to lose; otherwise it
-        // asks, like Cancel.
+        // Swipe-down only closes a sheet with nothing to lose. With unsaved
+        // changes the sheet springs back and Cancel asks "Discard changes?".
+        // (SwiftUI on iOS 26 doesn't report the refused swipe, so it can't
+        // open the dialog itself.)
         .interactiveDismissDisabled(isDirty || isSaving)
-        .background {
-            SheetDismissAttemptObserver {
-                if !isSaving { isConfirmingDiscard = true }
-            }
-            .accessibilityHidden(true)
-        }
         .confirmationDialog("Discard changes?", isPresented: $isConfirmingDiscard, titleVisibility: .visible) {
             Button("Discard changes", role: .destructive) { dismiss() }
             Button("Keep editing", role: .cancel) {}
@@ -386,67 +382,6 @@ struct EditProfileView: View {
         } catch {
             // Stay open with the edits intact; Save can be tried again.
             errorMessage = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't save your profile."))
-        }
-    }
-}
-
-/// Calls `onAttempt` when someone swipes down on a sheet whose dismissal is
-/// disabled (`interactiveDismissDisabled(true)`), so it can ask before
-/// discarding. SwiftUI has no hook for this; this wraps the sheet's
-/// presentation-controller delegate and forwards everything else to it.
-private struct SheetDismissAttemptObserver: UIViewControllerRepresentable {
-    let onAttempt: () -> Void
-
-    func makeUIViewController(context: Context) -> Controller {
-        Controller(onAttempt: onAttempt)
-    }
-
-    func updateUIViewController(_ controller: Controller, context: Context) {
-        controller.onAttempt = onAttempt
-    }
-
-    final class Controller: UIViewController {
-        var onAttempt: () -> Void
-        private var proxy: DelegateProxy?
-
-        init(onAttempt: @escaping () -> Void) {
-            self.onAttempt = onAttempt
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
-
-        override func viewDidAppear(_ animated: Bool) {
-            super.viewDidAppear(animated)
-            guard let presentation = presentationController,
-                  !(presentation.delegate is DelegateProxy)
-            else { return }
-            let proxy = DelegateProxy(original: presentation.delegate) { [weak self] in self?.onAttempt() }
-            self.proxy = proxy
-            presentation.delegate = proxy
-        }
-    }
-
-    final class DelegateProxy: NSObject, UIAdaptivePresentationControllerDelegate {
-        private weak var original: (any UIAdaptivePresentationControllerDelegate)?
-        private let onAttempt: () -> Void
-
-        init(original: (any UIAdaptivePresentationControllerDelegate)?, onAttempt: @escaping () -> Void) {
-            self.original = original
-            self.onAttempt = onAttempt
-        }
-
-        func presentationControllerDidAttemptToDismiss(_ presentationController: UIPresentationController) {
-            original?.presentationControllerDidAttemptToDismiss?(presentationController)
-            onAttempt()
-        }
-
-        override func responds(to aSelector: Selector!) -> Bool {
-            super.responds(to: aSelector) || (original?.responds(to: aSelector) ?? false)
-        }
-
-        override func forwardingTarget(for aSelector: Selector!) -> Any? {
-            original?.responds(to: aSelector) == true ? original : super.forwardingTarget(for: aSelector)
         }
     }
 }

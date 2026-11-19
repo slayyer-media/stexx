@@ -204,6 +204,45 @@ xcrun simctl launch booted gay.stexx.app \
 
 `-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
 
+## Error handling
+
+A failed request never looks like it worked, and the app never fills a gap
+with sample data.
+
+- **Wording.** `UserFacingError.message(for:failedAction:)`
+  (`DesignSystem/ErrorToast.swift`) turns an error into one sentence: 429 says
+  how long to wait from `Retry-After` ("Try again in 10 min."), 402 /
+  `requires_plus` points at Stexx+, a 403 (`account_under_review`, anti-spam
+  limits) shows the server's own message, offline or unreachable asks to check
+  the connection, and anything else gets a generic "Try again". Pass
+  `failedAction` ("Couldn't send the tap.") to lead the offline and generic
+  cases. It returns `nil` for cancellations, which should stay silent.
+- **Toast.** `.errorToast($message)` shows a small black-glass banner at the
+  top of a screen for errors that don't need a decision (a tap, a favorite, a
+  failed save). VoiceOver announces it; it has a Dismiss button and the escape
+  gesture, and goes away after 6 s unless VoiceOver is running. Set the binding
+  to `nil` to hide it.
+- **Alerts** are for failures that need a decision or are about safety. A
+  failed block shows "Couldn't block …" with Retry, and the profile stays on
+  screen: it's only hidden once the server confirms the block.
+- **Optimistic UI is undone on failure.** A failed favorite puts the star
+  back; a failed tap re-enables the button. `Features/Nearby/ProfileActions.swift`
+  holds these paths so they're unit tested.
+- **Loading your own profile.** The You tab shows a skeleton until `fetchMe`
+  answers and an error with Retry if it fails. Edit stays disabled until the
+  real profile has loaded, so sample data can never be saved over an account.
+  `MockData` is for previews, tests and the Debug (mock) scheme only.
+- **Unsaved edits.** Edit profile is a sheet. With unsaved changes, swipe-down
+  is disabled and Cancel asks "Discard changes?"; a failed save keeps the sheet
+  open with the error in a toast. The filter sheet is the exception: a filter
+  draft is cheap, so Cancel and swipe-down both discard it without asking.
+- **Trying failures in the mock.** `MockAPIClient.inject(_:for:)` makes one
+  endpoint fail or hang in tests. In Debug builds the same works from a launch
+  argument, e.g. `-StexxMockFail "fetchMe=offline,sendTap=429,block=offline"`
+  (values: `offline`, `429`, `402`, `403`, `500`, `hang`). Combine it with the
+  screenshot routes `-StexxScreenshotRoute me` (the You tab before your profile
+  has loaded), `profile` or `filters`.
+
 ## Configuration
 
 Build settings in `project.yml` are exposed through `Info.plist`:
