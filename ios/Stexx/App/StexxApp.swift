@@ -67,6 +67,9 @@ struct StexxApp: App {
             Task { await SessionRevocation.revoke(session, using: api) }
         }
 
+        // Covers the app in the app switcher (Settings › Privacy).
+        PrivacyCover.shared.install()
+
         let chatStore = ChatStore(api: api)
         self.api = api
         _appState = State(initialValue: appState)

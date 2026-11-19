@@ -182,6 +182,10 @@ struct HTTPAPIClient: APIClient {
         try await callVoid("POST", "conversations/\(conversationID)/read")
     }
 
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        try await call("POST", "conversations/\(conversationID)/messages/\(messageID)/open")
+    }
+
     func deleteConversation(_ conversationID: Conversation.ID) async throws {
         try await callVoid("DELETE", "conversations/\(conversationID)")
     }

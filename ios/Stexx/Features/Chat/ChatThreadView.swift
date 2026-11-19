@@ -21,6 +21,8 @@ struct ChatThreadView: View {
     /// Why the last send was refused (rate limit or new-account limit), shown above the composer.
     @State private var sendNotice: String?
     @State private var expiresPhotos = true
+    /// Photos sent now are view-once (exclusive with `expiresPhotos`).
+    @State private var sendsViewOnce = false
     @State private var isConfirmingBlock = false
     @State private var isReporting = false
     @State private var isPickingPhoto = false
@@ -34,7 +36,7 @@ struct ChatThreadView: View {
     @State private var isAcceptingKeyChange = false
     /// Blurred incoming photos the user tapped to see, while this thread is open.
     @State private var revealedPhotoIDs: Set<Message.ID> = []
-    /// The encrypted view-once photo open in the full-screen viewer.
+    /// The view-once photo open in the full-screen viewer.
     @State private var viewOnceMessage: Message?
     /// Plaintext view-once photos `GET …/messages` listed without a URL: spent.
     @State private var spentViewOnceIDs: Set<Message.ID> = []
@@ -76,6 +78,7 @@ struct ChatThreadView: View {
                             isLastInGroup: isLastInGroup(at: index),
                             showsReadReceipt: index == lastReadIndex,
                             isViewOnceSpent: spentViewOnceIDs.contains(message.id),
+                            isViewOnceOpenedHere: chatStore.hasOpenedViewOnce(message.id),
                             isPhotoRevealed: revealedPhotoIDs.contains(message.id),
                             onRevealPhoto: { revealedPhotoIDs.insert(message.id) },
                             onOpenViewOnce: { Task { await openViewOnce(message) } }
@@ -193,8 +196,8 @@ struct ChatThreadView: View {
             }
         }
         .fullScreenCover(item: $viewOnceMessage) { message in
-            ViewOnceViewer(message: message) { outcome in
-                Task { await closeViewOnce(message, outcome: outcome) }
+            ViewOnceViewer(message: message, onOpened: { markViewOnceOpened(message) }) { outcome, opened in
+                Task { await closeViewOnce(message, outcome: outcome, opened: opened) }
             }
         }
         .photosPicker(isPresented: $isPickingPhoto, selection: $photoItem, matching: .images)
@@ -258,6 +261,9 @@ struct ChatThreadView: View {
             Toggle(isOn: $expiresPhotos) {
                 Label("Expiring photos", systemImage: "timer")
             }
+            Toggle(isOn: $sendsViewOnce) {
+                Label("View once", systemImage: "eye.slash")
+            }
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 16, weight: .medium))
@@ -267,17 +273,21 @@ struct ChatThreadView: View {
                 .hairlineBorder(shape)
                 .contentShape(shape)
                 .overlay(alignment: .topTrailing) {
-                    // Small timer: photos sent now will expire.
-                    if expiresPhotos {
-                        Image(systemName: "timer")
+                    // Small badge: photos sent now are view-once, or will expire.
+                    if sendsViewOnce || expiresPhotos {
+                        Image(systemName: sendsViewOnce ? "eye.slash" : "timer")
                             .font(.system(size: 8, weight: .semibold))
                             .foregroundStyle(Theme.ice)
                             .offset(x: -5, y: 5)
                     }
                 }
         }
+        .onChange(of: sendsViewOnce) { _, isOn in if isOn { expiresPhotos = false } }
+        .onChange(of: expiresPhotos) { _, isOn in if isOn { sendsViewOnce = false } }
         .accessibilityLabel("Attachments")
-        .accessibilityValue(expiresPhotos ? Text("Expiring photos on") : Text(verbatim: ""))
+        .accessibilityValue(
+            sendsViewOnce ? Text("View-once photos on") : expiresPhotos ? Text("Expiring photos on") : Text(verbatim: "")
+        )
     }
 
     private var messageField: some View {
@@ -409,34 +419,59 @@ struct ChatThreadView: View {
         messages = ChatStore.reconcile(snapshot: snapshot, with: messages, myID: myID)
     }
 
-    /// An encrypted view-once photo was tapped. Realtime events don't carry
-    /// its URL, so the thread is refetched first if needed; if the server no
-    /// longer has it, the bubble turns into "no longer available" instead.
+    /// A view-once photo (encrypted or plaintext) was tapped. Realtime
+    /// events don't carry its URL, so the thread is refetched first if
+    /// needed; if the server no longer has it, the bubble turns into "no
+    /// longer available" instead. Listing doesn't open it: the viewer does,
+    /// once the photo is on screen (`markViewOnceOpened`).
     private func openViewOnce(_ message: Message) async {
+        guard !chatStore.hasOpenedViewOnce(message.id), !message.isViewOnceOpened else { return }
         var target = message
         if target.attachment?.url == nil, let id = conversation?.id {
             try? await refreshMessages(in: id)
             target = messages.first { $0.id == message.id } ?? target
         }
-        guard target.e2eAttachment != nil, target.attachment?.url != nil else { return }
+        guard target.attachment?.url != nil, !target.isViewOnceOpened else { return }
+        if target.attachment?.isEncrypted == true, target.e2eAttachment == nil { return }
         viewOnceMessage = target
     }
 
-    /// The viewer closed: the photo is done on this phone. Its key is
-    /// forgotten (unless a network error kept it from showing at all) and
-    /// the bubble says "Opened" (or "no longer available").
-    private func closeViewOnce(_ message: Message, outcome: ChatMediaLoader.Outcome?) async {
+    /// The viewer shows the photo: it's opened. The server is told (and
+    /// deletes it shortly); for an encrypted photo the key goes as soon as
+    /// the server confirms. The bubble says "Opened" from now on.
+    private func markViewOnceOpened(_ message: Message) {
+        guard let conversationID = conversation?.id else { return }
+        Task {
+            guard let opened = await chatStore.openViewOnce(message.id, in: conversationID),
+                  let index = messages.firstIndex(where: { $0.id == opened.id })
+            else { return }
+            messages[index] = ChatStore.updating(messages[index], with: opened)
+        }
+    }
+
+    /// The viewer closed: if the photo was opened, it's done on this phone.
+    /// An encrypted photo's key is forgotten (also when the server call
+    /// failed) and the bubble says "Opened"; a photo the server no longer
+    /// has says "no longer available". A network error or a photo still
+    /// blurred leaves it unopened, to try again.
+    private func closeViewOnce(_ message: Message, outcome: ChatMediaLoader.Outcome?, opened: Bool) async {
         let removal: Message.AttachmentRemoval
-        switch outcome {
-        case .image?, .tampered?, .unreadable?: removal = .opened
-        case .gone?: removal = .gone
-        case .failed?, nil: return
+        if opened {
+            removal = .opened
+        } else if case .gone? = outcome {
+            removal = .gone
+        } else {
+            return
         }
         await ChatMediaLoader.shared.evict(message.id)
-        await e2e.forgetAttachmentKey(messageID: message.id, gone: removal == .gone)
-        if let index = messages.firstIndex(where: { $0.id == message.id }) {
+        guard let index = messages.firstIndex(where: { $0.id == message.id }) else { return }
+        if messages[index].attachment?.isEncrypted == true {
+            await e2e.forgetAttachmentKey(messageID: message.id, gone: removal == .gone)
+            guard let index = messages.firstIndex(where: { $0.id == message.id }) else { return }
             messages[index].e2eAttachment = nil
             messages[index].e2eAttachmentRemoval = removal
+        } else if removal == .gone {
+            spentViewOnceIDs.insert(message.id)
         }
     }
 
@@ -479,7 +514,7 @@ struct ChatThreadView: View {
             conversationID: conversation.id,
             senderID: appState.myID
         )
-        pending.attachment = Message.Attachment(kind: .photo, url: nil)
+        pending.attachment = Message.Attachment(kind: .photo, url: nil, isViewOnce: sendsViewOnce)
         landingKeys.insert(pending.bubbleKey)
         sendCount += 1
         messages.append(pending)
@@ -488,12 +523,14 @@ struct ChatThreadView: View {
 
     private func deliverPhoto(_ jpeg: Data?, clientID: String, pendingID: Message.ID, in conversation: Conversation) {
         let expiresAfter = expiresPhotos ? Self.expiringPhotoSeconds : nil
+        let viewOnce = sendsViewOnce
         Task {
             do {
                 let sent = try await chatStore.sendPhoto(
                     jpegData: jpeg,
                     clientID: clientID,
                     expiresAfterSeconds: expiresAfter,
+                    isViewOnce: viewOnce,
                     in: conversation
                 )
                 if let index = messages.firstIndex(where: { $0.id == pendingID }) {
@@ -600,6 +637,8 @@ struct MessageBubble: View {
     var showsReadReceipt = true
     /// A plaintext view-once photo the server no longer gives a URL for.
     var isViewOnceSpent = false
+    /// A view-once photo opened on this phone (before the server confirms).
+    var isViewOnceOpenedHere = false
     /// A blurred incoming photo the user tapped to see.
     var isPhotoRevealed = false
     var onRevealPhoto: () -> Void = {}
@@ -747,21 +786,74 @@ struct MessageBubble: View {
         }
     }
 
+    /// What a plaintext view-once photo's tile says.
+    private enum ViewOnceTile {
+        case closed(canOpen: Bool), opened, gone
+    }
+
+    private func viewOnceTile(_ attachment: Message.Attachment) -> ViewOnceTile {
+        // The sender learns of the open only if the recipient sends read receipts.
+        if isMine { return attachment.openedAt != nil ? .opened : .closed(canOpen: false) }
+        if attachment.openedAt != nil || isViewOnceOpenedHere { return .opened }
+        if isViewOnceSpent { return .gone }
+        return .closed(canOpen: message.status != .sending)
+    }
+
+    @ViewBuilder
     private func plaintextAttachmentView(_ attachment: Message.Attachment) -> some View {
+        if attachment.isViewOnce {
+            plaintextViewOnceTile(viewOnceTile(attachment))
+        } else {
+            plaintextPhotoTile(attachment)
+        }
+    }
+
+    /// A plaintext view-once photo is never fetched in the bubble: only the
+    /// full-screen viewer loads it, and showing it there opens it.
+    private func plaintextViewOnceTile(_ tile: ViewOnceTile) -> some View {
         let shape = RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
-        let isOpened = !isMine && attachment.isViewOnce && isViewOnceSpent
+        return ZStack {
+            Theme.ink1
+            switch tile {
+            case .closed(let canOpen):
+                PhotoTileNotice(systemImage: "eye.slash", title: "View once", detail: canOpen ? "Tap to open" : nil)
+                    .accessibilityAddTraits(canOpen ? .isButton : [])
+            case .opened:
+                PhotoTileNotice(systemImage: "checkmark.circle", title: "Opened")
+            case .gone:
+                PhotoTileNotice(systemImage: "hourglass", detail: "Photo no longer available")
+            }
+            if message.status == .sending {
+                ProgressView()
+                    .tint(Theme.frost)
+            }
+        }
+        .frame(width: 180, height: 220)
+        .clipShape(shape)
+        .hairlineBorder(shape)
+        .contentShape(shape)
+        .onTapGesture {
+            if case .closed(canOpen: true) = tile { onOpenViewOnce() }
+        }
+        .accessibilityActions {
+            if case .closed(canOpen: true) = tile {
+                Button("Open view-once photo", action: onOpenViewOnce)
+            }
+        }
+    }
+
+    private func plaintextPhotoTile(_ attachment: Message.Attachment) -> some View {
+        let shape = RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
         return ZStack {
             Theme.ink1
             VStack(spacing: 6) {
-                Image(systemName: isOpened ? "checkmark.circle" : attachment.isViewOnce ? "eye.slash" : "photo")
+                Image(systemName: "photo")
                     .font(.title2.weight(.light))
-                Text(isOpened ? "Opened" : attachment.isViewOnce ? "View once" : "Photo")
+                Text("Photo")
                     .stexxLabelStyle(.micro, color: Theme.steel)
             }
             .foregroundStyle(Theme.steel)
-            // View-once photos aren't fetched automatically: the first fetch
-            // counts as opening them.
-            if let url = attachment.url, !attachment.isViewOnce {
+            if let url = attachment.url {
                 // Never through the shared URL cache: no copy on disk.
                 PrivateAsyncImage(url: url) { image in
                     image.resizable().scaledToFill()

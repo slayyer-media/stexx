@@ -10,6 +10,8 @@ struct SettingsView: View {
     @State private var errorMessage: String?
     @State private var isShowingViewers = false
     @State private var boostEndsAt: Date?
+    /// Local to this phone (`PrivacyCover`), never sent to the server.
+    @AppStorage(PrivacyCover.enabledKey) private var coversAppSwitcher = true
 
     private var version: String {
         let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
@@ -25,6 +27,7 @@ struct SettingsView: View {
                 Toggle("Hide my distance", isOn: $bindable.privacy.hideDistance)
                 Toggle("Show when I'm online", isOn: $bindable.privacy.showOnlineStatus)
                 Toggle("Send read receipts", isOn: $bindable.privacy.sendReadReceipts)
+                Toggle("Hide Stexx in the app switcher", isOn: $coversAppSwitcher)
                 LabeledContent("Location precision") {
                     Text("About \(StexxFormat.distance(LocationFuzzer.defaultCellMeters))")
                         .stexxLabelStyle()
@@ -32,7 +35,7 @@ struct SettingsView: View {
             } header: {
                 SectionLabel("Privacy")
             } footer: {
-                SettingsFooter("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map.")
+                SettingsFooter("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map. Read receipts also tell people when you open their view-once photos. Hiding Stexx in the app switcher covers the screen with the logo whenever you leave the app; this setting stays on this phone.")
             }
             .settingsRows()
 

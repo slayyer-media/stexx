@@ -89,6 +89,8 @@ final class PurchaseService {
         isPurchasing = true
         defer { isPurchasing = false }
         errorMessage = nil
+        // The App Store sheet deactivates the app: not the app switcher.
+        PrivacyCover.shared.expectSystemPrompt()
         do {
             switch try await purchaseAction(product) {
             case .success(let verification):
