@@ -318,7 +318,7 @@ describe("edge cases of the windows", () => {
     expect(ins).toHaveLength(2);
     const mine = [close.id, ...ins, ...outs];
     const ordered = (await sql<{ id: string }[]>`SELECT id FROM unnest(${[...ins, ...outs]}::text[]) id ORDER BY id`).map((r) => r.id);
-    expect(outs).toContain(ordered[0]);
+    expect(outs).toContain(ordered[0]!);
 
     const cell = (await viewerCell(me.id))!;
     // limit 2: the page is [close, smallest-id 5000 user], and the first window (5 km) can't prove it.
