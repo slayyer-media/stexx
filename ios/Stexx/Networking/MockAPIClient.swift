@@ -20,6 +20,8 @@ actor MockAPIClient: APIClient {
     private var nextID = 1
     private var plusExpiresAt: Date?
     private var travelLocation: FuzzedLocation?
+    /// Injected failures and delays, by method name (see `inject(_:for:)`).
+    private var injectedOutcomes: [String: InjectedOutcome] = [:]
 
     init(latency: Duration = .milliseconds(250), plusActive: Bool = false) {
         let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
@@ -414,12 +416,79 @@ actor MockAPIClient: APIClient {
 
     // MARK: Helpers
 
-    private func pause() async throws {
+    private func pause(_ function: String = #function) async throws {
         try await Task.sleep(for: latency)
+        try await injectedOutcome(for: function)
     }
 
     private func makeID(_ prefix: String) -> String {
         defer { nextID += 1 }
         return "\(prefix)-\(nextID)-\(UUID().uuidString.prefix(8))"
+    }
+}
+
+// MARK: - Failure injection
+
+/// Lets tests, previews and Debug screenshots make one mock endpoint fail (or
+/// hang) without a server. Keys are the method's base name, as in
+/// `"fetchMe"`, `"sendTap"` or `"setFavorite"`; every method that calls
+/// `pause()` honours them.
+extension MockAPIClient {
+    /// What an injected endpoint does instead of answering.
+    enum InjectedOutcome: Sendable {
+        case fail(any Error)
+        /// Waits this long before answering normally (loading states).
+        case delay(Duration)
+    }
+
+    /// Makes `method` fail (or hang) until cleared with `nil`.
+    func inject(_ outcome: InjectedOutcome?, for method: String) {
+        injectedOutcomes[method] = outcome
+    }
+
+    fileprivate func injectedOutcome(for function: String) async throws {
+        let method = String(function.prefix { $0 != "(" })
+        switch injectedOutcomes[method] ?? Self.launchOutcomes[method] {
+        case .fail(let error)?:
+            throw error
+        case .delay(let duration)?:
+            try await Task.sleep(for: duration)
+        case nil:
+            break
+        }
+    }
+
+    /// Debug builds only: `-StexxMockFail "fetchMe=offline,sendTap=429"`.
+    /// Values: `offline`, `429` (Retry-After 10 min), `402`, `403` (account
+    /// under review), `500`, or `hang` (answers after 10 minutes).
+    static let launchOutcomes: [String: InjectedOutcome] = {
+        #if DEBUG
+        guard let spec = UserDefaults.standard.string(forKey: "StexxMockFail") else { return [:] }
+        return parseLaunchOutcomes(spec)
+        #else
+        return [:]
+        #endif
+    }()
+
+    static func parseLaunchOutcomes(_ spec: String) -> [String: InjectedOutcome] {
+        var outcomes: [String: InjectedOutcome] = [:]
+        for entry in spec.split(separator: ",") {
+            let parts = entry.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2, !parts[0].isEmpty else { continue }
+            let outcome: InjectedOutcome? = switch parts[1] {
+            case "offline": .fail(URLError(.notConnectedToInternet))
+            case "429": .fail(APIError.rateLimited(retryAfter: 600))
+            case "402": .fail(APIError.requiresPlus)
+            case "403": .fail(APIError.server(
+                status: 403,
+                message: "Your account is being reviewed by our moderators. Until then you can keep chatting with people who've written to you, but you can't start new chats."
+            ))
+            case "500": .fail(APIError.server(status: 500, message: nil))
+            case "hang": .delay(.seconds(600))
+            default: nil
+            }
+            if let outcome { outcomes[parts[0]] = outcome }
+        }
+        return outcomes
     }
 }

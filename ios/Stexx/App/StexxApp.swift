@@ -20,6 +20,8 @@ struct StexxApp: App {
             ? CachedSessionStore(backing: InMemorySessionStore(session: ScreenshotRoute.devSession))
             : CachedSessionStore(backing: KeychainSessionStore())
         let appState = ScreenshotRoute.current?.usesMockData == true ? AppState.preview() : AppState(sessionStore: sessionStore)
+        // `me` screenshots start before the profile has loaded.
+        if ScreenshotRoute.current == .me { appState.me = nil }
         #else
         let sessionStore = CachedSessionStore(backing: KeychainSessionStore())
         let appState = AppState(sessionStore: sessionStore)

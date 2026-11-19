@@ -12,8 +12,13 @@ import SwiftUI
 /// written to the Keychain), `-StexxScreenshotPeer <profileID>` and
 /// `-stexx.ageConfirmed YES`; `-StexxScreenshotDraft <text>` sends that text
 /// once the thread has loaded. See `ios/README.md`.
+///
+/// `me` opens the You tab with no profile loaded yet, so it shows the real
+/// fetch (pair it with `-StexxMockFail fetchMe=offline` or `fetchMe=hang`);
+/// `filters` opens the filter sheet over Nearby with filters already applied.
 enum ScreenshotRoute: String {
     case profile, chat, reportFromChat, reportPicker, reportSent, liveChat
+    case me, filters
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -40,17 +45,44 @@ struct ScreenshotRouteView: View {
     private let profile = MockData.profiles[0]
 
     var body: some View {
-        NavigationStack {
-            switch route {
-            case .profile:
-                ProfileDetailView(profile: profile)
-            case .liveChat:
-                LiveChatRoute()
-            default:
-                ChatThreadView(route: ChatRoute(participant: profile))
+        switch route {
+        case .me:
+            // Has its own NavigationStack.
+            MyProfileView().tint(Theme.ice)
+        case .filters:
+            FiltersRoute().tint(Theme.ice)
+        default:
+            NavigationStack {
+                switch route {
+                case .profile:
+                    ProfileDetailView(profile: profile)
+                case .liveChat:
+                    LiveChatRoute()
+                default:
+                    ChatThreadView(route: ChatRoute(participant: profile))
+                }
             }
+            .tint(Theme.ice)
         }
-        .tint(Theme.ice)
+    }
+}
+
+/// The filter sheet over Nearby, with ages 21–35 and Vers applied.
+private struct FiltersRoute: View {
+    @State private var query: NearbyQuery = {
+        var query = NearbyQuery()
+        query.minAge = 21
+        query.maxAge = 35
+        query.positions = [.versatile]
+        return query
+    }()
+    @State private var isPresented = true
+
+    var body: some View {
+        NearbyView()
+            .sheet(isPresented: $isPresented) {
+                FilterSheet(query: $query)
+            }
     }
 }
 
