@@ -16,6 +16,10 @@ final class AppState {
     var privacy: PrivacySettings
     /// Stexx+ entitlement. Set from the server (`GET /subscriptions/status`,
     /// 402 responses); StoreKit purchases only trigger a server re-check.
+    /// Also dropped when `plusExpiresAt` passes while the app is open, or
+    /// when `GET /me` reports travel mode paused (both followed by a server
+    /// re-check), so the UI never claims a Plus feature the server has
+    /// already stopped applying.
     var hasPlus = false
     private(set) var plusExpiresAt: Date?
     /// Profiles blocked during this session; hidden everywhere immediately,
@@ -24,7 +28,8 @@ final class AppState {
     var isPaywallPresented = false
     /// Stexx+ travel mode, or `nil` when it's off. The server says whether
     /// it's on; where it is (the cell that was sent and a place name looked
-    /// up on this phone) is only kept here, in this device's preferences.
+    /// up on this phone) is only kept on this device (`TravelPlaceStore`:
+    /// a backup-excluded, protected file).
     private(set) var travel: TravelPlace?
     /// Bumped whenever travel mode is turned on, moved or off, so the grid
     /// reloads.
@@ -32,24 +37,33 @@ final class AppState {
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let sessionStore: any SessionStore
+    @ObservationIgnored private let travelStore: any TravelPlaceStore
     /// Revokes a session on the server when the user signs out. Set by the app.
     @ObservationIgnored var revokeSession: ((Session) -> Void)?
+    /// Asks the server for the entitlement again
+    /// (`PurchaseService.refreshEntitlement`). Set by the app.
+    @ObservationIgnored var recheckEntitlement: (() -> Void)?
+    /// Drops Stexx+ locally when `plusExpiresAt` passes.
+    @ObservationIgnored private var plusExpiryTask: Task<Void, Never>?
 
     private enum Keys {
         static let ageConfirmed = "stexx.ageConfirmed"
         static let privacy = "stexx.privacy"
-        static let travel = "stexx.travel"
     }
 
-    init(defaults: UserDefaults = .standard, sessionStore: any SessionStore = KeychainSessionStore()) {
+    init(
+        defaults: UserDefaults = .standard,
+        sessionStore: any SessionStore = KeychainSessionStore(),
+        travelStore: any TravelPlaceStore = FileTravelPlaceStore()
+    ) {
         self.defaults = defaults
         self.sessionStore = sessionStore
+        self.travelStore = travelStore
         self.isAgeConfirmed = defaults.bool(forKey: Keys.ageConfirmed)
         self.session = sessionStore.load()
         self.privacy = defaults.data(forKey: Keys.privacy)
             .flatMap { try? JSONDecoder().decode(PrivacySettings.self, from: $0) } ?? PrivacySettings()
-        self.travel = session == nil ? nil : defaults.data(forKey: Keys.travel)
-            .flatMap { try? JSONDecoder().decode(TravelPlace.self, from: $0) }
+        self.travel = session == nil ? nil : travelStore.load()
     }
 
     var isSignedIn: Bool { isAgeConfirmed && session != nil }
@@ -100,7 +114,7 @@ final class AppState {
         session = nil
         me = nil
         hasPlus = false
-        plusExpiresAt = nil
+        setPlusExpiry(nil)
         blockedIDs = []
         // The place belongs to this account; the next one starts clean.
         setTravel(nil)
@@ -111,7 +125,11 @@ final class AppState {
     /// Applies the server's view of the entitlement.
     func applySubscription(_ status: SubscriptionStatus) {
         hasPlus = status.isActive
-        plusExpiresAt = status.isActive ? status.expiresAt : nil
+        setPlusExpiry(status.isActive ? status.expiresAt : nil)
+        // The server's travel `isActive` is the same entitlement check.
+        if me?.travel != nil, me?.travel?.isActive != status.isActive {
+            me?.travel?.isActive = status.isActive
+        }
         if !status.isActive { dropPlusOnlySettings() }
     }
 
@@ -119,9 +137,43 @@ final class AppState {
     /// never existed), so turn off Plus-only settings and show the paywall.
     func handleRequiresPlus() {
         hasPlus = false
-        plusExpiresAt = nil
+        setPlusExpiry(nil)
         dropPlusOnlySettings()
         isPaywallPresented = true
+    }
+
+    /// Drops Stexx+ if `plusExpiresAt` has passed (run by a timer at that
+    /// moment). The server stops applying Plus features then, travel mode
+    /// included, so the UI follows right away instead of at the next
+    /// foreground. Plus-only settings are only dropped once the server
+    /// confirms (a renewal may already be on its way).
+    func checkPlusExpiry(now: Date = .now) {
+        guard hasPlus, let plusExpiresAt, plusExpiresAt <= now else { return }
+        plusDidLapse()
+    }
+
+    /// Stexx+ looks gone (local clock or `GET /me`): show the free state and
+    /// ask the server, which turns it back on if it was renewed.
+    private func plusDidLapse() {
+        hasPlus = false
+        setPlusExpiry(nil)
+        if me?.travel?.isActive == true { me?.travel?.isActive = false }
+        recheckEntitlement?()
+    }
+
+    private func setPlusExpiry(_ date: Date?) {
+        plusExpiresAt = date
+        plusExpiryTask?.cancel()
+        plusExpiryTask = nil
+        guard let date else { return }
+        let delay = date.timeIntervalSinceNow
+        // Already past: the server says active, trust it until the next check.
+        guard delay > 0 else { return }
+        plusExpiryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay) + .milliseconds(500), clock: .continuous)
+            guard !Task.isCancelled else { return }
+            self?.checkPlusExpiry()
+        }
     }
 
     private func dropPlusOnlySettings() {
@@ -148,23 +200,27 @@ final class AppState {
     }
 
     /// Adopts the server's state. On but unknown here (a reinstall, or set
-    /// before this version): on, without a place.
+    /// before this version): on, without a place. Paused by the server
+    /// (`isActive: false`) while this device still thinks it has Stexx+:
+    /// the server has already moved you back home, so Plus is dropped here
+    /// too and re-checked.
     private func syncTravel(with status: TravelStatus?) {
         switch (status, travel) {
-        case (nil, nil), (.some, .some): return
+        case (nil, nil), (.some, .some): break
         case (nil, .some): setTravel(nil)
         case (.some, nil): setTravel(TravelPlace())
         }
+        if status?.isActive == false, hasPlus { plusDidLapse() }
     }
 
     private func setTravel(_ place: TravelPlace?) {
         guard place != travel else { return }
         travel = place
         travelRevision += 1
-        if let place, let data = try? JSONEncoder().encode(place) {
-            defaults.set(data, forKey: Keys.travel)
+        if let place {
+            travelStore.save(place)
         } else {
-            defaults.removeObject(forKey: Keys.travel)
+            travelStore.clear()
         }
     }
 
@@ -201,7 +257,7 @@ extension AppState {
     static func preview(signedIn: Bool = true, plus: Bool = false) -> AppState {
         let defaults = UserDefaults(suiteName: "stexx.preview") ?? .standard
         defaults.removePersistentDomain(forName: "stexx.preview")
-        let state = AppState(defaults: defaults, sessionStore: InMemorySessionStore())
+        let state = AppState(defaults: defaults, sessionStore: InMemorySessionStore(), travelStore: InMemoryTravelPlaceStore())
         if signedIn {
             state.confirmAge()
             state.signIn(MockData.session)

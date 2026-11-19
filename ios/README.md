@@ -215,17 +215,24 @@ sent (`PUT /me/travel`). The picker starts on a world view, never at your
 own position, and won't pick while zoomed out past ~60 km.
 
 - **State.** `AppState.travel` holds the sent cell and a place name looked
-  up on the device (`MKReverseGeocodingRequest` on the fuzzed cell), in this
-  phone's preferences only; the server never receives the name and never
+  up on the device (`MKReverseGeocodingRequest` on the fuzzed cell), on this
+  phone only: a small file in Application Support, excluded from backups
+  and protected until first unlock (`FileTravelPlaceStore`), not the
+  backed-up preferences plist. The server never receives the name and never
   returns coordinates. `GET /me` says whether travel mode is on
   (`Profile.travel`), and that wins: after a reinstall it shows as on
   without a place name. Sign-out forgets it.
 - **Stexx+ lapses.** The server keeps the cell but ignores it, so the app
   shows travel mode as paused (Settings explains it and offers a free
-  "Turn off travel mode", which sends `null`); it resumes on renewal.
+  "Turn off travel mode", which sends `null`); it resumes on renewal. The
+  app notices without waiting for the next foreground: a timer drops
+  Stexx+ at `plusExpiresAt`, and `GET /me` reporting `travel.isActive:
+  false` does the same; both then re-check with the server, which turns
+  Stexx+ back on after a renewal.
 - **Nearby.** While it's on, a "Browsing from …" pill sits above the grid:
-  tap it to change the place, × to turn it off. The grid reloads whenever
-  travel mode changes.
+  tap it to change the place, × to turn it off. While paused it says
+  "Travel paused · You're shown near home" instead (tap for the paywall, ×
+  to turn it off). The grid reloads whenever travel mode changes.
 
 Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
 signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.

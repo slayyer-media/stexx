@@ -250,8 +250,10 @@ private struct TravelPicker: View {
 
 /// Nearby's travel-mode pill: where you're browsing from, tap to change,
 /// × to turn it off. Flat (it scrolls with the grid), no rim light.
+/// Paused (Stexx+ lapsed): says you're shown near home again; tap to renew.
 struct TravelBanner: View {
     let placeName: String?
+    var isPaused = false
     var isBusy = false
     let onOpen: () -> Void
     let onTurnOff: () -> Void
@@ -261,13 +263,13 @@ struct TravelBanner: View {
         HStack(spacing: Theme.Spacing.s) {
             Button(action: onOpen) {
                 HStack(spacing: Theme.Spacing.s) {
-                    Image(systemName: "airplane")
+                    Image(systemName: isPaused ? "airplane.arrival" : "airplane")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Theme.ice)
-                    Text("Browsing from")
+                        .foregroundStyle(isPaused ? Theme.steel : Theme.ice)
+                    Text(isPaused ? "Travel paused" : "Browsing from")
                         .stexxLabelStyle(.micro)
                         .fixedSize()
-                    Text(placeName ?? String(localized: "your travel spot"))
+                    Text(isPaused ? String(localized: "You're shown near home") : placeName ?? String(localized: "your travel spot"))
                         .font(.system(.footnote, weight: .semibold))
                         .foregroundStyle(Theme.frost)
                         .lineLimit(1)
@@ -276,7 +278,7 @@ struct TravelBanner: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityHint("Opens travel mode")
+            .accessibilityHint(isPaused ? "Renew Stexx+ to resume travel mode" : "Opens travel mode")
 
             if isBusy {
                 ProgressView().controlSize(.mini).tint(Theme.steel)
@@ -308,7 +310,10 @@ struct TravelBanner: View {
 }
 
 #Preview("Banner") {
-    TravelBanner(placeName: "Lisbon, Portugal", onOpen: {}, onTurnOff: {})
+    VStack {
+        TravelBanner(placeName: "Lisbon, Portugal", onOpen: {}, onTurnOff: {})
+        TravelBanner(placeName: "Lisbon, Portugal", isPaused: true, onOpen: {}, onTurnOff: {})
+    }
         .padding()
         .background(Theme.ink)
         .preferredColorScheme(.dark)

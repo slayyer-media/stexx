@@ -83,11 +83,16 @@ struct NearbyView: View {
 
         NavigationStack(path: $path) {
             ScrollView {
-                if appState.isTravelActive {
+                if appState.isTravelActive || appState.isTravelPaused {
+                    // Paused: Stexx+ lapsed and the server shows you near
+                    // home again; say so here, where it matters most.
                     TravelBanner(
                         placeName: appState.travel?.name,
+                        isPaused: appState.isTravelPaused,
                         isBusy: isTurningOffTravel,
-                        onOpen: { path.append(TravelRoute()) },
+                        onOpen: {
+                            if appState.requirePlus() { path.append(TravelRoute()) }
+                        },
                         onTurnOff: { Task { await turnOffTravel() } }
                     )
                     .padding(.horizontal, NearbyGridMetrics.spacing)
@@ -134,7 +139,7 @@ struct NearbyView: View {
                 guard loadKey != loadedKey || profiles.isEmpty else { return }
                 await reload()
             }
-            .animation(Motion.animation(Motion.standard, reduceMotion: reduceMotion), value: appState.isTravelActive)
+            .animation(Motion.animation(Motion.standard, reduceMotion: reduceMotion), value: appState.travel != nil)
             .alert(
                 "Couldn't turn off travel mode",
                 isPresented: Binding(get: { travelError != nil }, set: { if !$0 { travelError = nil } })

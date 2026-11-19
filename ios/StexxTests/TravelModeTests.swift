@@ -38,11 +38,20 @@ struct TravelModeTests {
     private let precise = TravelModeModel.Point(latitude: 38.7223456, longitude: -9.1393456)
 
     private func makeState(plus: Bool, suite: String = "stexx.tests.travel.\(UUID().uuidString)") -> AppState {
-        let state = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: InMemorySessionStore())
+        let state = AppState(
+            defaults: UserDefaults(suiteName: suite)!,
+            sessionStore: InMemorySessionStore(),
+            travelStore: InMemoryTravelPlaceStore()
+        )
         state.signIn(MockData.session)
         state.me = MockData.me
         state.hasPlus = plus
         return state
+    }
+
+    /// A file store in a fresh temporary directory.
+    private func makeFileStore() -> FileTravelPlaceStore {
+        FileTravelPlaceStore(directory: URL.temporaryDirectory.appending(path: "stexx-travel-\(UUID().uuidString)", directoryHint: .isDirectory))
     }
 
     private func makeModel(_ state: AppState, spy: TravelSpy, naming: FakeNaming = FakeNaming()) -> TravelModeModel {
@@ -238,6 +247,80 @@ struct TravelModeTests {
 
         state.applySubscription(SubscriptionStatus(isActive: true, expiresAt: .now.addingTimeInterval(3600)))
         #expect(state.isTravelActive)
+        #expect(state.me?.travel == TravelStatus(isActive: true))
+    }
+
+    @Test("Stexx+ running out while the app is open pauses travel mode and re-checks with the server")
+    func plusRunsOutInForeground() async {
+        let state = makeState(plus: true)
+        var rechecks = 0
+        state.recheckEntitlement = { rechecks += 1 }
+        let model = makeModel(state, spy: TravelSpy())
+        model.centerChanged(to: precise)
+        #expect(await model.browseFromSelection())
+        state.privacy.incognito = true
+        let expiresAt = Date.now.addingTimeInterval(3600)
+        state.applySubscription(SubscriptionStatus(isActive: true, expiresAt: expiresAt))
+
+        state.checkPlusExpiry(now: expiresAt.addingTimeInterval(-1))
+        #expect(state.isTravelActive)
+        #expect(rechecks == 0)
+
+        state.checkPlusExpiry(now: expiresAt)
+        #expect(!state.hasPlus)
+        #expect(!state.isTravelActive)
+        #expect(state.isTravelPaused)
+        #expect(state.me?.travel == TravelStatus(isActive: false))
+        #expect(rechecks == 1)
+        // Plus-only settings wait for the server's answer (it may have renewed).
+        #expect(state.privacy.incognito)
+        #expect(!state.isPaywallPresented)
+
+        // The server says it renewed: back on.
+        state.applySubscription(SubscriptionStatus(isActive: true, expiresAt: expiresAt.addingTimeInterval(30 * 24 * 3600)))
+        #expect(state.isTravelActive)
+        #expect(state.me?.travel == TravelStatus(isActive: true))
+    }
+
+    @Test("A timer drops Stexx+ at plusExpiresAt without waiting for the next foreground")
+    func plusExpiryTimer() async throws {
+        let state = makeState(plus: true)
+        var rechecks = 0
+        state.recheckEntitlement = { rechecks += 1 }
+        state.me?.travel = TravelStatus(isActive: true)
+        state.applySubscription(SubscriptionStatus(isActive: true, expiresAt: .now.addingTimeInterval(0.1)))
+        #expect(state.isTravelActive)
+
+        for _ in 0..<40 where state.hasPlus {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(!state.hasPlus)
+        #expect(state.isTravelPaused)
+        #expect(rechecks == 1)
+    }
+
+    @Test("GET /me saying travel is paused wins over a stale Stexx+ flag here")
+    func serverPausedTravelDropsPlus() {
+        let state = makeState(plus: true)
+        var rechecks = 0
+        state.recheckEntitlement = { rechecks += 1 }
+        var me = MockData.me
+        me.travel = TravelStatus(isActive: true)
+        state.me = me
+        #expect(state.isTravelActive)
+        #expect(rechecks == 0)
+
+        me.travel = TravelStatus(isActive: false)
+        state.me = me
+        #expect(!state.hasPlus)
+        #expect(!state.isTravelActive)
+        #expect(state.isTravelPaused)
+        #expect(state.travel != nil)
+        #expect(rechecks == 1)
+
+        // Already free: nothing more to do.
+        state.me = me
+        #expect(rechecks == 1)
     }
 
     @Test("The server's state wins: on without a known place, or off")
@@ -258,7 +341,8 @@ struct TravelModeTests {
     func persistence() async {
         let suite = "stexx.tests.travel.\(UUID().uuidString)"
         let store = InMemorySessionStore()
-        let state = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: store)
+        let travelStore = makeFileStore()
+        let state = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: store, travelStore: travelStore)
         state.signIn(MockData.session)
         state.hasPlus = true
         let model = makeModel(state, spy: TravelSpy())
@@ -266,8 +350,11 @@ struct TravelModeTests {
         await model.nameSelection(after: .zero)
         #expect(await model.browseFromSelection())
 
-        let relaunched = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: store)
+        let relaunched = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: store, travelStore: travelStore)
         #expect(relaunched.travel == state.travel)
+        // Kept in the protected file, not in the backed-up preferences plist.
+        #expect(UserDefaults(suiteName: suite)!.data(forKey: "stexx.travel") == nil)
+        #expect(travelStore.load() == state.travel)
         // Reopening the picker starts at the saved cell with its name.
         let reopened = makeModel(relaunched, spy: TravelSpy())
         #expect(reopened.selection == state.travel?.location)
@@ -275,8 +362,28 @@ struct TravelModeTests {
 
         relaunched.signOut()
         #expect(relaunched.travel == nil)
-        let afterSignOut = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: InMemorySessionStore(session: MockData.session))
+        #expect(travelStore.load() == nil)
+        let afterSignOut = AppState(
+            defaults: UserDefaults(suiteName: suite)!,
+            sessionStore: InMemorySessionStore(session: MockData.session),
+            travelStore: travelStore
+        )
         #expect(afterSignOut.travel == nil)
+    }
+
+    @Test("The travel file is excluded from backups and removed when cleared")
+    func fileStore() throws {
+        let store = makeFileStore()
+        #expect(store.load() == nil)
+        let place = TravelPlace(location: LocationFuzzer.fuzz(latitude: precise.latitude, longitude: precise.longitude), name: "Lisbon, Portugal")
+        store.save(place)
+        #expect(store.load() == place)
+        let values = try store.directory.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        #expect(values.isExcludedFromBackup == true)
+
+        store.clear()
+        #expect(store.load() == nil)
+        store.clear() // Clearing twice is fine.
     }
 
     // MARK: Wire and mock
