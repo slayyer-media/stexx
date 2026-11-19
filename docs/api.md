@@ -256,7 +256,7 @@ ids.
 | `encryptionKeys` | Your public key state (`GET /keys/status`). |
 | `subscriptions` | `productID, expiresAt, environment, revokedAt`. |
 | `devices` | Attested app installs linked to the account (anti-spam, [security.md](security.md#1-device-attestation-app-attest-devicecheck-fallback)): `id, environment, linkedToAccountAt`. Never the App Attest key, the other accounts on the same device, or the per-install fields every account on it shares (ban flag, first attestation, last-seen day). |
-| `moderation` | Moderation decisions about the account: `action` (`auto_hide, hide, unhide, dismiss, action, ban, unban`), `by` (`automatic \| moderator`), `createdAt`. Never which moderator, their note, or the reports behind it. |
+| `moderation` | Moderation decisions about the account: `action` (`auto_hide, hide, unhide, dismiss, action, ban, unban`, and the photo-flag decisions on its photos `photo_clear, photo_hide, photo_blocklist, photo_escalate`), `by` (`automatic \| moderator`), `createdAt`. Never which moderator, their note, or the reports behind it. |
 | `rateLimitCounters` | Abuse-limit counters keyed by the account (`messageAccount`, `photoAccount`, `keyBundleAccount`, `keyRegisterAccount`, `prekeyTarget`): `limit, windowSeconds, windowStartedAt, countThisWindow, countPreviousWindow, deletedAfter`. Per-device counters count every account on the install, so they are not exported (a `notes` line says so). |
 | `signIn` | Passkeys (`credentialID, transports, createdAt, lastUsedAt`) and sessions (dates only). |
 
