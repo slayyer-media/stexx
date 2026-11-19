@@ -526,18 +526,29 @@ describe("moderation CLI", () => {
     await hideAccount({ actor: "mod-a", userId: hidden.id });
     const minor = await user();
     await expectNoContent(await report(await veteran(), minor, { reason: "underage" }));
+    // The test DB is shared and keeps every open report earlier runs left behind (well over 1000 accounts),
+    // and normal reports sort oldest first, so a fresh one falls outside the 1000-row window. Backdate it to
+    // the head of the normal group; it still sorts after every high-priority and hidden account.
+    await sql`UPDATE reports SET created_at = '2000-01-01' WHERE reported_id = ${plain.id} AND status = 'open'`;
 
-    const queue = await reviewQueue({ limit: 1000 });
-    const pos = (id: string) => queue.findIndex((q) => q.userId === id);
-    expect(pos(minor.id)).toBeGreaterThanOrEqual(0);
-    expect(pos(minor.id)).toBeLessThan(pos(hidden.id));
-    expect(pos(hidden.id)).toBeLessThan(pos(plain.id));
-    expect(queue[pos(minor.id)]).toMatchObject({ highPriority: true, state: "hidden", openReports: 1, reasons: { underage: 1 } });
+    try {
+      const queue = await reviewQueue({ limit: 1000 });
+      const pos = (id: string) => queue.findIndex((q) => q.userId === id);
+      expect(pos(minor.id)).toBeGreaterThanOrEqual(0);
+      expect(pos(minor.id)).toBeLessThan(pos(hidden.id));
+      expect(pos(hidden.id)).toBeLessThan(pos(plain.id));
+      expect(queue[pos(minor.id)]).toMatchObject({ highPriority: true, state: "hidden", openReports: 1, reasons: { underage: 1 } });
 
-    const { code, out } = await cli("list", "--limit", "1000");
-    expect(code).toBe(0);
-    expect(out).toContain(minor.id);
-    expect(out).toMatch(new RegExp(`HIGH +${minor.id}`));
+      const { code, out } = await cli("list", "--limit", "1000");
+      expect(code).toBe(0);
+      expect(out).toContain(minor.id);
+      expect(out).toMatch(new RegExp(`HIGH +${minor.id}`));
+    } finally {
+      // Leave the shared queue as we found it, so these rows don't crowd later runs' windows.
+      const ids = [plain.id, hidden.id, minor.id];
+      await sql`UPDATE reports SET status = 'dismissed', closed_at = now() WHERE reported_id IN ${sql(ids)} AND status = 'open'`;
+      await sql`UPDATE users SET hidden_at = NULL, hidden_reason = NULL WHERE id IN ${sql(ids)} AND banned_at IS NULL`;
+    }
   });
 
   test("show prints reasons, details, shared evidence and how each reporter was judged; never location", async () => {
