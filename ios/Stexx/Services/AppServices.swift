@@ -11,6 +11,7 @@ final class AppServices {
     @ObservationIgnored let location: LocationService?
     @ObservationIgnored let realtime: RealtimeClient?
     @ObservationIgnored let e2e: E2EStatus
+    @ObservationIgnored let profilePhotos: ProfilePhotoLoader
 
     @ObservationIgnored private let appState: AppState
     @ObservationIgnored private let chatStore: ChatStore
@@ -26,9 +27,11 @@ final class AppServices {
         purchases: PurchaseService,
         location: LocationService?,
         realtime: RealtimeClient?,
-        e2e: E2EStatus = E2EStatus(engine: nil)
+        e2e: E2EStatus = E2EStatus(engine: nil),
+        profilePhotos: ProfilePhotoLoader = .shared
     ) {
         self.appState = appState
+        self.profilePhotos = profilePhotos
         self.chatStore = chatStore
         self.purchases = purchases
         self.location = location
@@ -122,6 +125,11 @@ final class AppServices {
             sessionGeneration += 1
             location?.reset()
             e2e.signedOut()
+            // Photos of other people (and the user's own) don't outlive the
+            // session: drop the in-memory copies, and anything that reached
+            // the shared URL cache despite `ProfilePhotoLoader`.
+            profilePhotos.clear()
+            SharedURLCacheHygiene.purge()
         }
         wasSignedIn = isSignedIn
 

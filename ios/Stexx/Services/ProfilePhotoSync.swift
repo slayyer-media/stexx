@@ -32,8 +32,13 @@ final class ProfilePhotoSync {
         serverPhotos.filter { !unsavedUploads.contains($0.id) }
     }
 
-    init(photos: [Photo]) {
+    /// Deleted photos are dropped from here too, so a removed photo isn't
+    /// kept in memory for the rest of the session.
+    private let loader: ProfilePhotoLoader
+
+    init(photos: [Photo], loader: ProfilePhotoLoader = .shared) {
         serverPhotos = photos
+        self.loader = loader
     }
 
     /// A photo was uploaded (the server appends it to the gallery).
@@ -68,6 +73,7 @@ final class ProfilePhotoSync {
             } catch APIError.notFound {
                 // Already gone (an earlier attempt got through).
             }
+            if let url = photo.url { loader.evict(url) }
             serverPhotos.removeAll { $0.id == photo.id }
             unsavedUploads.removeAll { $0 == photo.id }
         }
@@ -87,12 +93,17 @@ final class ProfilePhotoSync {
         for id in uploads {
             do {
                 try await api.deletePhoto(id: id)
-                serverPhotos.removeAll { $0.id == id }
+                forget(id)
             } catch APIError.notFound {
-                serverPhotos.removeAll { $0.id == id }
+                forget(id)
             } catch {
                 // Offline: the photo stays; the user can remove it next edit.
             }
         }
+    }
+
+    private func forget(_ id: Photo.ID) {
+        for photo in serverPhotos where photo.id == id { if let url = photo.url { loader.evict(url) } }
+        serverPhotos.removeAll { $0.id == id }
     }
 }
