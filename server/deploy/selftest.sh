@@ -342,6 +342,15 @@ PY
   check "nightly uploaded the archive and the reports sidecar" bash -c "ls '$T/remote' | grep -q '.dump.age\$' && ls '$T/remote' | grep -q '.reports.csv.age\$'"
   check "objects are age files" bash -c "for f in '$T'/remote/*; do [ \"\$(head -c 21 \"\$f\")\" = age-encryption.org/v1 ] || exit 1; done"
 
+  # A failing upload: nothing may be left behind and last-success must not move.
+  mkdir -p "$T/remote-ro"; chmod 0500 "$T/remote-ro"; cp -p "$T/bstate/last-success" "$T/last-success.before"
+  "${B[@]}" STEXX_BACKUP_REMOTE="$T/remote-ro" bash "$HERE/backup.sh" > "$T/nightly-ro" 2>&1; echo $? > "$T/nightly-ro.rc"
+  echo "  backup.sh with an unwritable remote:"; show "$T/nightly-ro"
+  check "failed nightly exits non-zero" bash -c "! grep -qx 0 '$T/nightly-ro.rc'"
+  check "failed nightly leaves no objects" test -z "$(ls -A "$T/remote-ro")"
+  check "failed nightly does not touch last-success" cmp -s "$T/bstate/last-success" "$T/last-success.before"
+  chmod 0700 "$T/remote-ro"
+
   "${B[@]}" STEXX_PREMIGRATE_DIR="$T/pre" bash "$HERE/backup.sh" --pre-migrate > "$T/pre.out" 2>&1; echo $? > "$T/pre.rc"
   echo "  backup.sh --pre-migrate:"; show "$T/pre.out"
   check "pre-migrate exits 0" has "$T/pre.rc" 0

@@ -83,6 +83,7 @@ MIN_BYTES=2048        # an empty-but-valid dump is still larger than this; anyth
 MIN_SIDECAR_BYTES=64  # age header + an (encrypted) CSV header line
 
 die() { echo "backup failed: $*" >&2; exit 1; }
+[[ "$COMPRESS" =~ ^[a-z0-9:=,]+$ ]] || die "STEXX_BACKUP_COMPRESS has unexpected characters"
 
 check_age_setup() {
   command -v pg_dump >/dev/null || die "pg_dump not installed"
@@ -182,7 +183,6 @@ command -v rclone >/dev/null  || die "rclone not installed"
 [[ "$KEEP_DAYS" =~ ^[0-9]+$ ]] && [ "$KEEP_DAYS" -ge 1 ] && [ "$KEEP_DAYS" -le 28 ] \
   || die "STEXX_BACKUP_KEEP_DAYS must be 1..28 (the privacy promise is 30 days; keep a margin for timer jitter)"
 [ "$REDACT_REPORTS" = 0 ] || [ "$REDACT_REPORTS" = 1 ] || die "STEXX_BACKUP_REDACT_REPORTS must be 0 or 1"
-[[ "$COMPRESS" =~ ^[a-z0-9:=,]+$ ]] || die "STEXX_BACKUP_COMPRESS has unexpected characters"
 
 # Retention FIRST: hard-delete (no hidden versions) anything older than KEEP_DAYS, whether or not tonight's dump
 # succeeds. A prune failure is reported but does not stop the dump. Covers .dump.age and .reports.csv.age alike.
@@ -232,9 +232,10 @@ if [ "$SIDECAR_WANTED" = 1 ]; then
   STEXX_BACKUP_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   STEXX_ARCHIVE_NAME="$NAME"
   export STEXX_ARCHIVE_STATUS STEXX_BACKUP_SELF STEXX_ARCHIVE_NAME
+  SIDE_RC=0
   psql --dbname="$DB" -X -q -At -v ON_ERROR_STOP=1 -f - <<'SQL' \
     | age --encrypt --recipients-file "$RECIPIENTS" \
-    | rclone rcat "$REMOTE/$SIDECAR" --quiet
+    | rclone rcat "$REMOTE/$SIDECAR" --quiet || SIDE_RC=$?
 BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 SELECT pg_export_snapshot() AS stexx_snapshot \gset
 \setenv STEXX_SNAPSHOT :stexx_snapshot
@@ -243,13 +244,14 @@ COPY (SELECT (jsonb_populate_record(r, '{"details": null, "reporter_ip_hash": nu
 COMMIT;
 SQL
   ARC_RC="$(cat "$STEXX_ARCHIVE_STATUS")"; rm -f "$STEXX_ARCHIVE_STATUS"
-  [ "$ARC_RC" = 0 ] || die "archive pipeline failed (status $ARC_RC)"
+  [ "$ARC_RC" = 0 ] || die "archive pipeline (pg_dump | age | rclone) failed (status $ARC_RC); partial objects removed"
+  [ "$SIDE_RC" = 0 ] || die "reports sidecar pipeline (psql | age | rclone) failed (status $SIDE_RC); partial objects removed"
 else
   # --no-owner/--no-privileges: restores must not depend on role names. zstd is built into PGDG's pg_dump.
   # The pipeline fails if any stage fails (pipefail); the EXIT trap above then removes whatever partial object was written.
   pg_dump --dbname="$DB" --format=custom --compress="$COMPRESS" --no-owner --no-privileges "${DUMP_ARGS[@]}" \
     | age --encrypt --recipients-file "$RECIPIENTS" \
-    | rclone rcat "$REMOTE/$NAME" --quiet
+    | rclone rcat "$REMOTE/$NAME" --quiet || die "archive pipeline (pg_dump | age | rclone) failed; partial object removed"
 fi
 
 SIZE="$(object_size "$NAME")"

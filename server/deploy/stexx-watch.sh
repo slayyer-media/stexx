@@ -89,7 +89,7 @@ alerting_configured() { [ -n "$ALERT_EMAIL" ] || [ -n "$ALERT_WEBHOOK_URL" ]; }
 
 # curl config values are double-quoted; escape backslashes and quotes.
 cq() { local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}"; }
-pct_decode() { printf '%b' "${1//%/\\x}"; }
+pct_decode() { local v="${1//\\/\\\\}"; printf '%b' "${v//%/\\x}"; }   # %XX -> byte; a literal \ stays
 env_value() { # env_value <file> <KEY>: last KEY=value in a systemd-style env file, surrounding quotes removed
   [ -r "$1" ] || return 0
   sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$2=(.*)$/\\2/p" "$1" | tail -n1 | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/'

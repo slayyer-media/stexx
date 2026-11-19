@@ -219,7 +219,10 @@ fi
 # In sections: tables first, then rows, then (after the reports sidecar is in) indexes, keys and triggers. A table
 # whose rows reference reports (e.g. a foreign key to reports.id) only gets its key once the reports are loaded.
 restore_section() { pg_restore --dbname="$DB" --no-owner --no-privileges --exit-on-error --section="$1" "$PLAIN" 2>"$WORK/err"; }
-restore_err() { grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err"; }
+restore_err() {
+  grep -m1 -i 'error' "$WORK/err" || head -n1 "$WORK/err"
+  [ -z "$TARGET" ] || echo " -- $TARGET now holds a PARTIAL restore: drop it, re-create it empty (roles.sql), then retry"
+}
 T0="$(date +%s)"
 restore_section pre-data || fatal restore "pg_restore (schema) into $DB failed: $(restore_err)"
 restore_section data     || fatal restore "pg_restore (rows) into $DB failed: $(restore_err)"
