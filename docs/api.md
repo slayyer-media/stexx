@@ -281,7 +281,7 @@ everything else stays at 64 KB.
   "preKeyLowWatermark": 20,
   "pqPreKeyLowWatermark": 5,
   "envelopeMaxBytes": 32768,
-  "contentRules": { "restricted": true, "noLinks": true, "duplicateRecipients": 3, "duplicateMinLength": 16 }
+  "contentRules": { "restricted": true, "noLinks": true, "noHandles": true, "duplicateRecipients": 3, "duplicateMinLength": 16 }
 }
 ```
 
@@ -289,7 +289,10 @@ everything else stays at 64 KB.
 encrypting, because the server can't read ciphertext
 ([`security.md`](security.md#with-end-to-end-encrypted-chats)): while
 `restricted`, refuse links (`noLinks`, same rule as `containsLink` in
-`server/src/lib/abuse/content.ts`) and refuse sending the same text (case and
+`server/src/lib/abuse/content.ts`), refuse payment and crypto handles and
+off-platform redirects (`noHandles`, the rules in
+`server/src/lib/abuse/content-rules.json`, which the app bundles as is; absent
+from older servers, treat as `false`) and refuse sending the same text (case and
 spacing ignored, at least `duplicateMinLength` characters) to more than
 `duplicateRecipients` people in 24 h. Re-read it on launch and after a 403.
 
@@ -413,7 +416,10 @@ last-resort `pqPreKey`, so nobody can drain someone else's one-time prekeys.
   `lastMessage`, `message.created`).
 - Everything else is unchanged: blocks (404), hidden accounts
   (`account_under_review`), rate limits, `new_account_limit`, expiry, read
-  receipts, idempotent `clientID`. The text rules (`links_not_allowed`,
+  receipts, idempotent `clientID`, and the spam heuristics' metadata rules
+  (a shadow-limited sender's envelope can be held like a plaintext message,
+  see [`security.md`](security.md#8-spam-heuristics-on-messages-shadow-limits)).
+  The text rules (`links_not_allowed`, `handles_not_allowed`,
   `duplicate_message`) aren't run on ciphertext: the app runs them
   (`contentRules`).
 - `attachmentPhotoID` next to an `envelope` should be an encrypted upload

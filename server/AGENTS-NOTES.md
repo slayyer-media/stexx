@@ -151,6 +151,15 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Actions (one tx + `moderation_actions` audit row each): `hideAccount`, `unhideAccount`, `dismissReports`,
   `actionReports`, `banAccount`, `unbanAccount`; read: `reviewQueue`, `accountReview`, `auditLog`. CLI:
   `src/moderation/cli.ts` (`scripts/moderate.ts`). Tests: `overrideAutoHideForTests`.
+- `spam.ts` (spam heuristics, shadow limits; docs/security.md section 8; migration 112): `screenSentMessage(tx, …)` runs in
+  the send transaction after the insert (records `ContentPolicy.features` for plaintext, re-assesses, holds the message
+  via `messages.held_at` if the sender is limited and the recipient hasn't written). `reassessAfterSafetyEvent(id)` after
+  blocks/reports. Pure rules: `assessSpam(facts, settings)`. Moderator hooks `clearSpamLimit` / `confirmSpam` are called
+  by `dismissReports` / `actionReports` / `banAccount`; `runSpamJobs` is in the slow jobs. Any query that shows messages
+  to someone other than their sender must exclude held ones (`held_at IS NULL OR sender_id = viewer`; chat.ts
+  `visibleTo` does it). `notModerated` also hides limited accounts. System reports have `reports.source = 'spam'`.
+  `handles.ts` loads the shared pattern table `content-rules.json` (copy it to `ios/Stexx/E2E/` after editing).
+  Tests: `overrideSpamForTests`.
 ### photocheck/ (profile photo checks, see docs/security.md §6; migration 106)
 - `checkPhoto(jpeg) → {phash, nsfw}` never throws (null parts = unchecked). `checkColumns(check)` → INSERT values.
   `flagPhotoMatches(tx, {id, ownerId, phash})` → rows in `photo_flags` (duplicates on other accounts, blocklist).
