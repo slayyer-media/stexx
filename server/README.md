@@ -45,7 +45,7 @@ Tests share one database with each other: they never truncate tables, they creat
 
 ```
 src/index.ts            Bun.serve (127.0.0.1:8787), websocket handler, starts jobs, graceful shutdown
-src/app.ts              createApp(): security headers -> request logger -> /healthz -> /v1 (body limits, general rate limit, routers)
+src/app.ts              createApp(): security headers -> request logger -> /healthz, /.well-known/apple-app-site-association -> /v1 (body limits, general rate limit, routers)
 src/config.ts           zod-parsed env; fails fast; production guards
 src/db/                 postgres.js client (sql.ts), migration runner (migrate.ts)
 src/lib/                errors, ids, time (isoDate), auth (tokens, sessions), serialize (the only builders of wire JSON),
@@ -120,7 +120,7 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `APPLE_ROOT_CA_DIR` | unset | Directory of Apple root `.cer` files (the repo ships `certs/`). Unset: `POST /subscriptions/apple` returns 503. |
 | `APPLE_PLUS_PRODUCT_ID` | `gay.stexx.app.plus.monthly` | |
 | `ATTESTATION_MODE` | `dev` (prod: `enforce` if `APPLE_TEAM_ID` set, else `off`) | `off` / `dev` / `enforce`. `dev` accepts the simulator bypass header and is refused in production. See [`docs/security.md`](../docs/security.md). |
-| `APPLE_TEAM_ID` | unset | App Attest app ID is `TEAMID.APPLE_BUNDLE_ID`. |
+| `APPLE_TEAM_ID` | unset | App Attest app ID is `TEAMID.APPLE_BUNDLE_ID`. Also names the app in `/.well-known/apple-app-site-association` (passkeys; 404 while unset). |
 | `DEVICECHECK_KEY_ID`, `DEVICECHECK_PRIVATE_KEY` / `_PATH`, `DEVICECHECK_ENVIRONMENT` | unset | DeviceCheck fallback and per-device bits. |
 | `APP_ATTEST_ENVIRONMENTS`, `APP_ATTEST_ROOT_CA` | see security.md | |
 | `MAX_ACCOUNTS_PER_DEVICE` | `1` | |

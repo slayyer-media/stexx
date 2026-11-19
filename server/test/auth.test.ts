@@ -480,6 +480,43 @@ describe("passkeys", () => {
     await expectError(await post("/v1/auth/passkey/register/finish", { json: auth.register(o) }), 409, "credential_exists");
   });
 
+  test("the iOS app's payloads: platform attachment, transports, userHandle, sign count always 0", async () => {
+    // What ios/Stexx/Services/Passkeys.swift sends (PasskeyWire): iCloud Keychain passkeys report counter 0 on every
+    // use, and the app adds authenticatorAttachment, the transports and (on sign-in) the userHandle.
+    const auth = new SoftAuthenticator();
+    const o = await passkeyOptions();
+    const reg = auth.register(o);
+    const session = await expectJson(
+      await post("/v1/auth/passkey/register/finish", {
+        json: {
+          ...reg,
+          authenticatorAttachment: "platform",
+          response: { ...reg.response, transports: ["hybrid", "internal"] },
+          confirmedAdult: true,
+        },
+      }),
+      200,
+    );
+    const [cred] = await sql`SELECT transports FROM passkey_credentials WHERE id = ${auth.credentialId.toString("base64url")}`;
+    expect(cred!.transports).toEqual(["hybrid", "internal"]);
+
+    for (let i = 0; i < 2; i++) {
+      const lo = await expectJson(await post("/v1/auth/passkey/login/options"), 200);
+      const assertion = auth.assert(lo, { counter: 0 });
+      const login = await expectJson(
+        await post("/v1/auth/passkey/login/finish", {
+          json: {
+            ...assertion,
+            authenticatorAttachment: "platform",
+            response: { ...assertion.response, userHandle: o.user.id },
+          },
+        }),
+        200,
+      );
+      expect(login.userID).toBe(session.userID);
+    }
+  });
+
   test("malformed bodies are 400", async () => {
     await expectError(await post("/v1/auth/passkey/register/finish", { json: {} }), 400);
     await expectError(await post("/v1/auth/passkey/register/finish", { json: { id: "a", rawId: "a", type: "public-key", response: { clientDataJSON: "!!", attestationObject: "x" } } }), 400);

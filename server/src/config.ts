@@ -148,6 +148,11 @@ export interface Config {
     plusProductId: string;
     /** True when StoreKit verification can run; otherwise POST /subscriptions/apple → 503. */
     enabled: boolean;
+    /**
+     * `${APPLE_TEAM_ID}.${APPLE_BUNDLE_ID}`, or null when APPLE_TEAM_ID is unset. Names the app in the
+     * apple-app-site-association file (passkeys); also the App Attest app ID.
+     */
+    appId: string | null;
   };
   trustProxy: boolean;
   antiSpam: AntiSpamConfig;
@@ -389,6 +394,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       rootCaDir: e.APPLE_ROOT_CA_DIR ?? null,
       plusProductId: e.APPLE_PLUS_PRODUCT_ID,
       enabled: appleEnabled,
+      appId,
     },
     trustProxy: e.TRUST_PROXY,
     antiSpam: {
