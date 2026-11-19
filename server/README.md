@@ -134,7 +134,7 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `SPAM_FANOUT_MIN`, `SPAM_FANOUT_MAX_REPLY_RATE` | `20`, `0.1` | `fan_out_no_replies` (weight 3): conversations started in the window, and the reply rate at or under which it fires. |
 | `SPAM_BURST_FIRST_CONTACTS`, `SPAM_BURST_MINUTES` | `8`, `10` | `first_contact_burst` (2): conversations started inside any such span. |
 | `SPAM_FIRST_CONTACT_MIN`, `SPAM_FIRST_CONTACT_RATIO` | `10`, `0.9` | `first_contact_rate` (1): unanswered cold starts, and their share of all conversations written in. |
-| `SPAM_BLOCKED_MIN`, `SPAM_BLOCKED_HOURS`, `SPAM_BLOCKED_DAYS` | `3`, `24`, `7` | `blocked_after_first_contact` (3): people who blocked or reported within the hours after its first message, over the days. |
+| `SPAM_BLOCKED_MIN`, `SPAM_BLOCKED_HOURS`, `SPAM_BLOCKED_DAYS` | `3`, `24`, `7` | `blocked_after_first_contact` (3): trusted, independent people (as for auto-hide) who blocked or reported within the hours after its first message, over the days. The days (or the window, if longer) are also how long `spam_contacts` rows live. |
 | `SPAM_DUPLICATE_RECIPIENTS`, `SPAM_DUPLICATE_SIMILARITY` | `5`, `0.6` | `duplicate_text` (3): recipients of near-identical text (keyed MinHash similarity). |
 | `SPAM_HANDLE_RECIPIENTS`, `SPAM_LINK_RECIPIENTS` | `1`, `2` | Cold conversations for `payment_handle` (2) / `redirect_handle` (1), and for `links` (1). |
 | `SPAM_SCORE_NEW`, `SPAM_SCORE_ESTABLISHED`, `SPAM_ESTABLISHED_DAYS` | `3`, `5`, `14` | Score that limits a new / an established account; established accounts also need two different signals. |

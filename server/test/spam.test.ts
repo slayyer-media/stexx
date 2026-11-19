@@ -3,9 +3,11 @@
  * across chat / nearby / taps / websocket / export, lifting (moderator clear, cooldown), ban and action, the moderation
  * queue and CLI, encrypted envelopes, and what is (not) stored.
  */
+import { randomBytes } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   assessSpam,
+  gatherSpamFacts,
   liftSpamLimitsAfterCooldown,
   maxInWindow,
   overrideSpamForTests,
@@ -16,6 +18,7 @@ import {
 import { overrideTrustForTests, trustState } from "../src/lib/abuse/trust.ts";
 import { accountReview, actionReports, banAccount, dismissReports } from "../src/lib/moderation.ts";
 import { addConnection, removeConnection } from "../src/lib/realtime.ts";
+import { newId } from "../src/lib/ids.ts";
 import { DAY, HOUR, MINUTE } from "../src/lib/time.ts";
 import { runModerationCli } from "../src/moderation/cli.ts";
 import { listenForReleasedMessages } from "../src/routes/chat.ts";
@@ -246,6 +249,29 @@ describe("shadow limit in chat", () => {
     }
   });
 
+  test("a held message to a connected recipient shows \"delivered\" to its sender, exactly like a delivered one", async () => {
+    const { s } = await limitByFanOut();
+    const statusTo = async (from: TestUser) => {
+      const target = await createUser();
+      const conv = await open(from, target);
+      const theirs = captureRealtime(target.id);
+      addConnection(theirs.conn);
+      try {
+        const msg = await sendText(from, conv, "hello stranger");
+        return { msg, conv, target, listed: (await thread(from, conv))[0]!.status };
+      } finally {
+        removeConnection(theirs.conn);
+      }
+    };
+    const held = await statusTo(s);
+    expect(held.msg.status).toBe("delivered");
+    expect(held.listed).toBe("delivered");
+    expect(await thread(held.target, held.conv)).toEqual([]); // still held
+    expect(await heldCount(s.id)).toBe(2);
+    const normal = await statusTo(await sender());
+    expect([normal.msg.status, normal.listed]).toEqual([held.msg.status, held.listed]);
+  });
+
   test("taps are silently dropped; the account leaves nearby and viewers (but still sees nearby itself)", async () => {
     const cell = randomCell();
     const { s } = await limitByFanOut();
@@ -332,6 +358,7 @@ describe("signals through the API", () => {
     settings({ blockedMin: 3 });
     const s = await sender();
     const { people, convs } = await strangers(s, 4);
+    for (const p of people) await ageDays(p, 3); // trusted blockers (see the next test)
     for (const c of convs) await sendText(s, c, "hi");
     await expectNoContent(await as(people[0]!).put(`/v1/blocks/${s.id}`));
     await expectNoContent(await as(people[1]!).post("/v1/reports", { json: { profileID: s.id, reason: "spam" } }));
@@ -341,10 +368,96 @@ describe("signals through the API", () => {
 
     const late = await sender();
     const l = await strangers(late, 3);
+    for (const p of l.people) await ageDays(p, 3);
     for (const c of l.convs) await sendText(late, c, "hi");
-    await sql`UPDATE messages SET sent_at = sent_at - interval '2 days' WHERE sender_id = ${late.id}`;
+    await sql`UPDATE spam_contacts SET first_at = first_at - interval '2 days' WHERE sender_id = ${late.id}`;
     for (const p of l.people) await expectNoContent(await as(p).put(`/v1/blocks/${late.id}`));
     expect(await limited(late.id)).toBe(false);
+  });
+
+  test("blocked_after_first_contact: only trusted, independent blockers count (throwaways can't limit a newcomer)", async () => {
+    settings({ blockedMin: 3 });
+    // A newcomer writes first to three fresh accounts (attractive bait), which all block it at once.
+    const victim = await sender();
+    const bait = await strangers(victim, 3);
+    for (const c of bait.convs) await sendText(victim, c, "hi");
+    for (const p of bait.people) await expectNoContent(await as(p).put(`/v1/blocks/${victim.id}`));
+    expect(await limited(victim.id)).toBe(false);
+    expect((await gatherSpamFacts(victim.id))!.blockedAfterFirstContact).toBe(0);
+
+    // Old enough, but all on one device (device_accounts): they count once.
+    const v2 = await sender();
+    const ring = await strangers(v2, 3);
+    const device = newId("device");
+    await sql`INSERT INTO devices (id, key_id, public_key, environment)
+              VALUES (${device}, ${randomBytes(32)}, ${randomBytes(65)}, 'development')`;
+    for (const p of ring.people) {
+      await ageDays(p, 3);
+      await sql`INSERT INTO device_accounts (device_id, user_id) VALUES (${device}, ${p.id})`;
+    }
+    for (const c of ring.convs) await sendText(v2, c, "hi");
+    for (const p of ring.people) await expectNoContent(await as(p).put(`/v1/blocks/${v2.id}`));
+    expect(await limited(v2.id)).toBe(false);
+    expect((await gatherSpamFacts(v2.id))!.blockedAfterFirstContact).toBe(1);
+
+    // Reports from one connection count once too; a hidden or spam-limited blocker never counts.
+    const v3 = await sender();
+    const mixed = await strangers(v3, 4);
+    for (const p of mixed.people) await ageDays(p, 3);
+    for (const c of mixed.convs) await sendText(v3, c, "hi");
+    for (const p of mixed.people.slice(0, 2)) {
+      await expectNoContent(await as(p).post("/v1/reports", { json: { profileID: v3.id, reason: "spam" }, ip: "198.51.100.77" }));
+    }
+    await sql`UPDATE users SET spam_limited_at = now() WHERE id = ${mixed.people[2]!.id}`;
+    await sql`UPDATE users SET hidden_at = now(), hidden_reason = 'moderator' WHERE id = ${mixed.people[3]!.id}`;
+    for (const p of mixed.people.slice(2)) await expectNoContent(await as(p).put(`/v1/blocks/${v3.id}`));
+    expect(await limited(v3.id)).toBe(false);
+    expect((await gatherSpamFacts(v3.id))!.blockedAfterFirstContact).toBe(1);
+  });
+
+  test("self-expiring messages don't erase the metadata signals (fan-out, blocked after first contact)", async () => {
+    // Each recipient reads a 1-second message, and the expiry job deletes it (as it would 1 s later).
+    const sendExpiringRead = async (s: TestUser, p: TestUser, conv: string) => {
+      await expectJson(await send(s, conv, { text: "hi", expiresAfterSeconds: 1 }));
+      await expectNoContent(await as(p).post(`/v1/conversations/${conv}/read`));
+      await sql`DELETE FROM messages WHERE sender_id = ${s.id} AND expires_at IS NOT NULL`;
+    };
+    settings({ fanOutMin: 3 });
+    const s = await sender();
+    const a = await strangers(s, 3);
+    for (let i = 0; i < 3; i++) await sendExpiringRead(s, a.people[i]!, a.convs[i]!);
+    expect((await activeFlag(s.id))!.signals).toEqual(["fan_out_no_replies"]);
+
+    settings({ fanOutMin: 1000, blockedMin: 2 });
+    const t = await sender();
+    const b = await strangers(t, 2);
+    for (const p of b.people) await ageDays(p, 3);
+    for (let i = 0; i < 2; i++) await sendExpiringRead(t, b.people[i]!, b.convs[i]!);
+    const [left] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM messages WHERE sender_id = ${t.id}`;
+    expect(left!.n).toBe(0);
+    for (const p of b.people) await expectNoContent(await as(p).put(`/v1/blocks/${t.id}`));
+    expect((await activeFlag(t.id))!.signals).toEqual(["blocked_after_first_contact"]);
+  });
+
+  test("a reply still counts as one after it expires; the trust ramp's first-contact count survives expiry too", async () => {
+    settings({ fanOutMin: 2 });
+    const s = await sender();
+    const { people, convs } = await strangers(s, 2);
+    await sendText(s, convs[0]!, "hi");
+    await expectJson(await send(people[0]!, convs[0]!, { text: "hey", expiresAfterSeconds: 1 }));
+    await sql`DELETE FROM messages WHERE sender_id = ${people[0]!.id}`;
+    await sendText(s, convs[1]!, "hi");
+    expect(await limited(s.id)).toBe(false); // 1 of 2 answered: not a fan-out with no replies
+
+    restores.push(overrideTrustForTests({ firstMessagesPerDay: 2 }));
+    const newbie = await createUser(); // inside the 24 h trust ramp
+    const n = await strangers(newbie, 3);
+    for (let i = 0; i < 2; i++) {
+      await expectJson(await send(newbie, n.convs[i]!, { text: "hi", expiresAfterSeconds: 1 }));
+      await expectNoContent(await as(n.people[i]!).post(`/v1/conversations/${n.convs[i]}/read`));
+    }
+    await sql`DELETE FROM messages WHERE sender_id = ${newbie.id}`;
+    await expectError(await send(newbie, n.convs[2]!, { text: "hi" }), 403, "new_account_limit");
   });
 
   test("first_contact_burst plus links (weak signals together) limit a new account", async () => {
@@ -378,6 +491,8 @@ describe("signals through the API", () => {
     expect(await limited(s.id)).toBe(false);
     const [f] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM spam_message_features WHERE sender_id = ${s.id}`;
     expect(f!.n).toBe(0);
+    const [c] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM spam_contacts WHERE sender_id = ${s.id}`;
+    expect(c!.n).toBe(0);
   });
 });
 
@@ -582,6 +697,15 @@ describe("cooldown and retention", () => {
     expect((await runSpamJobs()).flags).toBeGreaterThanOrEqual(1);
     const [left] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM spam_flags WHERE user_id = ${s.id}`;
     expect(left!.n).toBe(0);
+
+    // The ledger: kept SPAM_BLOCKED_DAYS (longer than the 24 h window) after the last message, then deleted.
+    const [ttl] = await sql<{ ms: number }[]>`
+      SELECT (extract(epoch FROM max(expires_at - last_at)) * 1000)::float8 AS ms FROM spam_contacts WHERE sender_id = ${s.id}`;
+    expect(ttl!.ms).toBe(spamSettings().blockedDays * DAY);
+    await sql`UPDATE spam_contacts SET expires_at = now() - interval '1 second' WHERE sender_id = ${s.id}`;
+    expect((await runSpamJobs()).contacts).toBeGreaterThanOrEqual(5);
+    const [contacts] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM spam_contacts WHERE sender_id = ${s.id}`;
+    expect(contacts!.n).toBe(0);
   });
 
   test("what is stored: counters, signal names, keyed hashes and rule kinds, never text", async () => {
@@ -595,6 +719,11 @@ describe("cooldown and retention", () => {
     expect(cols.map((c) => c.column_name)).toEqual([
       "id", "sender_id", "conversation_id", "created_at", "expires_at", "minhash", "near_dupes", "has_link", "has_payment",
       "has_redirect", "cold",
+    ]);
+    const ledger = await sql<{ column_name: string }[]>`
+      SELECT column_name FROM information_schema.columns WHERE table_name = 'spam_contacts' ORDER BY ordinal_position`;
+    expect(ledger.map((c) => c.column_name)).toEqual([
+      "sender_id", "conversation_id", "other_id", "first_at", "first_visible_at", "last_at", "expires_at",
     ]);
     const rows = await sql`SELECT * FROM spam_message_features WHERE sender_id = ${s.id}`;
     const flags = await sql`SELECT * FROM spam_flags WHERE user_id = ${s.id}`;

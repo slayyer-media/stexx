@@ -93,7 +93,7 @@ An account is **restricted** while it is younger than `TRUST_RAMP_HOURS` (24) an
 | --- | --- |
 | `links_not_allowed` | No URLs, bare domains (`example.xyz`, `t.me/...`) or `www.` links. |
 | `handles_not_allowed` | No payment or crypto handles (Cash App `$tags`, Venmo, PayPal.me, Zelle, wallet addresses) and no off-platform redirects (Telegram, WhatsApp, Snapchat, Instagram, Kik, Signal usernames, OnlyFans), from the shared table in section 8. |
-| `new_account_limit` | At most `TRUST_RAMP_FIRST_MESSAGES_PER_DAY` (10) conversations started in 24h that nobody has replied to yet. |
+| `new_account_limit` | At most `TRUST_RAMP_FIRST_MESSAGES_PER_DAY` (10) conversations started in 24h that nobody has replied to yet. Counted from the messages and from the spam heuristics' ledger (`spam_contacts`, section 8), so a first message that expires right after it is read still counts. |
 | `duplicate_message` | The same text (case, spacing and punctuation ignored, 16+ characters) to more than `TRUST_RAMP_DUPLICATE_RECIPIENTS` (3) people in 24h. |
 
 ### With end-to-end encrypted chats
@@ -346,7 +346,7 @@ Every send re-assesses the sender, and every block or report re-assesses the per
 | Signal | Weight | Fires when (defaults) | Needs |
 | --- | --- | --- | --- |
 | `fan_out_no_replies` | 3 | 20+ conversations started in 24 h and at most 10% got a reply | metadata |
-| `blocked_after_first_contact` | 3 | 3+ people blocked or reported it within 24 h of its first message to them (it wrote first), over 7 days | metadata |
+| `blocked_after_first_contact` | 3 | 3+ **trusted, independent** people blocked or reported it within 24 h of its first message to them (it wrote first), over 7 days | metadata |
 | `duplicate_text` | 3 | near-identical text (similarity 0.6+) to 5+ people in 24 h | plaintext |
 | `first_contact_burst` | 2 | 8+ conversations started inside any 10 minutes | metadata |
 | `payment_handle` | 2 | a payment or crypto handle in 1+ cold conversation in 24 h | plaintext |
@@ -356,7 +356,9 @@ Every send re-assesses the sender, and every block or report re-assesses the per
 
 **Decision.** An account younger than `SPAM_ESTABLISHED_DAYS` (14) is limited at a score of 3: one strong signal, or weaker ones together (a burst plus links, a payment handle plus a redirect). An established account needs 5 **and** at least two different signals, so a single signal, however strong, never limits it.
 
-**Metadata signals work forever**, including for end-to-end encrypted chats: they only use who wrote first in which conversation and when, and blocks and reports. **Content signals are plaintext only**: `ContentPolicy.features` (section 4) turns a plaintext message into features, and an encrypted envelope gets none; the server never tries to read one.
+**Metadata signals work forever**, including for end-to-end encrypted chats: they only use who wrote first in which conversation and when, and blocks and reports. They read a small ledger (`spam_contacts`: sender, conversation, the other person, when it first wrote, first wrote something visible, last wrote), not the messages themselves, so a sender can't erase them by making every cold message expire one second after it is read, or by clearing threads.
+
+**Who counts for `blocked_after_first_contact`.** The same people auto-hide trusts (section 5): at least `REPORT_REPORTER_MIN_AGE_HOURS` old, not restricted by the trust ramp, not hidden, banned or spam-limited themselves, and one per device (`device_accounts`) and per report connection (`reports.reporter_ip_hash`), earlier ones first. Otherwise three throwaway accounts with attractive profiles could wait for a newcomer to write to them and block it, silently limiting it. **Content signals are plaintext only**: `ContentPolicy.features` (section 4) turns a plaintext message into features, and an encrypted envelope gets none; the server never tries to read one.
 
 **Near-identical text.** The text is normalized (NFKC, lower case, letters and digits only) and cut into overlapping 5-character shingles, and a 64-position MinHash signature is kept. Two signatures agree in about as many positions as the texts share shingles, so changed names, punctuation and emoji still match ("Hey Jake!! …" and "hey sam …" score about 0.75) and different messages score near 0. The shingle hash is an HMAC with a key derived from `EMAIL_PEPPER`, so the stored numbers can't be checked against a dictionary of guesses without the key, and they are deleted after `SPAM_HASH_TTL_HOURS` (48). Near-duplicates are counted per sender; text repeated by a ring of accounts isn't linked across accounts (follow-up).
 
@@ -370,7 +372,7 @@ When the score reaches the threshold the account is **shadow-limited** (`users.s
 
 | | Shadow-limited |
 | --- | --- |
-| Messages to people who haven't written to it (first messages and follow-ups to non-repliers) | **held**: stored and shown to the sender as sent (status `sent`, pushed to the sender's own sockets), never shown or pushed to the recipient: no conversation, no unread count, no re-sorted chat list (a held message doesn't move the thread's `updatedAt` for the recipient; the sender's own list re-sorts as usual), can't be read, left out of the recipient's data export. The message that tripped the limit is already held. |
+| Messages to people who haven't written to it (first messages and follow-ups to non-repliers) | **held**: stored and shown to the sender like any other message (status `delivered` if the recipient was connected when it was sent, otherwise `sent`, exactly as for a message that went through; pushed to the sender's own sockets), never shown or pushed to the recipient: no conversation, no unread count, no re-sorted chat list (a held message doesn't move the thread's `updatedAt` for the recipient; the sender's own list re-sorts as usual), can't be read, left out of the recipient's data export. The message that tripped the limit is already held. |
 | Messages to people who have written to it | delivered as usual |
 | Taps | accepted (204) and dropped |
 | Nearby, viewers | left out for everyone (it still sees nearby itself) |
@@ -403,6 +405,7 @@ stexx-mod spam-clear p_abc… --as mod-a --note "busy night, real person"
 
 - `spam_message_features`: per plaintext message with text worth checking, the sender, the conversation id, the MinHash signature (64 keyed integers) and which rule kinds matched (`has_link`, `has_payment`, `has_redirect`, `cold`). No text, no match. Deleted after `SPAM_HASH_TTL_HOURS` (48).
 - `spam_flags`: one row per episode: signal names, score, counters (numbers such as `started=23 replied=1`), the system report, how and when it ended, how many held messages were delivered or dropped. Deleted `SPAM_FLAG_RETENTION_DAYS` (180) after the episode ended.
+- `spam_contacts`: per sender and conversation, the other person's id and four timestamps (first message, first message the other person could see, last message, expiry). No text, no message ids. Deleted `SPAM_BLOCKED_DAYS` (7) or `SPAM_WINDOW_HOURS` after the sender's last message there, whichever is longer, and with either account; it survives a cleared thread or an expired message for that time on purpose. Only written while the heuristics are on.
 - `messages.held_at`, `users.spam_limited_at` / `spam_cleared_at`, `reports.source`.
 - Moderation records hold no message text from these rules: moderators see only what reporters attach (section 5).
 - The account's own data export doesn't list its spam state, like reports filed against it and photo flags.
@@ -497,12 +500,12 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - A banned account is deleted like any other after a 30-day review window (`BANNED_RETENTION_DAYS`); what's left is its email HMAC in `banned_emails` and its device bans (section 5).
 - Reports add two things: the messages and photos a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Evidence photos are files in `MEDIA_DIR` with random names that no API response contains; only the moderation CLI prints their path. Nothing in moderation stores or shows a location.
 - Encrypted chat photos add nothing readable: a blob, its size bucket and the usual message metadata.
-- Spam heuristics (section 8) store counters, signal names, and per plaintext message a keyed MinHash signature and which rule kinds matched, for 48 hours; never message text. Held messages are the sender's own messages, kept as they would be anyway, and deleted if the account is banned or nobody reviews them in 30 days.
+- Spam heuristics (section 8) store counters, signal names, and per plaintext message a keyed MinHash signature and which rule kinds matched, for 48 hours; never message text. They also keep who wrote in which conversation when (`spam_contacts`) for 7 days after the last message, even if the messages expired or the thread was cleared: metadata the server had anyway, kept a little longer so disappearing messages can't hide spam. Held messages are the sender's own messages, kept as they would be anyway, and deleted if the account is banned or nobody reviews them in 30 days.
 - Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read.
 
 ## Not done yet
 
-- Spam heuristics (section 8): near-identical text is detected per sender, not across a ring of accounts sending the same text; released held messages are pushed over the websocket only to recipients connected at that moment (no APNs push); the CLI's `show` labels the system's spam report as `reporter automatic (spam heuristics)`; the thresholds are educated defaults that haven't met real traffic yet, so watch `stexx-mod spam` after launch and tune the `SPAM_*` values.
+- Spam heuristics (section 8): near-identical text is detected per sender, not across a ring of accounts sending the same text; released held messages are pushed over the websocket only to recipients connected at that moment (no APNs push); the CLI's `show` labels the system's spam report as `reporter automatic (spam heuristics)`; the thresholds are educated defaults that haven't met real traffic yet, so watch `stexx-mod spam` after launch and tune the `SPAM_*` values. A limited account can still guess from indirect hints: its cold messages never turn `read` (people often don't open them anyway), a held message to someone offline stays `sent` where a delivered one turns `delivered` when they open it, and its data export doesn't list taps that were dropped (they were never stored).
 
 - Report evidence photos are re-uploaded by the reporter's app, so the server can't prove a photo is the one that was in the chat (same as evidence text).
 - No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Review turnaround depends on someone running `list`; there are no notifications for new high-priority reports yet.
