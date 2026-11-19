@@ -98,12 +98,13 @@ actor E2EEngine {
     /// Accounts deleted in this run: nothing may write their keys again.
     private var wipedUsers: Set<Profile.ID> = []
     /// After a 429 on `PUT /keys` (10 a day), don't try again before this.
-    private var registerBlockedUntil: Date?
+    private var registerBlockedUntil: [Profile.ID: Date] = [:]
     private var sessionSetups: [Profile.ID: Task<Void, any Error>] = [:]
     private var identityCheckedAt: [Profile.ID: Date] = [:]
     private var encryptedPeers: Set<Profile.ID> = []
     private var lastSnapshot = E2ESnapshot()
     private var syncTask: Task<Void, Never>?
+    private var syncGeneration = 0
 
     static let deviceID: UInt32 = 1
     /// How long a fetched `E2EConfig` is used before it's re-read.
@@ -239,7 +240,7 @@ actor E2EEngine {
         let fresh: E2EConfig
         do {
             fresh = try await api.e2eConfig()
-        } catch APIError.notFound {
+        } catch APIError.notFound where cached == nil {
             // A server from before end-to-end encryption: plaintext.
             fresh = .off
         } catch {
@@ -266,26 +267,27 @@ actor E2EEngine {
     /// launch and foreground; best effort (the next run retries). Does nothing
     /// while the server's mode is `off`.
     func syncKeys() async {
-        if let syncTask {
-            await syncTask.value
-            return
-        }
-        let task = Task { await self.performSync(onlyReplenish: false) }
-        syncTask = task
-        await task.value
-        syncTask = nil
+        await runSync(onlyReplenish: false)
     }
 
     /// `keys.low`: top up one-time prekeys.
     func replenishKeys() async {
+        await runSync(onlyReplenish: true)
+    }
+
+    /// Single flight. Only the run that started a task clears it, so a run
+    /// that outlived a sign-out never drops a newer account's task.
+    private func runSync(onlyReplenish: Bool) async {
         if let syncTask {
             await syncTask.value
             return
         }
-        let task = Task { await self.performSync(onlyReplenish: true) }
+        syncGeneration += 1
+        let generation = syncGeneration
+        let task = Task { await self.performSync(onlyReplenish: onlyReplenish) }
         syncTask = task
         await task.value
-        syncTask = nil
+        if syncGeneration == generation { syncTask = nil }
     }
 
     private func performSync(onlyReplenish: Bool) async {
@@ -306,6 +308,9 @@ actor E2EEngine {
                 try await register(account, config: config)
                 return
             }
+            // A saved registration that's no longer needed (and that the
+            // server doesn't show): drop it and its keys.
+            if let stale = try account.store.pendingRegistration() { try discard(stale, from: account.store) }
             try await replenish(account, config: config, status: status)
             guard isCurrent(account), !Task.isCancelled else { return }
             if !onlyReplenish {
@@ -342,15 +347,20 @@ actor E2EEngine {
     /// once the server has it (here, or by `reconcileUploads` if only the
     /// response was lost).
     private func register(_ account: Account, config: E2EConfig) async throws {
-        if let until = registerBlockedUntil, until > now() { return }
+        if let until = registerBlockedUntil[account.userID], until > now() { return }
         let store = account.store
         let upload: E2EPendingRegistration
         if let pending = try store.pendingRegistration(),
            pending.registration.identityKey == store.identityKeyBase64,
            pending.registration.registrationID == store.state.registrationID,
-           (try? store.loadSignedPreKey(id: pending.registration.signedPreKey.keyID, context: NullContext())) != nil {
+           pending.registration.preKeys.count <= config.maxPreKeys,
+           pending.registration.pqPreKeys.count <= config.maxPqPreKeys,
+           // Every private key still here: none used up by a peer since a
+           // first attempt that did reach the server.
+           try hasAllKeys(of: pending, in: store) {
             upload = pending
         } else {
+            if let stale = try store.pendingRegistration() { try discard(stale, from: store) }
             let newEpoch = store.state.epoch + 1
             let signed = try makeSignedPreKey(store)
             let lastResort = try makeKyberPreKeys(store, count: 1, lastResort: true, epoch: newEpoch)[0]
@@ -373,13 +383,56 @@ actor E2EEngine {
         do {
             _ = try await api.registerKeys(upload.registration)
         } catch APIError.rateLimited(let retryAfter) {
-            registerBlockedUntil = now().addingTimeInterval(retryAfter ?? 3600)
+            registerBlockedUntil[account.userID] = now().addingTimeInterval(retryAfter ?? 3600)
             throw APIError.rateLimited(retryAfter: retryAfter)
+        } catch let error as APIError where Self.isPermanentRejection(error) {
+            // The server refused this upload for good: never resend it.
+            try discard(upload, from: store)
+            throw error
         }
         // The keys are this account's even if it signed out meanwhile; only a
         // deleted account's must not come back.
         guard !wipedUsers.contains(account.userID) else { return }
         try commit(upload, to: store)
+    }
+
+    /// A 4xx other than 429: re-sending the same body can't succeed.
+    private static func isPermanentRejection(_ error: APIError) -> Bool {
+        switch error {
+        case .server(let status, _): (400..<500).contains(status) && status != 429
+        case .e2e(let code, _): code != E2EErrorCode.disabled
+        default: false
+        }
+    }
+
+    private func hasAllKeys(of upload: E2EPendingRegistration, in store: E2EProtocolStore) throws -> Bool {
+        let registration = upload.registration
+        guard (try? store.loadSignedPreKey(id: registration.signedPreKey.keyID, context: NullContext())) != nil else { return false }
+        for key in registration.preKeys where (try? store.loadPreKey(id: key.keyID, context: NullContext())) == nil { return false }
+        for key in registration.pqPreKeys + [registration.pqLastResortPreKey]
+        where (try? store.loadKyberPreKey(id: key.keyID, context: NullContext())) == nil { return false }
+        return true
+    }
+
+    /// Forgets a saved registration the server doesn't have, with its keys.
+    private func discard(_ upload: E2EPendingRegistration, from store: E2EProtocolStore) throws {
+        let registration = upload.registration
+        let state = store.state
+        if registration.signedPreKey.keyID != state.currentSignedPreKeyID,
+           state.replacedSignedPreKeys[registration.signedPreKey.keyID] == nil {
+            try store.removeSignedPreKey(id: registration.signedPreKey.keyID)
+        }
+        if registration.pqLastResortPreKey.keyID != state.currentLastResortKyberID,
+           state.replacedLastResortKyber[registration.pqLastResortPreKey.keyID] == nil {
+            try store.removeKyberPreKey(id: registration.pqLastResortPreKey.keyID)
+        }
+        for key in registration.preKeys where state.oneTimePreKeys[key.keyID] == upload.epoch && upload.epoch > state.epoch {
+            try store.removePreKey(id: key.keyID, context: NullContext())
+        }
+        for key in registration.pqPreKeys where state.oneTimeKyberPreKeys[key.keyID] == upload.epoch && upload.epoch > state.epoch {
+            try store.removeKyberPreKey(id: key.keyID)
+        }
+        try store.setPendingRegistration(nil)
     }
 
     private func commit(_ upload: E2EPendingRegistration, to store: E2EProtocolStore) throws {
@@ -487,13 +540,24 @@ actor E2EEngine {
         let store = account.store
         let cutoff = now().addingTimeInterval(-E2EKeyPolicy.keepReplacedKeys)
         let state = store.state
-        // Generated for an upload that may still land: never dropped here.
-        if try store.pendingRegistration() != nil || store.pendingRotation() != nil { return }
-        for (id, replacedAt) in state.replacedSignedPreKeys where replacedAt < cutoff && id != state.currentSignedPreKeyID {
+        var protectedSigned: Set<UInt32> = []
+        var protectedKyber: Set<UInt32> = []
+        // Keys of an upload that may still land are never dropped here.
+        if let rotation = try store.pendingRotation() {
+            if let id = rotation.signedPreKey?.keyID { protectedSigned.insert(id) }
+            if let id = rotation.pqLastResortPreKey?.keyID { protectedKyber.insert(id) }
+        }
+        if let pending = try store.pendingRegistration() {
+            protectedSigned.insert(pending.registration.signedPreKey.keyID)
+            protectedKyber.insert(pending.registration.pqLastResortPreKey.keyID)
+        }
+        for (id, replacedAt) in state.replacedSignedPreKeys
+        where replacedAt < cutoff && id != state.currentSignedPreKeyID && !protectedSigned.contains(id) {
             try store.removeSignedPreKey(id: id)
             try store.updateState { $0.replacedSignedPreKeys[id] = nil }
         }
-        for (id, replacedAt) in state.replacedLastResortKyber where replacedAt < cutoff && id != state.currentLastResortKyberID {
+        for (id, replacedAt) in state.replacedLastResortKyber
+        where replacedAt < cutoff && id != state.currentLastResortKyberID && !protectedKyber.contains(id) {
             try store.removeKyberPreKey(id: id)
             try store.updateState { $0.replacedLastResortKyber[id] = nil }
         }
@@ -939,7 +1003,14 @@ actor E2EEngine {
         else { return }
         if current != trusted {
             try? account.store.recordPendingIdentity(current, for: peer, now: date)
-        } else if (try? account.store.pendingIdentity(of: peer)) != nil {
+        } else if let pending = try? account.store.pendingIdentity(of: peer),
+                  // Not a newer hold recorded while this request was out.
+                  pending.detectedAt <= date {
+            // The server still publishes the trusted key: the pending one is
+            // stale or forged. Dismiss it so it can't come back.
+            if let data = Data(base64Encoded: pending.identityKey), let key = try? IdentityKey(bytes: data) {
+                try? account.store.dismissIdentity(key, of: peer)
+            }
             try? account.store.clearPendingIdentity(of: peer)
         }
         await publish()

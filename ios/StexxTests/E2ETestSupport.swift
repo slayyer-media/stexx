@@ -21,7 +21,7 @@ actor FakeE2EServer {
     var statusOverride: [Profile.ID: KeyStatus] = [:]
     /// How the next `PUT /keys` fails: before storing anything, or after
     /// storing (the response is lost).
-    enum Failure { case beforeApply, afterApply }
+    enum Failure { case beforeApply, afterApply, reject }
     var nextRegisterFailure: Failure?
     /// Every `PUT /keys` body received, including failed ones.
     private(set) var registerAttempts: [KeyRegistration] = []
@@ -60,6 +60,7 @@ actor FakeE2EServer {
         let failure = nextRegisterFailure
         nextRegisterFailure = nil
         if failure == .beforeApply { throw URLError(.timedOut) }
+        if failure == .reject { throw APIError.server(status: 400, message: "preKeys: at most 50 per upload.") }
         defer { if failure == .afterApply { lostResponse = true } }
         registrations[user] = registration
         preKeys[user] = registration.preKeys

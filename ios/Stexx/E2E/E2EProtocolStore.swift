@@ -215,6 +215,16 @@ final class E2EProtocolStore: IdentityKeyStore, PreKeyStore, SignedPreKeyStore, 
         try put(identity.serialize(), "trusted.\(peer)")
     }
 
+    /// Refuses `identity` for `peer` from now on without a warning (a key the
+    /// server never backed).
+    func dismissIdentity(_ identity: IdentityKey, of peer: Profile.ID) throws {
+        var retired = try retiredIdentities(of: peer)
+        guard !retired.contains(identity.serialize()) else { return }
+        retired.append(identity.serialize())
+        try put(try JSONEncoder().encode(Array(retired.suffix(10))), "retired.\(peer)")
+    }
+
+    /// Keys the user moved on from, or that were dismissed: refused quietly.
     func retiredIdentities(of peer: Profile.ID) throws -> [Data] {
         try get("retired.\(peer)").map { try JSONDecoder().decode([Data].self, from: $0) } ?? []
     }

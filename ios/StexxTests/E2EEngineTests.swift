@@ -516,4 +516,20 @@ struct E2EEngineTests {
         #expect(try Data(contentsOf: aside) == Data("garbage".utf8))
         #expect(try persistence.load(userID: "alice")?.sent.isEmpty == false || persistence.load(userID: "alice")?.messages.isEmpty == false)
     }
+
+    @Test("A PUT /keys the server rejects for good is dropped with its keys, and the next sync starts over")
+    func rejectedRegistrationIsDropped() async throws {
+        let server = FakeE2EServer()
+        let alice = FakeDevice("alice", peer: "bob", server: server)
+        await server.failNextRegister(.reject)
+        await alice.engine.syncKeys()
+        #expect(try alice.secrets.read("alice/upload.registration") == nil)
+        #expect(try alice.secrets.keys(withPrefix: "alice/prekey.").isEmpty)
+        await alice.engine.syncKeys()
+        let attempts = await server.registerAttempts
+        #expect(attempts.count == 2)
+        #expect(attempts[0].preKeys.map(\.keyID) != attempts[1].preKeys.map(\.keyID))
+        #expect(await server.registrations["alice"] != nil)
+        #expect(try alice.secrets.keys(withPrefix: "alice/prekey.").count == 100)
+    }
 }

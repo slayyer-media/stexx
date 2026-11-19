@@ -63,7 +63,8 @@ struct ChatThreadView: View {
                             message: message,
                             isMine: isMine,
                             senderName: participant.displayName,
-                            isKeyChangePending: e2e.hasKeyChange(for: participant.id),
+                            // Held bubbles keep their "key" placeholder until the refetch after Accept.
+                            isKeyChangePending: e2e.hasKeyChange(for: participant.id) || isAcceptingKeyChange,
                             showsTimestamp: showsTimestamp(at: index),
                             isFirstInGroup: !continues,
                             isLastInGroup: isLastInGroup(at: index),
@@ -508,7 +509,13 @@ struct ChatThreadView: View {
             return
         }
         sendNotice = nil
-        if let id = conversation?.id { try? await refreshMessages(in: id) }
+        if let id = conversation?.id {
+            do {
+                try await refreshMessages(in: id)
+            } catch {
+                sendNotice = String(localized: "Key accepted. Couldn't load the held messages; they'll appear when the chat refreshes.")
+            }
+        }
         // The chat list's preview may have been a held message too.
         await chatStore.load()
     }
