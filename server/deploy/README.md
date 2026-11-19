@@ -16,6 +16,7 @@ watchdog every 5 minutes (`stexx-watch.timer`).
 | File | Purpose |
 | --- | --- |
 | `Caddyfile` | Site blocks for `api.stexx.gay` and `media.stexx.gay`. Installed as `/etc/caddy/sites/stexx.caddy`. |
+| `Caddyfile.apex` | Optional: `stexx.gay` serving only `/.well-known/apple-app-site-association` (passkeys), when the apex points at this box. Installed by hand as `/etc/caddy/sites/stexx-apex.caddy` (step 8). |
 | `Caddyfile.main` | Global options (Cloudflare trusted proxies, log filtering) + `import sites/*.caddy`. The whole `/etc/caddy/Caddyfile` on a dedicated box. |
 | `stexx-api.service` | The API, with strong systemd sandboxing. |
 | `stexx-backup.service` / `.timer` / `backup.sh` | Encrypted nightly backup; `backup.sh --pre-migrate` is the snapshot `deploy.sh` takes before migrating. |
@@ -51,8 +52,18 @@ watchdog every 5 minutes (`stexx-watch.timer`).
 7. **First deploy:** `DEPLOY_HOST=you@host ./deploy/deploy.sh --no-backup` (no data yet), then `--status`.
    **Alerts** ([Monitoring and alerts](#monitoring-and-alerts)): fill `/etc/stexx/watch.env`, then `sudo stexx-watch --test-alert`.
    **Restore drill** from your laptop once the first nightly backup exists ([Restore drill](#restore-drill)).
-8. **Apple app-site-association.** Passkeys and universal links need `https://stexx.gay/.well-known/apple-app-site-association` (`webcredentials` + `applinks`).
-   That host is not served by this box's `Caddyfile`; wherever `stexx.gay` lives must serve it with `Content-Type: application/json` and no redirect.
+8. **Apple app-site-association (passkeys).** The iOS app can only create or use passkeys for `stexx.gay` (`WEBAUTHN_RP_ID`) once Apple's CDN
+   has fetched `https://stexx.gay/.well-known/apple-app-site-association` (HTTPS, `Content-Type: application/json`, **no redirect**).
+   The API builds that file from `APPLE_TEAM_ID` + `APPLE_BUNDLE_ID` (`webcredentials` for passkeys, `applinks` for `/auth/email` sign-in links;
+   `src/lib/aasa.ts`) and serves it at that path on every host it answers; it is 404 until `APPLE_TEAM_ID` is set in `/etc/stexx/stexx.env`.
+   - Set `APPLE_TEAM_ID`, restart (`deploy.sh` or `systemctl restart stexx-api`), then check the API copy:
+     `curl -si https://api.stexx.gay/.well-known/apple-app-site-association` → 200, `application/json`, your `TEAMID.gay.stexx.app`.
+   - Then make **`stexx.gay`** serve the same bytes. If the apex points at this box and nothing else serves it, install the optional site
+     block: `sudo install -m 0644 Caddyfile.apex /etc/caddy/sites/stexx-apex.caddy`, `caddy validate`, `systemctl reload caddy`
+     (`--sync-config` leaves it alone). If `stexx.gay` is a website hosted elsewhere, have that host proxy this one path to
+     `https://api.stexx.gay/.well-known/apple-app-site-association`, or publish a copy of the JSON there (and update it if the team or bundle ID changes).
+   - Verify what Apple sees: `curl -s https://app-site-association.cdn-apple.com/a/v1/stexx.gay` (the CDN caches for up to a day; a device
+     re-checks on install and app update). Cloudflare must not redirect, challenge (bot fight mode, WAF) or rewrite that path.
 
 Day to day: `DEPLOY_HOST=you@host ./deploy/deploy.sh` (runs `bun run check` locally first), `--status`, `--list-releases`, `--rollback`.
 Config-only changes (units, Caddy site file, backup and watchdog scripts, tmpfiles rule): `--sync-config`. It also enables

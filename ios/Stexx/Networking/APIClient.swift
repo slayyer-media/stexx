@@ -3,9 +3,13 @@ import SwiftUI
 
 /// Everything the app needs from the Stexx backend. The UI only talks to
 /// this protocol, so the mock and the real HTTP client are interchangeable.
-/// See `docs/api.md` for the wire format.
-protocol APIClient: Sendable {
+/// See `docs/api.md` for the wire format. Passkey sign-up and sign-in
+/// (`PasskeyAPI`) are driven by `PasskeyFlow`.
+protocol APIClient: PasskeyAPI {
     // MARK: Auth & account
+    /// `POST /auth/register`: the dev server's shortcut (a session without
+    /// a credential). Production answers 400 `use_passkey_flow` /
+    /// `use_email_link`.
     func register(_ request: RegistrationRequest) async throws -> Session
     /// Sends a one-time sign-in link. Succeeds whether or not the address exists.
     func requestEmailLink(email: String) async throws
@@ -168,6 +172,15 @@ struct APIConfiguration: Sendable {
     var baseURL: URL
     var apiVersion = "v1"
     var useMock: Bool
+    /// The passkey relying party this build is associated with
+    /// (`StexxPasskeyRelyingParty` ← `STEXX_PASSKEY_RP_ID`); empty in the
+    /// Local configuration, which has no associated domain.
+    var passkeyRelyingPartyID: String? = nil
+
+    /// Whether the passkey buttons work (see `PasskeyAvailability`).
+    var passkeyAvailability: PasskeyAvailability {
+        PasskeyAvailability.resolve(baseURL: baseURL, relyingPartyID: passkeyRelyingPartyID, useMock: useMock)
+    }
 
     static func fromBundle(_ bundle: Bundle = .main) -> APIConfiguration {
         var urlString = bundle.object(forInfoDictionaryKey: "StexxAPIBaseURL") as? String
@@ -181,7 +194,8 @@ struct APIConfiguration: Sendable {
         #endif
         return APIConfiguration(
             baseURL: urlString.flatMap { URL(string: $0) } ?? defaultBaseURL,
-            useMock: mockFlag?.uppercased() != "NO"
+            useMock: mockFlag?.uppercased() != "NO",
+            passkeyRelyingPartyID: bundle.object(forInfoDictionaryKey: "StexxPasskeyRelyingParty") as? String
         )
     }
 

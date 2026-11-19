@@ -256,6 +256,16 @@ struct E2EAPIClient: APIClient {
     // MARK: Pass-through
 
     func register(_ request: RegistrationRequest) async throws -> Session { try await base.register(request) }
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions {
+        try await base.passkeyRegistrationOptions(displayName: displayName)
+    }
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session {
+        try await base.finishPasskeyRegistration(credential)
+    }
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions { try await base.passkeyLoginOptions() }
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session {
+        try await base.finishPasskeyLogin(credential)
+    }
     func requestEmailLink(email: String) async throws { try await base.requestEmailLink(email: email) }
     func verifyEmailLink(token: String) async throws -> Session { try await base.verifyEmailLink(token: token) }
     func refreshSession(refreshToken: String) async throws -> Session { try await base.refreshSession(refreshToken: refreshToken) }

@@ -7,6 +7,7 @@ struct StexxApp: App {
     @State private var services: AppServices
     @State private var e2e: E2EStatus
     private let api: any APIClient
+    private let passkeys: PasskeySupport
 
     init() {
         let configuration = APIConfiguration.fromBundle()
@@ -74,6 +75,10 @@ struct StexxApp: App {
 
         let chatStore = ChatStore(api: api)
         self.api = api
+        // The system passkey sheet, or the simulated one with the mock API.
+        // Unavailable (button explained) when the build can't use passkeys
+        // with its server, e.g. the Local configuration on 127.0.0.1.
+        self.passkeys = PasskeySupport.live(configuration)
         _appState = State(initialValue: appState)
         _chatStore = State(initialValue: chatStore)
         _e2e = State(initialValue: e2e)
@@ -96,6 +101,7 @@ struct StexxApp: App {
                 .environment(services.purchases)
                 .environment(e2e)
                 .environment(\.apiClient, api)
+                .environment(\.passkeys, passkeys)
                 .preferredColorScheme(.dark)
                 .tint(Theme.violet)
         }
