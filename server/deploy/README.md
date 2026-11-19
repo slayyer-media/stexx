@@ -148,7 +148,11 @@ systemd-analyze security stexx-admin
 
 Not run against a real host while writing this: the unit, the Caddy site with a real tailscaled certificate, the ufw rule and the Tailscale ACL (no Linux box or tailnet was touched). Caddy's config validates and the site's listener and drop-peer logic were exercised locally; the `deploy.sh` and `selftest.sh` paths run against stubs.
 
-**Turning it off:** `sudo systemctl disable --now stexx-admin`, remove `/etc/caddy/sites/stexx-admin.caddy` and `/etc/systemd/system/caddy.service.d/stexx-admin.conf`, `sudo systemctl daemon-reload && sudo systemctl reload caddy`, and delete the ufw rule (`sudo ufw status numbered`, `sudo ufw delete N`). The staff tables stay (the audit log is kept).
+**Reading the audit log** (on the server): `stexx-mod staff audit --as <your admin handle>` prints the newest 50 rows; add a handle to see only what that account did and what was done to it (`stexx-mod staff audit mod-a --as admin-1 --limit 200`), or `--json`. Reading it is recorded too.
+
+**Turning it off:** `sudo systemctl disable --now stexx-admin`, remove `/etc/caddy/sites/stexx-admin.caddy`, `/etc/systemd/system/caddy.service.d/stexx-admin.conf` and `/etc/stexx/caddy-admin.env`, `sudo systemctl daemon-reload && sudo systemctl reload caddy`, and delete the ufw rule (`sudo ufw status numbered`, `sudo ufw delete N`). The staff tables stay (the audit log is kept). If only `caddy-admin.env` goes missing, Caddy still starts (the drop-in's env file is optional, so the public sites never depend on it), and the next `deploy.sh --sync-config` removes the console's site and drop-in.
+
+**Deploy safety nets:** the console is restarted only after the API passed its health check, so a deploy that rolls the API back leaves the console on the previous release too (a failed first deploy stops both). `--rollback` to a release from before the console stops and disables `stexx-admin` (no crash loop at the next boot); the next forward deploy enables it again. The console's boot check also compares `admin.env` with `caddy-admin.env` (same host, same port, no `CHANGE_ME` left) and fails the run at the end if they disagree, because a mismatch boots fine but refuses every sign-in, and a wrong host binds passkeys to the wrong name. In production `ADMIN_ORIGIN` must be a hostname (WebAuthn refuses an IP address) and not one of the public hosts.
 
 ## Postgres notes
 

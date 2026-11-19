@@ -409,7 +409,9 @@ case "$cmd" in
   # Non-dry-run rollbacks: the API answers 204; the console answers 200, or (STUB_ADMIN_DOWN) is down the way curl
   # reports it, "000" AND exit 7; STUB_OLD_RELEASE: the target release predates the console; STUB_ADMIN_START_FAIL:
   # `systemctl restart stexx-admin` fails.
-  *"127.0.0.1:8787/healthz"*) printf 204 ;;
+  # STUB_API_DOWN: the API's health check fails (a real deploy then rolls back); STUB_PREV: a previous release exists.
+  *"127.0.0.1:8787/healthz"*) if [ -n "${STUB_API_DOWN:-}" ]; then printf 500; else printf 204; fi ;;
+  *"readlink -f"*) [ -n "${STUB_PREV:-}" ] && printf '/srv/stexx/releases/20260101-000000' ;;
   *"127.0.0.1:8788"*) if [ -n "${STUB_ADMIN_DOWN:-}" ]; then printf 000; exit 7; fi; printf 200 ;;
   *"src/admin/index.ts"*) [ -z "${STUB_OLD_RELEASE:-}" ]; exit $? ;;
   *"systemctl restart stexx-admin"*) echo "    [stub ssh $host] $cmd" >&2; [ -z "${STUB_ADMIN_START_FAIL:-}" ]; exit $? ;;
@@ -463,7 +465,24 @@ check "--rollback with the console down (curl: 000 and exit 7) fails, not 'HTTP 
 rb "$T/rb-startfail" STUB_ADMIN_START_FAIL=1
 check "--rollback whose console restart fails still runs the API health check, then fails" bash -c "! grep -qx 0 '$T/rb-startfail.rc' && grep -q 'attempt 1: HTTP 204' '$T/rb-startfail' && grep -q 'stexx-admin is not answering' '$T/rb-startfail'"
 rb "$T/rb-old" STUB_OLD_RELEASE=1
-check "--rollback to a release without the console stops it instead of restarting it" bash -c "grep -qx 0 '$T/rb-old.rc' && grep -q 'systemctl stop stexx-admin' '$T/rb-old' && ! grep -q 'systemctl restart stexx-admin' '$T/rb-old'"
+check "--rollback to a release without the console stops and disables it (no crash loop at the next boot)" bash -c "grep -qx 0 '$T/rb-old.rc' && grep -q 'systemctl disable --now stexx-admin' '$T/rb-old' && ! grep -q 'systemctl restart stexx-admin' '$T/rb-old'"
+check "--rollback to a release with the console enables it again" bash -c "grep -q 'systemctl enable stexx-admin' '$T/rb-ok'"
+# Real (not dry-run) deploys against the stub: the console follows the API only once the API is healthy.
+dp() { # dp <outfile> [VAR=value ...]: a real deploy against the stub ssh/rsync
+  local out="$1"; shift
+  (cd "$HERE/.." && env PATH="$T/fastsleep:$PATH" DEPLOY_HOST=ops@stexx.invalid PUBLIC_HEALTH_URL='' "$@" bash deploy/deploy.sh --no-checks) > "$out" 2>&1
+  echo $? > "$out.rc"
+}
+dp "$T/dp-ok" STUB_PREV=1
+check "deploy restarts the console only after the API's health check passed" bash -c "grep -qx 0 '$T/dp-ok.rc' && awk '/Health check/{h=NR} /systemctl restart stexx-admin/{r=NR} END{exit !(h && r > h)}' '$T/dp-ok'"
+check "every remote root script of a real deploy parses" bash -c "! grep -q 'SYNTAX ERROR' '$T/dp-ok' && grep -q 'bash -n ok' '$T/dp-ok'"
+dp "$T/dp-bad" STUB_PREV=1 STUB_API_DOWN=1
+check "a deploy whose API fails its health check rolls back and never moves the console to the rejected release" bash -c "! grep -qx 0 '$T/dp-bad.rc' && grep -q \"ln -sfn '/srv/stexx/releases/20260101-000000'\" '$T/dp-bad' && grep -q 'deploy of .* failed' '$T/dp-bad' && ! grep -q 'restart stexx-admin' '$T/dp-bad'"
+dp "$T/dp-first" STUB_API_DOWN=1
+check "a failed first deploy stops the console too" bash -c "! grep -qx 0 '$T/dp-first.rc' && grep -q 'systemctl stop stexx-admin' '$T/dp-first' && ! grep -q 'restart stexx-admin' '$T/dp-first'"
+check "the Caddy drop-in's env file is optional (a missing caddy-admin.env must never stop Caddy)" grep -qx 'EnvironmentFile=-/etc/stexx/caddy-admin.env' "$HERE/system/caddy-admin-dropin.conf"
+check "--sync-config removes the console's Caddy site and drop-in when caddy-admin.env is gone" bash -c "grep -q 'rm -f /etc/caddy/sites/stexx-admin.caddy /etc/caddy/sites/stexx-admin.caddy.prev /etc/systemd/system/caddy.service.d/stexx-admin.conf' '$HERE/deploy.sh'"
+check "the console boot check compares admin.env with caddy-admin.env" bash -c "grep -q 'differs from STEXX_ADMIN_HOST' '$HERE/deploy.sh' && grep -q 'CHANGE_ME' '$HERE/deploy.sh'"
 
 # The public site file never names the console's host or address, and refuses /admin; the private one takes both
 # from the environment and has no access log.

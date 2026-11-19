@@ -247,6 +247,13 @@ if [ '$ADMIN' = 1 ]; then
     set -a; . /etc/stexx/caddy-admin.env; set +a
   else
     echo '  /etc/stexx/caddy-admin.env is missing, so the private Caddy site is NOT installed yet. Copy /etc/stexx/caddy-admin.env.example there, set STEXX_ADMIN_HOST, and run --sync-config again.' >&2
+    # Installed earlier and the settings file removed since (turned off, or a restore without it): take the site and
+    # the drop-in out too, so nothing about the console is left for Caddy to trip over at its next restart.
+    if [ -e /etc/caddy/sites/stexx-admin.caddy ] || [ -e /etc/systemd/system/caddy.service.d/stexx-admin.conf ]; then
+      rm -f /etc/caddy/sites/stexx-admin.caddy /etc/caddy/sites/stexx-admin.caddy.prev /etc/systemd/system/caddy.service.d/stexx-admin.conf
+      systemctl daemon-reload
+      echo '  removed the console'"'"'s Caddy site and drop-in (no /etc/stexx/caddy-admin.env)'
+    fi
   fi
 fi
 # validate does not open listeners, so a reload can still fail (a port clash): that restores the files too, because a
@@ -289,11 +296,13 @@ if [ "$ROLLBACK" = 1 ]; then
   if admin_installed; then
     if admin_in_release "$RELEASES_DIR/$TARGET"; then
       ADMIN_ROLLBACK=restart
-      admin_restart
+      admin_restart enable   # enabled again if an earlier rollback to a pre-console release disabled it
     else
       ADMIN_ROLLBACK=stop
-      echo "  $TARGET has no staff console (src/admin): stopping $ADMIN_SERVICE"
-      rrun "sudo systemctl stop $ADMIN_SERVICE" || true
+      # Disabled too, or it would crash-loop on the missing file at the next boot and page the operator. The next
+      # forward deploy enables it again (admin_restart enable).
+      echo "  $TARGET has no staff console (src/admin): stopping and disabling $ADMIN_SERVICE"
+      rrun "sudo systemctl disable --now $ADMIN_SERVICE" || true
     fi
   fi
   [ "$DRY" = 1 ] && exit 0
@@ -380,15 +389,47 @@ HOME=/nonexistent exec setpriv --reuid=stexx --regid=stexx --clear-groups $BUN -
 EOF
 
 if [ "$ADMIN" = 1 ]; then
-  log "Boot check for the staff console (its own settings from /etc/stexx/admin.env; a problem warns here and stops the console later, never the API)"
+  log "Boot check for the staff console (its own settings from /etc/stexx/admin.env; a problem never stops the API, but fails the run at the end)"
+  # Also checks that admin.env and caddy-admin.env name the same host and port, and that no CHANGE_ME placeholder is
+  # left: a mismatch boots fine and passes every health check, but every sign-in is refused (wrong Origin), and a
+  # wrong host binds passkeys to the wrong relying party (a one-way door). Exit 3 = such a mismatch.
+  set +e
   rscript <<EOF
 export NODE_ENV=production HOST=127.0.0.1 PORT=8787 MEDIA_DIR='$APP_ROOT/media' ADMIN_HOST=127.0.0.1 ADMIN_PORT=8788
 set -a; . /etc/stexx/stexx.env; [ -f /etc/stexx/admin.env ] && . /etc/stexx/admin.env; set +a
+if [ -f /etc/stexx/caddy-admin.env ]; then
+  STEXX_CHECK_CADDY_HOST="\$(. /etc/stexx/caddy-admin.env; printf '%s' "\${STEXX_ADMIN_HOST:-}")"
+  STEXX_CHECK_CADDY_PORT="\$(. /etc/stexx/caddy-admin.env; printf '%s' "\${STEXX_ADMIN_PORT:-8443}")"
+  export STEXX_CHECK_CADDY_HOST STEXX_CHECK_CADDY_PORT
+else
+  echo "  note: no /etc/stexx/caddy-admin.env yet, so the console has no Caddy site (deploy/README.md, Staff console)" >&2
+fi
 cd '$NEW'
-HOME=/nonexistent setpriv --reuid=stexx --regid=stexx --clear-groups $BUN -e 'const { config } = await import("./src/config.ts"); if (!config.admin.configured) { console.error("  console config incomplete: set ADMIN_ORIGIN in /etc/stexx/admin.env"); process.exit(1) } console.log("  console config ok")' \
-  || echo "  WARNING: $ADMIN_SERVICE will refuse to start with this configuration (see above)" >&2
-true
+HOME=/nonexistent setpriv --reuid=stexx --regid=stexx --clear-groups $BUN -e '
+const { config } = await import("./src/config.ts");
+if (!config.admin.configured) { console.error("  console config incomplete: set ADMIN_ORIGIN in /etc/stexx/admin.env"); process.exit(1); }
+const origin = new URL(config.admin.origin);
+const host = process.env.STEXX_CHECK_CADDY_HOST;
+const port = process.env.STEXX_CHECK_CADDY_PORT || "8443";
+const problems = [];
+if (/CHANGE_ME/i.test(origin.hostname)) problems.push("ADMIN_ORIGIN in admin.env still has the CHANGE_ME placeholder");
+if (host !== undefined) {
+  if (!host || /CHANGE_ME/i.test(host)) problems.push("STEXX_ADMIN_HOST in caddy-admin.env is unset or still CHANGE_ME");
+  else if (host.toLowerCase() !== origin.hostname.toLowerCase()) problems.push("ADMIN_ORIGIN host " + origin.hostname + " differs from STEXX_ADMIN_HOST " + host);
+  if ((origin.port || "443") !== port) problems.push("ADMIN_ORIGIN port " + (origin.port || "443") + " differs from STEXX_ADMIN_PORT " + port);
+}
+if (problems.length) { for (const p of problems) console.error("  " + p); process.exit(3); }
+console.log("  console config ok (" + config.admin.origin + ")");
+'
 EOF
+  rc=$?
+  set -e
+  if [ "$rc" = 3 ]; then
+    ADMIN_FAILED=1
+    echo "  WARNING: admin.env and caddy-admin.env disagree (above): sign-ins would fail. Fix them before anyone enrolls." >&2
+  elif [ "$rc" != 0 ]; then
+    echo "  WARNING: $ADMIN_SERVICE will refuse to start with this configuration (see above)" >&2
+  fi
 fi
 
 if [ "$SKIP_BACKUP" != 1 ]; then
@@ -420,10 +461,9 @@ log "Switching to $STAMP"
 flip_to "$NEW"
 rrun "sudo systemctl enable $SERVICE >/dev/null 2>&1; sudo systemctl restart $SERVICE"
 
-if [ "$ADMIN" = 1 ]; then admin_restart enable; fi
-
 if [ "$DRY" = 1 ]; then
   echo "  [dry-run] health check$([ "$ADMIN" = 1 ] && echo " (API, then $ADMIN_SERVICE)"), prune to $KEEP_RELEASES releases"
+  if [ "$ADMIN" = 1 ]; then admin_restart enable; fi
   exit 0
 fi
 
@@ -431,6 +471,8 @@ log "Health check"
 if ! health_ok 20; then
   echo "unhealthy: rolling back" >&2
   rsh "sudo journalctl -u $SERVICE -n 40 --no-pager" >&2 || true
+  # The console has not been restarted on this release (that waits for a healthy API below), so it is still running
+  # the previous release's code, which `current` points at again after the flip.
   if [ -n "$PREV" ]; then
     flip_to "$PREV"
     rsh "sudo systemctl restart $SERVICE"
@@ -438,13 +480,16 @@ if ! health_ok 20; then
     die "deploy of $STAMP failed AND the rollback is unhealthy; investigate now"
   else
     rsh "sudo systemctl stop $SERVICE" || true
-    die "first deploy failed; service stopped. Read the journal above."
+    if [ "$ADMIN" = 1 ]; then rsh "sudo systemctl stop $ADMIN_SERVICE" || true; fi
+    die "first deploy failed; service$([ "$ADMIN" = 1 ] && echo "s") stopped. Read the journal above."
   fi
 fi
 
-# The console is a separate process: a failure here never rolls the API back (the release is already live and healthy),
-# but it fails the run at the end so it is not missed (ADMIN_FAILED may already be set by a failed restart above).
+# The console follows the API onto the new release only once the API is healthy, so the two always run the same
+# release. It is a separate process: a failure here never rolls the API back (the release is already live and
+# healthy), but it fails the run at the end so it is not missed (admin_restart sets ADMIN_FAILED).
 if [ "$ADMIN" = 1 ]; then
+  admin_restart enable
   log "Staff console check ($ADMIN_SERVICE on 127.0.0.1:8788)"
   if [ "$ADMIN_FAILED" = 1 ] || ! admin_up 15; then
     ADMIN_FAILED=1
@@ -467,5 +512,5 @@ done
 true
 EOF
 
-[ "$ADMIN_FAILED" = 0 ] || die "deployed $STAMP and the API is healthy, but $ADMIN_SERVICE failed to start (journal above). Fix /etc/stexx/admin.env, then: sudo systemctl restart $ADMIN_SERVICE"
+[ "$ADMIN_FAILED" = 0 ] || die "deployed $STAMP and the API is healthy, but $ADMIN_SERVICE failed its config check or did not start (see above). Fix /etc/stexx/admin.env (and caddy-admin.env), then: sudo systemctl restart $ADMIN_SERVICE"
 log "Deployed $STAMP"
