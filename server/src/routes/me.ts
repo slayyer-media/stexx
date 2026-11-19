@@ -420,9 +420,11 @@ meRoutes.get("/me/viewers", async (c) => {
  *
  * Also listed: the attested devices the account is linked to (`devices`), moderation decisions about the account
  * (`moderation`: what and when, never which moderator, their notes, or the reports behind them), the abuse-limit
- * counters kept for the account and its devices, and whether the new-account limits apply. Left out on purpose
+ * counters kept for the account, and whether the new-account limits apply. Left out on purpose
  * (docs/security.md "Data export"): reports filed by others, photo flags (duplicate / blocklist matches, which name
- * other accounts' photos), and IP-keyed counters (stored only as a keyed hash, not linked to the account).
+ * other accounts' photos), IP-keyed counters (stored only as a keyed hash, not linked to the account), and anything
+ * stored per app install that every account on it shares (device-keyed counters, the install's last-seen day, its
+ * ban flag and when it first attested), because on a shared phone that would show one account another's activity.
  */
 meRoutes.get("/me/export", async (c) => {
   const me = c.get("userId");
@@ -477,10 +479,11 @@ meRoutes.get("/me/export", async (c) => {
           FROM conversations c JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = ${me}
          WHERE c.user_a = ${me} OR c.user_b = ${me} ORDER BY c.created_at`,
       // Attested app installs this account was created or signed in on (docs/security.md section 1).
-      // Never the App Attest key itself, and never the other accounts linked to the same device.
-      sql<{ id: string; environment: string; banned: boolean; created_at: Date; last_seen_on: string; linked_at: Date }[]>`
-        SELECT d.id, d.environment, d.banned_at IS NOT NULL AS banned, d.created_at,
-               to_char(d.last_seen_on, 'YYYY-MM-DD') AS last_seen_on, da.created_at AS linked_at
+      // Only what this account did: the link itself. Never the App Attest key, the other accounts linked to the same
+      // device, or the per-install fields every account on it shares (last-seen day, ban flag, first attestation),
+      // which would tell someone sharing the phone how it is used by others.
+      sql<{ id: string; environment: string; linked_at: Date }[]>`
+        SELECT d.id, d.environment, da.created_at AS linked_at
           FROM device_accounts da JOIN devices d ON d.id = da.device_id
          WHERE da.user_id = ${me} ORDER BY da.created_at, d.id`,
       // Moderation decisions about this account: what and when, never who (the moderator's handle), the note or
@@ -490,7 +493,7 @@ meRoutes.get("/me/export", async (c) => {
           FROM moderation_actions WHERE user_id = ${me} ORDER BY created_at, id`,
       trustState(me),
     ]);
-  const counters = await accountCounters(me, devices.map((d) => d.id));
+  const counters = await accountCounters(me);
 
   // What the photo checks stored about each photo (docs/security.md "Photo checks"). Moderation flags are not
   // included, like reports filed against the account.
@@ -562,6 +565,7 @@ meRoutes.get("/me/export", async (c) => {
       "Other members appear only as opaque ids. Your email address is never stored, only a one-way hash, so it is not part of this archive.",
       "Locations are the 500 m grid cell centre we keep, never a precise position. We keep no location history.",
       "End-to-end encrypted messages appear as ciphertext (envelope): their text is only on the phones in the chat.",
+      "Devices lists the app installs your account was created on and when. Anti-spam data kept per app install (its rate-limit counters, last-seen day and ban flag) is shared by every account that uses that install, so it is not included: on a shared phone it would show you someone else's activity.",
     ],
     account: {
       id: user.id,
@@ -686,10 +690,6 @@ meRoutes.get("/me/export", async (c) => {
     devices: devices.map((d) => ({
       id: d.id,
       environment: d.environment,
-      isBanned: d.banned,
-      firstSeenAt: isoDate(d.created_at),
-      // Day granularity only.
-      lastSeenOn: d.last_seen_on,
       linkedToAccountAt: isoDate(d.linked_at),
     })),
     moderation: moderation.map((m) => ({
@@ -699,8 +699,6 @@ meRoutes.get("/me/export", async (c) => {
     })),
     rateLimitCounters: counters.map((r) => ({
       limit: r.limit,
-      appliesTo: r.subject.kind,
-      deviceID: r.subject.kind === "device" ? r.subject.deviceId : null,
       windowSeconds: Math.round(r.windowMs / 1000),
       windowStartedAt: isoDate(new Date(r.windowStart)),
       countThisWindow: r.current,

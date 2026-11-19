@@ -228,7 +228,7 @@ struct SettingsView: View {
         .confirmationDialog("Sign out of Stexx?", isPresented: $isConfirmingSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { appState.signOut() }
         } message: {
-            Text("Your encryption keys and decrypted messages are removed from this phone. When you sign back in, earlier encrypted messages show as not available here.")
+            Text("Your encryption keys and decrypted messages are removed from this phone. When you sign back in, earlier encrypted messages, and any sent to you while you're signed out, show as not available here.")
         }
         .confirmationDialog("Delete your account?", isPresented: $isConfirmingDelete, titleVisibility: .visible) {
             Button("Delete everything", role: .destructive) { Task { await deleteAccount() } }

@@ -319,7 +319,9 @@ ios/
   backup-excluded file on the phone. Signing out and deleting the account
   both remove them (`E2EEngine.erase`); signing back in on the same phone
   starts a new identity, so chat partners see the key-change warning and
-  earlier messages show "not available on this phone". A session that just
+  earlier messages, and any sent while signed out (the server keeps the old
+  public keys; deleting them would make peers fall back to plaintext), show
+  "not available on this phone". A session that just
   expires keeps them for the same account. The sign-out dialog says this.
 - Privacy settings come from the server: `GET /me` carries `privacy`, and
   `AppState` keeps the toggles disabled (with a "Loading" label, or a retry

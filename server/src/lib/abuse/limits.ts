@@ -357,8 +357,6 @@ export async function tryAbuseLimits(action: AbuseAction, subject: AbuseSubject,
 
 export interface AccountCounter {
   limit: AbuseLimitName;
-  /** Whose counter it is: this account, or one of the devices it was created or signed in on. */
-  subject: { kind: "account" } | { kind: "device"; deviceId: string };
   windowMs: number;
   windowStart: number;
   current: number;
@@ -367,25 +365,25 @@ export interface AccountCounter {
 }
 
 /**
- * The abuse-limit counters stored about an account and its attested devices (GET /me/export). Counters keyed by
- * an IP or network hash are not linked to any account (only the keyed hash is stored) and can't be listed; nor can
- * the per-pair prekey counters, which name another account.
+ * The abuse-limit counters stored about an account (GET /me/export): the ones keyed by the account itself
+ * (`userId`, or `targetId` for fetches of its prekeys). Left out on purpose:
+ * - counters keyed by an attested device: they count every account that uses that app install, so on a shared
+ *   phone they would tell one account how active another is (docs/security.md "Data export");
+ * - counters keyed by an IP or network hash, which are not linked to any account (only the keyed hash is stored);
+ * - the per-pair prekey counters, which name another account.
  */
-export async function accountCounters(userId: string, deviceIds: string[]): Promise<AccountCounter[]> {
-  const wanted = new Map<string, Omit<AccountCounter, "windowMs" | "windowStart" | "current" | "previous" | "expiresAt">>();
+export async function accountCounters(userId: string): Promise<AccountCounter[]> {
+  const wanted = new Map<string, AbuseLimitName>();
   for (const steps of Object.values(PLAN)) {
     for (const [name, field] of steps) {
-      if (field === "userId" || field === "targetId") wanted.set(`${name}:${userId}`, { limit: name, subject: { kind: "account" } });
-      if (field === "deviceId") {
-        for (const deviceId of deviceIds) wanted.set(`${name}:${deviceId}`, { limit: name, subject: { kind: "device", deviceId } });
-      }
+      if (field === "userId" || field === "targetId") wanted.set(`${name}:${userId}`, name);
     }
   }
   const rows = await store.snapshot([...wanted.keys()]);
   return rows.flatMap((r) => {
-    const meta = wanted.get(r.key);
-    return meta
-      ? [{ ...meta, windowMs: r.windowMs, windowStart: r.windowStart, current: r.current, previous: r.previous, expiresAt: r.expiresAt }]
+    const limit = wanted.get(r.key);
+    return limit
+      ? [{ limit, windowMs: r.windowMs, windowStart: r.windowStart, current: r.current, previous: r.previous, expiresAt: r.expiresAt }]
       : [];
   });
 }

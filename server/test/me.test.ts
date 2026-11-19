@@ -569,7 +569,7 @@ describe("GET /me/export: account-level records", () => {
     await hideAccount({ actor: "quiet_moderator", userId: me.id, note: "SECRET-MODERATOR-NOTE" });
     await sql`INSERT INTO moderation_actions (actor, action, user_id) VALUES ('quiet_moderator', 'ban', ${stranger.id})`;
 
-    // Abuse-limit counters for my account and my device, and some that aren't mine.
+    // Abuse-limit counters for my account (made on the shared phone), and some that aren't mine.
     const wasDisabled = rateLimitsDisabled();
     setRateLimitsDisabled(false);
     try {
@@ -593,9 +593,6 @@ describe("GET /me/export: account-level records", () => {
       {
         id: phone.id,
         environment: "development",
-        isBanned: false,
-        firstSeenAt: expect.stringMatching(/Z$/),
-        lastSeenOn: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
         linkedToAccountAt: expect.stringMatching(/Z$/),
       },
     ]);
@@ -606,11 +603,9 @@ describe("GET /me/export: account-level records", () => {
     ]);
     for (const m of dump.moderation) expect(Object.keys(m).sort()).toEqual(["action", "by", "createdAt"]);
 
-    const counters = dump.rateLimitCounters as { limit: string; appliesTo: string; deviceID: string | null; countThisWindow: number; windowSeconds: number }[];
-    expect(counters.map((c) => [c.limit, c.appliesTo, c.deviceID, c.countThisWindow]).sort()).toEqual([
-      ["messageAccount", "account", null, 2],
-      ["messageDevice", "device", phone.id, 2],
-    ]);
+    // Only the account's own counters: the phone's counters also count everyone else who uses it.
+    const counters = dump.rateLimitCounters as { limit: string; countThisWindow: number; windowSeconds: number }[];
+    expect(counters.map((c) => [c.limit, c.countThisWindow])).toEqual([["messageAccount", 2]]);
     expect(counters.every((c) => c.windowSeconds > 0)).toBe(true);
 
     // Nothing about the people on the other side, the moderator, or keys.
@@ -623,6 +618,36 @@ describe("GET /me/export: account-level records", () => {
     // Leave the shared database's moderation queue as we found it.
     await unhideAccount({ actor: "quiet_moderator", userId: me.id });
     await sql`UPDATE reports SET status = 'dismissed', closed_at = now() WHERE id = ${reportAboutMe}`;
+  });
+
+  test("a shared phone: another account's activity on it doesn't show in my export", async () => {
+    const me = await createUser();
+    const partner = await createUser({ displayName: "PartnerOnPhone" });
+    const phone = await device(me, partner);
+
+    const before = await expectJson(await as(me).get("/v1/me/export"));
+
+    // The partner signs in on the shared install and messages people; the install is seen today and later banned.
+    const wasDisabled = rateLimitsDisabled();
+    setRateLimitsDisabled(false);
+    try {
+      await hitAbuseLimits("login", { deviceId: phone.id, ip: "198.51.100.9" });
+      for (let i = 0; i < 3; i++) await hitAbuseLimits("message", { userId: partner.id, deviceId: phone.id });
+      await hitAbuseLimits("photo", { userId: partner.id, deviceId: phone.id });
+      await hitAbuseLimits("keyBundle", { userId: partner.id, deviceId: phone.id });
+    } finally {
+      setRateLimitsDisabled(wasDisabled);
+    }
+    await sql`UPDATE devices SET last_seen_on = current_date + 1, banned_at = now(), created_at = now() - interval '9 days' WHERE id = ${phone.id}`;
+
+    const after = await expectJson(await as(me).get("/v1/me/export"));
+    for (const key of ["devices", "rateLimitCounters", "moderation", "notes"] as const) expect(after[key]).toEqual(before[key]);
+    expect(after.rateLimitCounters).toEqual([]);
+    expect(after.devices).toEqual([{ id: phone.id, environment: "development", linkedToAccountAt: expect.stringMatching(/Z$/) }]);
+    const text = JSON.stringify(after);
+    for (const leak of [partner.id, "PartnerOnPhone", "lastSeen", "isBanned", "firstSeen"]) expect(text).not.toContain(leak);
+    expect(text).not.toMatch(/(signup|login|message|photo|keyBundle)Device/);
+    expect(after.notes.join(" ")).toContain("shared by every account");
   });
 
   test("an account with no devices, decisions or counters gets empty lists, and old accounts no new-account limits", async () => {
