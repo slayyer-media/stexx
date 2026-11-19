@@ -1,7 +1,7 @@
 # Stexx Privacy Policy
 
 > **DRAFT, not reviewed by a lawyer; not legal advice.**
-> Written from what the code in this repository stores and for how long (`server/migrations/`, `server/src/jobs/retention.ts`, [`docs/security.md`](../security.md), [`server/deploy/README.md`](../../server/deploy/README.md)). Text in `[brackets]` is for the owner to fill in. Proposed address: `https://stexx.gay/privacy` (the website is not in this repository). If the code changes what it stores, this page must change with it.
+> Written from what the code in this repository stores and for how long (`server/migrations/`, `server/src/jobs/retention.ts`, `server/src/lib/abuse/limits.ts`, `server/deploy/backup.sh`, [`docs/security.md`](../security.md), [`server/deploy/README.md`](../../server/deploy/README.md)). Text in `[brackets]` is for the owner to fill in. Proposed address: `https://stexx.gay/privacy` (the website is not in this repository). If the code changes what it stores, this page must change with it.
 
 *Last updated: [date]*
 
@@ -13,7 +13,7 @@ Stexx is a dating app for gay, bi and queer men, built to know as little about y
 - Your exact location never leaves your phone. The app rounds it to a 500 m grid square first, and other people only see a rounded distance.
 - No ads, no analytics, no trackers, and we never sell or share your data for advertising.
 - Chats are being moved to end-to-end encryption (the Signal Protocol): once a chat is encrypted, we can't read its messages or photos.
-- Deleting your account deletes your data right away, and it is gone from our backups within 30 days.
+- Deleting your account deletes your data right away, and it is gone from our backups within 30 days. A few anti-abuse records are kept longer or expire on their own; they're listed below.
 
 ## Who we are
 
@@ -28,7 +28,7 @@ Stexx is run by [legal entity name, address]. For anything about your data, writ
 | **Nickname** and the profile details you choose to add: age, pronouns, height, headline, about, position, what you're looking for, tags | To show your profile to people nearby | Everyone who can see your profile |
 | **Photos** on your profile | Same | Everyone who can see your profile, except photos our checks label explicit (see below), which only you see |
 | **That you are 18 or older.** The birth date you enter at the start is checked on your phone and never sent to us | To keep the app adults-only | Nobody |
-| **Email address** (optional, only if you sign in with an email link instead of a passkey) | To send you sign-in links | Nobody. We store only a keyed fingerprint of it (an HMAC), never the address. To send a link, the address passes through our email provider |
+| **Email address** (optional, only if you sign in with an email link instead of a passkey) | To send you sign-in links | Nobody. We store only a keyed fingerprint of it (an HMAC), never the address. The fingerprint can't be turned back into the address without a secret key kept only on our server. Because signing in has to find your account from your address, though, we (or anyone who took over our server) can check whether a given address belongs to a Stexx account, and which one. To send a link, the address passes through our email provider |
 | **Passkey** (if you use one) | To sign you in without a password | We store only its public key. The private key stays in your Apple account's keychain |
 | **Messages and chat photos** | To deliver them | The person you're talking to. See "Your chats" |
 | **Reports** you file: the reason, any details you write, and the messages and photos you choose to include | To review the report | Our moderators. The person you report is never told who reported them |
@@ -43,9 +43,10 @@ Your profile, and the fact that you have an account on Stexx, can reveal your se
 | **Approximate location** | To show people near you and how far away they are | Only while you use the app, and only if you allow it. Your phone rounds its position to a 500 m grid square before sending it. We keep one square per account (your latest), never a history. Others see a rounded distance (at least 100 m, coarser further away), or none if you hide your distance. With Stexx+ travel mode, we also keep the one square you chose to appear in |
 | **Activity**: when you were last active, the profiles you viewed, taps, favorites and blocks | Online status, "who viewed you" (Stexx+), taps, favorites, blocking | Your online status and last-active time are hidden from others if you turn them off. Profile views are kept for 7 days and aren't recorded while you're incognito |
 | **Stexx+ purchases** | To unlock Stexx+ | Apple handles the payment. We receive and store the signed transaction: product, transaction id, expiry date. We never see your card or Apple account |
-| **A device check** | To keep out bots and stop banned people from coming back | When you sign up, sign in, send messages or upload photos, the app proves to us it's a genuine Stexx app on a real iPhone (Apple's App Attest, with DeviceCheck as a fallback). We store the public key and a key id that Apple's system creates for this install of the app, a counter, and the date (not time) it was last used, plus which accounts were created with it. It isn't a hardware serial number or an advertising id. Apple also keeps two yes/no flags per device for us: "an account was made here" and "this device is banned" |
-| **Your IP address, briefly** | Rate limits and spotting several reports from one connection | We never store your IP address. For rate limits we keep a keyed fingerprint of it, or of its network, that can't be turned back into the address, and delete it within two days at most. When you file a report we keep a fingerprint of your IP with that report until its evidence is deleted (below) |
-| **Encryption keys** | End-to-end encrypted chat | Only **public** keys. Your private keys never leave your phone |
+| **A device check** | To keep out bots and stop banned people from coming back | When you sign up, sign in, send messages or upload photos, the app proves to us it's a genuine Stexx app on a real iPhone (Apple's App Attest, with DeviceCheck as a fallback). We store the public key and a key id that Apple's system creates for this install of the app, a counter, the exact time the install was first checked, the date (not time) it was last used, and which accounts were created with it and at what exact time. It isn't a hardware serial number or an advertising id. Apple also keeps two yes/no flags per device for us: "an account was made here" and "this device is banned" |
+| **Your IP address, briefly** | Rate limits and spotting several reports from one connection | We never store your IP address. For rate limits we keep a keyed fingerprint (an HMAC) of it and of its network, and delete it within two days at most. When you file a report we keep a fingerprint of your IP with that report until its evidence is deleted (below), 180 days at most. A fingerprint can't be turned back into the address without a secret key kept only on our server, outside the database and backups. Whoever holds that key (we, or anyone who took over our server) could work out the address by trying every possible one |
+| **Rate-limit counters** | Limits on sign-ups, sign-ins, messages, photo uploads and encryption-key requests, to stop spam and abuse | Short-lived counters, each stored under a keyed fingerprint (as above) of what it counts: your IP or network, your account id, your device check key id, or, when your app fetches someone's encryption keys to start an encrypted chat, the pair "your account → their account". The pair counter exists even if no message is ever sent. Whoever holds our server key could tell from it that you started an encrypted chat with that person. Counters are deleted within two days at most, also after you delete your account, and copies can stay in our encrypted backups for up to 28 days (below) |
+| **Encryption keys** | End-to-end encrypted chat | Only **public** keys. Your private keys never leave your phone. Fetching someone's keys leaves a short-lived rate-limit counter (above) |
 | **Checks on profile photos** | To keep explicit photos off public profiles and spot copied or stock photos | A model running on our own server labels each profile photo when you upload it. We keep a 64-bit fingerprint of the photo and the model's scores, not an extra copy. Explicit photos stay on your profile for you and can be sent in a chat, but nobody else sees them on your profile |
 
 We do **not** collect your contacts, phone number, real name, precise location, location history, advertising identifier, browsing or search history, crash reports, or analytics. Our server logs record which kind of request was made, its result and how long it took. They contain no IP addresses, no message text, no locations, no email addresses and no account ids.
@@ -88,16 +89,16 @@ Moderators are people on the Stexx team. They review reports with a tool on our 
 | Profile views | 7 days |
 | Sign-in sessions | Until they expire (30 days after the last refresh) or you sign out (we then keep the revoked record until it would have expired) |
 | Email sign-in links | 15 minutes, single use |
-| Rate-limit fingerprints | 2 days at most |
+| Rate-limit counters (fingerprints of IPs, networks, account ids, device check key ids and who-fetched-whose-keys pairs) | 2 days at most, also after you delete your account. Copies in backups age out with the backup (28 days) |
 | Report evidence (messages and photos you shared, the details you wrote, your IP fingerprint) | 30 days after the report is closed, 180 days at most. The report itself (reason, status, dates) is kept for safety records, without your account once you delete it |
 | Device check record (App Attest key) | Kept after you delete your account, so the one-account-per-device rule and bans still work; deleted after 90 days without use. Kept for banned devices |
 | Banned accounts | Kept, so the same person can't sign up again [owner: set a limit] |
 | Server logs | 7 days, with no personal data |
-| Backups | 28 days. They leave out messages, locations, profile views and sign-in links, and photo files aren't backed up at all |
+| Backups | 28 days. They leave out messages, locations, profile views and sign-in links, and photo files aren't backed up at all. Everything else in the database is in them, including hashed sign-in sessions, reports and their evidence, device check records and rate-limit counters |
 
 ## Deleting your account
 
-You → Settings → Delete account. It's immediate: your profile, photos (files included), messages, chats, location, favorites, taps, blocks, sessions, keys and purchase records are deleted in one go. Reports you filed stay, without your account attached. The device check record and the Apple device flag that says "an account was made here" are cleared or age out as described above. Copies in our encrypted backups disappear within 30 days.
+You → Settings → Delete account. It's immediate: your profile, photos (files included), messages, chats, location, favorites, taps, blocks, sessions, keys and purchase records are deleted in one go. Reports you filed stay, without your account attached. The device check record (including when your account was created on that install) and the Apple device flag that says "an account was made here" are kept or age out as described above. Rate-limit counters, including the fingerprints of your account id and of who-fetched-whose-keys pairs, aren't deleted with your account; they expire within two days. Copies of everything in our encrypted backups disappear within 30 days.
 
 Cancelling Stexx+ is separate: deleting your account doesn't cancel an Apple subscription. Cancel it in your iPhone's Settings → [your name] → Subscriptions.
 
@@ -111,7 +112,7 @@ Stexx is only for people 18 and over. If you think someone on Stexx is under 18,
 
 ## Security
 
-Sign-in tokens are stored only as hashes. Email addresses are stored only as keyed fingerprints. Photos are re-encoded and stripped of all metadata (including GPS) on upload. Backups are encrypted. Our server's database, logs and firewall are locked down as described in our [deployment notes](https://github.com/stexxapp/stexx/blob/main/server/deploy/README.md). No system is perfectly secure; if we have a breach that affects you, we'll tell you as the law requires.
+Sign-in tokens are stored only as hashes. Email addresses and IP addresses are stored only as keyed fingerprints, whose key is kept on our server outside the database and backups (so a stolen backup doesn't reveal them, but the fingerprints aren't hidden from us; see above). Photos are re-encoded and stripped of all metadata (including GPS) on upload. Backups are encrypted. Our server's database, logs and firewall are locked down as described in our [deployment notes](https://github.com/stexxapp/stexx/blob/main/server/deploy/README.md). No system is perfectly secure; if we have a breach that affects you, we'll tell you as the law requires.
 
 ## Changes
 

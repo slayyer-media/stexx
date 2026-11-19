@@ -13,6 +13,7 @@ import {
   resetAbuseLimits,
   setAbuseLimitForTests,
   setLimiterStoreForTests,
+  tryAbuseLimits,
 } from "../src/lib/abuse/limits.ts";
 import { purgeAbuseCounters } from "../src/jobs/retention.ts";
 import { HOUR, MINUTE } from "../src/lib/time.ts";
@@ -136,6 +137,22 @@ describe("Postgres store", () => {
     expect(abuseKeyHash("203.0.113.7")).not.toContain("203");
   });
 
+  test("account ids and (fetcher, target) pairs are keyed hashes too: no plaintext id or social-graph edge at rest", async () => {
+    const fetcher = `p_fetch${uniq()}`;
+    const target = `p_target${uniq()}`;
+    expect(await tryAbuseLimits("prekeyConsume", { pair: `${fetcher}>${target}`, targetId: target })).toBe(0);
+    expect(await tryAbuseLimits("keyRegister", { userId: fetcher })).toBe(0);
+    const plain = await sql<{ key: string }[]>`
+      SELECT key FROM abuse_counters WHERE strpos(key, ${fetcher}) > 0 OR strpos(key, ${target}) > 0`;
+    expect(plain).toHaveLength(0);
+    const hashed = await sql<{ key: string }[]>`
+      SELECT key FROM abuse_counters
+       WHERE key LIKE ${`%:prekeyPair:${abuseKeyHash(`${fetcher}>${target}`)}`}
+          OR key LIKE ${`%:prekeyTarget:${abuseKeyHash(target)}`}
+          OR key LIKE ${`%:keyRegisterAccount:${abuseKeyHash(fetcher)}`}`;
+    expect(hashed).toHaveLength(3);
+  });
+
   test("the memory store can stand in (setLimiterStoreForTests)", async () => {
     const restore = setLimiterStoreForTests(new MemorySlidingWindowStore());
     try {
@@ -181,6 +198,10 @@ describe("limits on the API", () => {
     // An idempotent retry of a sent message is not counted.
     await expectJson(await as(me).post(path, { json: second }));
     await expectError(await as(me).post(path, { json: { clientID: uniq(), text: "three" } }), 429, "rate_limited");
+    // The per-account counter is stored under a keyed hash of the account id, never the id itself.
+    expect(await sql`SELECT key FROM abuse_counters WHERE strpos(key, ${me.id}) > 0`).toHaveLength(0);
+    const hashed = await sql`SELECT key FROM abuse_counters WHERE key LIKE ${`%:messageAccount:${abuseKeyHash(me.id)}`}`;
+    expect(hashed).toHaveLength(1);
   });
 
   test("photo uploads per account (profile photos and chat attachments share the window)", async () => {
