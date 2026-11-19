@@ -30,9 +30,13 @@ struct FilterSheet: View {
                             .accessibilityLabel(Text("Ages \(Int(ageRange.lowerBound)) to \(Int(ageRange.upperBound))"))
                         LabeledContent("From") {
                             Stepper("\(Int(ageRange.lowerBound))", value: lowerAge, in: 18...Double(Int(ageRange.upperBound)))
+                                .accessibilityLabel("Minimum age")
+                                .accessibilityValue(Text("\(Int(ageRange.lowerBound))"))
                         }
                         LabeledContent("To") {
                             Stepper("\(Int(ageRange.upperBound))", value: upperAge, in: ageRange.lowerBound...99)
+                                .accessibilityLabel("Maximum age")
+                                .accessibilityValue(Text("\(Int(ageRange.upperBound))"))
                         }
                     }
                 } header: {
@@ -47,7 +51,10 @@ struct FilterSheet: View {
                             Text(StexxFormat.distance(maxDistanceKm * 1000))
                                 .stexxTitleStyle(.title)
                                 .monospacedDigit()
+                                .accessibilityHidden(true)
                             Slider(value: $maxDistanceKm, in: 1...100, step: 1)
+                                .accessibilityLabel("Maximum distance")
+                                .accessibilityValue(Text(StexxFormat.distance(maxDistanceKm * 1000)))
                         }
                     }
                 } header: {
@@ -90,6 +97,8 @@ struct FilterSheet: View {
                 Section {
                     TextField("Add a tag, e.g. Physics", text: $tagText)
                         .textInputAutocapitalization(.words)
+                        .accessibilityLabel("Add a tag")
+                        .accessibilityHint("Type a tag and press Return. Up to 10.")
                         .onSubmit(addTag)
                     if !draft.tags.isEmpty {
                         FlowLayout {
@@ -100,6 +109,7 @@ struct FilterSheet: View {
                                     TagChip(text: tag, systemImage: "xmark")
                                 }
                                 .buttonStyle(.plain)
+                                .accessibilityLabel(Text("Remove tag \(tag)"))
                             }
                         }
                         .padding(.vertical, 4)
