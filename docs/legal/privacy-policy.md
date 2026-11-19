@@ -111,7 +111,7 @@ Stexx is only for people 18 and over. If you think someone on Stexx is under 18,
 
 ## Security
 
-Sign-in tokens are stored only as hashes. Email addresses are stored only as keyed fingerprints. Photos are re-encoded and stripped of all metadata (including GPS) on upload. Backups are encrypted. Our server's database, logs and firewall are locked down as described in our [deployment notes](../../server/deploy/README.md). No system is perfectly secure; if we have a breach that affects you, we'll tell you as the law requires.
+Sign-in tokens are stored only as hashes. Email addresses are stored only as keyed fingerprints. Photos are re-encoded and stripped of all metadata (including GPS) on upload. Backups are encrypted. Our server's database, logs and firewall are locked down as described in our [deployment notes](https://github.com/stexxapp/stexx/blob/main/server/deploy/README.md). No system is perfectly secure; if we have a breach that affects you, we'll tell you as the law requires.
 
 ## Changes
 
