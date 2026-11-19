@@ -93,6 +93,11 @@ struct HTTPAPIClient: APIClient {
         return try decode(Photo.self, from: data)
     }
 
+    func uploadEncryptedAttachment(_ blob: Data) async throws -> Photo {
+        let data = try await exchange("POST", "me/attachments", body: .raw(blob, contentType: "application/octet-stream"))
+        return try decode(Photo.self, from: data)
+    }
+
     func deletePhoto(id: Photo.ID) async throws {
         try await callVoid("DELETE", "me/photos/\(id)")
     }

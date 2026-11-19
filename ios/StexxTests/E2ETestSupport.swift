@@ -27,12 +27,29 @@ actor FakeE2EServer {
     private(set) var registerAttempts: [KeyRegistration] = []
     private var nextID = 1
 
+    /// Pending chat uploads (`POST /me/attachments`), by ID.
+    private(set) var uploads: [Photo.ID: (data: Data, encrypted: Bool)] = [:]
+    /// Every upload body received, in order.
+    private(set) var uploadLog: [(data: Data, encrypted: Bool)] = []
+    /// Files of sent photos, by URL.
+    private(set) var media: [URL: Data] = [:]
+    /// Makes the next send fail as if the network dropped it (nothing stored).
+    var failNextSend = false
+    /// `GET /e2e/config` fails as if the network dropped it.
+    var failConfig = false
+    /// Applied right after the next plaintext upload (the server's mode
+    /// changing, and its config becoming unreachable, mid-send).
+    var afterNextPlaintextUpload: (mode: E2EConfig.Mode, failConfig: Bool)?
+
     static let conversationID = "c-ab"
 
     func set(mode: E2EConfig.Mode) { self.mode = mode }
     func set(contentRules: E2EConfig.ContentRules) { self.contentRules = contentRules }
     func set(status: KeyStatus?, for user: Profile.ID) { statusOverride[user] = status }
     func failNextRegister(_ failure: Failure) { nextRegisterFailure = failure }
+    func failNextSendOnce() { failNextSend = true }
+    func set(failConfig: Bool) { self.failConfig = failConfig }
+    func afterNextPlaintextUpload(mode: E2EConfig.Mode, failConfig: Bool) { afterNextPlaintextUpload = (mode, failConfig) }
     func count(_ call: String) -> Int { calls.filter { $0 == call }.count }
 
     var config: E2EConfig {
@@ -48,8 +65,9 @@ actor FakeE2EServer {
 
     private func disabled() -> APIError { .e2e(code: E2EErrorCode.disabled, message: "off") }
 
-    func e2eConfig(as user: Profile.ID) -> E2EConfig {
+    func e2eConfig(as user: Profile.ID) throws -> E2EConfig {
         calls.append("config")
+        if failConfig { throw URLError(.notConnectedToInternet) }
         return config
     }
 
@@ -151,21 +169,80 @@ actor FakeE2EServer {
         return IdentityKeyResponse(userID: target, identityKey: registration.identityKey, identityKeyChangedAt: nil)
     }
 
+    func uploadAttachment(_ jpeg: Data, as user: Profile.ID) -> Photo {
+        calls.append("upload.plaintext")
+        if let change = afterNextPlaintextUpload {
+            afterNextPlaintextUpload = nil
+            mode = change.mode
+            failConfig = change.failConfig
+        }
+        return storeUpload(jpeg, encrypted: false)
+    }
+
+    func uploadEncryptedAttachment(_ blob: Data, as user: Profile.ID) throws -> Photo {
+        calls.append("upload.encrypted")
+        // Like the server: 400 `e2e_disabled` with E2E off.
+        guard mode != .off else { throw disabled() }
+        return storeUpload(blob, encrypted: true)
+    }
+
+    private func storeUpload(_ data: Data, encrypted: Bool) -> Photo {
+        let id = "ph\(nextID)"
+        nextID += 1
+        uploads[id] = (data, encrypted)
+        uploadLog.append((data, encrypted))
+        return Photo(id: id, url: URL(string: "https://media.test/\(id).\(encrypted ? "bin" : "jpg")"))
+    }
+
+    /// Like the server's view-once purge: the file is gone, the message stays with `url: null`.
+    func spendAttachment(of messageID: Message.ID) {
+        guard let index = messages.firstIndex(where: { $0.id == messageID }), let url = messages[index].attachment?.url else { return }
+        media[url] = nil
+        messages[index].attachment?.url = nil
+    }
+
+    /// Replaces a stored file (a server swapping blobs).
+    func replaceMedia(at url: URL, with data: Data) { media[url] = data }
+
+    /// Sets a message's `expiresAt` (its recipient read it).
+    func setExpiresAt(_ date: Date?, of messageID: Message.ID) {
+        guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
+        messages[index].expiresAt = date
+    }
+
     func send(_ draft: MessageDraft, as user: Profile.ID) throws -> Message {
         calls.append(draft.envelope == nil ? "send.plaintext" : "send.envelope")
         if let existing = messages.first(where: { $0.clientID == draft.clientID && $0.senderID == user }) { return existing }
+        if failNextSend {
+            failNextSend = false
+            throw URLError(.networkConnectionLost)
+        }
         if draft.envelope != nil && mode == .off { throw disabled() }
         if draft.text != nil && mode == .required {
             throw APIError.e2e(code: E2EErrorCode.encryptionRequired, message: "required")
         }
         precondition(draft.text == nil || draft.envelope == nil, "text and envelope are exclusive")
+        var attachment: Message.Attachment?
+        if let photoID = draft.attachmentPhotoID {
+            guard let upload = uploads[photoID] else { throw APIError.notFound }
+            if upload.encrypted && draft.envelope == nil {
+                throw APIError.server(status: 400, message: "An encrypted photo must be sent inside an encrypted message.")
+            }
+            if !upload.encrypted && mode == .required {
+                throw APIError.e2e(code: E2EErrorCode.encryptionRequired, message: "required")
+            }
+            uploads[photoID] = nil
+            let url = URL(string: "https://media.test/\(photoID).\(upload.encrypted ? "bin" : "jpg")")!
+            media[url] = upload.data
+            attachment = Message.Attachment(kind: .photo, url: url, isViewOnce: draft.isViewOnce ?? false, isEncrypted: upload.encrypted)
+        }
         let message = Message(
             id: "m\(nextID)",
             conversationID: Self.conversationID,
             senderID: user,
             text: draft.text,
             envelope: draft.envelope,
-            attachment: nil,
+            attachment: attachment,
             sentAt: Date(timeIntervalSince1970: 1_800_000_000 + Double(nextID)),
             status: .sent,
             expiresAt: nil,
@@ -197,7 +274,7 @@ struct FakeE2EClient: APIClient {
     func openConversation(with profileID: Profile.ID) async throws -> Conversation { try await conversations()[0] }
     func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message> { await server.page() }
     func send(_ draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message { try await server.send(draft, as: userID) }
-    func e2eConfig() async throws -> E2EConfig { await server.e2eConfig(as: userID) }
+    func e2eConfig() async throws -> E2EConfig { try await server.e2eConfig(as: userID) }
     func registerKeys(_ registration: KeyRegistration) async throws -> KeyStatus { try await server.registerKeys(registration, as: userID) }
     func keyStatus() async throws -> KeyStatus { try await server.keyStatus(as: userID) }
     func uploadPreKeys(_ replenishment: PreKeyReplenishment) async throws -> KeyStatus { try await server.uploadPreKeys(replenishment, as: userID) }
@@ -217,7 +294,8 @@ struct FakeE2EClient: APIClient {
     func updateMe(_ update: ProfileUpdate) async throws -> Profile { throw Self.unused }
     func uploadPhoto(jpegData: Data) async throws -> Photo { throw Self.unused }
     func deletePhoto(id: Photo.ID) async throws { throw Self.unused }
-    func uploadAttachment(jpegData: Data) async throws -> Photo { throw Self.unused }
+    func uploadAttachment(jpegData: Data) async throws -> Photo { await server.uploadAttachment(jpegData, as: userID) }
+    func uploadEncryptedAttachment(_ blob: Data) async throws -> Photo { try await server.uploadEncryptedAttachment(blob, as: userID) }
     func reorderPhotos(_ photoIDs: [Photo.ID]) async throws -> [Photo] { throw Self.unused }
     func updatePrivacy(_ settings: PrivacySettings) async throws -> PrivacySettings { throw Self.unused }
     func updateLocation(_ location: FuzzedLocation) async throws { throw Self.unused }
@@ -248,6 +326,8 @@ struct FakeDevice {
     let client: E2EAPIClient
     let secrets: InMemorySecretStorage
     let history: any E2EHistoryPersistence
+    /// Message IDs whose decrypted photos the engine evicted.
+    let evicted = CallLog()
 
     init(
         _ userID: Profile.ID,
@@ -262,7 +342,10 @@ struct FakeDevice {
         self.history = history
         let api = FakeE2EClient(server: server, userID: userID, peerID: peer)
         let id: @Sendable () async -> Profile.ID? = { userID }
-        engine = E2EEngine(api: api, secrets: secrets, history: history, currentUserID: id, now: now)
+        let evicted = evicted
+        engine = E2EEngine(api: api, secrets: secrets, history: history, currentUserID: id, now: now) { ids in
+            for id in ids { await evicted.record(id) }
+        }
         client = E2EAPIClient(base: api, engine: engine, currentUserID: id)
     }
 
@@ -272,6 +355,17 @@ struct FakeDevice {
 
     func thread() async throws -> [Message] {
         try await client.messages(in: FakeE2EServer.conversationID, before: nil).items
+    }
+
+    func sendPhoto(
+        _ jpeg: Data,
+        caption: String? = nil,
+        clientID: String = UUID().uuidString,
+        expiresAfterSeconds: Int? = nil,
+        isViewOnce: Bool? = false
+    ) async throws -> Message {
+        let draft = MessageDraft(clientID: clientID, text: caption, expiresAfterSeconds: expiresAfterSeconds, isViewOnce: isViewOnce)
+        return try await client.sendPhoto(jpegData: jpeg, draft: draft, in: FakeE2EServer.conversationID)
     }
 }
 

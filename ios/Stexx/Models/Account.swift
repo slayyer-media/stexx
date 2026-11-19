@@ -106,14 +106,19 @@ struct ReportRequest: Codable, Hashable, Sendable {
     var evidence: [ReportEvidence]?
 }
 
-/// One message the reporter chose to share. Chats are headed for end-to-end
-/// encryption, so the app sends the plaintext itself. Photos are not
-/// uploaded: a photo message is flagged with `hasPhoto`.
+/// One message the reporter chose to share. Chats are end-to-end encrypted,
+/// so the app sends the plaintext itself. A photo message is flagged with
+/// `hasPhoto`; the app also re-uploads the photo it can show (decrypted for
+/// an encrypted one) as a fresh, sanitized private upload and passes its
+/// `photoID`, so moderators see exactly the photos the reporter ticked.
 struct ReportEvidence: Codable, Hashable, Sendable {
     /// The server accepts at most this many items per report.
     static let maxItems = 20
     static let maxTextLength = 4000
     static let maxIDLength = 64
+    /// At most this many photos per report: each is a pending upload, and the
+    /// server allows 10 of those at once.
+    static let maxPhotos = 10
 
     var messageID: String?
     var sentAt: Date?
@@ -121,6 +126,9 @@ struct ReportEvidence: Codable, Hashable, Sendable {
     var fromReported: Bool
     var text: String?
     var hasPhoto: Bool?
+    /// One of the reporter's own pending uploads (`POST /me/attachments`)
+    /// holding this message's photo. Implies `hasPhoto`.
+    var photoID: Photo.ID? = nil
 
     /// Builds the evidence list from exactly the selected messages, oldest
     /// first. Unselected messages are never included; messages with neither
@@ -183,5 +191,71 @@ struct NearbyQuery: Codable, Hashable, Sendable {
 
     var usesAdvancedFilters: Bool {
         minAge != nil || maxAge != nil || maxDistanceMeters != nil || !positions.isEmpty || !tags.isEmpty
+    }
+}
+
+extension ReportEvidence {
+    /// Adds `photoID`s to the photo items of `evidence`: for each, `load`
+    /// returns the photo this device can show as a sanitized JPEG (decrypted
+    /// for an encrypted one), and `upload` stores it as a private upload.
+    ///
+    /// At most `maxPhotos`, the reported person's photos first. A photo that
+    /// can't be loaded or uploaded keeps `hasPhoto: true` without a
+    /// `photoID`; the report still goes out.
+    ///
+    /// - Parameters:
+    ///   - uploaded: Photos an earlier attempt of this report already
+    ///     uploaded, by evidence `messageID` (`uploadedPhotoIDs(in:)`): reused,
+    ///     never uploaded again (each upload holds one of the server's
+    ///     pending upload slots).
+    ///   - upload: A 409 (`attachment_limit`: every pending slot is taken)
+    ///     stops further uploads; those items go with `hasPhoto` only.
+    static func attachingPhotos(
+        to evidence: [ReportEvidence],
+        messages: [Message],
+        reusing uploaded: [String: Photo.ID] = [:],
+        load: @Sendable (Message) async -> Data?,
+        upload: @Sendable (Data) async throws -> Photo.ID
+    ) async -> [ReportEvidence] {
+        var result = evidence
+        let byID = Dictionary(messages.map { (String($0.id.prefix(maxIDLength)), $0) }, uniquingKeysWith: { first, _ in first })
+        let photoIndices = result.indices
+            .filter { result[$0].hasPhoto == true && result[$0].photoID == nil }
+            .sorted { lhs, rhs in
+                // The reported person's photos first, then newest first.
+                if result[lhs].fromReported != result[rhs].fromReported { return result[lhs].fromReported }
+                return lhs > rhs
+            }
+        var attached = 0
+        var atLimit = false
+        for index in photoIndices {
+            guard attached < maxPhotos, !Task.isCancelled else { break }
+            guard let id = result[index].messageID else { continue }
+            if let known = uploaded[id] {
+                result[index].photoID = known
+                attached += 1
+                continue
+            }
+            guard !atLimit, let message = byID[id], let jpeg = await load(message) else { continue }
+            do {
+                result[index].photoID = try await upload(jpeg)
+                attached += 1
+            } catch APIError.server(status: 409, message: _) {
+                // `attachment_limit`: more uploads would fail too.
+                atLimit = true
+            } catch {
+                continue
+            }
+        }
+        return result
+    }
+
+    /// The uploaded photos of `evidence`, by `messageID`, for a retry.
+    static func uploadedPhotoIDs(in evidence: [ReportEvidence]) -> [String: Photo.ID] {
+        var ids: [String: Photo.ID] = [:]
+        for item in evidence {
+            if let messageID = item.messageID, let photoID = item.photoID { ids[messageID] = photoID }
+        }
+        return ids
     }
 }

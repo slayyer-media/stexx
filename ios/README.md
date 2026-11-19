@@ -45,7 +45,7 @@ via `.previewEnvironment()`.
 
 ## End-to-end encryption
 
-Chat text is end-to-end encrypted with the Signal Protocol (PQXDH, then the
+Chat text and photos are end-to-end encrypted with the Signal Protocol (PQXDH, then the
 Double Ratchet) when the server's `E2E_MODE` allows it. Design and threat
 notes: [`../docs/security.md`](../docs/security.md#the-ios-client); wire
 contract: [`../docs/api.md`](../docs/api.md#end-to-end-encryption).
@@ -86,7 +86,12 @@ Stexx/E2E/
   E2EEngine.swift          Keys (register, top up, rotate), PQXDH, encrypt/decrypt, identity holds
   E2EAPIClient.swift       APIClient wrapper: encrypts sends, decrypts conversations and messages
   E2EStatus.swift          Main-actor state for the UI; realtime identity.changed / keys.low
+  E2EMediaCrypto.swift     Encrypted photo format v1 (AES-256-GCM, padding, SHA-256 digest, attachment pointer)
 ```
+
+Photo helpers outside `E2E/`: `Networking/ChatMediaLoader.swift` (download, verify, decrypt),
+`Features/Chat/EncryptedPhotoViews.swift` (bubble states, view-once viewer) and
+`Features/Chat/ChatPhotoModeration.swift` (on-device check hook).
 
 Screens keep reading `Message.text`: `E2EAPIClient` fills it in from the
 decrypted envelope, and `Message.encryption` says when it couldn't (the
@@ -99,6 +104,78 @@ thread then shows a placeholder bubble instead of a blank one).
 - **Local scheme:** against `../server` with `E2E_MODE=optional` (the dev
   default) the app registers keys on sign-in and encrypts whenever the other
   person has keys.
+
+### Encrypted photos
+
+Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
+
+- **Format v1.** The sanitized JPEG is zero-padded to Signal's size buckets
+  (`max(541, 1.05^ceil(log(n)/log(1.05)))` bytes), sealed with AES-256-GCM
+  under a fresh random 32-byte key and 12-byte nonce, and uploaded as
+  `application/octet-stream`. The blob is `nonce ‖ ciphertext ‖ tag`. The key
+  and the blob's SHA-256 digest go in the Signal envelope's payload
+  (`E2EPayload.attachment`, `E2EAttachmentPointer`). The receiver checks the
+  digest before decrypting because GCM isn't key-committing; the digest in the
+  authenticated envelope pins one blob to the message. A pointer with a `v`
+  other than 1 shows as unsupported ("needs a newer version").
+- **Sending.** `E2EAPIClient.sendPhoto` routes first, then uploads: under
+  `optional` with keys it encrypts and uploads the blob; without keys (or
+  `off`) it takes the plaintext path; under `required` it never uploads
+  plaintext. An encryption failure or identity hold throws and never falls back
+  to a plaintext upload. A plaintext upload only follows a freshly re-read
+  `GET /e2e/config` (a stale cached mode can't send a plaintext photo; no
+  config, no upload), and the `encryption_required` / `e2e_disabled` retry only
+  runs on a fresh config. A retry of the same `clientID` reuses the same blob
+  and key. The payload also carries the message's timer
+  (`E2EPayload.expiresAfterSeconds`, omitted without one).
+- **Showing.** `ChatMediaLoader` downloads through the ephemeral
+  `PrivateMedia.session` (no URL cache, nothing in `Library/Caches`), verifies
+  and decrypts, and keeps decoded images **in memory only** (a small cache
+  keyed by message ID, cleared on sign-out and when a key is forgotten; a load
+  still running then doesn't cache its result). A body longer than the largest
+  possible blob is cut off while streaming, never buffered whole.
+  Bubble states: loading, shown, "Photo no longer available" (404 or no URL),
+  "Couldn't verify this photo" (digest or tag mismatch), "Encrypted photo. Not
+  available on this phone.", and unsupported.
+- **Key dropping.** The history file keeps a photo's key only while the photo
+  can exist. An expiring message's whole entry goes at `expiresAt`; a sent
+  photo whose read time the sender can't see loses its key 14 days plus the
+  timer after sending (the server's hard cap); the recipient, which learns the
+  timer from the envelope, keeps it a day longer, and stamps `expiresAt` itself
+  when it marks the chat read. The history is pruned on load, on foreground and
+  (at most once a minute) while messages are revealed, and the decrypted images
+  of dropped keys leave memory too. A view-once photo's key is
+  dropped when the viewer closes (`forgetAttachmentKey`), and the bubble shows
+  "Opened". The viewer downloads and decrypts on tap, never earlier.
+- **Payload timer.** Sent photos with a timer put `expiresAfterSeconds` (integer
+  seconds) in the encrypted payload, because the server doesn't tell the
+  recipient the timer. The recipient uses it only when it is 1 to 2592000 and
+  otherwise ignores it; older builds ignore it too.
+- **Report retries.** `ReportEvidence.attachingPhotos` takes a `reusing:` map of
+  message ID to uploaded photo ID, and `ReportSheet` keeps that map between
+  attempts, so a retried report doesn't upload the photos again. A 409
+  `attachment_limit` stops further uploads (those items keep `hasPhoto: true`
+  without a `photoID`). If the report fails with not-found, the sheet forgets the
+  IDs and the next attempt uploads afresh.
+- **Known limitations.** A decrypted photo on screen can show up in iOS's
+  app-switcher snapshot (plaintext photos already can); a privacy cover is a
+  follow-up. The app never sends view-once photos; see docs/security.md for the
+  open-on-list rule that affects ones from other clients.
+- **Moderation hook.** Incoming decrypted photos go through
+  `ChatPhotoAnalyzer` (`ChatPhotoModeration`). The real analyzer is Apple's
+  Sensitive Content Analysis, which needs the
+  `com.apple.developer.sensitivecontentanalysis.client` entitlement. It is
+  **not** in this build, so the analyzer answers "unknown" and photos are shown
+  (no automatic blur). When an analyzer says "explicit" and **Blur explicit
+  photos** or the system's Sensitive Content Warning is on, the photo is blurred
+  until tapped. Your own photos are never blurred. To see the blur in a Debug or
+  Local build, launch with `-StexxDebugFlagChatPhotos YES`, which flags every
+  incoming photo as explicit (compiled out of Release).
+- **Try it.** On a dev server with `E2E_MODE=optional`, send a photo from the
+  peer with `e2e-peer.ts send --to <your ID> --photo cat.jpg` (optionally
+  `--text`, `--expires <sec>`, `--view-once`); `read --with <your ID>` decrypts
+  photos the app sent to it and prints `photo: ok <n> bytes` (or `tampered` / `gone`). The mock backend behaves like `E2E_MODE=off`, so
+  photos stay plaintext there.
 
 ### Trying it without a second phone
 

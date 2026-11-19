@@ -139,16 +139,18 @@ final class ChatStore {
 
     // MARK: Photo messages
 
-    /// Sends a photo message: uploads the (already sanitized) JPEG as a
-    /// private chat attachment (`POST /me/attachments`, never on the public
-    /// profile), then sends it as `attachmentPhotoID`.
+    /// Sends a photo message (`APIClient.sendPhoto`): the (already
+    /// sanitized) JPEG goes up as a private chat attachment
+    /// (`POST /me/attachments`, never on the public profile), end-to-end
+    /// encrypted when the chat is, and is sent as `attachmentPhotoID`.
     ///
     /// `expiresAfterSeconds == nil` sends the photo explicitly as not
     /// view-once (`isViewOnce: false`); otherwise the server would apply the
     /// sender's "expiring photos by default" setting.
     ///
     /// Re-sending the same `clientID` after a failure is safe: the server
-    /// deduplicates by client ID, and an unsent upload expires on its own.
+    /// deduplicates by client ID, an unsent upload expires on its own, and an
+    /// encrypted photo is re-sent with the same key.
     func sendPhoto(
         jpegData: Data? = nil,
         clientID: String,
@@ -160,15 +162,13 @@ final class ChatStore {
         guard let jpeg = pendingPhotos[clientID] else { throw APIError.invalidResponse }
         let epoch = self.epoch
 
-        let attachment = try await api.uploadAttachment(jpegData: jpeg)
         let draft = MessageDraft(
             clientID: clientID,
             text: text,
-            attachmentPhotoID: attachment.id,
             expiresAfterSeconds: expiresAfterSeconds,
             isViewOnce: expiresAfterSeconds == nil ? false : nil
         )
-        let sent = try await api.send(draft, in: conversation.id)
+        let sent = try await api.sendPhoto(jpegData: jpeg, draft: draft, in: conversation.id)
         guard epoch == self.epoch else { return sent }
         pendingPhotos[clientID] = nil
         didSend(sent, in: conversation)

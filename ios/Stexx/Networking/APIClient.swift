@@ -29,6 +29,11 @@ protocol APIClient: Sendable {
     /// the profile and not counted in its 6 photos; pass the returned ID as
     /// `attachmentPhotoID`. The server deletes it if it is never sent.
     func uploadAttachment(jpegData: Data) async throws -> Photo
+    /// Private upload of an end-to-end encrypted chat photo
+    /// (`POST /me/attachments` as `application/octet-stream`): an opaque
+    /// blob the server stores as is (`E2EMediaCrypto`). Throws
+    /// `e2e_disabled` when the server has E2E off.
+    func uploadEncryptedAttachment(_ blob: Data) async throws -> Photo
     /// Sets the profile photo order; returns the photos in their new order.
     func reorderPhotos(_ photoIDs: [Photo.ID]) async throws -> [Photo]
     func updatePrivacy(_ settings: PrivacySettings) async throws -> PrivacySettings
@@ -49,6 +54,11 @@ protocol APIClient: Sendable {
     func openConversation(with profileID: Profile.ID) async throws -> Conversation
     func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message>
     func send(_ draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message
+    /// Sends a photo message: `jpegData` is already sanitized, `draft` has
+    /// the client ID, an optional caption and the expiry options. The
+    /// default uploads it as a plaintext attachment; `E2EAPIClient` encrypts
+    /// it when the chat is end-to-end encrypted.
+    func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message
     func markRead(conversationID: Conversation.ID) async throws
     func deleteConversation(_ conversationID: Conversation.ID) async throws
 
@@ -90,6 +100,16 @@ protocol APIClient: Sendable {
     /// `POST /v1/dev/plus`). Debug builds only.
     func debugGrantPlus() async throws
     #endif
+}
+
+extension APIClient {
+    /// A plaintext chat photo: a private upload, then its ID as `attachmentPhotoID`.
+    func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message {
+        let upload = try await uploadAttachment(jpegData: jpegData)
+        var wire = draft
+        wire.attachmentPhotoID = upload.id
+        return try await send(wire, in: conversationID)
+    }
 }
 
 enum APIError: LocalizedError, Equatable, Sendable {

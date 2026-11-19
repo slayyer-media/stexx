@@ -45,6 +45,9 @@ struct ReportSheet: View {
     @State private var selectedMessageIDs: Set<Message.ID> = []
     @State private var isPickingEvidence = false
     @State private var isSent = false
+    /// Evidence photos an earlier attempt uploaded, by evidence message ID:
+    /// a retry reuses them instead of using up more pending upload slots.
+    @State private var uploadedEvidencePhotos: [String: Photo.ID] = [:]
 
     /// The newest sent messages, oldest first, as offered in the picker.
     private var evidenceCandidates: [Message] {
@@ -248,24 +251,34 @@ struct ReportSheet: View {
         isSubmitting = true
         errorMessage = nil
         // Evidence only goes with a chat report, and only what was ticked.
-        let evidence: [ReportEvidence]? = conversationID == nil ? nil : {
-            let items = ReportEvidence.from(
-                messages: evidenceCandidates,
-                selectedIDs: selectedMessageIDs,
-                reportedID: profile.id
-            )
-            return items.isEmpty ? nil : items
-        }()
-        let request = ReportRequest(
-            profileID: profile.id,
-            reason: reason,
-            details: details.isEmpty ? nil : details,
-            conversationID: conversationID,
-            alsoBlock: alsoBlock,
-            evidence: evidence
+        let items: [ReportEvidence] = conversationID == nil ? [] : ReportEvidence.from(
+            messages: evidenceCandidates,
+            selectedIDs: selectedMessageIDs,
+            reportedID: profile.id
         )
+        let candidates = evidenceCandidates
+        let api = self.api
         Task {
             defer { isSubmitting = false }
+            // Ticked photos: the photo this phone can show (decrypted for an
+            // encrypted one), re-encoded without metadata and uploaded
+            // privately, so moderators see exactly what was ticked.
+            let withPhotos = await ReportEvidence.attachingPhotos(
+                to: items,
+                messages: candidates,
+                reusing: uploadedEvidencePhotos,
+                load: { await Self.evidenceJPEG(for: $0) },
+                upload: { try await api.uploadAttachment(jpegData: $0).id }
+            )
+            uploadedEvidencePhotos.merge(ReportEvidence.uploadedPhotoIDs(in: withPhotos)) { _, new in new }
+            let request = ReportRequest(
+                profileID: profile.id,
+                reason: reason,
+                details: details.isEmpty ? nil : details,
+                conversationID: conversationID,
+                alsoBlock: alsoBlock,
+                evidence: withPhotos.isEmpty ? nil : withPhotos
+            )
             do {
                 try await api.report(request)
                 if alsoBlock {
@@ -274,9 +287,32 @@ struct ReportSheet: View {
                 }
                 isSent = true
             } catch {
+                // A photo the server no longer has (swept, or already used):
+                // the next attempt uploads afresh.
+                if case APIError.notFound = error { uploadedEvidencePhotos = [:] }
                 errorMessage = error.localizedDescription
             }
         }
+    }
+}
+
+extension ReportSheet {
+    /// A ticked photo as a sanitized JPEG, or `nil` if this phone can't show
+    /// it (no key here, expired, a spent view-once photo).
+    nonisolated static func evidenceJPEG(for message: Message) async -> Data? {
+        guard let attachment = message.attachment, let url = attachment.url else { return nil }
+        let data: Data
+        if attachment.isEncrypted {
+            guard let pointer = message.e2eAttachment,
+                  let decrypted = try? await ChatMediaLoader.shared.decrypted(url: url, pointer: pointer)
+            else { return nil }
+            data = decrypted
+        } else {
+            guard let (downloaded, response) = try? await PrivateMedia.session.data(from: url) else { return nil }
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return nil }
+            data = downloaded
+        }
+        return ImageSanitizer.strippedJPEG(from: data)
     }
 }
 
@@ -333,7 +369,7 @@ struct ReportEvidencePicker: View {
                     if isFull {
                         Text("You can share up to \(ReportEvidence.maxItems) messages.")
                     }
-                    Text("Only the messages you tick are shared with our moderators. Photos aren't uploaded; moderators only see that a photo was sent.")
+                    Text("Only the messages you tick are shared with our moderators. Photos you tick are shared with them too (up to \(ReportEvidence.maxPhotos)).")
                 }
                 .font(.footnote)
                 .foregroundStyle(Theme.slate)

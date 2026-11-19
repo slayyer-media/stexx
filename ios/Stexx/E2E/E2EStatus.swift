@@ -48,10 +48,29 @@ final class E2EStatus {
         Task { await engine.syncKeys() }
     }
 
+    /// Back in the foreground: drop messages and photo keys that expired
+    /// while the app was in the background.
+    func pruneHistory() {
+        guard let engine else { return }
+        Task { await engine.pruneHistory() }
+    }
+
     func signedOut() {
         apply(E2ESnapshot())
+        // Decrypted photos are memory only; none survive the account.
+        Task { await ChatMediaLoader.shared.clear() }
         guard let engine else { return }
         Task { await engine.signedOut() }
+    }
+
+    /// A view-once photo was closed (or found spent): drop its key.
+    func forgetAttachmentKey(messageID: Message.ID, gone: Bool = false) async {
+        guard let engine else { return }
+        if gone {
+            await engine.attachmentsGone(messageIDs: [messageID])
+        } else {
+            await engine.forgetAttachmentKey(messageID: messageID)
+        }
     }
 
     func threadOpened(with peer: Profile.ID) async {

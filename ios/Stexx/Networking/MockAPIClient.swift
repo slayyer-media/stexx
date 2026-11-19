@@ -141,6 +141,13 @@ actor MockAPIClient: APIClient {
         return Photo(id: id, url: url)
     }
 
+    /// Like a server with `E2E_MODE=off`: encrypted uploads are refused, so
+    /// the app never gets this far (it routes to plaintext first).
+    func uploadEncryptedAttachment(_ blob: Data) async throws -> Photo {
+        try await pause()
+        throw Self.e2eDisabled
+    }
+
     func deletePhoto(id: Photo.ID) async throws {
         try await pause()
         guard me.photos.contains(where: { $0.id == id }) else { throw APIError.notFound }
@@ -355,6 +362,14 @@ actor MockAPIClient: APIClient {
 
     func report(_ report: ReportRequest) async throws {
         try await pause()
+        // Like the server: an evidence photo is one of your pending uploads
+        // (consumed by the report), each used once.
+        let photoIDs = report.evidence?.compactMap(\.photoID) ?? []
+        guard Set(photoIDs).count == photoIDs.count else {
+            throw APIError.server(status: 400, message: "Each evidence photo can only be used once.")
+        }
+        guard photoIDs.allSatisfy({ attachments[$0] != nil }) else { throw APIError.notFound }
+        for id in photoIDs { attachments[id] = nil }
         lastReport = report
         if report.alsoBlock { blocked.insert(report.profileID) }
     }
