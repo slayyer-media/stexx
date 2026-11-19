@@ -3,6 +3,8 @@ import { config } from "./config.ts";
 import { sql } from "./db/sql.ts";
 import { startJobs } from "./jobs/index.ts";
 import { logInfo } from "./lib/logger.ts";
+import { closeAllConnections } from "./lib/realtime.ts";
+import { createShutdown } from "./lib/shutdown.ts";
 import { verifierName } from "./lib/e2e/crypto.ts";
 import { photoClassifier } from "./lib/photocheck/classifier.ts";
 import { websocket } from "./routes/ws.ts";
@@ -39,11 +41,14 @@ if (config.isProduction && config.antiSpam.attestation.mode === "off") {
   logInfo("attestation_disabled", { reason: "APPLE_TEAM_ID unset or ATTESTATION_MODE=off" });
 }
 
-async function shutdown() {
-  stopJobs();
-  await server.stop();
-  await sql.end({ timeout: 5 });
-  process.exit(0);
-}
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+// Graceful stop (lib/shutdown.ts): stop listening, close websockets with 1012, await the jobs, close lingering
+// requests after a short grace, close the pool, and exit before systemd's TimeoutStopSec=20 SIGKILL.
+const shutdown = createShutdown({
+  server,
+  stopJobs,
+  closeSockets: () => closeAllConnections(1012, "restarting"),
+  endDb: () => sql.end({ timeout: 5 }),
+  exit: (code) => process.exit(code),
+});
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

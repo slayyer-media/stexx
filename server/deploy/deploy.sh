@@ -2,11 +2,11 @@
 #
 # Deploy the Stexx API to the VPS. Run from your machine; everything remote goes over ssh + sudo.
 #
-#   DEPLOY_HOST=user@host ./deploy/deploy.sh              # check, upload, install, back up, migrate, flip, verify
+#   DEPLOY_HOST=user@host ./deploy/deploy.sh              # check, upload, install, snapshot, migrate, flip, verify
 #   ./deploy/deploy.sh --dry-run                          # print every remote step, change nothing
 #   ./deploy/deploy.sh --no-checks                        # skip local typecheck + tests
-#   ./deploy/deploy.sh --no-backup                        # skip the pre-migration backup (first deploy only)
-#   ./deploy/deploy.sh --sync-config                      # refresh systemd units, backup script, Caddy site file
+#   ./deploy/deploy.sh --no-backup                        # skip the pre-migration snapshot (first deploy only)
+#   ./deploy/deploy.sh --sync-config                      # refresh systemd units, backup + watchdog scripts, Caddy site
 #   ./deploy/deploy.sh --bootstrap                        # one-time provisioning (runs deploy/bootstrap.sh as root)
 #   ./deploy/deploy.sh --list-releases | --status
 #   ./deploy/deploy.sh --rollback [NAME]                  # flip back to the previous (or named) release
@@ -18,7 +18,9 @@
 # `current` is a symlink flipped atomically. A failed health check flips it back and restarts, so a bad build
 # cannot leave the API down. Migrations are NOT reverted by a rollback: write them additive (new tables, columns,
 # indexes; no drops or renames in the same release that stops using the old shape) so the previous release keeps
-# working against the new schema.
+# working against the new schema. Before migrating, `stexx-backup --pre-migrate` writes a FULL encrypted snapshot to
+# /var/lib/stexx-premigrate/ (root-only, never uploaded, deleted after 24 h): that is what undoes a bad
+# migration (restore-drill.sh --restore-into, see README "Disaster recovery").
 #
 # Nothing here ships dev code: src/dev/ is excluded from the upload; tests and .env files never leave your machine.
 
@@ -133,7 +135,12 @@ echo "$SERVICE:       \$(systemctl is-active $SERVICE)"
 echo "caddy:          \$(systemctl is-active caddy)"
 echo "postgresql:     \$(systemctl is-active postgresql)"
 echo "last backup:    \$(cat /var/lib/stexx-backup/last-success 2>/dev/null || echo NEVER)"
-echo "backup timer:   \$(systemctl is-active stexx-backup.timer)"
+echo "backup timer:   \$(systemctl is-active stexx-backup.timer)  (last run: \$(systemctl show -p Result --value stexx-backup.service))"
+echo "pre-migrate:    \$(find /var/lib/stexx-premigrate -maxdepth 1 -type f -name 'stexx-premigrate-*' 2>/dev/null | wc -l) snapshot(s) on disk"
+echo "watchdog timer: \$(systemctl is-active stexx-watch.timer)"
+echo "watchdog:       \$(cat /var/lib/stexx-watch/last-run 2>/dev/null || echo 'never ran')"
+if grep -Eqs '^[[:space:]]*ALERT_(EMAIL|WEBHOOK_URL)=.+' /etc/stexx/watch.env; then echo "alerting:       configured"; else echo "alerting:       OFF (set ALERT_EMAIL or ALERT_WEBHOOK_URL in /etc/stexx/watch.env)"; fi
+echo "failed units:   \$(systemctl list-units --failed --no-legend --plain 'stexx-*' 2>/dev/null | awk '{print \$1}' | tr '\n' ' ')"
 echo "ufw:            \$(ufw status 2>/dev/null | head -1)"
 echo "health:         HTTP \$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 '$HEALTH_URL' 2>/dev/null || echo 000)"
 EOF
@@ -143,18 +150,26 @@ fi
 # --- sync config -------------------------------------------------------------------------------------------------
 if [ "$SYNC" = 1 ]; then
   preflight
-  log "Syncing systemd units, backup script and Caddy site file"
+  log "Syncing systemd units, backup and watchdog scripts, tmpfiles rule and Caddy site file"
   TMP_REMOTE="/tmp/stexx-config-$$"
-  if [ "$DRY" = 1 ]; then echo "  [dry-run] install units, stexx-backup, sites/stexx.caddy; validate caddy; reload"; exit 0; fi
+  if [ "$DRY" = 1 ]; then echo "  [dry-run] install units, stexx-backup, stexx-watch, tmpfiles rule, watch.env.example, sites/stexx.caddy; enable stexx-watch.timer; validate caddy; reload"; exit 0; fi
   rsh "mkdir -p $TMP_REMOTE"
   rsync -az -e "ssh ${SSH_OPTS_ARR[*]}" deploy/stexx-api.service deploy/stexx-backup.service deploy/stexx-backup.timer \
-    deploy/backup.sh deploy/Caddyfile "$DEPLOY_HOST:$TMP_REMOTE/"
+    deploy/stexx-watch.service deploy/stexx-watch.timer deploy/stexx-alert@.service deploy/stexx-watch.sh \
+    deploy/watch.env.example deploy/system/tmpfiles-stexx.conf deploy/backup.sh deploy/Caddyfile "$DEPLOY_HOST:$TMP_REMOTE/"
   rscript <<EOF
 set -e
 cd '$TMP_REMOTE'
 install -m 0644 stexx-api.service stexx-backup.service stexx-backup.timer /etc/systemd/system/
+install -m 0644 stexx-watch.service stexx-watch.timer stexx-alert@.service /etc/systemd/system/
 install -m 0755 backup.sh /usr/local/sbin/stexx-backup
+install -m 0755 stexx-watch.sh /usr/local/sbin/stexx-watch
+install -m 0644 watch.env.example /etc/stexx/watch.env.example
+install -D -m 0644 tmpfiles-stexx.conf /etc/tmpfiles.d/stexx.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/stexx.conf
 systemctl daemon-reload
+systemctl enable --now stexx-watch.timer >/dev/null 2>&1
+echo '  stexx-watch.timer enabled (alerting stays off until /etc/stexx/watch.env sets ALERT_EMAIL or ALERT_WEBHOOK_URL)'
 cp -p /etc/caddy/sites/stexx.caddy /etc/caddy/sites/stexx.caddy.prev 2>/dev/null || true
 install -m 0644 Caddyfile /etc/caddy/sites/stexx.caddy
 if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
@@ -256,13 +271,15 @@ HOME=/nonexistent exec setpriv --reuid=stexx --regid=stexx --clear-groups $BUN -
 EOF
 
 if [ "$SKIP_BACKUP" != 1 ]; then
-  log "Encrypted backup before migrating"
-  if ! rrun "sudo systemctl start stexx-backup.service"; then
-    rsh "sudo journalctl -u stexx-backup -n 15 --no-pager" >&2 || true
-    die "pre-deploy backup failed. Fix backups, or pass --no-backup (acceptable only for the very first deploy, when there is no data)."
+  log "Full encrypted snapshot before migrating (local to the server, root-only, deleted after 24 h, never uploaded)"
+  # The nightly backup leaves rows out (messages, sessions, locations, ...), so it cannot undo a migration; this can.
+  rsh "grep -q -- '--pre-migrate' /usr/local/sbin/stexx-backup" \
+    || die "the server's stexx-backup has no --pre-migrate mode yet. Run: DEPLOY_HOST=$DEPLOY_HOST $0 --sync-config"
+  if ! rrun "sudo /usr/local/sbin/stexx-backup --pre-migrate"; then
+    die "pre-migration snapshot failed. Fix it (age recipients, disk space), or pass --no-backup (acceptable only for the very first deploy, when there is no data)."
   fi
 else
-  echo "  --no-backup: skipping the pre-deploy backup"
+  echo "  --no-backup: skipping the pre-migration snapshot"
 fi
 
 log "Migrations (as the schema owner), then grants"
