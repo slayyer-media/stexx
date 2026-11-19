@@ -187,7 +187,7 @@ function printReview(r: PhotoFlagReview, out: (line: string) => void, now: Date)
 
 function printResult(res: PhotoActionResult, out: (line: string) => void): void {
   const extra = Object.keys(res.details).length ? ` ${JSON.stringify(res.details)}` : "";
-  out(`${res.action}: flag #${res.flagId} is now ${res.status}; photo ${res.photoId} is ${res.photoHidden ? "hidden" : "shown"}${extra}`);
+  out(`${res.action}: flag #${res.flagId} is now ${res.status}; photo ${res.photoId} is ${res.photoHidden ? "hidden" : "not hidden"}${extra}`);
 }
 
 const STATUSES = ["open", "actioned", "dismissed", "all"];
