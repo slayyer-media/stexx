@@ -1,12 +1,16 @@
 # Stexx for iOS
 
 Native SwiftUI app for iOS 26, built on Apple's Liquid Glass APIs. No ad SDKs,
-no analytics, no third-party dependencies.
+no analytics. The one dependency is Signal's official
+[`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0, like Stexx)
+for end-to-end encrypted chat.
 
 ## Requirements
 
-- macOS with **Xcode 26** or newer (iOS 26 SDK)
+- macOS with **Xcode 26** or newer (iOS 26 SDK; built and tested with Xcode 27.2)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) to generate the project
+- Network access on the first build: Swift Package Manager fetches libsignal
+  (see [End-to-end encryption](#end-to-end-encryption)). No Rust toolchain needed.
 
 ## Build & run
 
@@ -38,6 +42,90 @@ The `.xcodeproj` and generated `Info.plist` are git-ignored. Change
 
 Every screen has SwiftUI previews (`#Preview`) that inject mock dependencies
 via `.previewEnvironment()`.
+
+## End-to-end encryption
+
+Chat text is end-to-end encrypted with the Signal Protocol (PQXDH, then the
+Double Ratchet) when the server's `E2E_MODE` allows it. Design and threat
+notes: [`../docs/security.md`](../docs/security.md#the-ios-client); wire
+contract: [`../docs/api.md`](../docs/api.md#end-to-end-encryption).
+
+### libsignal, pinned
+
+| Part | Source | Pin |
+| --- | --- | --- |
+| Swift bindings (`LibSignalClient`) | `https://github.com/signalapp/libsignal`, built from source by SwiftPM | `exactVersion: 0.108.1` in `project.yml` |
+| Rust library (`libsignal_ffi.a`) | Signal's prebuilt XCFramework, `https://build-artifacts.signal.org/libraries/libsignal-client-ios-build-v0.108.1.xcframework.zip` (device + simulator) | SHA-256 `1a1ebf8b50a9f885ae0d336b1aaa5d0d1b984794ef9280b20df11c3156a896cb` in `Packages/LibSignalFfi/Package.swift` |
+
+SwiftPM downloads both on the first build and refuses the zip if its checksum
+doesn't match (the value Signal publishes as the release asset
+`libsignal-client-ios-build-v0.108.1.xcframework.zip.sha256`). Both halves must
+be the same version, or linking fails with an undefined
+`signal_ffi_version_X_Y_Z`. 0.108.1 is used because 0.108.2 (the server's Node
+version) has no iOS prebuild; the two interoperate (checked with
+`server/scripts/e2e-peer.ts`).
+
+To bump: change `exactVersion` in `project.yml` and `libsignalVersion` plus
+`checksum` in `Packages/LibSignalFfi/Package.swift`, then `xcodegen generate`.
+Get the checksum from the release asset, or download the zip and run
+`shasum -a 256` on it. If Signal ever stops publishing a prebuild, build the
+XCFramework from the tagged source instead (`swift/build_ffi.sh` for
+`aarch64-apple-ios` and `aarch64-apple-ios-sim`, then
+`swift/build_xcframework.py`; needs the Rust version in libsignal's
+`rust-toolchain`) and point the binary target at it with `path:`.
+
+### How it fits in
+
+```
+Stexx/E2E/
+  E2EModels.swift          Wire models (E2EConfig, KeyRegistration, PreKeyBundleResponse, MessageEnvelope, ...)
+  E2ESecretStorage.swift   Keychain items (this device only, not synced) / in-memory for tests
+  E2EProtocolStore.swift   libsignal's identity, prekey, signed, Kyber and session stores over it
+  E2EHistoryStore.swift    Decrypted text, kept in an AES-GCM sealed file (key in the Keychain)
+  E2EContentRules.swift    Port of the server's link and duplicate-text rules
+  E2EEngine.swift          Keys (register, top up, rotate), PQXDH, encrypt/decrypt, identity holds
+  E2EAPIClient.swift       APIClient wrapper: encrypts sends, decrypts conversations and messages
+  E2EStatus.swift          Main-actor state for the UI; realtime identity.changed / keys.low
+```
+
+Screens keep reading `Message.text`: `E2EAPIClient` fills it in from the
+decrypted envelope, and `Message.encryption` says when it couldn't (the
+thread then shows a placeholder bubble instead of a blank one).
+
+- **Debug scheme (mock backend):** `MockAPIClient` is a server with
+  `E2E_MODE=off`, so previews and mock screenshots stay plaintext and need no
+  Keychain. The crypto is covered by `StexxTests/E2EEngineTests.swift`: two
+  in-memory devices with real libsignal keys talking through a fake server.
+- **Local scheme:** against `../server` with `E2E_MODE=optional` (the dev
+  default) the app registers keys on sign-in and encrypts whenever the other
+  person has keys.
+
+### Trying it without a second phone
+
+`../server/scripts/e2e-peer.ts` is a scriptable chat partner using libsignal's
+Node bindings (dev servers on this machine only):
+
+```sh
+cd ../server
+bun scripts/e2e-peer.ts --server http://127.0.0.1:8787 --state /tmp/peer.json init --name Rowan
+bun scripts/e2e-peer.ts --state /tmp/peer.json send --to <your profile ID> --text "Hi!"
+bun scripts/e2e-peer.ts --state /tmp/peer.json read --with <your profile ID>
+bun scripts/e2e-peer.ts --state /tmp/peer.json reinstall   # new identity key → identity.changed
+```
+
+For screenshots of a live encrypted chat (Local build, debug only), the
+`liveChat` route opens a chat on a dev server with a session kept in memory
+(never written to the Keychain):
+
+```sh
+xcrun simctl launch booted gay.stexx.app \
+  -StexxAPIBaseURL http://127.0.0.1:8791 -StexxScreenshotRoute liveChat \
+  -StexxScreenshotPeer <peer profile ID> -stexx.ageConfirmed YES \
+  -StexxDevSession "$(bun scripts/e2e-peer.ts --state /tmp/me.json session | base64)" \
+  [-StexxScreenshotDraft "text to send once loaded"]
+```
+
+`-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
 
 ## Configuration
 
@@ -71,14 +159,16 @@ ios/
 │   ├── DesignSystem/           Theme, typography, glow background, glass components, brand views
 │   ├── Models/                 Profile, Conversation, Message, account & query types, formatting, location fuzzing
 │   ├── Networking/             APIClient protocol, HTTP client, mock client & data, Keychain session store
+│   ├── E2E/                    Signal Protocol client (see "End-to-end encryption")
 │   ├── Features/
 │   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up
 │   │   ├── Nearby/             Grid, filters, profile detail
-│   │   ├── Chat/               Conversation list and thread
+│   │   ├── Chat/               Conversation list and thread (key-change banner, encrypted placeholders)
 │   │   ├── Me/                 Own profile, edit profile, settings
 │   │   ├── Safety/             Block/report UI, blocked list
 │   │   └── Paywall/            Stexx+ placeholder
 │   └── Resources/              Asset catalog (AppIcon, StexxMark SVG, colors)
+├── Packages/LibSignalFfi/      Binary target for Signal's prebuilt libsignal XCFramework
 └── StexxTests/                 Unit tests (Swift Testing)
 ```
 
@@ -107,6 +197,9 @@ ios/
 - Photos are re-encoded on device (`ImageSanitizer`), which drops
   EXIF/GPS metadata.
 - The session token is kept in the Keychain (`ThisDeviceOnly`, never synced).
+- End-to-end encryption keys and sessions live in the Keychain the same way
+  (`gay.stexx.app.e2e`); decrypted chat text is kept only in an encrypted,
+  backup-excluded file on the phone. Deleting the account removes both.
 
 ## Not done yet
 
@@ -117,3 +210,7 @@ ios/
 - Push notifications
 - Discreet alternate app icons, localization
 - Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)
+- End-to-end encryption for chat photos (they're still sent as plain
+  attachments), the safety-number comparison screen, and multi-device
+- A run of the E2E client on a physical iPhone (Keychain classes, App Attest
+  on key upload, the libsignal device slice); so far simulator and unit tests

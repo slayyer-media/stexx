@@ -52,6 +52,24 @@ protocol APIClient: Sendable {
     func markRead(conversationID: Conversation.ID) async throws
     func deleteConversation(_ conversationID: Conversation.ID) async throws
 
+    // MARK: End-to-end encryption (`docs/api.md`)
+    /// `GET /e2e/config`: the server's `E2E_MODE`, prekey limits and the
+    /// text rules to enforce before encrypting.
+    func e2eConfig() async throws -> E2EConfig
+    /// `PUT /keys`: register this device's full key state (replaces every
+    /// stored one-time prekey).
+    func registerKeys(_ registration: KeyRegistration) async throws -> KeyStatus
+    /// `GET /keys/status`.
+    func keyStatus() async throws -> KeyStatus
+    /// `POST /keys/prekeys`.
+    func uploadPreKeys(_ replenishment: PreKeyReplenishment) async throws -> KeyStatus
+    /// `PUT /keys/signed`.
+    func rotateSignedPreKeys(_ rotation: SignedPreKeyRotation) async throws -> KeyStatus
+    /// `GET /keys/bundle/{id}`. Consumes one-time prekeys on the server.
+    func preKeyBundle(for profileID: Profile.ID) async throws -> PreKeyBundleResponse
+    /// `GET /keys/identity/{id}`. Consumes nothing.
+    func identityKey(for profileID: Profile.ID) async throws -> IdentityKeyResponse
+
     // MARK: Safety (always free)
     func block(profileID: Profile.ID) async throws
     func unblock(profileID: Profile.ID) async throws
@@ -81,6 +99,9 @@ enum APIError: LocalizedError, Equatable, Sendable {
     /// 429. `retryAfter` is the server's `Retry-After`, in seconds, when sent.
     case rateLimited(retryAfter: TimeInterval?)
     case server(status: Int, message: String?)
+    /// An end-to-end encryption answer the app acts on (`E2EErrorCode`):
+    /// `e2e_disabled`, `keys_unavailable`, `encryption_required`, ….
+    case e2e(code: String, message: String?)
     case invalidResponse
 
     var errorDescription: String? {
@@ -90,6 +111,10 @@ enum APIError: LocalizedError, Equatable, Sendable {
         case .requiresPlus: String(localized: "This feature is part of Stexx+.")
         case .rateLimited(let retryAfter): Self.rateLimitedMessage(retryAfter: retryAfter)
         case .server(_, let message): message ?? String(localized: "Something went wrong on our side.")
+        case .e2e(let code, let message):
+            code == E2EErrorCode.encryptionRequired
+                ? String(localized: "Update Stexx to keep chatting.")
+                : message ?? String(localized: "Something went wrong on our side.")
         case .invalidResponse: String(localized: "Unexpected response from the server.")
         }
     }
@@ -119,8 +144,15 @@ struct APIConfiguration: Sendable {
     var useMock: Bool
 
     static func fromBundle(_ bundle: Bundle = .main) -> APIConfiguration {
-        let urlString = bundle.object(forInfoDictionaryKey: "StexxAPIBaseURL") as? String
+        var urlString = bundle.object(forInfoDictionaryKey: "StexxAPIBaseURL") as? String
         let mockFlag = bundle.object(forInfoDictionaryKey: "StexxUseMockAPI") as? String
+        #if DEBUG
+        // Debug/Local builds only: `-StexxAPIBaseURL http://127.0.0.1:8791`
+        // points the app at another local dev server.
+        if let override = UserDefaults.standard.string(forKey: "StexxAPIBaseURL"), !override.isEmpty {
+            urlString = override
+        }
+        #endif
         return APIConfiguration(
             baseURL: urlString.flatMap { URL(string: $0) } ?? defaultBaseURL,
             useMock: mockFlag?.uppercased() != "NO"

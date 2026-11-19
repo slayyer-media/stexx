@@ -133,7 +133,7 @@ enum SessionRevocation {
                 switch error {
                 // The tokens are already invalid: nothing left to revoke.
                 case .unauthorized, .notFound: return true
-                case .rateLimited, .server, .invalidResponse: break
+                case .rateLimited, .server, .e2e, .invalidResponse: break
                 case .requiresPlus: return false
                 }
             } catch is CancellationError {

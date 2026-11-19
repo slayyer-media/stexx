@@ -28,12 +28,26 @@ settings:
     # Set your own team locally (Xcode > Signing & Capabilities); never commit it.
     DEVELOPMENT_TEAM: ""
 
+# Signal Protocol (end-to-end encrypted chat): Signal's official libsignal,
+# AGPL-3.0 like Stexx. The Swift bindings come from the tagged source; the Rust
+# library is Signal's prebuilt XCFramework, pinned by SHA-256 in
+# Packages/LibSignalFfi. Both must be the same version. See README.md.
+packages:
+  LibSignalClient:
+    url: https://github.com/signalapp/libsignal
+    exactVersion: 0.108.1
+  LibSignalFfi:
+    path: Packages/LibSignalFfi
+
 targets:
   Stexx:
     type: application
     platform: iOS
     sources:
       - path: Stexx
+    dependencies:
+      - package: LibSignalClient
+      - package: LibSignalFfi
     settings:
       base:
         PRODUCT_NAME: Stexx

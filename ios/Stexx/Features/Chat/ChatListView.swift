@@ -133,7 +133,8 @@ private struct ConversationRow: View {
 
     private var preview: String {
         guard let message = conversation.lastMessage else { return String(localized: "New conversation") }
-        let body = message.text ?? String(localized: "Photo")
+        let body = message.text
+            ?? (message.encryption.map { _ in String(localized: "Encrypted message") } ?? String(localized: "Photo"))
         return message.senderID == myID ? String(localized: "You: \(body)") : body
     }
 

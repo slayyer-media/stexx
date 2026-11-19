@@ -13,6 +13,7 @@ extension View {
             .environment(chatStore)
             .environment(services)
             .environment(services.purchases)
+            .environment(services.e2e)
             .environment(\.apiClient, api)
             .preferredColorScheme(.dark)
             .tint(Theme.violet)
