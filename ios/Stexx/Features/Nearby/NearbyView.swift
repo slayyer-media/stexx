@@ -41,8 +41,10 @@ struct NearbyView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var isShowingFilters = false
-    @State private var loadedQuery: NearbyQuery?
+    @State private var loadedKey: LoadKey?
     @State private var path = NavigationPath()
+    @State private var isTurningOffTravel = false
+    @State private var travelError: String?
 
     @Namespace private var zoomNamespace
 
@@ -52,6 +54,18 @@ struct NearbyView: View {
 
     private var hasActiveAdvancedFilters: Bool {
         appState.hasPlus && advanced.usesAdvancedFilters
+    }
+
+    /// What the grid depends on: the filters, and where you browse from
+    /// (travel mode on, moved or off, or paused by a lapsed Stexx+).
+    private struct LoadKey: Hashable {
+        var query: NearbyQuery
+        var travelRevision: Int
+        var isTravelActive: Bool
+    }
+
+    private var loadKey: LoadKey {
+        LoadKey(query: query, travelRevision: appState.travelRevision, isTravelActive: appState.isTravelActive)
     }
 
     private var query: NearbyQuery {
@@ -69,6 +83,17 @@ struct NearbyView: View {
 
         NavigationStack(path: $path) {
             ScrollView {
+                if appState.isTravelActive {
+                    TravelBanner(
+                        placeName: appState.travel?.name,
+                        isBusy: isTurningOffTravel,
+                        onOpen: { path.append(TravelRoute()) },
+                        onTurnOff: { Task { await turnOffTravel() } }
+                    )
+                    .padding(.horizontal, NearbyGridMetrics.spacing)
+                    .padding(.top, NearbyGridMetrics.spacing)
+                    .transition(.opacity)
+                }
                 LazyVGrid(columns: NearbyGridMetrics.gridColumns, spacing: NearbyGridMetrics.spacing) {
                     ForEach(visible) { profile in
                         tileLink(profile)
@@ -103,11 +128,20 @@ struct NearbyView: View {
             .sensoryFeedback(.selection, trigger: quickFilter)
             .stexxBackground()
             .refreshable { await reload() }
-            .task(id: query) {
-                // Runs on first appearance and whenever a filter changes;
-                // skips reloading when popping back from a profile.
-                guard query != loadedQuery || profiles.isEmpty else { return }
+            .task(id: loadKey) {
+                // Runs on first appearance, whenever a filter or travel mode
+                // changes; skips reloading when popping back from a profile.
+                guard loadKey != loadedKey || profiles.isEmpty else { return }
                 await reload()
+            }
+            .animation(Motion.animation(Motion.standard, reduceMotion: reduceMotion), value: appState.isTravelActive)
+            .alert(
+                "Couldn't turn off travel mode",
+                isPresented: Binding(get: { travelError != nil }, set: { if !$0 { travelError = nil } })
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(travelError ?? "")
             }
             .navigationTitle("Nearby")
             .navigationDestination(for: Profile.self) { profile in
@@ -116,6 +150,9 @@ struct NearbyView: View {
             }
             .navigationDestination(for: ChatRoute.self) { route in
                 ChatThreadView(route: route)
+            }
+            .navigationDestination(for: TravelRoute.self) { _ in
+                TravelModeView()
             }
             .sheet(isPresented: $isShowingFilters) {
                 FilterSheet(query: $advanced)
@@ -229,16 +266,23 @@ struct NearbyView: View {
 
     // MARK: Loading
 
+    private func turnOffTravel() async {
+        isTurningOffTravel = true
+        defer { isTurningOffTravel = false }
+        let model = TravelModeModel(appState: appState, api: api)
+        if await !model.turnOff() { travelError = model.errorMessage }
+    }
+
     private func reload() async {
         isLoading = true
         defer { isLoading = false }
         do {
-            let requested = query
-            let page = try await api.nearby(requested)
+            let requestedKey = loadKey
+            let page = try await api.nearby(requestedKey.query)
             // A newer reload (filter change) superseded this one.
             guard !Task.isCancelled else { return }
             profiles = page.items
-            loadedQuery = requested
+            loadedKey = requestedKey
             nextCursor = page.nextCursor
             errorMessage = nil
         } catch is CancellationError {

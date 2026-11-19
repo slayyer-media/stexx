@@ -8,7 +8,11 @@ import Observation
 final class AppState {
     private(set) var isAgeConfirmed: Bool
     private(set) var session: Session?
-    var me: Profile? = nil
+    /// Your own profile. Setting it also adopts the server's travel mode
+    /// state (`Profile.travel`): the server wins.
+    var me: Profile? = nil {
+        didSet { if let me { syncTravel(with: me.travel) } }
+    }
     var privacy: PrivacySettings
     /// Stexx+ entitlement. Set from the server (`GET /subscriptions/status`,
     /// 402 responses); StoreKit purchases only trigger a server re-check.
@@ -18,6 +22,13 @@ final class AppState {
     /// even before the server round-trip finishes.
     private(set) var blockedIDs: Set<Profile.ID> = []
     var isPaywallPresented = false
+    /// Stexx+ travel mode, or `nil` when it's off. The server says whether
+    /// it's on; where it is (the cell that was sent and a place name looked
+    /// up on this phone) is only kept here, in this device's preferences.
+    private(set) var travel: TravelPlace?
+    /// Bumped whenever travel mode is turned on, moved or off, so the grid
+    /// reloads.
+    private(set) var travelRevision = 0
 
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let sessionStore: any SessionStore
@@ -27,6 +38,7 @@ final class AppState {
     private enum Keys {
         static let ageConfirmed = "stexx.ageConfirmed"
         static let privacy = "stexx.privacy"
+        static let travel = "stexx.travel"
     }
 
     init(defaults: UserDefaults = .standard, sessionStore: any SessionStore = KeychainSessionStore()) {
@@ -36,6 +48,8 @@ final class AppState {
         self.session = sessionStore.load()
         self.privacy = defaults.data(forKey: Keys.privacy)
             .flatMap { try? JSONDecoder().decode(PrivacySettings.self, from: $0) } ?? PrivacySettings()
+        self.travel = session == nil ? nil : defaults.data(forKey: Keys.travel)
+            .flatMap { try? JSONDecoder().decode(TravelPlace.self, from: $0) }
     }
 
     var isSignedIn: Bool { isAgeConfirmed && session != nil }
@@ -88,6 +102,8 @@ final class AppState {
         hasPlus = false
         plusExpiresAt = nil
         blockedIDs = []
+        // The place belongs to this account; the next one starts clean.
+        setTravel(nil)
     }
 
     // MARK: Stexx+
@@ -111,6 +127,45 @@ final class AppState {
     private func dropPlusOnlySettings() {
         // Re-sending incognito without Plus would just 402 again.
         if privacy.incognito { privacy.incognito = false }
+        // Travel mode is NOT dropped: the server keeps the cell and ignores
+        // it while Stexx+ is off (`isTravelPaused`), and resumes it when
+        // Stexx+ is back. The user can still turn it off for free.
+    }
+
+    // MARK: Travel mode (Stexx+)
+
+    /// You browse, and others see you, from the travel place right now.
+    var isTravelActive: Bool { travel != nil && hasPlus }
+
+    /// Travel mode is on but has no effect because Stexx+ has lapsed.
+    var isTravelPaused: Bool { travel != nil && !hasPlus }
+
+    /// The server accepted a travel change (`PUT /me/travel`): `place` is
+    /// the new travel place, `nil` when it was turned off.
+    func travelDidChange(to place: TravelPlace?) {
+        setTravel(place)
+        me?.travel = place.map { _ in TravelStatus(isActive: hasPlus) }
+    }
+
+    /// Adopts the server's state. On but unknown here (a reinstall, or set
+    /// before this version): on, without a place.
+    private func syncTravel(with status: TravelStatus?) {
+        switch (status, travel) {
+        case (nil, nil), (.some, .some): return
+        case (nil, .some): setTravel(nil)
+        case (.some, nil): setTravel(TravelPlace())
+        }
+    }
+
+    private func setTravel(_ place: TravelPlace?) {
+        guard place != travel else { return }
+        travel = place
+        travelRevision += 1
+        if let place, let data = try? JSONEncoder().encode(place) {
+            defaults.set(data, forKey: Keys.travel)
+        } else {
+            defaults.removeObject(forKey: Keys.travel)
+        }
     }
 
     // MARK: Privacy
