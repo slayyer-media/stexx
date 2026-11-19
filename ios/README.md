@@ -273,6 +273,20 @@ ios/
   upload.
 - Photos are re-encoded on device (`ImageSanitizer`), which drops
   EXIF/GPS metadata.
+- No photo of a person is written to the app's disk cache. Profile photos
+  (grid, avatars, profiles, the user's own photos including "Hidden" ones)
+  load through `ProfilePhotoLoader` (`ProfilePhotoImage` in views) over the
+  ephemeral `PrivateMedia.session`, and decoded copies stay **in memory
+  only** (capped at 300 photos / 80 MB decoded, dropped on sign-out and
+  account deletion, and when the owner deletes a photo in the editor).
+  Plaintext chat photos use `PrivateAsyncImage`, encrypted ones
+  `ChatMediaLoader`. Don't use `AsyncImage`: it goes through
+  `URLSession.shared`, whose `URLCache` keeps anything the media host marks
+  cacheable (a year, for photos) in `Library/Caches`. A unit test fails the
+  build's tests if `AsyncImage(` appears in the app sources.
+- At launch the app deletes whatever older builds left in the shared URL
+  cache and replaces it with a memory-only one (`SharedURLCacheHygiene`),
+  and purges it again on sign-out.
 - The session token is kept in the Keychain (`ThisDeviceOnly`, never synced).
 - End-to-end encryption keys and sessions live in the Keychain the same way
   (`gay.stexx.app.e2e`); decrypted chat text is kept only in an encrypted,
