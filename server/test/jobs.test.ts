@@ -294,13 +294,17 @@ describe("job runners", () => {
     const id = await message(conv, { attachmentKey: key, readAt: T0, expiresAfter: 1, expiresAt: at(T0, 1 * SEC) });
     const stop = startJobs();
     try {
-      let gone = false;
-      for (let i = 0; i < 40 && !gone; i++) {
+      // One tick deletes the row first and unlinks the file a few queries later (drainMediaTrash), so wait for
+      // both: checking the file as soon as the row is gone races the drain on a slow database connection.
+      let rowGone = false;
+      let fileGone = false;
+      for (let i = 0; i < 50 && !(rowGone && fileGone); i++) {
         await Bun.sleep(100);
-        gone = !(await messageExists(id));
+        rowGone = !(await messageExists(id));
+        fileGone = !exists(key);
       }
-      expect(gone).toBe(true);
-      expect(exists(key)).toBe(false);
+      expect(rowGone).toBe(true);
+      expect(fileGone).toBe(true);
     } finally {
       stop();
     }
