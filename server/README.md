@@ -36,7 +36,7 @@ explicit or not at upload (see [Photo checks](../docs/security.md#6-photo-checks
 | `bun run dev` / `start` | run with / without file watching |
 | `bun test [file]` | tests against a real Postgres database (`stexx_test`); the preload migrates it |
 | `bun run typecheck` / `check` | `tsc --noEmit` / typecheck + tests |
-| `bun run moderate -- <command>` | moderator CLI: `list`, `show`, `dismiss`, `action`, `hide`, `unhide`, `ban`, `unban`, `log` (see [`docs/security.md`](../docs/security.md#5-reports-auto-hide-and-moderation)) |
+| `bun run moderate -- <command>` | moderator CLI: `list`, `show`, `dismiss`, `action`, `hide`, `unhide`, `ban`, `unban`, `purge`, `log` (see [`docs/security.md`](../docs/security.md#5-reports-auto-hide-and-moderation)) |
 
 Tests share one database with each other: they never truncate tables, they create unique users and use random location cells (`test/helpers.ts`).
 `AGENTS-NOTES.md` documents every internal helper and the conventions route code follows.
@@ -52,7 +52,7 @@ src/lib/                errors, ids, time (isoDate), auth (tokens, sessions), se
                         distance (cell snapping, haversine, buckets), visibility (blocks, incognito), cursor, ratelimit,
                         logger, media (sharp pipeline, storage, trash), mailer, plus, realtime, validation
 src/routes/             auth, me, discovery, chat, safety, plus, ws   (one Hono router per group, mounted at /v1)
-src/jobs/               in-process retention jobs: expiry every 15 s, session/challenge/token and profile-view purges, boosts, report evidence, orphan media sweep
+src/jobs/               in-process retention jobs: expiry every 15 s, session/challenge/token and profile-view purges, boosts, report evidence, banned accounts past their review window, orphan media sweep
 src/moderation/         moderator CLI (entry point scripts/moderate.ts); rules in src/lib/moderation.ts
 src/dev/                dev-only: seed, welcome conversations, bot replies, /v1/dev/*  (dynamically imported only when STEXX_DEV_AUTH=1)
 migrations/NNN_*.sql    plain SQL, applied in order, one transaction each, tracked in schema_migrations
@@ -85,6 +85,7 @@ These are the product promises from `docs/api.md`. "Enforced" names the code tha
 | **Spam heuristics keep no text**: a shadow-limited account's messages to people who haven't written to it are held (only its sender sees them) until a moderator clears (delivered) or bans (dropped); the rules store counters, signal names and keyed MinHash signatures for 48 h, never message text, and never read encrypted envelopes | `lib/abuse/spam.ts`, `lib/abuse/content.ts` (`features`), `lib/abuse/minhash.ts`, `routes/chat.ts` (`visibleTo`), `jobs/retention.ts` (`runSpamJobs`), migration 112 | `spam.test.ts`, `spam-content.test.ts` |
 | **Expiring content is really deleted** (rows *and* files): timer starts at the recipient's read, view-once files go after first open, unread expiring messages after 14 days | `jobs/retention.ts` (every 15 s), `media_trash` triggers in migration 001, `lib/media.ts` (`drainMediaTrash`) | `jobs.test.ts`, `chat.test.ts` ("read, receipts and expiry"), `foundation.test.ts` (media) |
 | **Account deletion is real**: one transaction cascades every table, unlinks every file, revokes sessions, anonymizes reports you filed. Backups age out within 30 days | `routes/me.ts` (`DELETE /me`), FKs in migration 001, `deploy/backup.sh` (hard 30-day cap, `messages` rows never backed up) | `me.test.ts` ("DELETE /me"); backup retention is a script check, see `deploy/README.md` |
+| **Banned accounts don't keep data forever**: a ban keeps the account intact for a 30-day review window (`unban` cancels), then it is purged with the same code as `DELETE /me`; only its email HMAC (`banned_emails`) and device bans remain, and moderator notes about it are cleared | `lib/moderation.ts` (`purgeBannedAccount`, `purgeNow`), `lib/account.ts`, `jobs/retention.ts` (`purgeBannedAccounts`), migration 123 | `banned-purge.test.ts` |
 | **No trackers, no sensitive logs.** The request logger emits method, route *pattern*, status, duration, nothing else. Caddy writes no access logs, Postgres logs no statements or values, journald keeps 7 days | `lib/logger.ts`, `deploy/Caddyfile*`, `deploy/postgres/90-stexx.conf`, `deploy/system/journald-stexx.conf` | `foundation.test.ts` (logger) |
 | **Uploads are sanitized**: EXIF/GPS stripped, re-encoded, size and pixel capped, HEIC/other formats rejected | `lib/media.ts` (`sanitizeImage`) | `foundation.test.ts` (media), `me.test.ts` (photos) |
 | **Encrypted chat photos are opaque**: stored verbatim as `.bin`, never decoded or classified, only sendable inside an envelope, refused when `E2E_MODE=off`; under `required` plaintext photos can't be sent in a chat | `lib/media.ts` (`storeBlob`), `routes/me.ts` (`POST /me/attachments`), `routes/chat.ts`, migration 111 | `e2e-media.test.ts` |
@@ -127,6 +128,7 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `MAX_ACCOUNTS_PER_DEVICE` | `1` | |
 | `TRUST_RAMP_*`, `RATE_LIMIT_*` | see security.md | New-account limits and sliding-window rate limits. |
 | `REPORT_*` | see security.md | Auto-hide thresholds (`REPORT_AUTOHIDE_THRESHOLD` 3, window 14 days, underage 1 trusted / 2 any) and evidence retention (30 days after closing, 180 max). |
+| `BANNED_RETENTION_DAYS` | `30` | 1..3650. Review/appeal window after a ban; then the slow job purges the account like `DELETE /me`, keeping only its email HMAC and device bans ([security.md section 5](../docs/security.md#banned-accounts-review-window-and-purge)). Owner decision. |
 | `SPAM_HEURISTICS_ENABLED` | `1` | Spam heuristics on messages and shadow limits ([security.md section 8](../docs/security.md#8-spam-heuristics-on-messages-shadow-limits)). `0` stops new limits and content features; existing limits run their course. |
 | `SPAM_WINDOW_HOURS` | `24` | Window for fan-out, first-contact rate, duplicate text, links and handles. |
 | `SPAM_FANOUT_MIN`, `SPAM_FANOUT_MAX_REPLY_RATE` | `20`, `0.1` | `fan_out_no_replies` (weight 3): conversations started in the window, and the reply rate at or under which it fires. |
