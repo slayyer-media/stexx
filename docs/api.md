@@ -39,7 +39,9 @@ These aren't optional implementation details; they are product promises.
 6. **Expiring content is actually deleted** (database rows and media objects)
    at `expiresAt`, not just hidden.
 7. **Account deletion is real deletion**: profile, photos, messages, reports
-   filed (anonymized), and location within 30 days, including backups.
+   filed (anonymized), and location within 30 days, including backups
+   (encrypted nightly backups are kept 28 days). It doesn't cancel an App
+   Store subscription; the app says so before deleting.
 8. **No third-party trackers or ad SDKs**, server-side included. Logs must
    not contain locations or message bodies.
 9. Media is served from `media.stexx.gay` with unguessable URLs; uploaded
@@ -103,6 +105,13 @@ Non-2xx responses carry:
   It carries no coordinates, like every `/me` response; the app keeps the
   place it picked on the device. Other people's profiles never include
   `travel`.
+- Your **own** profile also adds `privacy`: the six stored
+  [`PrivacySettings`](#me) (`hideDistance, showOnlineStatus, sendReadReceipts,
+  expiringPhotosByDefault, blurExplicitPhotos, incognito`). The app shows
+  these, not a local copy, so a reinstall, a new phone or another account
+  never displays (or saves back) values the server isn't using. `incognito`
+  is the stored choice; it only applies while Stexx+ is active. Other
+  people's profiles never include `privacy`.
 - The server labels every uploaded profile photo with a nudity classifier
   ([security.md](security.md#6-photo-checks-profile-photos)). A photo labelled
   explicit is still accepted (`201`) but comes back with `isExplicit: true` and
@@ -181,16 +190,48 @@ Non-2xx responses carry:
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| GET | `/me` | → `Profile` | Own profile (includes hidden fields, and `travel`; see Profile). |
+| GET | `/me` | → `Profile` | Own profile (includes hidden fields, `travel` and `privacy`; see Profile). The app loads it on launch and sign-in and keeps its privacy toggles disabled until it has. |
 | PATCH | `/me` | `ProfileUpdate` → `Profile` | `displayName, age, pronouns, headline, about, heightCm, position, lookingFor, tags`. Same own-profile shape as `GET /me`. |
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
 | POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
-| PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito` (incognito → 402 without Stexx+) |
+| PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito`, all six required (a full replacement). Turning incognito on → 402 without Stexx+; a lapsed subscriber who sends it back on just has it switched off. Read back with `GET /me` (`privacy`). The app sends one change at a time and rolls the toggle back if this fails. |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
-| GET | `/me/export` | → JSON archive | Data export (GDPR). Each photo includes `checks`: `perceptualHash`, `checkedAt`, `model`, `explicitScore`, `labels`. |
+| GET | `/me/export` | → JSON archive | Data export (GDPR), [contents below](#data-export). Settings › Privacy › Download my data in the app. |
+
+### Data export
+
+`GET /me/export` returns one JSON object (`Content-Disposition: attachment;
+filename="stexx-export.json"`, `Cache-Control: no-store`). Dates follow the
+usual rule (ISO 8601 UTC, no fractions). Other members appear only as opaque
+ids.
+
+| Key | What |
+| --- | --- |
+| `exportedAt`, `notes` | When, and plain-language notes on what's in it and what isn't. |
+| `account` | `id, createdAt, lastActiveAt, confirmedAdult, hasEmailSignIn, stexxPlusExpiresAt, boostEndsAt`, and moderation state: `hiddenPendingReviewSince`, `hiddenReason` (`reports \| underage \| moderator`), `lastModeratorReviewAt`, and `newAccountLimitsApply` (worked out when exported, not stored). |
+| `profile`, `privacy` | The profile fields and the six privacy settings. |
+| `photos` | Each photo plus its `checks`: `perceptualHash`, `checkedAt`, `model`, `explicitScore`, `labels`. |
+| `pendingChatUploads` | Chat photo uploads not sent yet. |
+| `location` | `home` and `travel`: the 500 m cell centre kept (no history). |
+| `favorites`, `tapsSent`, `tapsReceived`, `blocked`, `profilesViewed` | Profile ids with dates. |
+| `reportsFiled` | Reports you filed, with the evidence you shared while it's kept. |
+| `conversations` | Each with its messages: text, or the E2E `envelope` (ciphertext only), attachment URLs (none for a view-once photo you received), and read times only where the other person sends read receipts. |
+| `encryptionKeys` | Your public key state (`GET /keys/status`). |
+| `subscriptions` | `productID, expiresAt, environment, revokedAt`. |
+| `devices` | Attested app installs linked to the account (anti-spam, [security.md](security.md#1-device-attestation-app-attest-devicecheck-fallback)): `id, environment, isBanned, firstSeenAt, lastSeenOn` (a day), `linkedToAccountAt`. Never the App Attest key, nor other accounts on the same device. |
+| `moderation` | Moderation decisions about the account: `action` (`auto_hide, hide, unhide, dismiss, action, ban, unban`), `by` (`automatic \| moderator`), `createdAt`. Never which moderator, their note, or the reports behind it. |
+| `rateLimitCounters` | Abuse-limit counters kept for the account and its devices: `limit, appliesTo (account \| device), deviceID, windowSeconds, windowStartedAt, countThisWindow, countPreviousWindow, deletedAfter`. |
+| `signIn` | Passkeys (`credentialID, transports, createdAt, lastUsedAt`) and sessions (dates only). |
+
+Left out on purpose: secrets (token hashes, passkey and App Attest public
+keys), the email address (only a one-way hash is stored), other people's
+profiles, blocks, views and read times, reports others filed about you and
+automatic photo-match flags (they'd expose the reporters, or other accounts'
+photos and the blocklist), and counters keyed by IP or network (stored only
+as a keyed hash that isn't linked to the account).
 
 ### Discovery
 

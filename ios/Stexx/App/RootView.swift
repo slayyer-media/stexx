@@ -1,7 +1,6 @@
 import SwiftUI
 
-/// Switches between onboarding and the main app, and keeps privacy settings
-/// persisted and synced wherever they are changed.
+/// Switches between onboarding and the main app.
 struct RootView: View {
     @Environment(AppState.self) private var appState
     @Environment(ChatStore.self) private var chatStore
@@ -32,11 +31,6 @@ struct RootView: View {
             #endif
         }
         .animation(.smooth(duration: 0.4), value: appState.isSignedIn)
-        .onChange(of: appState.privacy) { _, newValue in
-            appState.persistPrivacy()
-            guard appState.isSignedIn else { return }
-            Task { _ = try? await api.updatePrivacy(newValue) }
-        }
         .onChange(of: appState.isSignedIn) { _, isSignedIn in
             if !isSignedIn { chatStore.reset() }
         }
@@ -68,7 +62,7 @@ struct RootView: View {
         guard let session = try? await api.verifyEmailLink(token: token) else { return }
         // The link proves the email, not age: the 18+ gate still applies.
         appState.signIn(session)
-        appState.me = try? await api.fetchMe()
+        await appState.loadMe(from: api)
     }
 }
 
@@ -107,8 +101,10 @@ struct MainTabView: View {
         }
         .task {
             await chatStore.loadIfNeeded()
-            if appState.me == nil {
-                appState.me = try? await api.fetchMe()
+            // Launch and sign-in: the profile, travel mode and the privacy
+            // settings the server applies (the settings screen waits for them).
+            if appState.me == nil || appState.privacyStatus != .loaded {
+                await appState.loadMe(from: api)
             }
         }
     }

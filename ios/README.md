@@ -204,6 +204,13 @@ xcrun simctl launch booted gay.stexx.app \
 
 `-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
 
+Settings has two screenshot routes: `-StexxScreenshotRoute settings` (mock
+backend) and `liveSettings` (a dev server, with `-StexxDevSession` like
+`liveChat`). `-StexxScreenshotAction hideDistance|export|signOut|delete`
+does that once the settings have loaded; with the mock,
+`-StexxMockMeDelay <seconds>` holds `GET /me` (the loading state) and
+`-StexxMockFailPrivacy YES` fails `PUT /me/privacy` (the rollback).
+
 ## Travel mode (Stexx+)
 
 Settings → Travel mode opens a map (`Features/Plus/TravelModeView.swift`,
@@ -309,7 +316,26 @@ ios/
 - The session token is kept in the Keychain (`ThisDeviceOnly`, never synced).
 - End-to-end encryption keys and sessions live in the Keychain the same way
   (`gay.stexx.app.e2e`); decrypted chat text is kept only in an encrypted,
-  backup-excluded file on the phone. Deleting the account removes both.
+  backup-excluded file on the phone. Signing out and deleting the account
+  both remove them (`E2EEngine.erase`); signing back in on the same phone
+  starts a new identity, so chat partners see the key-change warning and
+  earlier messages show "not available on this phone". A session that just
+  expires keeps them for the same account. The sign-out dialog says this.
+- Privacy settings come from the server: `GET /me` carries `privacy`, and
+  `AppState` keeps the toggles disabled (with a "Loading" label, or a retry
+  if it failed) until it has them. Each change is shown at once, sent with
+  `PUT /me/privacy`, and switched back with a "Couldn't save" alert if that
+  fails (a 402 for incognito opens the paywall instead). Nothing is cached in
+  UserDefaults any more; older versions' copy (`stexx.privacy`) is deleted on
+  launch.
+- Settings › Privacy › **Download my data** fetches `GET /me/export` and
+  hands it to the share sheet as `stexx-data-<date>.json`, written to its
+  own folder under the temporary directory with complete file protection and
+  deleted when the sheet closes (leftovers go on the next launch).
+- The delete-account dialog says what deletion means: data is gone from the
+  servers at once and from the encrypted backups within 28 days, reports and
+  moderation records stay without a link to you, and Stexx+ has to be
+  cancelled in the App Store (the dialog offers "Manage Stexx+ subscription").
 
 ## Not done yet
 

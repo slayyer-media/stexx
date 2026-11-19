@@ -90,6 +90,13 @@ final class E2EProtocolStore: IdentityKeyStore, PreKeyStore, SignedPreKeyStore, 
     private(set) var state: E2ELocalKeyState
     private var cache: [String: Data] = [:]
     private var pendingCache: [Profile.ID: E2EPendingIdentity]?
+    /// Set when the account's keys were erased from this device (sign-out or
+    /// account deletion). An operation that was already running then (a key
+    /// upload, a decryption) fails instead of writing any of them back.
+    private(set) var isRevoked = false
+
+    /// A write to a store whose keys were erased.
+    struct RevokedError: Error {}
 
     static let deviceID: UInt32 = 1
 
@@ -128,7 +135,14 @@ final class E2EProtocolStore: IdentityKeyStore, PreKeyStore, SignedPreKeyStore, 
         return E2EProtocolStore(storage: storage, userID: userID, identity: identity, state: state)
     }
 
-    /// Removes every secret of `userID` (account deletion).
+    /// Stops this instance from writing: its account's keys are being erased.
+    func revoke() {
+        isRevoked = true
+        cache = [:]
+        pendingCache = nil
+    }
+
+    /// Removes every secret of `userID` (sign-out and account deletion).
     static func wipe(storage: any E2ESecretStorage, userID: Profile.ID) throws {
         try storage.deleteAll(withPrefix: prefix(for: userID))
     }
@@ -153,6 +167,7 @@ final class E2EProtocolStore: IdentityKeyStore, PreKeyStore, SignedPreKeyStore, 
     }
 
     private func put(_ data: Data, _ suffix: String) throws {
+        guard !isRevoked else { throw RevokedError() }
         let key = key(suffix)
         try storage.write(data, for: key)
         cache[key] = data

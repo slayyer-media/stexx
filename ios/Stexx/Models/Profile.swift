@@ -26,6 +26,9 @@ struct Profile: Identifiable, Hashable, Codable, Sendable {
     /// Travel mode. Only on your own profile (`GET`/`PATCH /me`); `nil` on
     /// everyone else's and when travel mode is off.
     var travel: TravelStatus? = nil
+    /// Your stored privacy settings. Only on your own profile (`GET`/`PATCH
+    /// /me`): the server is the source of truth for the settings screen.
+    var privacy: PrivacySettings? = nil
 
     var primaryPhotoURL: URL? { photos.first?.url }
 
