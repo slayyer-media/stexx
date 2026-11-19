@@ -16,7 +16,10 @@ import { DAY, HOUR, MINUTE, SECOND } from "../lib/time.ts";
 export const BATCH = 1000;
 /** Unread messages that were sent with an expiry timer are deleted after this long, read or not. */
 export const UNREAD_EXPIRING_CAP_MS = 14 * DAY;
-/** How long a view-once photo stays fetchable after the recipient first opens it (lets the image finish loading). */
+/**
+ * How long a view-once photo stays fetchable after the recipient opens it (POST .../messages/:id/open), so an app
+ * that marks it opened before (or while) downloading can still finish loading it.
+ */
 export const VIEW_ONCE_GRACE_MS = 30 * SECOND;
 export const PROFILE_VIEW_RETENTION_MS = 7 * DAY;
 /** Files younger than this are never swept as orphans (an upload may not have its DB row yet). */
@@ -61,8 +64,10 @@ export async function purgeUnreadExpiringMessages(now: Date = new Date()): Promi
 }
 
 /**
- * View-once photos: once the recipient has opened one (`attachment_opened_at`) and the grace window has passed, the
- * file is deleted. The message row stays with attachment_kind = 'photo' and no key, so the client shows a spent photo.
+ * View-once photos (plaintext `.jpg` and end-to-end encrypted `.bin` alike): once the recipient has opened one
+ * (`attachment_opened_at`, set only by the open endpoint; listing the thread doesn't count) and the grace window has
+ * passed, the file is deleted. The message row stays with attachment_kind = 'photo' and no key, so the client shows a
+ * spent photo.
  */
 export async function purgeViewedOnceAttachments(
   now: Date = new Date(),
@@ -83,10 +88,11 @@ export async function purgeViewedOnceAttachments(
 }
 
 /**
- * Hard cap for view-once photos the recipient never opened (never fetched GET .../messages: inactive, deleted the
- * app, hid the thread...). They carry no expiresAfterSeconds, so the unread-expiring cap above doesn't see them;
- * without this the file would stay on disk and in the DB forever. After UNREAD_EXPIRING_CAP_MS the file is deleted
- * (row kept as a spent photo, like an opened one).
+ * Hard cap for view-once photos the recipient never opened (never called the open endpoint: didn't tap it, inactive,
+ * deleted the app, hid the thread, or an app version from before the endpoint, which only lists the thread). They
+ * carry no expiresAfterSeconds, so the unread-expiring cap above doesn't see them; without this the file would stay on
+ * disk and in the DB forever. After UNREAD_EXPIRING_CAP_MS (14 days after sending) the file is deleted (row kept as a
+ * spent photo, like an opened one). Same for `.jpg` and `.bin` files.
  */
 export async function purgeUnopenedViewOnceAttachments(now: Date = new Date()): Promise<number> {
   const cutoff = new Date(now.getTime() - UNREAD_EXPIRING_CAP_MS);

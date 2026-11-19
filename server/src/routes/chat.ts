@@ -30,7 +30,8 @@ import type { AppEnv } from "../types.ts";
 
 /**
  * chat routes, mounted at /v1. Paths are written in full relative to /v1 (e.g. "/me", not "/").
- * Owns: /conversations, /conversations/:id/messages, /conversations/:id/read, DELETE /conversations/:id
+ * Owns: /conversations, /conversations/:id/messages, /conversations/:id/messages/:messageID/open,
+ * /conversations/:id/read, DELETE /conversations/:id
  * See server/AGENTS-NOTES.md for helpers and conventions.
  *
  * Rules implemented here (each has a test in test/chat.test.ts):
@@ -44,9 +45,11 @@ import type { AppEnv } from "../types.ts";
  *  - expiresAfterSeconds starts counting when the recipient reads (expires_at = read_at + seconds).
  *  - Read receipts: messages.read_receipt records the reader's sendReadReceipts at read time. The sender
  *    only sees `read` (and the resulting expiresAt) if it is true.
- *  - View-once photos: the URL is only handed to the recipient by GET .../messages (which stamps
- *    attachment_opened_at so the expiry job can delete the file after a grace window). Realtime events and the
- *    conversation list never carry a view-once URL to the recipient.
+ *  - View-once photos: the URL is only handed to the recipient by GET .../messages and by the open route, never by
+ *    realtime events or the conversation list, and never to the sender. Listing does NOT open the photo: the
+ *    recipient's app calls POST .../messages/:messageID/open when the photo is actually shown, which stamps
+ *    attachment_opened_at (the retention job deletes the file a grace window later) and, if the opener sends read
+ *    receipts, tells the sender (`message.updated`). Never-opened ones fall under the 14-day cap.
  *  - DELETE /conversations/:id hides the thread for the caller only (cleared_before = now); a new message
  *    un-hides it. Once both people have cleared it, the rows (and files) are physically deleted.
  */
@@ -59,7 +62,8 @@ const MAX_PAGE = 100;
 /** Message select list (alias `m`). Matches MessageRow. */
 const MSG_COLS = sql`m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
   m.attachment_kind, m.attachment_key,
-  m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
+  m.attachment_view_once, m.attachment_encrypted, m.attachment_opened_at, m.attachment_open_receipt,
+  m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
 
 /** SQL: message `m` is visible to the member row `cm` (not cleared, not expired). */
 const visibleTo = (cmAlias: string): Fragment =>
@@ -315,23 +319,72 @@ chatRoutes.get("/conversations/:id/messages", requireAuth, async (c) => {
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit).reverse();
 
-  // Fetching incoming messages = delivery; fetching a view-once photo = opening it.
-  const incoming = page.filter((m) => m.sender_id !== me);
-  if (incoming.length > 0) {
+  // Fetching incoming messages = delivery. It does NOT open a view-once photo (that is POST .../open, when the app
+  // actually shows it): an app that lists the thread without the user tapping the photo must not start its deletion.
+  const undelivered = page.filter((m) => m.sender_id !== me && m.delivered_at === null);
+  if (undelivered.length > 0) {
     await sql`
-      UPDATE messages
-         SET delivered_at = COALESCE(delivered_at, now()),
-             attachment_opened_at = CASE WHEN attachment_view_once AND attachment_key IS NOT NULL
-                                         THEN COALESCE(attachment_opened_at, now()) ELSE attachment_opened_at END
-       WHERE id = ANY(${incoming.map((m) => m.id)}) AND sender_id <> ${me}
-         AND (delivered_at IS NULL
-              OR (attachment_view_once AND attachment_key IS NOT NULL AND attachment_opened_at IS NULL))`;
+      UPDATE messages SET delivered_at = COALESCE(delivered_at, now())
+       WHERE id = ANY(${undelivered.map((m) => m.id)}) AND sender_id <> ${me} AND delivered_at IS NULL`;
   }
 
   return c.json({
     items: page.map((m) => viewMessage(m, me)),
     nextCursor: hasMore ? page[0]!.id : null,
   });
+});
+
+// ---- POST /conversations/:id/messages/:messageID/open ----------------------------------------------
+
+/**
+ * The recipient opened a view-once photo: stamp `attachment_opened_at` (the retention job deletes the file
+ * VIEW_ONCE_GRACE_MS later) and return the message as the recipient sees it (with the URL while the file exists).
+ * Idempotent: a second call changes nothing and returns the same message. A photo that is already gone (opened
+ * earlier, or hit the 14-day cap unopened) is returned with `url: null` and never stamped late.
+ * 404 for anything else: not a participant, blocked either way, a banned partner, the sender, a message that isn't a
+ * view-once photo, or one the caller can no longer see (cleared, expired).
+ * The sender gets `message.updated` (and `conversation.updated`) only if the opener sends read receipts.
+ */
+chatRoutes.post("/conversations/:id/messages/:messageID/open", requireAuth, rateLimit("viewOnceOpens"), async (c) => {
+  const me = currentUserId(c);
+  const conversationId = idParam(c, "id", "conversation");
+  const messageId = idParam(c, "messageID", "message");
+  const { otherId } = await requireConversation(me, conversationId);
+
+  const result = await sql.begin(async (tx) => {
+    const [row] = await tx<MessageRow[]>`
+      SELECT ${MSG_COLS}
+        FROM messages m
+        JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
+       WHERE m.id = ${messageId} AND m.conversation_id = ${conversationId} AND m.sender_id <> ${me}
+         AND m.attachment_kind = 'photo' AND m.attachment_view_once AND ${visibleTo("cm")}
+         FOR UPDATE OF m`;
+    if (!row) return null;
+    if (row.attachment_opened_at !== null || row.attachment_key === null) return { row, opened: false };
+    const [reader] = await tx<{ send_read_receipts: boolean }[]>`SELECT send_read_receipts FROM users WHERE id = ${me}`;
+    const [updated] = await tx<MessageRow[]>`
+      UPDATE messages AS m
+         SET attachment_opened_at = now(),
+             attachment_open_receipt = ${reader?.send_read_receipts ?? false},
+             delivered_at = COALESCE(m.delivered_at, now())
+       WHERE m.id = ${row.id}
+      RETURNING ${MSG_COLS}`;
+    return { row: updated!, opened: true };
+  });
+  if (!result) throw notFound();
+
+  const { row, opened } = result;
+  if (opened && row.attachment_open_receipt) {
+    void (async () => {
+      try {
+        publish(otherId, { type: "message.updated", data: viewMessage(row, otherId) });
+        await pushConversationUpdated(otherId, conversationId);
+      } catch (err) {
+        logError("chat.fanout", err);
+      }
+    })();
+  }
+  return c.json(viewMessage(row, me));
 });
 
 // ---- POST /conversations/:id/messages ----------------------------------------------------------

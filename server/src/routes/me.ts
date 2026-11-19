@@ -395,8 +395,8 @@ meRoutes.get("/me/viewers", async (c) => {
 /**
  * GDPR-style archive of everything we hold about the caller. Other people appear only as opaque ids; no
  * other user's profile, location, blocks-against-you, views-of-you or reports-about-you are included, nor
- * when they read your messages unless they send read receipts. Expired messages are left out, and incoming
- * view-once photos carry no URL (as everywhere outside the messages listing).
+ * when they read your messages (or opened your view-once photos) unless they send read receipts. Expired messages
+ * are left out, and view-once photos carry no URL (as everywhere outside the recipient's messages listing).
  * Secrets (token hashes, passkey public keys) are never included.
  */
 meRoutes.get("/me/export", async (c) => {
@@ -474,6 +474,8 @@ meRoutes.get("/me/export", async (c) => {
           attachment_key: string | null;
           attachment_view_once: boolean;
           attachment_encrypted: boolean;
+          attachment_opened_at: Date | null;
+          attachment_open_receipt: boolean;
           sent_at: Date;
           read_at: Date | null;
           read_receipt: boolean;
@@ -482,7 +484,8 @@ meRoutes.get("/me/export", async (c) => {
       >`
         SELECT m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
                m.attachment_kind, m.attachment_key,
-               m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.read_at, m.read_receipt, m.expires_at
+               m.attachment_view_once, m.attachment_encrypted, m.attachment_opened_at, m.attachment_open_receipt,
+               m.sent_at, m.read_at, m.read_receipt, m.expires_at
           FROM messages m
           JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
          WHERE m.conversation_id = ANY(${convs.map((x) => x.id)})
@@ -602,10 +605,12 @@ meRoutes.get("/me/export", async (c) => {
       lastReadAt: isoDate(cv.last_read_at),
       messages: (byConv.get(cv.id) ?? []).map((m) => {
         const mine = m.sender_id === me;
-        // Same rules as the chat views: the other person's read time (and the expiry it starts) is theirs, not
-        // ours, unless they send read receipts; a view-once photo is only released (and marked opened) by
-        // GET /conversations/:id/messages, never by the archive.
+        // Same rules as the chat views: the other person's read time (and the expiry it starts) and when they
+        // opened a view-once photo are theirs, not ours, unless they send read receipts; a view-once photo's URL is
+        // only released to its recipient by GET /conversations/:id/messages (and the open route), never by the
+        // archive, and never to its sender.
         const hideRead = mine && m.read_at !== null && !m.read_receipt;
+        const showOpened = m.attachment_view_once && (!mine || m.attachment_open_receipt);
         return {
           id: m.id,
           senderID: m.sender_id,
@@ -616,10 +621,11 @@ meRoutes.get("/me/export", async (c) => {
           attachment: m.attachment_kind
             ? {
                 kind: m.attachment_kind,
-                url: !mine && m.attachment_view_once ? null : mediaUrl(m.attachment_key),
+                url: m.attachment_view_once ? null : mediaUrl(m.attachment_key),
                 isViewOnce: m.attachment_view_once,
                 // The key to an encrypted photo is inside `envelope`; the archive holds only the opaque blob's URL.
                 isEncrypted: m.attachment_encrypted,
+                openedAt: showOpened ? isoDate(m.attachment_opened_at) : null,
               }
             : null,
           sentAt: isoDate(m.sent_at),

@@ -140,13 +140,15 @@ describe("GET /me/export respects the other person's privacy and expiry", () => 
 
     const dump = await expectJson(await as(b).get("/v1/me/export"));
     const [m] = dump.conversations.find((c: { id: string }) => c.id === conv).messages;
-    expect(m.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
+    expect(m.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false, openedAt: null });
     const [row] = await sql`SELECT attachment_opened_at, attachment_key FROM messages WHERE id = ${sent.id}`;
     expect(row!.attachment_opened_at).toBeNull();
     expect(JSON.stringify(dump)).not.toContain(row!.attachment_key);
-    // the sender keeps their own copy's URL, as in the chat views
+    // nor the sender's: as in the chat views, a view-once URL never goes to its sender (its deletion would reveal
+    // when it was opened)
     const mine = await expectJson(await as(a).get("/v1/me/export"));
-    expect(mine.conversations.find((c: { id: string }) => c.id === conv).messages[0].attachment.url).toContain(row!.attachment_key);
+    expect(mine.conversations.find((c: { id: string }) => c.id === conv).messages[0].attachment.url).toBeNull();
+    expect(JSON.stringify(mine)).not.toContain(row!.attachment_key);
   });
 
   test("expired-but-not-yet-purged messages are left out", async () => {
