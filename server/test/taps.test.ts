@@ -219,11 +219,33 @@ describe("GET /me/taps", () => {
     expect(page.unseenCount).toBe(1);
   });
 
-  test("incognito senders are listed: a tap is a deliberate reveal, like tap.received", async () => {
+  test("incognito senders are left out (like viewers) unless they messaged me; lapsed Plus or incognito off lists them", async () => {
     const me = await createUser();
     const ghost = await createUser({ plusDays: 30, privacy: { incognito: true } });
-    await tap(ghost, me, MIN);
-    expect(ids(await list(me))).toEqual([ghost.id]);
+    const lapsed = await createUser({ plusDays: -1, privacy: { incognito: true } });
+    const talker = await createUser({ plusDays: 30, privacy: { incognito: true } });
+    const fine = await createUser();
+    await tap(ghost, me, 4 * MIN);
+    await tap(lapsed, me, 3 * MIN);
+    await tap(talker, me, 2 * MIN);
+    await tap(fine, me, 1 * MIN);
+    // The incognito exception from visibleToViewer: `talker` has written to me.
+    const convId = newId("conversation");
+    const [ua, ub] = orderedPair(me.id, talker.id);
+    await sql`INSERT INTO conversations (id, user_a, user_b) VALUES (${convId}, ${ua}, ${ub})`;
+    await sql`INSERT INTO conversation_members (conversation_id, user_id) VALUES (${convId}, ${ua}), (${convId}, ${ub})`;
+    await sql`INSERT INTO messages (id, conversation_id, sender_id, client_id, text)
+              VALUES (${newId("message")}, ${convId}, ${talker.id}, ${"c" + uniq()}, 'hi')`;
+
+    let page = await list(me);
+    expect(ids(page)).toEqual([fine.id, talker.id, lapsed.id]);
+    expect(page.unseenCount).toBe(3); // the incognito sender isn't counted either
+
+    // Turning incognito off brings their tap back (still inside the retention window).
+    await sql`UPDATE users SET incognito = false WHERE id = ${ghost.id}`;
+    page = await list(me);
+    expect(ids(page)).toEqual([fine.id, talker.id, lapsed.id, ghost.id]);
+    expect(page.unseenCount).toBe(4);
   });
 
   test("a deleted sender's taps disappear with the account", async () => {

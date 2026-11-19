@@ -437,7 +437,7 @@ actor MockAPIClient: APIClient {
         ($0.0, Date.now.addingTimeInterval(-$0.1 * 60))
     }
     private var tapsSeenAt: Date? = Date.now.addingTimeInterval(-MockData.tapsSeenMinutesAgo * 60)
-    static let tapsPageSize = 30
+    private var tapsPageSize = 30
 
     func taps(before cursor: String?) async throws -> TapsPage {
         try await pause()
@@ -450,7 +450,7 @@ actor MockAPIClient: APIClient {
                 }
             }
         let start = cursor.flatMap(Int.init) ?? 0
-        let end = min(all.count, start + Self.tapsPageSize)
+        let end = min(all.count, start + tapsPageSize)
         let page = start < end ? Array(all[start..<end]) : []
         return TapsPage(
             items: page,
@@ -471,6 +471,11 @@ actor MockAPIClient: APIClient {
 
     func setFailsConversationList(_ fails: Bool) {
         failsConversationList = fails
+    }
+
+    /// Tests: a smaller taps page, to exercise infinite scroll.
+    func setTapsPageSize(_ size: Int) {
+        tapsPageSize = max(1, size)
     }
 
     /// Screenshots and tests: nobody has tapped you.

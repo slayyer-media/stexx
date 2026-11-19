@@ -30,8 +30,9 @@ These aren't optional implementation details; they are product promises.
 3. **Blocks are symmetric and immediate.** A blocked or blocking user never
    appears in `nearby`, `profiles/{id}` (404), `conversations` or `viewers`
    for the other party, and messages are rejected with 404.
-4. **Incognito** (Stexx+) users don't appear in `nearby` or `viewers` for
-   others, except people they've messaged.
+4. **Incognito** (Stexx+) users don't appear in `nearby`, `viewers` or the
+   taps inbox (`me/taps`) for others, except people they've messaged. (A live
+   `tap.received` still names the sender at the moment of the tap.)
 5. **Accounts hidden after reports** don't appear in `nearby` or `viewers`,
    and `profiles/{id}` and `conversations` show them only to people who have
    written to them. Banned accounts appear nowhere (404). A hidden account is
@@ -199,7 +200,7 @@ Non-2xx responses carry:
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| GET | `/me/taps` | → `TapsPage` | Taps you received in the last `TAP_RETENTION_DAYS` (30), newest first, **one entry per sender** (their latest tap). Query: `before` (the previous page's `nextCursor`), `limit` (1–100, default 30). Blocked senders (either direction), accounts hidden after reports and banned accounts are left out. A sender who taps again while you page moves to the top, so a later page can repeat them: dedupe by `from.id`. |
+| GET | `/me/taps` | → `TapsPage` | Taps you received in the last `TAP_RETENTION_DAYS` (30), newest first, **one entry per sender** (their latest tap). Query: `before` (the previous page's `nextCursor`), `limit` (1–100, default 30). Blocked senders (either direction), incognito senders (unless they've messaged you, rule 4), accounts hidden after reports and banned accounts are left out. A sender who taps again while you page moves to the top, so a later page can repeat them: dedupe by `from.id`. |
 | POST | `/me/taps/seen` | → 204 | Marks everything received so far as seen (moves `taps_seen_at` to now; never back). Idempotent. Call it when the taps screen opens. |
 
 ```json

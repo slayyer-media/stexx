@@ -45,8 +45,13 @@ final class ChatStore {
     /// Bumped by `reset()` (sign-out).
     @ObservationIgnored private var epoch = 0
     /// Like `loadGeneration`, for the taps list: bumped by every first-page
-    /// load, by `markTapsSeen()` and by `reset()`.
+    /// load and by `reset()`. A newer first page (or a sign-out) drops any
+    /// older first-page or next-page result.
     @ObservationIgnored private var tapsGeneration = 0
+    /// Bumped by `markTapsSeen()`. A first-page load that started before it
+    /// is dropped (its "new" flags and count are stale); a next-page load is
+    /// kept, with its "new" flags cleared, so infinite scroll never stalls.
+    @ObservationIgnored private var tapsSeenEpoch = 0
     /// Live taps that arrived while a first-page load was in flight; the
     /// load's snapshot may predate them.
     @ObservationIgnored private var tapsDuringLoad: [ReceivedTap] = []
@@ -184,12 +189,13 @@ final class ChatStore {
     func loadTaps() async {
         tapsGeneration += 1
         let generation = tapsGeneration
+        let seenEpoch = tapsSeenEpoch
         tapsDuringLoad = []
         isLoadingTaps = true
         defer { if generation == tapsGeneration { isLoadingTaps = false } }
         do {
             let page = try await api.taps(before: nil)
-            guard generation == tapsGeneration else { return }
+            guard generation == tapsGeneration, seenEpoch == tapsSeenEpoch else { return }
             apply(firstTapsPage: page)
             hasLoadedTaps = true
             tapsErrorMessage = nil
@@ -200,17 +206,24 @@ final class ChatStore {
     }
 
     /// The next page, for infinite scroll. Senders already listed (they may
-    /// have tapped again and moved up meanwhile) are skipped.
+    /// have tapped again and moved up meanwhile) are skipped. If the taps
+    /// were marked seen while it was in flight, the page still lands (only a
+    /// new first page or a sign-out drops it), with its "new" flags cleared.
     func loadMoreTaps() async {
         guard let cursor = tapsNextCursor, !isLoadingTaps else { return }
         let generation = tapsGeneration
+        let seenEpoch = tapsSeenEpoch
         isLoadingTaps = true
         defer { if generation == tapsGeneration { isLoadingTaps = false } }
         do {
             let page = try await api.taps(before: cursor)
             guard generation == tapsGeneration else { return }
             let known = Set(taps.map(\.id))
-            taps.append(contentsOf: page.items.filter { !known.contains($0.id) })
+            var older = page.items.filter { !known.contains($0.id) }
+            if seenEpoch != tapsSeenEpoch {
+                for index in older.indices { older[index].isNew = false }
+            }
+            taps.append(contentsOf: older)
             tapsNextCursor = page.nextCursor
         } catch {
             guard generation == tapsGeneration else { return }
@@ -242,11 +255,11 @@ final class ChatStore {
 
     /// Opening the taps screen: the badge drops to zero now, then the
     /// server's watermark moves (`POST /me/taps/seen`). A first-page load
-    /// still in flight is dropped, since it would bring back stale "new" flags.
+    /// still in flight is dropped, since it would bring back stale "new"
+    /// flags; a next-page load still lands (see `loadMoreTaps()`).
     func markTapsSeen() async {
-        tapsGeneration += 1
+        tapsSeenEpoch += 1
         tapsDuringLoad = []
-        isLoadingTaps = false
         tapsUnseen = 0
         for index in taps.indices where taps[index].isNew {
             taps[index].isNew = false

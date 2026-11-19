@@ -191,6 +191,51 @@ struct ChatStoreTapsTests {
         #expect(store.taps.count == MockData.seedTaps.count + 1)
     }
 
+    @Test("Marking taps seen while the next page loads keeps that page (infinite scroll doesn't stall)")
+    func markSeenDuringLoadMore() async throws {
+        let api = MockAPIClient(latency: .milliseconds(150))
+        await api.setTapsPageSize(2)
+        let store = ChatStore(api: api)
+        await store.loadTaps()
+        #expect(store.taps.map(\.id) == ["p06", "p02"])
+        #expect(store.tapsNextCursor != nil)
+
+        // Page two (p15 is still new on the server) is in flight when a live
+        // tap makes the open taps screen mark everything seen.
+        let more = Task { await store.loadMoreTaps() }
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(store.isLoadingTaps)
+        await store.markTapsSeen()
+        await more.value
+
+        #expect(store.taps.map(\.id) == ["p06", "p02", "p15", "p09"])
+        #expect(store.taps.allSatisfy { !$0.isNew })
+        #expect(store.tapsUnseen == 0)
+        #expect(!store.isLoadingTaps)
+        #expect(store.tapsNextCursor != nil)
+
+        // Scrolling on still works.
+        await store.loadMoreTaps()
+        #expect(store.taps.count == 6)
+    }
+
+    @Test("Marking taps seen while the first page loads drops that stale page")
+    func markSeenDuringFirstLoad() async throws {
+        let api = MockAPIClient(latency: .milliseconds(150))
+        let store = ChatStore(api: api)
+        let load = Task { await store.loadTaps() }
+        try await Task.sleep(for: .milliseconds(30))
+        await store.markTapsSeen()
+        await load.value
+        #expect(store.tapsUnseen == 0)
+        #expect(!store.isLoadingTaps)
+        // The next load reflects the moved watermark.
+        await store.loadTaps()
+        #expect(store.tapsUnseen == 0)
+        #expect(store.taps.count == MockData.seedTaps.count)
+        #expect(store.taps.allSatisfy { !$0.isNew })
+    }
+
     @Test("Blocking someone drops their tap and its count")
     func blockDropsTap() async throws {
         let store = await loadedStore()
