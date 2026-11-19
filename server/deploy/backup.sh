@@ -32,6 +32,15 @@
 #                                                                   30-day retention clock; a restore never needs it.
 #                                                                   Fixed (not in EXCLUDE_DATA) so an old backup.env
 #                                                                   that sets EXCLUDE_DATA can't put it back.
+#   spam_message_features                                            per-message sender/conversation/time + MinHash,
+#                                                                   a 48 h spam-detection cache (migration 112); 28
+#                                                                   nightly copies would be a month of who-wrote-where
+#   taps                                                             who tapped whom and when, deleted after
+#                                                                   TAP_RETENTION_DAYS (30); a restore starts with an
+#                                                                   empty taps inbox
+#   A name here that is not a table (yet) is fine: pg_dump ignores exclude patterns that match nothing (no
+#   --strict-names). The fixed list is not in EXCLUDE_DATA so an old backup.env that sets EXCLUDE_DATA can't put
+#   these back.
 #
 # Config (/etc/stexx/backup.env, optional, sourced if present):
 #   STEXX_BACKUP_REMOTE   rclone remote:bucket/prefix   (default b2:stexx-backups/db)
@@ -52,6 +61,11 @@
 #                         that user could swap it for a symlink, and root would then write through it. backup.sh refuses.
 #   STEXX_PREMIGRATE_TTL_HOURS  pre-migrate dumps are deleted after this many hours (default 24, max 24). The
 #                         watchdog (stexx-watch) enforces it every 5 minutes; a tmpfiles rule is the backstop.
+#   STEXX_PREMIGRATE_KEEP at most this many pre-migrate snapshots are kept (default 2, 1..5): after a new one is in
+#                         place, older ones beyond the newest KEEP are deleted, so retried deploys can't stack dumps.
+#   STEXX_PREMIGRATE_MIN_FREE_PCT  refuse to write a snapshot unless the snapshot's filesystem would still have this
+#                         much free space afterwards (default 15, the watchdog's warning level; 0..90). The estimate is
+#                         the newest existing snapshot plus a quarter, or the database size when there is none.
 #   STEXX_BACKUP_PG_USER  OS user that runs pg_dump in --pre-migrate mode (peer auth; default stexxbackup)
 #   STEXX_BACKUP_COMPRESS pg_dump --compress value (default zstd:6; PGDG builds have zstd, restoring needs it too)
 # Files: /etc/stexx/rclone.conf (RCLONE_CONFIG), /etc/stexx/backup-recipients.txt (age public keys).
@@ -75,13 +89,15 @@ esac
 REMOTE="${STEXX_BACKUP_REMOTE:-b2:stexx-backups/db}"
 DB="${STEXX_BACKUP_DB:-stexx}"
 KEEP_DAYS="${STEXX_BACKUP_KEEP_DAYS:-28}"
-ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys report_evidence"
+ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys report_evidence spam_message_features taps"
 EXCLUDE_DATA="${STEXX_BACKUP_EXCLUDE_DATA-messages media_trash locations travel_locations profile_views}"
 REDACT_REPORTS="${STEXX_BACKUP_REDACT_REPORTS:-1}"
 RECIPIENTS="${STEXX_BACKUP_RECIPIENTS:-/etc/stexx/backup-recipients.txt}"
 STATE_DIR="${STATE_DIRECTORY:-/var/lib/stexx-backup}"
 PRE_DIR="${STEXX_PREMIGRATE_DIR:-/var/lib/stexx-premigrate}"
 PRE_TTL_HOURS="${STEXX_PREMIGRATE_TTL_HOURS:-24}"
+PRE_KEEP="${STEXX_PREMIGRATE_KEEP:-2}"
+PRE_MIN_FREE_PCT="${STEXX_PREMIGRATE_MIN_FREE_PCT:-15}"
 PG_USER="${STEXX_BACKUP_PG_USER-stexxbackup}"
 COMPRESS="${STEXX_BACKUP_COMPRESS:-zstd:6}"
 MIN_BYTES=2048        # an empty-but-valid dump is still larger than this; anything smaller means a broken pipeline
@@ -142,11 +158,13 @@ fi
 if [ "$MODE" = premigrate ]; then
   [[ "$PRE_TTL_HOURS" =~ ^[0-9]+$ ]] && [ "$PRE_TTL_HOURS" -ge 1 ] && [ "$PRE_TTL_HOURS" -le 24 ] \
     || die "STEXX_PREMIGRATE_TTL_HOURS must be 1..24"
-  DUMP=(pg_dump)
+  [[ "$PRE_KEEP" =~ ^[0-9]+$ ]] && [ "$PRE_KEEP" -ge 1 ] && [ "$PRE_KEEP" -le 5 ] || die "STEXX_PREMIGRATE_KEEP must be 1..5"
+  [[ "$PRE_MIN_FREE_PCT" =~ ^[0-9]+$ ]] && [ "$PRE_MIN_FREE_PCT" -le 90 ] || die "STEXX_PREMIGRATE_MIN_FREE_PCT must be 0..90"
+  DUMP=(pg_dump) PSQL=(psql)
   ME="$(id -u)"
   if [ "$ME" = 0 ]; then
     # Root writes the file; pg_dump itself runs as the read-only backup role (peer auth over the unix socket).
-    if [ -n "$PG_USER" ]; then DUMP=(runuser -u "$PG_USER" -- pg_dump); fi
+    if [ -n "$PG_USER" ]; then DUMP=(runuser -u "$PG_USER" -- pg_dump) PSQL=(runuser -u "$PG_USER" -- psql); fi
   else
     # Only for rehearsals (deploy/selftest.sh): a non-root run must name its own directory.
     [ -n "${STEXX_PREMIGRATE_DIR:-}" ] || die "--pre-migrate must run as root (it writes a root-only dump)"
@@ -174,6 +192,24 @@ if [ "$MODE" = premigrate ]; then
     | sed 's|^|removed expired |'
   find "$PRE_DIR" -maxdepth 1 -type f -name '.partial-*' -mmin +120 -delete
 
+  # Free space: this directory normally shares a filesystem with /var/lib/postgresql, and a full disk stops the
+  # database. Estimate the new snapshot (the newest one plus a quarter, or the database size when there is none, which
+  # overestimates a compressed dump) and refuse unless STEXX_PREMIGRATE_MIN_FREE_PCT of the filesystem stays free.
+  NEWEST="$(find "$PRE_DIR" -maxdepth 1 -type f -name 'stexx-premigrate-*.dump.age' | sort | tail -n1)"
+  if [ -n "$NEWEST" ]; then
+    EST="$(wc -c < "$NEWEST" | tr -d ' ')"; EST=$(( EST + EST / 4 ))
+  else
+    EST="$("${PSQL[@]}" -X -q -At --dbname="$DB" -c 'SELECT pg_database_size(current_database())' 2>/dev/null || true)"
+    [[ "$EST" =~ ^[0-9]+$ ]] || die "cannot read the database size to check free space for the snapshot (psql as ${PG_USER:-$(id -un)})"
+  fi
+  read -r FS_TOTAL_KB FS_AVAIL_KB < <(df -Pk "$PRE_DIR" | awk 'NR==2 {print $2, $4}')
+  [[ "${FS_TOTAL_KB:-}" =~ ^[0-9]+$ ]] && [[ "${FS_AVAIL_KB:-}" =~ ^[0-9]+$ ]] && [ "$FS_TOTAL_KB" -gt 0 ] \
+    || die "cannot read free space of $PRE_DIR (df)"
+  EST_KB=$(( (EST + 1023) / 1024 ))
+  if [ $(( (FS_AVAIL_KB - EST_KB) * 100 )) -lt $(( FS_TOTAL_KB * PRE_MIN_FREE_PCT )) ]; then
+    die "not enough free space in $PRE_DIR for a pre-migrate snapshot: about $(( EST_KB / 1024 )) MiB needed, $(( FS_AVAIL_KB / 1024 )) MiB free, and ${PRE_MIN_FREE_PCT}% of the filesystem must stay free (STEXX_PREMIGRATE_MIN_FREE_PCT). Free space or delete old snapshots there first"
+  fi
+
   OUT="$PRE_DIR/stexx-premigrate-${STAMP}.dump.age"
   # mktemp creates the file exclusively (O_EXCL, 0600) under an unpredictable name: an existing name is never followed.
   PART="$(mktemp "$PRE_DIR/.partial-stexx-premigrate-${STAMP}.XXXXXX")" || die "cannot create a file in $PRE_DIR"
@@ -187,6 +223,10 @@ if [ "$MODE" = premigrate ]; then
   chmod 0600 "$PART"
   mv -f "$PART" "$OUT"
   trap - EXIT
+  # Count cap: keep the newest STEXX_PREMIGRATE_KEEP (the stamp in the name sorts by time). Older ones go only now,
+  # after the new snapshot is safely in place, so a failed run never leaves fewer snapshots than before.
+  find "$PRE_DIR" -maxdepth 1 -type f -name 'stexx-premigrate-*.dump.age' | sort -r | tail -n +"$((PRE_KEEP + 1))" \
+    | while IFS= read -r old; do rm -f -- "$old" && echo "removed older snapshot $old (keeping the newest $PRE_KEEP)"; done
   echo "pre-migrate snapshot written: $OUT ($SIZE bytes, root-only, deleted after ${PRE_TTL_HOURS} h, never uploaded)"
   echo "to restore it: copy it to the machine with the age key and run deploy/restore-drill.sh --file <it> (see deploy/README.md)"
   exit 0

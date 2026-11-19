@@ -122,16 +122,19 @@ Not run on a real host while writing this: the unit sandbox (no Linux box was to
 | `abuse_counters` | **never** | Rate-limit windows keyed by IP HMACs; they expire within two windows anyway. |
 | `e2e_one_time_prekeys` | **never** | A restored one-time prekey may already have been handed out and used. Bundles fall back to the last-resort prekey (in `e2e_devices`) until apps top up on launch. |
 | `report_evidence` | **never** | Plaintext a reporter chose to share, on its own 30-day clock; a restore never needs it. Fixed rather than configurable, so an older `backup.env` that sets `STEXX_BACKUP_EXCLUDE_DATA` can't put it back. |
+| `spam_message_features` | **never** | One row per message (sender, conversation, time, link/payment flags, a keyed MinHash) on a 48 h clock for the spam rules. 28 nightly copies would be a month of who wrote into which chat and when, outliving the expiring and view-once timers that keep `messages` out. The rules only look at the last 48 h, so a restore loses nothing useful. |
+| `taps` | **never** | Who tapped whom and when, a history with its own retention clock (`TAP_RETENTION_DAYS`, 30 days, from the taps inbox). In backups each tap would live up to 28 days longer (about 58 in all). After a restore the taps inbox starts empty, as profile views do. |
 | `messages`, `media_trash`, `locations`, `travel_locations`, `profile_views` | no (default `STEXX_BACKUP_EXCLUDE_DATA`) | Expiring and view-once messages must not outlive their timer; 28 nightly snapshots of location cells and views would be exactly the history the app promises not to keep. |
 | `reports` | yes, **redacted**: separate `.reports.csv.age` with `details` and `reporter_ip_hash` set to NULL | `pg_dump` can't leave out one column, so the archive keeps the table's schema but not its rows, and the rows go to the sidecar (same snapshot). Reason, priority, status, dates and the accounts involved survive; the free text and the IP hash don't. `STEXX_BACKUP_REDACT_REPORTS=0` puts them back in the archive unchanged; listing `reports` in `STEXX_BACKUP_EXCLUDE_DATA` drops them. |
 | everything else (accounts, profiles, photo rows, favorites, blocks, conversations, subscriptions, moderation history, devices, E2E identity keys, ...) | yes | |
 
-The schema of every table is always in the archive.
+The schema of every table is always in the archive. A fixed exclusion may name a table an older schema doesn't have yet (`spam_message_features` arrives with
+migration 112): `pg_dump` ignores an exclusion that matches nothing (`backup.sh` doesn't pass `--strict-names`), and `selftest.sh` checks both.
 
 **Trade-off (owner decision, the default chosen here):** after restoring a nightly backup **everyone is signed out** (they sign in again with their passkey or an email link), conversations are
 **empty**, nobody has a location until their app sends one, and **reports lose their free text and evidence** (moderators still see who reported whom, why and when).
-Override `STEXX_BACKUP_EXCLUDE_DATA` in `/etc/stexx/backup.env` if you decide chat history should survive a disaster more than the ephemerality promise; the credential tables and
-report evidence can't be put back by configuration (the backup log prints `backup note: rows of messages ARE included` while messages are in). An older `backup.env` that still sets
+Override `STEXX_BACKUP_EXCLUDE_DATA` in `/etc/stexx/backup.env` if you decide chat history should survive a disaster more than the ephemerality promise; the credential tables,
+report evidence, spam-detection features and taps can't be put back by configuration (the backup log prints `backup note: rows of messages ARE included` while messages are in). An older `backup.env` that still sets
 `STEXX_BACKUP_EXCLUDE_DATA` to the previous default keeps working: the fixed list covers what it lacks.
 
 - **Media files are not backed up** (and are deleted on schedule). After a restore, `photos` rows whose files are gone show as broken images until users re-upload.
@@ -155,16 +158,27 @@ a **full** dump (no exclusions at all) to `/var/lib/stexx-premigrate/stexx-premi
   write through it. `backup.sh` refuses a snapshot directory that is a symlink, isn't owned by root, or sits in a directory anyone but root can write to, and creates its partial file
   with `mktemp`, so an existing name is never followed;
 - **never uploaded**, and deleted after `STEXX_PREMIGRATE_TTL_HOURS` (24, the maximum) by the watchdog, with a `systemd-tmpfiles` age rule as the backstop if the watchdog isn't running;
+- **bounded on disk:** the directory usually shares a filesystem with `/var/lib/postgresql`, and a full disk stops the database. Before writing, `backup.sh` estimates the snapshot
+  (the newest existing one plus a quarter, or the database size if there is none) and refuses unless `STEXX_PREMIGRATE_MIN_FREE_PCT` (15, the watchdog's warning level) of the
+  filesystem stays free; the deploy then stops before migrating. After a new snapshot is in place it deletes all but the newest `STEXX_PREMIGRATE_KEEP` (2), so a migration
+  retried several times in a day can't stack dumps;
 - a deploy refuses to migrate if the snapshot fails (`--no-backup` skips it: only for the very first deploy) or if the server still has the old `backup.sh` (run `--sync-config`).
 
 So for up to 24 hours after a deploy, the box holds one complete encrypted copy, including messages and locations, readable only with the age private key that isn't on it.
 `stexxbackup` has a connection limit of 2 and the nightly run uses both: don't deploy during the backup window (03:17 UTC + up to 15 minutes).
 
-**Undoing a bad migration:** roll the code back (`deploy.sh --rollback`), copy the snapshot to your laptop (`ssh host sudo cat /var/lib/stexx-premigrate/<file> > <file>`; it's
-encrypted), and restore it with `restore-drill.sh --file <file> --restore-into stexx --revoke-sessions` into a fresh, empty `stexx` database (steps 4 to 8 of the
-[runbook](#disaster-recovery-runbook)). Because the snapshot is a full dump, the drill also empties `e2e_one_time_prekeys` (prekeys handed out since the snapshot would otherwise be
-handed out a second time), `attest_challenges` and `abuse_counters`; apps upload new prekeys on launch. Everything written after the snapshot is lost, **including account deletions,
-blocks and moderation bans**: before you drop the old database, export the `blocks` and `moderation_actions` rows created after the snapshot time and re-apply them (step 8).
+**Undoing a bad migration** (the box is live, so keep the API down until the restored database is safe to serve):
+
+1. `sudo systemctl stop stexx-api`. The watchdog alerts on health while it's down; that's expected.
+2. Copy the snapshot to your laptop (`ssh host sudo cat /var/lib/stexx-premigrate/<file> > <file>`; it's encrypted).
+3. Export what happened after the snapshot from the old database, **before** dropping it: `SELECT * FROM blocks WHERE created_at > '<snapshot time>'`,
+   `SELECT * FROM moderation_actions WHERE created_at > '<snapshot time>'`, and the ids of accounts that exist in the snapshot but not in the old database (deleted since).
+4. Drop and re-create an empty `stexx` database as `postgres` (`roles.sql`), then restore: `restore-drill.sh --file <file> --restore-into stexx` (steps 4 and 8 of the
+   [runbook](#disaster-recovery-runbook)). A real restore always revokes every session and deletes pending sign-in links (sessions revoked after the snapshot, by
+   "sign out everywhere" or a ban, would otherwise work again), and because the snapshot is a full dump it also empties `e2e_one_time_prekeys` (prekeys handed out since the
+   snapshot would otherwise be handed out a second time), `attest_challenges` and `abuse_counters`; apps upload new prekeys on launch.
+5. Re-apply the exported blocks, bans (moderation CLI) and deletions against the restored database (runbook step 6). Everything else written after the snapshot is lost.
+6. Only then roll the code back and start the API: `deploy.sh --rollback` (it restarts `stexx-api` and checks health).
 
 ### Restore drill
 
@@ -180,7 +194,8 @@ It fetches the newest `stexx-*.dump.age` and its sidecar, decrypts into a privat
 reports, restores indexes, keys and triggers, then checks: row counts (users, photos, subscriptions, reports, conversations), `max(schema_migrations)` against the newest file in your
 checkout, that the always-excluded tables are empty, and that `grants.sql` applies (for real if the role `stexx_app` exists on that server, otherwise inside a rolled-back
 transaction). It drops the scratch database and prints `RESULT: PASS` or `RESULT: FAIL` (exit 0/1). `--file` takes a local file instead, `--keep` keeps the database,
-`--min-users 0` accepts an empty install. `./deploy/selftest.sh` runs the same drill against any database you point it at.
+`--min-users 0` accepts an empty install. `./deploy/selftest.sh` runs the same drill against any database you point it at. With `--restore-into` (a real restore) it always
+revokes every restored session and deletes pending sign-in links, as `--revoke-sessions` does; there is no opt-out.
 
 ## Disaster recovery runbook
 
@@ -196,34 +211,36 @@ access, and this repo.
    ```sh
    ssh -N -L 5433:127.0.0.1:5432 you@new-host &
    PGHOST=127.0.0.1 PGPORT=5433 PGUSER=stexx_owner \
-     ./deploy/restore-drill.sh --identity ~/stexx-backup.key --remote b2read:stexx-backups/db --restore-into stexx --revoke-sessions
+     ./deploy/restore-drill.sh --identity ~/stexx-backup.key --remote b2read:stexx-backups/db --restore-into stexx
    ```
    It refuses a database that already has tables (a half-finished attempt: drop it as `postgres`, re-run `roles.sql`, retry). `grants.sql` is applied as part of it because
    `stexx_app` exists there; the age key never touches the server.
-5. **Deploy:** put the age **public** key in `/etc/stexx/backup-recipients.txt` first (the pre-migrate snapshot needs it), then `DEPLOY_HOST=you@new-host ./deploy/deploy.sh`
-   (migrates forward if the backup predates the latest migration, applies grants again, starts the API). Then the firewall (`ufw-cloudflare.sh --apply`), backups (a new B2
-   **write** key on the box, `systemctl enable --now stexx-backup.timer`) and alerts (`watch.env`, `stexx-watch --test-alert`).
-6. **DNS:** point the `api` and `media` records in Cloudflare at the new IP (still proxied, Full strict). Caddy gets certificates on the first requests; `--status` and
-   `curl -sI https://api.stexx.gay/healthz` should show 204.
-7. **Revoke sessions:** `--revoke-sessions` above already revoked every restored session and deleted pending sign-in links, and (as every `--restore-into` does) emptied the
-   one-time prekeys, attestation challenges and rate-limit counters. Nightly backups contain none of these, so this matters for a pre-migrate snapshot or an older backup, but
-   run it every time: a restore must never bring back a live login or a used prekey. If the old box may be compromised, also follow "Suspected key leak" below (B2 key, age
-   recipient, database passwords).
-8. **Re-apply what happened after the backup:** a restore silently undoes everything written since, and three kinds of change are safety-critical:
+5. **Deploy, with no traffic yet:** put the age **public** key in `/etc/stexx/backup-recipients.txt` first (the pre-migrate snapshot needs it), then
+   `DEPLOY_HOST=you@new-host ./deploy/deploy.sh` (migrates forward if the backup predates the latest migration, applies grants again, starts the API). Then the firewall
+   (`ufw-cloudflare.sh --apply`), backups (a new B2 **write** key on the box, `systemctl enable --now stexx-backup.timer`) and alerts (`watch.env`, `stexx-watch --test-alert`).
+   DNS still points elsewhere, so nobody reaches this API yet. **If the new box has the old IP** (a reinstall), DNS already points here: run `sudo systemctl stop stexx-api`
+   right after `deploy.sh` and keep it stopped until step 6 is done.
+6. **Re-apply what happened after the backup, before any traffic:** a restore silently undoes everything written since, and three kinds of change are safety-critical. Until
+   all three are re-applied, banned accounts are live again, blocked people can see and message each other, and deleted profiles are back (and someone who deleted their account
+   and signs in again lands in the old profile), so the API must not take traffic before this step is finished:
    - **account deletions:** deleted accounts come back (profile, photo rows, last location cell for a pre-migrate snapshot, chats) and show up in nearby. Re-run the deletion
      requests received since the backup date (in-app deletions leave no trace by design; check support mail). A deletion ledger is deliberately not kept: it would be a record of who
-     used the app. Do this **before** reopening the API if you can.
-   - **blocks:** a block placed after the backup is gone, so the two people can see and message each other again.
-   - **moderation bans:** a ban placed after the backup is gone and the account is live again.
+     used the app.
+   - **blocks:** a block placed after the backup is gone, so the two people can see and message each other again. Re-block.
+   - **moderation bans:** a ban placed after the backup is gone and the account is live again. Re-run the ban through the moderation CLI (`bun run moderate`, on the box).
 
    If the old database is still reachable (undoing a migration, or a box that is broken but readable), compare before dropping it:
-   `SELECT * FROM blocks WHERE created_at > '<backup time>'` and `SELECT * FROM moderation_actions WHERE created_at > '<backup time>'`, then re-apply them (re-block, re-run the
-   ban through the moderation CLI) and re-run deletions for accounts that are gone there but present in the restore. If it isn't reachable, go through the moderation queue and
-   support mail since the backup date.
+   `SELECT * FROM blocks WHERE created_at > '<backup time>'` and `SELECT * FROM moderation_actions WHERE created_at > '<backup time>'`, then re-apply them and re-run deletions
+   for accounts that are gone there but present in the restore. If it isn't reachable, go through the moderation queue and support mail since the backup date.
+7. **DNS, only now:** point the `api` and `media` records in Cloudflare at the new IP (still proxied, Full strict). Caddy gets certificates on the first requests; `--status` and
+   `curl -sI https://api.stexx.gay/healthz` should show 204. (Same IP: `sudo systemctl start stexx-api` instead.)
+8. **Sessions and keys:** `--restore-into` already revoked every restored session and deleted pending sign-in links, and emptied the one-time prekeys, attestation challenges and
+   rate-limit counters. Nightly backups contain none of these, so this matters for a pre-migrate snapshot or an older backup, but it happens on every real restore: a restore must
+   never bring back a live login or a used prekey. If the old box may be compromised, also follow "Suspected key leak" below (B2 key, age recipient, database passwords).
 
 **What is lost:** everything after the backup (up to about a day with the nightly schedule), all **messages and chat photos**, all **media files** (profile photos show as broken until
-re-uploaded), every **location** (repopulates as apps report in), profile views, report **free text and evidence**, and every **login** (people sign in again). One-time prekeys are
-gone too; apps upload new ones on launch. **Account deletions, blocks and moderation bans made after the backup are undone** until you re-apply them (step 8).
+re-uploaded), every **location** (repopulates as apps report in), profile views, **taps**, report **free text and evidence**, and every **login** (people sign in again). One-time prekeys are
+gone too; apps upload new ones on launch. **Account deletions, blocks and moderation bans made after the backup are undone** until you re-apply them (step 6).
 
 ## Monitoring and alerts
 

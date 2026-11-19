@@ -11,8 +11,9 @@
 #              disk checks and pre-migrate snapshots, and a fake last-success file. Shows pass, fail, debounce and
 #              recovery output, and checks that alert payloads hold no addresses.
 # 2b. backup   backup.sh with a stub pg_dump (no database): the fixed exclusions survive an old STEXX_BACKUP_EXCLUDE_DATA,
-#              and --pre-migrate refuses a symlinked directory or a parent others can write, and never follows a
-#              planted partial-file name.
+#              and --pre-migrate refuses a symlinked directory or a parent others can write, never follows a
+#              planted partial-file name, refuses when the snapshot would leave too little free space, and keeps at
+#              most STEXX_PREMIGRATE_KEEP snapshots.
 # 3. deploy    deploy.sh --dry-run / --sync-config --dry-run / --status with stub ssh/rsync; every remote root script
 #              deploy.sh would pipe to the server is syntax-checked with bash -n.
 # 4. backup    (needs SELFTEST_DATABASE_URL, read-only use of that database) backup.sh nightly into a local "remote"
@@ -312,9 +313,17 @@ cat > "$T/stubpg/pg_dump" <<'SH'
 printf '%s\n' "$@" > "${STUB_PG_ARGS:?}"
 printf 'PGDMP'; head -c 8192 /dev/zero
 SH
-chmod +x "$T/stubpg/pg_dump"
+# Stub psql: answers the pre-migrate free-space check's database-size query with STUB_DB_SIZE bytes.
+cat > "$T/stubpg/psql" <<'SH'
+#!/usr/bin/env bash
+echo "${STUB_DB_SIZE:-100000}"
+SH
+chmod +x "$T/stubpg/pg_dump" "$T/stubpg/psql"
 age-keygen -o "$T/stub.key" 2>/dev/null; grep -Eo 'age1[a-z0-9]+' "$T/stub.key" > "$T/stub-recipients.txt"
-SB=(env PATH="$T/stubpg:$PATH" STUB_PG_ARGS="$T/stub-args" STEXX_BACKUP_RECIPIENTS="$T/stub-recipients.txt" STEXX_BACKUP_DB=stexx_stub)
+# (STEXX_PREMIGRATE_MIN_FREE_PCT=0: a laptop disk may be fuller than a server's should be; the guard tests below use
+# estimates larger than any disk.)
+SB=(env PATH="$T/stubpg:$PATH" STUB_PG_ARGS="$T/stub-args" STEXX_BACKUP_RECIPIENTS="$T/stub-recipients.txt" STEXX_BACKUP_DB=stexx_stub
+    STEXX_PREMIGRATE_MIN_FREE_PCT=0)
 if command -v rclone >/dev/null; then
   : > "$T/stub-rclone.conf"; mkdir -p "$T/stub-remote" "$T/stub-state"
   # The exclude list an older backup.env.example set (before report_evidence was added to it).
@@ -323,12 +332,16 @@ if command -v rclone >/dev/null; then
     bash "$HERE/backup.sh" > "$T/stub-nightly" 2>&1; echo $? > "$T/stub-nightly.rc"
   echo "  nightly with an old STEXX_BACKUP_EXCLUDE_DATA:"; show "$T/stub-nightly"
   check "nightly (stub) exits 0" has "$T/stub-nightly.rc" 0
-  for t in report_evidence sessions e2e_one_time_prekeys abuse_counters attest_challenges messages; do
+  for t in report_evidence sessions e2e_one_time_prekeys abuse_counters attest_challenges spam_message_features taps messages; do
     check "old EXCLUDE_DATA still leaves out $t" grep -qx -- "--exclude-table-data=$t" "$T/stub-args"
   done
   "${SB[@]}" STEXX_BACKUP_REMOTE="$T/stub-remote" STATE_DIRECTORY="$T/stub-state" RCLONE_CONFIG="$T/stub-rclone.conf" \
     STEXX_BACKUP_REDACT_REPORTS=0 STEXX_BACKUP_EXCLUDE_DATA="" bash "$HERE/backup.sh" > "$T/stub-empty" 2>&1
-  check "empty EXCLUDE_DATA still leaves out report_evidence" grep -qx -- "--exclude-table-data=report_evidence" "$T/stub-args"
+  for t in report_evidence spam_message_features taps; do
+    check "empty EXCLUDE_DATA still leaves out $t" grep -qx -- "--exclude-table-data=$t" "$T/stub-args"
+  done
+  check "backup.sh never passes --strict-names (an exclusion naming a table that doesn't exist yet must not fail)" \
+    bash -c "! grep -v '^ *#' '$HERE/backup.sh' | grep -q -- '--strict-names' && ! grep -qx -- '--strict-names' '$T/stub-args'"
   check "empty EXCLUDE_DATA notes that messages are included" has "$T/stub-empty" "rows of messages ARE included"
 else
   echo "  (rclone not installed; nightly stub runs skipped)"
@@ -359,6 +372,24 @@ mkdir -p "$T/pm/shared"; chmod 0777 "$T/pm/shared"
 echo "  pre-migrate under a world-writable parent:"; show "$T/pm-shared"
 check "pre-migrate refuses a parent writable by others" bash -c "! grep -qx 0 '$T/pm-shared.rc' && grep -q 'writable by group/others' '$T/pm-shared'"
 chmod 0755 "$T/pm/shared"
+
+# Free-space guard: no snapshot yet, so the estimate is the database size (stub psql); one far larger than the disk
+# must be refused before anything is written.
+"${SB[@]}" STUB_DB_SIZE=1000000000000000 STEXX_PREMIGRATE_DIR="$T/pm/space" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-space" 2>&1; echo $? > "$T/pm-space.rc"
+echo "  pre-migrate when the database is larger than the free space:"; show "$T/pm-space"
+check "pre-migrate refuses when the snapshot would leave too little free space" bash -c "! grep -qx 0 '$T/pm-space.rc' && grep -q 'not enough free space' '$T/pm-space' && test -z \"\$(ls -A '$T/pm/space')\""
+# With a snapshot present, the estimate is the newest snapshot (a sparse file the size of a huge database).
+python3 -c 'import sys; f=open(sys.argv[1],"wb"); f.seek(10**15); f.write(b"\0")' "$T/pm/space/stexx-premigrate-20260101T000000Z.dump.age"
+"${SB[@]}" STEXX_PREMIGRATE_DIR="$T/pm/space" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-space2" 2>&1; echo $? > "$T/pm-space2.rc"
+check "the estimate follows the newest existing snapshot" bash -c "! grep -qx 0 '$T/pm-space2.rc' && grep -q 'not enough free space' '$T/pm-space2' && test \"\$(ls '$T/pm/space' | wc -l | tr -d ' ')\" = 1"
+"${SB[@]}" STEXX_PREMIGRATE_MIN_FREE_PCT=95 STEXX_PREMIGRATE_DIR="$T/pm/space" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-space3" 2>&1
+check "STEXX_PREMIGRATE_MIN_FREE_PCT above 90 is refused" has "$T/pm-space3" "must be 0..90"
+# Count cap: three older snapshots + the new one, STEXX_PREMIGRATE_KEEP=2 -> the new one and the newest older one.
+mkdir -m 0700 "$T/pm/cap"
+for d in 20260101 20260102 20260103; do head -c 4096 /dev/zero > "$T/pm/cap/stexx-premigrate-${d}T000000Z.dump.age"; done
+"${SB[@]}" STEXX_PREMIGRATE_KEEP=2 STEXX_PREMIGRATE_DIR="$T/pm/cap" bash "$HERE/backup.sh" --pre-migrate > "$T/pm-cap" 2>&1; echo $? > "$T/pm-cap.rc"
+echo "  pre-migrate with three snapshots already on disk (STEXX_PREMIGRATE_KEEP=2):"; show "$T/pm-cap"
+check "pre-migrate keeps only the newest STEXX_PREMIGRATE_KEEP snapshots" bash -c "grep -qx 0 '$T/pm-cap.rc' && test \"\$(ls '$T/pm/cap' | wc -l | tr -d ' ')\" = 2 && test -e '$T/pm/cap/stexx-premigrate-20260103T000000Z.dump.age' && test ! -e '$T/pm/cap/stexx-premigrate-20260102T000000Z.dump.age'"
 
 # =================================================================================================================
 hdr "3. deploy.sh with stub ssh/rsync"
@@ -416,7 +447,8 @@ PY
     COMPRESS=gzip:6; echo "  (local pg_dump has no zstd: using STEXX_BACKUP_COMPRESS=$COMPRESS; production uses zstd:6)"
   fi
   B=(env STEXX_BACKUP_REMOTE="$T/remote" STEXX_BACKUP_DB="$SELFTEST_DATABASE_URL" STATE_DIRECTORY="$T/bstate"
-     STEXX_BACKUP_RECIPIENTS="$T/recipients.txt" RCLONE_CONFIG="$T/rclone.conf" STEXX_BACKUP_COMPRESS="$COMPRESS")
+     STEXX_BACKUP_RECIPIENTS="$T/recipients.txt" RCLONE_CONFIG="$T/rclone.conf" STEXX_BACKUP_COMPRESS="$COMPRESS"
+     STEXX_PREMIGRATE_MIN_FREE_PCT=0)
 
   "${B[@]}" bash "$HERE/backup.sh" > "$T/nightly" 2>&1; echo $? > "$T/nightly.rc"
   echo "  backup.sh (nightly, local directory as the remote):"; show "$T/nightly"
@@ -449,6 +481,19 @@ PY
   check "drill on the nightly passes" has "$T/drill1" "RESULT: PASS"
   check "drill loaded the reports sidecar" has "$T/drill1" "reports:     ok"
   check "nightly restore has no sessions" bash -c "grep -q 'sessions=0' '$T/drill1'"
+  for t in spam_message_features taps; do
+    if [ -n "$(psql -X -At -d "$SELFTEST_DATABASE_URL" -c "SELECT to_regclass('$t')" 2>/dev/null)" ]; then
+      check "nightly restore has no $t rows" grep -q " $t=0" "$T/drill1"
+    else
+      echo "  ($t is not in this database's schema yet)"
+    fi
+  done
+
+  # An exclusion naming a table that does not exist (yet) must not break the real pg_dump.
+  mkdir -p "$T/remote-missing"
+  "${B[@]}" STEXX_BACKUP_REMOTE="$T/remote-missing" STEXX_BACKUP_EXCLUDE_DATA="messages stexx_selftest_no_such_table" \
+    bash "$HERE/backup.sh" > "$T/nightly-missing" 2>&1; echo $? > "$T/nightly-missing.rc"
+  check "nightly with an excluded table that doesn't exist still succeeds" bash -c "grep -qx 0 '$T/nightly-missing.rc' && ls '$T/remote-missing' | grep -q '.dump.age\$'"
   check "drill dropped its scratch database" has "$T/drill1" "dropped scratch database stexx_drill_selftest_$$_a"
 
   "${DRILL[@]}" --file "$PREFILE" --scratch-db "stexx_drill_selftest_$$_b" --revoke-sessions > "$T/drill2" 2>&1; echo $? > "$T/drill2.rc"
@@ -479,6 +524,14 @@ PY
   echo "  restore-drill.sh --restore-into <a database with tables>:"; show "$T/drill6"
   check "--restore-into a non-empty database refuses" bash -c "grep -q 'is not empty' '$T/drill6' && grep -q 'RESULT: FAIL' '$T/drill6'"
   psql -X -q -d postgres -c "DROP DATABASE IF EXISTS \"stexx_drill_selftest_$$_c\" WITH (FORCE)" >/dev/null
+
+  # A real restore (--restore-into) of a snapshot that holds sessions revokes them even without --revoke-sessions.
+  psql -X -q -d postgres -c "CREATE DATABASE \"stexx_drill_selftest_$$_g\" TEMPLATE template0 ENCODING 'UTF8'" >/dev/null
+  "${DRILL[@]}" --file "$PREFILE" --restore-into "stexx_drill_selftest_$$_g" --min-users 0 > "$T/drill9" 2>&1
+  echo "  restore-drill.sh --restore-into <empty database> without --revoke-sessions:"; grep -E '^(sessions|ephemeral|RESULT)' "$T/drill9" | sed 's/^/    | /'
+  LIVE="$(psql -X -At -d "stexx_drill_selftest_$$_g" -c "SELECT count(*) FROM sessions WHERE revoked_at IS NULL" 2>&1)"
+  check "--restore-into revokes every session on its own" bash -c "grep -q 'RESULT: PASS' '$T/drill9' && grep -q 'sessions:    ok (revoked' '$T/drill9' && test '$LIVE' = 0"
+  psql -X -q -d postgres -c "DROP DATABASE IF EXISTS \"stexx_drill_selftest_$$_g\" WITH (FORCE)" >/dev/null
 
   # Failure cases.
   age-keygen -o "$T/other.key" 2>/dev/null

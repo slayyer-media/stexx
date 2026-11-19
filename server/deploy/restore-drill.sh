@@ -5,7 +5,7 @@
 #
 #   ./deploy/restore-drill.sh --identity ~/stexx-backup.key                 # latest nightly from B2 -> scratch DB
 #   ./deploy/restore-drill.sh --identity KEY --file stexx-<stamp>.dump.age   # a local file (nightly or pre-migrate)
-#   ./deploy/restore-drill.sh --identity KEY --file F --restore-into stexx --revoke-sessions   # REAL restore
+#   ./deploy/restore-drill.sh --identity KEY --file F --restore-into stexx   # REAL restore (always revokes sessions)
 #
 # What it does, in order, and prints a PASS/FAIL line for each:
 #   1. fetch the newest stexx-*.dump.age from the remote (rclone; needs a key WITH readFiles) or take --file, plus
@@ -19,7 +19,7 @@
 #      row counts of the tables the nightly backup leaves out (expected 0)
 #   6. grants.sql: applied for real when the role stexx_app exists on that server, otherwise checked inside a
 #      rolled-back transaction (role names swapped for PUBLIC), which proves every table/function it names exists
-#   7. --revoke-sessions: revoke every session and drop pending sign-in links/challenges (use for real restores)
+#   7. --revoke-sessions (implied by --restore-into): revoke every session and drop pending sign-in links/challenges
 #   8. with --restore-into or --revoke-sessions: delete the rows that are dangerous to bring back from any backup
 #      (one-time E2E prekeys that may already have been handed out, attestation challenges, rate-limit counters).
 #      Nightly backups never hold them; a pre-migrate snapshot does. Apps upload new prekeys on launch.
@@ -36,7 +36,8 @@
 #   --reports FILE        explicit reports sidecar (.reports.csv.age or .csv)
 #   --remote REMOTE       rclone remote:path to fetch from (default $STEXX_BACKUP_REMOTE or b2:stexx-backups/db)
 #   --scratch-db NAME     drill database name (must start with stexx_drill_; default stexx_drill_<utc stamp>_<pid>)
-#   --restore-into NAME   REAL restore into an existing, empty database. Never dropped.
+#   --restore-into NAME   REAL restore into an existing, empty database. Never dropped. Always revokes sessions (as
+#                         --revoke-sessions): a snapshot's sessions include ones revoked after it was taken.
 #   --revoke-sessions     revoke all sessions, delete email_link_tokens/auth_challenges after restoring (and step 8)
 #   --keep                keep the scratch database (prints its name)
 #   --min-users N         fail if fewer users were restored (default 1; use 0 for an empty install)
@@ -67,7 +68,7 @@ while [ $# -gt 0 ]; do
     --expect-migration) need_arg "$1" "${2:-}"; EXPECT_MIG="$2"; shift ;;
     --max-age-hours)    need_arg "$1" "${2:-}"; MAX_AGE_HOURS="$2"; shift ;;
     --grants)           need_arg "$1" "${2:-}"; GRANTS="$2"; shift ;;
-    -h|--help)          sed -n '2,46p' "$0"; exit 0 ;;
+    -h|--help)          sed -n '2,47p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -118,6 +119,9 @@ if [ -n "$TARGET" ]; then
   [ -z "$SCRATCH" ] || { echo "--restore-into and --scratch-db are exclusive" >&2; exit 2; }
   [ "$KEEP" = 0 ] || { echo "--keep only applies to drills" >&2; exit 2; }
   ADMIN_DB="$TARGET"   # e.g. stexx_owner may connect to its own database only (pg_hba)
+  # A real restore always revokes sessions: a pre-migrate snapshot holds sessions, including ones signed out
+  # everywhere or revoked by a ban after it was taken. There is deliberately no opt-out.
+  REVOKE=1
 else
   SCRATCH="${SCRATCH:-stexx_drill_$(date -u +%Y%m%d%H%M%S)_$$}"
   if [[ "$SCRATCH" != stexx_drill_* ]] || ! valid_name "$SCRATCH"; then
@@ -291,7 +295,7 @@ else pass migrations "max(schema_migrations)=$MAXMIG"; fi
 
 EXCL=""
 for t in sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys messages \
-         report_evidence media_trash locations travel_locations profile_views; do
+         report_evidence spam_message_features taps media_trash locations travel_locations profile_views; do
   n="$(count "$t")"
   [ "$n" = "?" ] && continue    # table not in this schema version
   EXCL="$EXCL $t=$n"
@@ -351,5 +355,5 @@ if [ -n "$TARGET" ] || [ "$REVOKE" = 1 ]; then
   else pass ephemeral "rows deleted:${EPH:- none of these tables exist}"; fi
 fi
 
-[ -z "$TARGET" ] || line next "run grants.sql as postgres if not applied above, deploy (migrates forward), restart stexx-api; see deploy/README.md"
+[ -z "$TARGET" ] || line next "grants.sql as postgres if not applied above; re-apply deletions, blocks and bans made after the backup BEFORE the API takes traffic (deploy/README.md, runbook step 6)"
 finish
