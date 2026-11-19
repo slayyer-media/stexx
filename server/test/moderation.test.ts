@@ -522,6 +522,10 @@ describe("moderation CLI", () => {
   test("list puts underage first, then hidden accounts, then other open reports", async () => {
     const plain = await user();
     await expectNoContent(await report(await veteran(), plain));
+    // The queue lists other open reports oldest first and caps at 1000 rows. On the shared test database more
+    // than 1000 accounts with open reports pile up across runs, so a brand-new report would fall off the end.
+    // Backdate this test's own report so it sorts ahead of that backlog; the order under test is unchanged.
+    await sql`UPDATE reports SET created_at = '2000-01-01T00:00:00Z' WHERE reported_id = ${plain.id}`;
     const hidden = await user();
     await hideAccount({ actor: "mod-a", userId: hidden.id });
     const minor = await user();
