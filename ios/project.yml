@@ -123,6 +123,8 @@ targets:
         StexxUseMockAPI: $(STEXX_USE_MOCK_API)
         StexxAttestationMode: $(STEXX_ATTESTATION_MODE)
         StexxPasskeyRelyingParty: $(STEXX_PASSKEY_RP_ID)
+        # Email sign-in links are only accepted from this host (https).
+        StexxAppLinkHost: $(STEXX_APP_LINK_HOST)
     postBuildScripts:
       # Adds NSAppTransportSecurity/NSAllowsLocalNetworking = true (a real
       # boolean) to the built Info.plist in the Local configuration only.

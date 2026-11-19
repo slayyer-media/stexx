@@ -25,6 +25,8 @@ actor MockAPIClient: APIClient {
     private var pendingPasskeyLogins: Set<String> = []
     /// Email sign-in links "sent" (token → address), like `email_link_tokens`.
     private var emailLinks: [String: String] = [:]
+    /// The request nonce each link was asked for with (token → nonce).
+    private var emailLinkNonces: [String: String] = [:]
     /// Addresses with a live code (address → pending nickname, if a sign-up).
     private var emailCodes: [String: String?] = [:]
     /// Send times per address, for the server's 3-per-15-minutes limit.
@@ -105,17 +107,21 @@ actor MockAPIClient: APIClient {
         emailSends[address] = recent + [now]
         let token = Self.randomBase64URL(32)
         emailLinks[token] = address
+        emailLinkNonces[token] = request.requestNonce
         lastEmailLinkToken = token
         emailCodes.updateValue(request.displayName, forKey: address)
     }
 
-    func verifyEmailCode(email: String, code: String) async throws -> Session {
+    /// Like the server: only in the app install that asked for the email.
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session {
         try await pause()
         let address = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard code == Self.emailCode, let pending = emailCodes.removeValue(forKey: address) else {
+        let askedHere = emailLinks.contains { $0.value == address && emailLinkNonces[$0.key] == requestNonce }
+        guard code == Self.emailCode, askedHere, let pending = emailCodes.removeValue(forKey: address) else {
             throw EmailSignInError.invalidCode
         }
         emailLinks = emailLinks.filter { $0.value != address }
+        emailLinkNonces = emailLinkNonces.filter { emailLinks[$0.key] != nil }
         if let pending { me.displayName = pending }
         return MockData.session
     }
@@ -182,9 +188,16 @@ actor MockAPIClient: APIClient {
     }
 
     /// Links from `requestEmailLink` work once; anything else is expired.
-    func verifyEmailLink(token: String) async throws -> Session {
+    /// A link asked for with another nonce asks first, like the server.
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session {
         try await pause()
-        guard let address = emailLinks.removeValue(forKey: token) else { throw EmailSignInError.invalidLink }
+        guard let address = emailLinks[token] else { throw EmailSignInError.invalidLink }
+        if !confirmed, emailLinkNonces[token] != requestNonce {
+            let pending = emailCodes[address] ?? nil
+            throw EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: pending != nil, displayName: pending ?? me.displayName))
+        }
+        emailLinks.removeValue(forKey: token)
+        emailLinkNonces.removeValue(forKey: token)
         if let pending = emailCodes.removeValue(forKey: address), let pending { me.displayName = pending }
         return MockData.session
     }

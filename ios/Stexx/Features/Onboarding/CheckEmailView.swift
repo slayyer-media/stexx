@@ -195,15 +195,17 @@ private struct ProblemText: View {
 
     private var icon: String {
         switch problem {
-        case .rateLimited: "hourglass"
+        case .rateLimited, .tooManyCodeAttempts: "hourglass"
         case .offline: "wifi.slash"
         default: "exclamationmark.circle"
         }
     }
 
     private var color: Color {
-        if case .rateLimited = problem { return Theme.warning }
-        return Theme.danger
+        switch problem {
+        case .rateLimited, .tooManyCodeAttempts: Theme.warning
+        default: Theme.danger
+        }
     }
 }
 
@@ -261,6 +263,59 @@ struct EmailLinkProblemView: View {
     }
 }
 
+/// A sign-in link this app didn't ask for (409 `confirm_link`). Someone can
+/// send a link to their own account to get this phone into it, so it says
+/// whose account it is and is only used on an explicit yes.
+struct EmailLinkConfirmView: View {
+    let account: EmailLinkAccount
+    var onConfirm: () -> Void
+    var onCancel: () -> Void
+
+    private var title: String {
+        account.isNew
+            ? String(localized: "create the account \(account.displayName)?")
+            : String(localized: "sign in as \(account.displayName)?")
+    }
+
+    private var message: String {
+        account.isNew
+            ? String(localized: "This link creates a new Stexx account named \(account.displayName) on this iPhone. It wasn't requested in this app.")
+            : String(localized: "This link signs in to the Stexx account \(account.displayName). It wasn't requested in this app.")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.l) {
+            Image(systemName: "person.crop.circle.badge.questionmark")
+                .font(.system(size: 34, weight: .light))
+                .foregroundStyle(Theme.steel)
+                .accessibilityHidden(true)
+            Text(title)
+                .stexxTitleStyle(.title)
+                .accessibilityAddTraits(.isHeader)
+            Text(message)
+                .font(.stexxBody)
+                .foregroundStyle(Theme.steel)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Only continue if you asked for this link yourself. Someone may have sent you a link to their own account: whatever you do there, they can see.")
+                .font(.stexxSub)
+                .foregroundStyle(Theme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            VStack(spacing: Theme.Spacing.m) {
+                Button(action: onCancel) { WideLabel("Cancel") }
+                    .stexxPrimaryButton()
+                Button(action: onConfirm) {
+                    WideLabel(account.isNew ? "Create \(account.displayName)" : "Sign in as \(account.displayName)")
+                }
+                .stexxSecondaryButton()
+            }
+        }
+        .padding(Theme.Spacing.xl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .stexxBackground()
+    }
+}
+
 /// Over everything while a link is being used.
 struct EmailLinkVerifyingOverlay: View {
     var body: some View {
@@ -292,6 +347,11 @@ struct EmailLinkVerifyingOverlay: View {
 
 #Preview("Offline link") {
     EmailLinkProblemView(problem: .offline, isSignedIn: false, onRetry: {}) { _ in }
+        .previewEnvironment(signedIn: false)
+}
+
+#Preview("Link from someone else") {
+    EmailLinkConfirmView(account: EmailLinkAccount(isNew: false, displayName: "QuantumOtter"), onConfirm: {}, onCancel: {})
         .previewEnvironment(signedIn: false)
 }
 

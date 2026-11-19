@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Security
 import SwiftUI
 
 // Email sign-up and sign-in (docs/api.md, "Auth & account"):
@@ -16,6 +17,11 @@ import SwiftUI
 //
 // `POST /auth/register` is the dev server's shortcut only; production
 // answers it with 400 `use_email_link`.
+//
+// Every email is bound to this app install by a random request nonce
+// (`EmailRequestNonceStore`): the code only works here, and a link this
+// install didn't ask for (someone sending you a link to *their* account)
+// is only used after "Sign in as …?" (docs/security.md, login CSRF).
 
 /// `POST /auth/email/link`. `displayName` and `confirmedAdult` are sent
 /// together for a sign-up, and left out for a sign-in.
@@ -23,14 +29,141 @@ struct EmailLinkRequest: Encodable, Hashable, Sendable {
     var email: String
     var displayName: String?
     var confirmedAdult: Bool?
+    /// Binds the email to this app install (only its hash is stored).
+    var requestNonce: String?
 
-    static func signIn(email: String) -> EmailLinkRequest {
-        EmailLinkRequest(email: email)
+    static func signIn(email: String, requestNonce: String? = nil) -> EmailLinkRequest {
+        EmailLinkRequest(email: email, requestNonce: requestNonce)
     }
 
     /// Only reached after the 18+ gate, so the confirmation travels along.
-    static func signUp(email: String, displayName: String) -> EmailLinkRequest {
-        EmailLinkRequest(email: email, displayName: displayName, confirmedAdult: true)
+    static func signUp(email: String, displayName: String, requestNonce: String? = nil) -> EmailLinkRequest {
+        EmailLinkRequest(email: email, displayName: displayName, confirmedAdult: true, requestNonce: requestNonce)
+    }
+}
+
+/// Whose account a link this app didn't ask for would sign in to (409
+/// `confirm_link`).
+struct EmailLinkAccount: Equatable, Sendable {
+    /// The link creates this account (a sign-up link) rather than signing
+    /// in to an existing one.
+    var isNew: Bool
+    var displayName: String
+}
+
+/// The random value that ties sign-in emails to this app install. Sent with
+/// every `POST /auth/email/link` (the server keeps only its hash), with the
+/// code, and with every link this app opens.
+protocol EmailRequestNonceStore: Sendable {
+    /// The nonce for a new email: the pending one if it was used within the
+    /// last hour (so every email of one sign-in shares it), else a new one.
+    func issue(now: Date) -> String
+    /// The pending nonce, if any.
+    func current(now: Date) -> String?
+    /// After signing in: the next sign-in starts with a new one.
+    func clear()
+}
+
+enum EmailRequestNonce {
+    /// How long a nonce stays pending after its last email. Emails live 15
+    /// minutes; this only decides when a fresh nonce is due.
+    static let lifetime: TimeInterval = 60 * 60
+
+    /// 32 random bytes, base64url (what the server expects: 20-200 chars).
+    static func random() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if status != errSecSuccess {
+            var generator = SystemRandomNumberGenerator()
+            bytes = bytes.map { _ in UInt8.random(in: .min ... .max, using: &generator) }
+        }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    struct Stored: Codable, Equatable {
+        var nonce: String
+        var usedAt: Date
+    }
+}
+
+/// In the Keychain (this device only), so a link tapped after iOS closed
+/// the app while Mail was open still counts as asked for here.
+struct KeychainEmailRequestNonceStore: EmailRequestNonceStore {
+    var service = "gay.stexx.app.email-request"
+    var account = "nonce"
+
+    func issue(now: Date) -> String {
+        let nonce = current(now: now) ?? EmailRequestNonce.random()
+        save(EmailRequestNonce.Stored(nonce: nonce, usedAt: now))
+        return nonce
+    }
+
+    func current(now: Date) -> String? {
+        guard let stored = load(), now.timeIntervalSince(stored.usedAt) < EmailRequestNonce.lifetime else { return nil }
+        return stored.nonce
+    }
+
+    func clear() {
+        _ = SecItemDelete(baseQuery as CFDictionary)
+    }
+
+    private func load() -> EmailRequestNonce.Stored? {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return nil }
+        return try? JSONDecoder().decode(EmailRequestNonce.Stored.self, from: data)
+    }
+
+    private func save(_ stored: EmailRequestNonce.Stored) {
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        clear()
+        var query = baseQuery
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        _ = SecItemAdd(query as CFDictionary, nil)
+    }
+
+    private var baseQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+}
+
+/// Tests and previews.
+final class InMemoryEmailRequestNonceStore: EmailRequestNonceStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: EmailRequestNonce.Stored?
+
+    init(pending: String? = nil, usedAt: Date = .now) {
+        stored = pending.map { EmailRequestNonce.Stored(nonce: $0, usedAt: usedAt) }
+    }
+
+    func issue(now: Date) -> String {
+        lock.withLock {
+            let nonce = stored.flatMap { now.timeIntervalSince($0.usedAt) < EmailRequestNonce.lifetime ? $0.nonce : nil }
+                ?? EmailRequestNonce.random()
+            stored = EmailRequestNonce.Stored(nonce: nonce, usedAt: now)
+            return nonce
+        }
+    }
+
+    func current(now: Date) -> String? {
+        lock.withLock {
+            guard let stored, now.timeIntervalSince(stored.usedAt) < EmailRequestNonce.lifetime else { return nil }
+            return stored.nonce
+        }
+    }
+
+    func clear() {
+        lock.withLock { stored = nil }
     }
 }
 
@@ -45,6 +178,9 @@ enum EmailSignInError: Error, Equatable, Sendable {
     case registrationRequired
     /// 503 `email_unavailable`: the server can't send email right now.
     case unavailable
+    /// 409 `confirm_link`: a link this app didn't ask for. It is left
+    /// unused until the person confirms the account.
+    case confirmationRequired(EmailLinkAccount)
 
     init?(code: String?) {
         switch code {
@@ -63,8 +199,10 @@ enum EmailSignInProblem: Equatable, Sendable {
     case wrongCode
     case noAccount
     case unavailable
-    /// 429: wait until the date (the server's `Retry-After`).
+    /// 429 on an email: wait until the date (the server's `Retry-After`).
     case rateLimited(until: Date)
+    /// 429 on the code: too many tries from here for this address.
+    case tooManyCodeAttempts(until: Date)
     case offline
     /// Any other answer, shown as the server wrote it (e.g. 400
     /// `disposable_email`, 403 `device_account_limit`).
@@ -77,7 +215,7 @@ enum EmailSignInProblem: Equatable, Sendable {
     var isFinalForLink: Bool {
         switch self {
         case .expiredLink, .noAccount: true
-        case .wrongCode, .unavailable, .rateLimited, .offline, .other: false
+        case .wrongCode, .unavailable, .rateLimited, .tooManyCodeAttempts, .offline, .other: false
         }
     }
 
@@ -89,6 +227,8 @@ enum EmailSignInProblem: Equatable, Sendable {
             case .invalidCode: return .wrongCode
             case .registrationRequired: return .noAccount
             case .unavailable: return .unavailable
+            // Handled by `EmailLinkRedeemer` before it gets here.
+            case .confirmationRequired: return .other(String(localized: "Confirm the account to use this link."))
             }
         case APIError.rateLimited(let retryAfter):
             return .rateLimited(until: now.addingTimeInterval(retryAfter ?? EmailSignInModel.resendCooldown))
@@ -110,7 +250,7 @@ enum EmailSignInProblem: Equatable, Sendable {
         case .wrongCode: String(localized: "that code didn't work")
         case .noAccount: String(localized: "no account yet")
         case .unavailable: String(localized: "email is down")
-        case .rateLimited: String(localized: "slow down a little")
+        case .rateLimited, .tooManyCodeAttempts: String(localized: "slow down a little")
         case .offline: String(localized: "you're offline")
         case .other: String(localized: "that didn't work")
         }
@@ -128,6 +268,8 @@ enum EmailSignInProblem: Equatable, Sendable {
             String(localized: "We can't send email right now. Try again in a few minutes, or use a passkey.")
         case .rateLimited(let until):
             String(localized: "You've asked for a few emails already. Use the latest one, or ask again in \(Self.countdown(until.timeIntervalSince(now))).")
+        case .tooManyCodeAttempts(let until):
+            String(localized: "Too many tries with codes. Use the link in the email, or try again in \(Self.countdown(until.timeIntervalSince(now))).")
         case .offline:
             String(localized: "Check your connection and try again.")
         case .other(let message):
@@ -179,13 +321,22 @@ final class EmailSignInModel {
     private(set) var code = ""
 
     @ObservationIgnored private let api: any APIClient
+    @ObservationIgnored private let nonces: any EmailRequestNonceStore
     @ObservationIgnored private let now: () -> Date
     /// The complete code that last went out on its own (see `claimAutoSubmit`).
     @ObservationIgnored private var autoSubmittedCode: String?
+    /// The nonce this flow's emails were asked for with; the code needs it.
+    @ObservationIgnored private var requestNonce: String?
 
-    init(purpose: Purpose, api: any APIClient, now: @escaping () -> Date = { .now }) {
+    init(
+        purpose: Purpose,
+        api: any APIClient,
+        nonces: any EmailRequestNonceStore = KeychainEmailRequestNonceStore(),
+        now: @escaping () -> Date = { .now }
+    ) {
         self.purpose = purpose
         self.api = api
+        self.nonces = nonces
         self.now = now
     }
 
@@ -250,11 +401,17 @@ final class EmailSignInModel {
         phase = .verifying
         problem = nil
         defer { if phase == .verifying { phase = .sent } }
+        // The code only works with the nonce its email was asked for with
+        // (after a 429 on the first send, that's the pending one).
+        let nonce = requestNonce ?? nonces.current(now: now()) ?? EmailRequestNonce.random()
         do {
-            return try await api.verifyEmailCode(email: address, code: code)
+            let session = try await api.verifyEmailCode(email: address, code: code, requestNonce: nonce)
+            nonces.clear()
+            return session
         } catch {
-            let problem = EmailSignInProblem.from(error, now: now())
-            if case .rateLimited(let until) = problem { resendAvailableAt = max(resendAvailableAt ?? until, until) }
+            var problem = EmailSignInProblem.from(error, now: now())
+            // The code's own limit, not the email one: resending is still fine.
+            if case .rateLimited(let until) = problem { problem = .tooManyCodeAttempts(until: until) }
             self.problem = problem
             return nil
         }
@@ -272,9 +429,11 @@ final class EmailSignInModel {
         let previous = phase
         phase = .sending
         problem = nil
+        let nonce = nonces.issue(now: now())
+        requestNonce = nonce
         let request: EmailLinkRequest = switch purpose {
-        case .signUp(let displayName): .signUp(email: address, displayName: displayName)
-        case .signIn: .signIn(email: address)
+        case .signUp(let displayName): .signUp(email: address, displayName: displayName, requestNonce: nonce)
+        case .signIn: .signIn(email: address, requestNonce: nonce)
         }
         do {
             try await api.requestEmailLink(request)
@@ -320,6 +479,9 @@ final class EmailLinkRedeemer {
         /// token is kept (in memory) and only used after it.
         case needsAgeConfirmation
         case verifying
+        /// A link this app didn't ask for: "Sign in as …?" before it is
+        /// used. The token is kept (in memory) until the answer.
+        case needsConfirmation(EmailLinkAccount)
         /// Someone is signed in on this iPhone already; the link is left
         /// unused.
         case alreadySignedIn
@@ -336,15 +498,19 @@ final class EmailLinkRedeemer {
     var followUp: FollowUp?
 
     @ObservationIgnored private var pendingToken: String?
+    /// The person said yes to this link's account.
+    @ObservationIgnored private var confirmedToken: String?
     /// A link that signed in, or that the server called used, expired or
     /// account-less: delivering it again does nothing.
     @ObservationIgnored private var lastRedeemedToken: String?
     /// The link of a failed attempt the server didn't burn (offline, 429,
     /// 503, server error), for "Try again".
     @ObservationIgnored private var retryToken: String?
+    @ObservationIgnored private let nonces: any EmailRequestNonceStore
     @ObservationIgnored private let now: () -> Date
 
-    init(now: @escaping () -> Date = { .now }) {
+    init(nonces: any EmailRequestNonceStore = KeychainEmailRequestNonceStore(), now: @escaping () -> Date = { .now }) {
+        self.nonces = nonces
         self.now = now
     }
 
@@ -357,6 +523,7 @@ final class EmailLinkRedeemer {
         // The same link delivered twice (or tapped again while in flight).
         guard token != lastRedeemedToken, state != .verifying else { return true }
         retryToken = nil
+        confirmedToken = nil
         if isSignedIn {
             pendingToken = nil
             state = .alreadySignedIn
@@ -365,6 +532,14 @@ final class EmailLinkRedeemer {
         pendingToken = token
         state = isAgeConfirmed ? .verifying : .needsAgeConfirmation
         return true
+    }
+
+    /// "Sign in" on the confirmation sheet. When the state becomes
+    /// `.verifying`, call `redeem(with:)`.
+    func confirmAccount() {
+        guard case .needsConfirmation = state, let pendingToken else { return }
+        confirmedToken = pendingToken
+        state = .verifying
     }
 
     /// After the 18+ gate on this device.
@@ -379,11 +554,22 @@ final class EmailLinkRedeemer {
         guard state == .verifying, let token = pendingToken else { return nil }
         pendingToken = nil
         retryToken = nil
+        // Always sends a nonce, so the server always checks: with none
+        // pending, a throwaway one that matches no link.
+        let nonce = nonces.current(now: now()) ?? EmailRequestNonce.random()
+        let confirmed = confirmedToken == token
         do {
-            let session = try await api.verifyEmailLink(token: token)
+            let session = try await api.verifyEmailLink(token: token, requestNonce: nonce, confirmed: confirmed)
             lastRedeemedToken = token
+            confirmedToken = nil
+            nonces.clear()
             state = .idle
             return session
+        } catch EmailSignInError.confirmationRequired(let account) {
+            // Unused: ask whose account it is first.
+            pendingToken = token
+            state = .needsConfirmation(account)
+            return nil
         } catch {
             let problem = EmailSignInProblem.from(error, now: now())
             if problem.isFinalForLink {
@@ -408,6 +594,7 @@ final class EmailLinkRedeemer {
     /// becomes `.verifying`, call `redeem(with:)`.
     func retry() {
         guard canRetry, let token = retryToken else { return }
+        // A confirmed link stays confirmed for "Try again".
         retryToken = nil
         pendingToken = token
         state = .verifying
@@ -417,6 +604,7 @@ final class EmailLinkRedeemer {
     func dismiss(followUp: FollowUp? = nil) {
         pendingToken = nil
         retryToken = nil
+        confirmedToken = nil
         state = .idle
         self.followUp = followUp
     }

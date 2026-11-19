@@ -65,6 +65,18 @@ struct RootView: View {
             }
             .tint(Theme.ice)
         }
+        // A link this app didn't ask for: whose account, before it's used.
+        .sheet(isPresented: needsLinkConfirmation) {
+            if case .needsConfirmation(let account) = linkRedeemer.state {
+                EmailLinkConfirmView(account: account) {
+                    linkRedeemer.confirmAccount()
+                    redeemLink()
+                } onCancel: {
+                    linkRedeemer.dismiss()
+                }
+                .presentationDetents([.medium, .large])
+            }
+        }
         .sheet(isPresented: linkFailed) {
             if case .failed(let problem) = linkRedeemer.state {
                 EmailLinkProblemView(
@@ -102,7 +114,9 @@ struct RootView: View {
 
     /// Email sign-in links (`…/auth/email?token=…`, universal links through
     /// the `applinks:` associated domain) exchange their token for a session,
-    /// after the 18+ gate on a new iPhone. Never while signed in.
+    /// after the 18+ gate on a new iPhone. Never while signed in. A link this
+    /// app didn't ask for asks "Sign in as …?" first; nothing (location,
+    /// realtime) starts before the session exists.
     private func open(_ url: URL) {
         guard linkRedeemer.handle(url, isSignedIn: appState.isSignedIn, isAgeConfirmed: appState.isAgeConfirmed) else { return }
         redeemLink()
@@ -121,6 +135,13 @@ struct RootView: View {
         Binding(
             get: { linkRedeemer.state == .needsAgeConfirmation },
             set: { if !$0, linkRedeemer.state == .needsAgeConfirmation { linkRedeemer.dismiss() } }
+        )
+    }
+
+    private var needsLinkConfirmation: Binding<Bool> {
+        Binding(
+            get: { if case .needsConfirmation = linkRedeemer.state { true } else { false } },
+            set: { if !$0, case .needsConfirmation = linkRedeemer.state { linkRedeemer.dismiss() } }
         )
     }
 

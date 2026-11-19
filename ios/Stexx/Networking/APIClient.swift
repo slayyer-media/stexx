@@ -17,11 +17,15 @@ protocol APIClient: PasskeyAPI {
     /// `Retry-After`.
     func requestEmailLink(_ request: EmailLinkRequest) async throws
     /// `POST /auth/email/verify`: the token from a sign-in link → session.
-    /// Throws `EmailSignInError.invalidLink` / `.registrationRequired`.
-    func verifyEmailLink(token: String) async throws -> Session
+    /// `requestNonce` is this install's (see `EmailRequestNonceStore`); a
+    /// link it didn't ask for throws `.confirmationRequired` unless
+    /// `confirmed`. Throws `EmailSignInError.invalidLink` /
+    /// `.registrationRequired` / `.confirmationRequired`.
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session
     /// `POST /auth/email/code`: the 8-digit code from the same email →
-    /// session. Throws `EmailSignInError.invalidCode` / `.registrationRequired`.
-    func verifyEmailCode(email: String, code: String) async throws -> Session
+    /// session; only with the nonce the email was asked for with. Throws
+    /// `EmailSignInError.invalidCode` / `.registrationRequired`.
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session
     /// Rotates the refresh token. `HTTPAPIClient` calls this itself on 401.
     func refreshSession(refreshToken: String) async throws -> Session
     /// Revokes `session` on the server. Never reads or writes the stored

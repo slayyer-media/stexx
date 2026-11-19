@@ -231,9 +231,11 @@ struct E2EAPIClient: APIClient {
         try await base.finishPasskeyLogin(credential)
     }
     func requestEmailLink(_ request: EmailLinkRequest) async throws { try await base.requestEmailLink(request) }
-    func verifyEmailLink(token: String) async throws -> Session { try await base.verifyEmailLink(token: token) }
-    func verifyEmailCode(email: String, code: String) async throws -> Session {
-        try await base.verifyEmailCode(email: email, code: code)
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session {
+        try await base.verifyEmailLink(token: token, requestNonce: requestNonce, confirmed: confirmed)
+    }
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session {
+        try await base.verifyEmailCode(email: email, code: code, requestNonce: requestNonce)
     }
     func refreshSession(refreshToken: String) async throws -> Session { try await base.refreshSession(refreshToken: refreshToken) }
     func logout(_ session: Session) async throws { try await base.logout(session) }

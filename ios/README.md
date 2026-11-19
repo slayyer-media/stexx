@@ -111,10 +111,19 @@ only, stored on the server as a keyed hash, and never shown.
      address without an account in a sheet with a way forward. When a link
      fails without being used up (offline, 429, email or server trouble) the
      sheet offers **Try again**, and tapping the same link in Mail again works
-     too.
+     too. Only `https` links on `STEXX_APP_LINK_HOST` count.
+   - **Bound to this install.** Every email is asked for with a random
+     request nonce (`EmailRequestNonceStore`, in the Keychain, this device
+     only, reused for an hour after its last email and cleared on sign-in).
+     The code only works with it. A link this install didn't ask for (someone
+     can send you a link to their own account) gets `409 confirm_link`, and
+     the app asks **sign in as *nickname*?** (or **create the account
+     *nickname*?**) before using it; nothing is signed in, and location and
+     realtime stay off, until you say yes.
    - **The code** is typed (or AutoFilled from Mail) on that screen and sent
-     to `POST /v1/auth/email/code` on its own once all 8 digits are in (if
-     a resend is in flight then, as soon as it finishes). It covers the link being read on a
+     to `POST /v1/auth/email/code` with the nonce, on its own once all 8
+     digits are in (if a resend is in flight then, as soon as it finishes).
+     It covers the link being read on a
      computer or another phone, and mail apps that open links in their own
      browser. Opened without the app, the link shows a static page from the
      server saying exactly that.
@@ -123,11 +132,12 @@ only, stored on the server as a keyed hash, and never shown.
    4:05"). The server allows 3 emails per address per device in 15 minutes.
 
 Errors become plain sentences (`EmailSignInProblem`): wrong code, expired
-link, no account yet, mail down, offline, rate limited.
+link, no account yet, mail down, offline, rate limited (emails), too many
+code tries.
 
 | Configuration | What happens |
 | --- | --- |
-| `Debug` (mock API) | Faked: every email "contains" code **12345678**; the mock's links work once and anything else is expired; 3 emails per address per 15 min, then a countdown. |
+| `Debug` (mock API) | Faked: every email "contains" code **12345678**; the mock's links work once and anything else is expired; a link asked for with another nonce asks "sign in as …?" first; 3 emails per address per 15 min, then a countdown. |
 | `Local` | The real flow against your dev server, which prints each link and code (`[dev-mail] sign-in link: … code: …`) instead of mailing it. Links can't open the app here (no associated domain), so type the code. A small **Dev server: sign up without the email** button uses the dev server's `POST /auth/register` shortcut (Debug builds against a dev server only; production refuses it). |
 | `Release` | Real email, once the server has `SMTP_URL`. Links open the app once `stexx.gay` serves the AASA file (`server/deploy/README.md`, step 8); until then they open the server's explanation page and the code still works. |
 
@@ -310,7 +320,7 @@ Build settings in `project.yml` are exposed through `Info.plist`:
 | `STEXX_API_BASE_URL` | `https://api.stexx.gay` | Backend base URL (`/v1` is appended) |
 | `STEXX_USE_MOCK_API` | `YES` | `YES` uses `MockAPIClient`; `NO` uses `HTTPAPIClient` |
 | `STEXX_PASSKEY_RP_ID` | `stexx.gay` (`Local`: empty) | Passkey relying party: the `webcredentials:` associated domain and `StexxPasskeyRelyingParty` (see [Passkeys](#passkeys)) |
-| `STEXX_APP_LINK_HOST` | `stexx.gay` | Host of the server's `APP_LINK_BASE`: the `applinks:` associated domain that opens email sign-in links in the app (entitlement only, not in `Info.plist`; `Local` has no associated domains) |
+| `STEXX_APP_LINK_HOST` | `stexx.gay` | Host of the server's `APP_LINK_BASE`: the `applinks:` associated domain that opens email sign-in links in the app (`Local` has no associated domains), and `StexxAppLinkHost` in `Info.plist`: the only host whose `https` links the app treats as sign-in links |
 
 Build configurations:
 

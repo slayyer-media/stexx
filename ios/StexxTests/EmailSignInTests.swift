@@ -90,11 +90,12 @@ struct EmailSignInWireTests {
     func codeRequest() async throws {
         let server = ScriptedServer()
         await server.queue(codePath, (200, [:], sessionJSON))
-        let session = try await client(for: server).verifyEmailCode(email: "otter@example.com", code: "01234567")
+        let session = try await client(for: server).verifyEmailCode(email: "otter@example.com", code: "01234567", requestNonce: "nonce-nonce-nonce-nonce")
         #expect(session.accessToken == "acc")
         let body = try #require(await server.bodies(codePath).first)
         #expect(body["email"] as? String == "otter@example.com")
         #expect(body["code"] as? String == "01234567")
+        #expect(body["requestNonce"] as? String == "nonce-nonce-nonce-nonce")
     }
 
     @Test("The code route carries device attestation like the other email routes")
@@ -116,7 +117,9 @@ struct EmailSignInWireTests {
     func errorCodes(status: Int, code: String, expected: EmailSignInError) async throws {
         let server = ScriptedServer()
         await server.queue(verifyPath, error(status, code))
-        await #expect(throws: expected) { try await client(for: server).verifyEmailLink(token: "t0k3n-t0k3n-t0k3n-t0k3n") }
+        await #expect(throws: expected) {
+            try await client(for: server).verifyEmailLink(token: "t0k3n-t0k3n-t0k3n-t0k3n", requestNonce: "n0nc3-n0nc3-n0nc3-n0nc3", confirmed: false)
+        }
     }
 
     @Test("Other answers keep their server message (disposable email) and 429 keeps Retry-After")
@@ -174,7 +177,7 @@ struct EmailSignInModelTests {
         await server.queue(linkPath, (204, [:], Data()))
         await server.queue(linkPath, (204, [:], Data()))
         let clock = EmailTestClock()
-        let model = EmailSignInModel(purpose: .signUp(displayName: "QuantumOtter"), api: client(for: server), now: { clock.now })
+        let model = EmailSignInModel(purpose: .signUp(displayName: "QuantumOtter"), api: client(for: server), nonces: InMemoryEmailRequestNonceStore(), now: { clock.now })
         #expect(model.phase == .idle)
 
         #expect(await model.send(to: "  otter@example.com "))
@@ -206,7 +209,7 @@ struct EmailSignInModelTests {
         await server.queue(linkPath, (204, [:], Data()))
         await server.queue(linkPath, error(429, "rate_limited", headers: ["Retry-After": "240"]))
         let clock = EmailTestClock()
-        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), now: { clock.now })
+        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), nonces: InMemoryEmailRequestNonceStore(), now: { clock.now })
         await model.send(to: "otter@example.com")
         clock.advance(60)
         await model.resend()
@@ -221,7 +224,7 @@ struct EmailSignInModelTests {
         let server = ScriptedServer()
         await server.queue(linkPath, error(429, "rate_limited", headers: ["Retry-After": "120"]))
         let clock = EmailTestClock()
-        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), now: { clock.now })
+        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), nonces: InMemoryEmailRequestNonceStore(), now: { clock.now })
         #expect(await model.send(to: "otter@example.com"))
         #expect(model.phase == .sent)
         #expect(model.sentCount == 0)
@@ -233,7 +236,7 @@ struct EmailSignInModelTests {
         let server = ScriptedServer()
         await server.queue(linkPath, error(400, "disposable_email"))
         await server.queue(linkPath, error(503, "email_unavailable"))
-        let model = EmailSignInModel(purpose: .signIn, api: client(for: server))
+        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), nonces: InMemoryEmailRequestNonceStore())
         #expect(!(await model.send(to: "a@mailinator.com")))
         #expect(model.phase == .idle)
         #expect(model.problem == .other("server says disposable_email"))
@@ -244,7 +247,7 @@ struct EmailSignInModelTests {
 
     @Test("The code field keeps digits only, at most 8 (paste, AutoFill, spaces)")
     func codeSanitizing() {
-        let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .zero))
+        let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .zero), nonces: InMemoryEmailRequestNonceStore())
         model.updateCode("1234 5678")
         #expect(model.code == "12345678")
         #expect(model.isCodeComplete)
@@ -261,7 +264,7 @@ struct EmailSignInModelTests {
         await server.queue(linkPath, (204, [:], Data()))
         await server.queue(codePath, error(400, "invalid_code"))
         await server.queue(codePath, (200, [:], sessionJSON))
-        let model = EmailSignInModel(purpose: .signIn, api: client(for: server))
+        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), nonces: InMemoryEmailRequestNonceStore())
         #expect(await model.submitCode() == nil) // nothing sent yet
         await model.send(to: "otter@example.com")
 
@@ -285,7 +288,7 @@ struct EmailSignInModelTests {
     @Test("Auto-submit: once per complete code, and 8 digits that land during a resend go out when it's done")
     func autoSubmit() async throws {
         let clock = EmailTestClock()
-        let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .milliseconds(300)), now: { clock.now })
+        let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .milliseconds(300)), nonces: InMemoryEmailRequestNonceStore(), now: { clock.now })
         model.updateCode("12345678")
         #expect(!model.claimAutoSubmit()) // nothing sent yet
         await model.send(to: "otter@example.com")
@@ -311,7 +314,7 @@ struct EmailSignInModelTests {
         let server = ScriptedServer()
         await server.queue(linkPath, (204, [:], Data()))
         await server.queue(codePath, error(400, "registration_required"))
-        let model = EmailSignInModel(purpose: .signIn, api: client(for: server))
+        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), nonces: InMemoryEmailRequestNonceStore())
         await model.send(to: "new@example.com")
         model.updateCode("12345678")
         #expect(await model.submitCode() == nil)
@@ -320,7 +323,7 @@ struct EmailSignInModelTests {
 
     @Test("Different address: back to the form, code cleared")
     func reset() async {
-        let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .zero))
+        let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .zero), nonces: InMemoryEmailRequestNonceStore())
         await model.send(to: "otter@example.com")
         model.updateCode("123")
         model.reset()
@@ -331,7 +334,7 @@ struct EmailSignInModelTests {
     @Test("Mock backend: fake emails carry code 12345678, links work once, 4th email in 15 min is 429")
     func mockBackend() async throws {
         let mock = MockAPIClient(latency: .zero)
-        let model = EmailSignInModel(purpose: .signUp(displayName: "MockOtter"), api: mock)
+        let model = EmailSignInModel(purpose: .signUp(displayName: "MockOtter"), api: mock, nonces: InMemoryEmailRequestNonceStore())
         await model.send(to: "otter@example.com")
         model.updateCode("87654321")
         #expect(await model.submitCode() == nil)
@@ -342,8 +345,8 @@ struct EmailSignInModelTests {
 
         try await mock.requestEmailLink(.signIn(email: "link@example.com"))
         let token = try #require(await mock.lastEmailLinkToken)
-        _ = try await mock.verifyEmailLink(token: token)
-        await #expect(throws: EmailSignInError.invalidLink) { try await mock.verifyEmailLink(token: token) }
+        _ = try await mock.verifyEmailLink(token: token, requestNonce: "other", confirmed: true)
+        await #expect(throws: EmailSignInError.invalidLink) { try await mock.verifyEmailLink(token: token, requestNonce: "other", confirmed: true) }
 
         try await mock.requestEmailLink(.signIn(email: "link@example.com"))
         try await mock.requestEmailLink(.signIn(email: "link@example.com"))
@@ -366,7 +369,7 @@ struct EmailLinkRedeemerTests {
 
     @Test("Not a sign-in link: ignored")
     func otherURLs() {
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         #expect(!redeemer.handle(URL(string: "https://stexx.gay/about")!, isSignedIn: false, isAgeConfirmed: true))
         #expect(redeemer.state == .idle)
     }
@@ -375,7 +378,7 @@ struct EmailLinkRedeemerTests {
     func success() async throws {
         let server = ScriptedServer()
         await server.queue(verifyPath, (200, [:], sessionJSON))
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         #expect(redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true))
         #expect(redeemer.state == .verifying)
         let session = try #require(await redeemer.redeem(with: client(for: server)))
@@ -387,7 +390,7 @@ struct EmailLinkRedeemerTests {
     @Test("Already signed in: the link is left unused")
     func alreadySignedIn() async throws {
         let server = ScriptedServer()
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         #expect(redeemer.handle(link, isSignedIn: true, isAgeConfirmed: true))
         #expect(redeemer.state == .alreadySignedIn)
         #expect(await redeemer.redeem(with: client(for: server)) == nil)
@@ -400,7 +403,7 @@ struct EmailLinkRedeemerTests {
     func ageGateFirst() async throws {
         let server = ScriptedServer()
         await server.queue(verifyPath, (200, [:], sessionJSON))
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         redeemer.handle(link, isSignedIn: false, isAgeConfirmed: false)
         #expect(redeemer.state == .needsAgeConfirmation)
         #expect(await redeemer.redeem(with: client(for: server)) == nil)
@@ -409,7 +412,7 @@ struct EmailLinkRedeemerTests {
         #expect(redeemer.state == .verifying)
         #expect(await redeemer.redeem(with: client(for: server)) != nil)
 
-        let other = EmailLinkRedeemer()
+        let other = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         other.handle(link, isSignedIn: false, isAgeConfirmed: false)
         other.dismiss()
         other.ageConfirmed()
@@ -423,7 +426,7 @@ struct EmailLinkRedeemerTests {
     func failures(code: String, expected: EmailSignInProblem) async throws {
         let server = ScriptedServer()
         await server.queue(verifyPath, error(400, code))
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
         #expect(await redeemer.redeem(with: client(for: server)) == nil)
         #expect(redeemer.state == .failed(expected))
@@ -455,7 +458,7 @@ struct EmailLinkRedeemerTests {
             session: StubURLProtocol.session(),
             sessions: SessionCoordinator(store: InMemorySessionStore())
         )
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
         #expect(await redeemer.redeem(with: api) == nil)
         guard case .failed(let problem) = redeemer.state else {
@@ -489,7 +492,7 @@ struct EmailLinkRedeemerTests {
     func expiredLinkNoRetry() async throws {
         let server = ScriptedServer()
         await server.queue(verifyPath, error(400, "invalid_link"))
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
         _ = await redeemer.redeem(with: client(for: server))
         #expect(redeemer.state == .failed(.expiredLink))
@@ -502,7 +505,7 @@ struct EmailLinkRedeemerTests {
     func duplicateDelivery() async throws {
         let server = ScriptedServer()
         await server.queue(verifyPath, error(400, "invalid_link"))
-        let redeemer = EmailLinkRedeemer()
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
         redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
         #expect(redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)) // while in flight
         _ = await redeemer.redeem(with: client(for: server))
@@ -510,5 +513,191 @@ struct EmailLinkRedeemerTests {
         #expect(redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true))
         #expect(redeemer.state == .idle)
         #expect(await server.count(verifyPath) == 1)
+    }
+}
+
+// MARK: - Binding emails to this app install (combined audit)
+
+@MainActor
+struct EmailRequestBindingTests {
+    private let link = URL(string: "https://stexx.gay/auth/email?token=tok_abcdefghijklmnopqrstuvwxyz")!
+
+    private func confirmLink(account: String, name: String) -> ScriptedServer.Reply {
+        (409, [:], Fixtures.json(["code": "confirm_link", "message": "whose", "account": account, "displayName": name]))
+    }
+
+    @Test("Every email of one sign-in carries the same nonce, kept in the store; the code goes with it")
+    func nonceTravels() async throws {
+        let server = ScriptedServer()
+        await server.queue(linkPath, (204, [:], Data()))
+        await server.queue(linkPath, (204, [:], Data()))
+        await server.queue(codePath, (200, [:], sessionJSON))
+        let clock = EmailTestClock()
+        let store = InMemoryEmailRequestNonceStore()
+        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), nonces: store, now: { clock.now })
+        await model.send(to: "otter@example.com")
+        clock.advance(EmailSignInModel.resendCooldown)
+        await model.resend()
+        let nonces = await server.bodies(linkPath).compactMap { $0["requestNonce"] as? String }
+        #expect(nonces.count == 2)
+        #expect(Set(nonces).count == 1)
+        let nonce = try #require(nonces.first)
+        #expect(nonce.count == 43) // 32 bytes, base64url without padding
+        #expect(nonce.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+        #expect(store.current(now: clock.now) == nonce)
+
+        model.updateCode("12345678")
+        #expect(await model.submitCode() != nil)
+        #expect(await server.bodies(codePath).first?["requestNonce"] as? String == nonce)
+        // Signed in: the next sign-in starts with a new nonce.
+        #expect(store.current(now: clock.now) == nil)
+    }
+
+    @Test("A 429 on the code says it's the code limit, and doesn't hold up \"Send another email\"")
+    func codeRateLimit() async throws {
+        let server = ScriptedServer()
+        await server.queue(linkPath, (204, [:], Data()))
+        await server.queue(codePath, error(429, "rate_limited", headers: ["Retry-After": "600"]))
+        let clock = EmailTestClock()
+        let model = EmailSignInModel(purpose: .signIn, api: client(for: server), nonces: InMemoryEmailRequestNonceStore(), now: { clock.now })
+        await model.send(to: "otter@example.com")
+        model.updateCode("12345678")
+        #expect(await model.submitCode() == nil)
+        #expect(model.problem == .tooManyCodeAttempts(until: clock.now.addingTimeInterval(600)))
+        #expect(model.resendWait() == EmailSignInModel.resendCooldown)
+        let text = try #require(model.problem).message(now: clock.now)
+        #expect(text.contains("Too many tries with codes"))
+        #expect(text.contains("10:00"))
+        #expect(!text.contains("asked for a few emails"))
+    }
+
+    @Test("Wire: verify sends the nonce, and confirmed only once the person said yes")
+    func verifyBody() async throws {
+        let server = ScriptedServer()
+        await server.queue(verifyPath, (200, [:], sessionJSON))
+        await server.queue(verifyPath, (200, [:], sessionJSON))
+        let api = client(for: server)
+        _ = try await api.verifyEmailLink(token: "t0k3n-t0k3n-t0k3n-t0k3n", requestNonce: "n0nc3-n0nc3-n0nc3-n0nc3", confirmed: false)
+        _ = try await api.verifyEmailLink(token: "t0k3n-t0k3n-t0k3n-t0k3n", requestNonce: "n0nc3-n0nc3-n0nc3-n0nc3", confirmed: true)
+        let bodies = await server.bodies(verifyPath)
+        #expect(bodies[0].keys.sorted() == ["requestNonce", "token"])
+        #expect(bodies[1]["confirmed"] as? Bool == true)
+        #expect(bodies[1]["requestNonce"] as? String == "n0nc3-n0nc3-n0nc3-n0nc3")
+    }
+
+    @Test("Wire: 409 confirm_link names the account", arguments: [("existing", false), ("new", true)])
+    func confirmLinkDecodes(account: String, isNew: Bool) async throws {
+        let server = ScriptedServer()
+        await server.queue(verifyPath, confirmLink(account: account, name: "SomeoneElse"))
+        await #expect(throws: EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: isNew, displayName: "SomeoneElse"))) {
+            try await client(for: server).verifyEmailLink(token: "t0k3n-t0k3n-t0k3n-t0k3n", requestNonce: "n0nc3-n0nc3-n0nc3-n0nc3", confirmed: false)
+        }
+    }
+
+    @Test("A link this app asked for signs in at once, with the stored nonce, which is then cleared")
+    func askedHere() async throws {
+        let server = ScriptedServer()
+        await server.queue(verifyPath, (200, [:], sessionJSON))
+        let store = InMemoryEmailRequestNonceStore(pending: "mine-mine-mine-mine-mine")
+        let redeemer = EmailLinkRedeemer(nonces: store)
+        redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
+        #expect(await redeemer.redeem(with: client(for: server)) != nil)
+        let body = try #require(await server.bodies(verifyPath).first)
+        #expect(body["requestNonce"] as? String == "mine-mine-mine-mine-mine")
+        #expect(body["confirmed"] == nil)
+        #expect(store.current(now: .now) == nil)
+    }
+
+    @Test("Login CSRF: someone else's link isn't used until \"Sign in as …?\" gets a yes")
+    func someoneElsesLink() async throws {
+        let server = ScriptedServer()
+        await server.queue(verifyPath, confirmLink(account: "existing", name: "Stranger"))
+        await server.queue(verifyPath, (200, [:], sessionJSON))
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore()) // nothing asked for here
+        let api = client(for: server)
+        redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
+        #expect(await redeemer.redeem(with: api) == nil) // no session: nobody gets signed in
+        #expect(redeemer.state == .needsConfirmation(EmailLinkAccount(isNew: false, displayName: "Stranger")))
+        #expect(await redeemer.redeem(with: api) == nil) // nothing more is sent while it asks
+        #expect(await server.count(verifyPath) == 1)
+
+        redeemer.confirmAccount()
+        #expect(redeemer.state == .verifying)
+        let session = try #require(await redeemer.redeem(with: api))
+        #expect(session.accessToken == "acc")
+        let bodies = await server.bodies(verifyPath)
+        // Even with no nonce pending, one is sent (a throwaway), so the server always checks.
+        #expect((bodies[0]["requestNonce"] as? String)?.count == 43)
+        #expect(bodies[0]["confirmed"] == nil)
+        #expect(bodies[1]["confirmed"] as? Bool == true)
+        #expect(bodies[1]["token"] as? String == "tok_abcdefghijklmnopqrstuvwxyz")
+    }
+
+    @Test("Cancel on \"Sign in as …?\" forgets the link; opening it again asks again")
+    func cancelConfirmation() async throws {
+        let server = ScriptedServer()
+        await server.queue(verifyPath, confirmLink(account: "new", name: "Stranger"))
+        await server.queue(verifyPath, confirmLink(account: "new", name: "Stranger"))
+        let redeemer = EmailLinkRedeemer(nonces: InMemoryEmailRequestNonceStore())
+        let api = client(for: server)
+        redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
+        _ = await redeemer.redeem(with: api)
+        #expect(redeemer.state == .needsConfirmation(EmailLinkAccount(isNew: true, displayName: "Stranger")))
+        redeemer.dismiss()
+        #expect(redeemer.state == .idle)
+        redeemer.confirmAccount() // too late: nothing pending
+        #expect(redeemer.state == .idle)
+
+        redeemer.handle(link, isSignedIn: false, isAgeConfirmed: true)
+        #expect(await redeemer.redeem(with: api) == nil)
+        #expect(redeemer.state == .needsConfirmation(EmailLinkAccount(isNew: true, displayName: "Stranger")))
+        #expect(await server.bodies(verifyPath).allSatisfy { $0["confirmed"] == nil })
+    }
+
+    @Test("Mock backend asks too, for a link asked for with another nonce")
+    func mockAsks() async throws {
+        let mock = MockAPIClient(latency: .zero)
+        try await mock.requestEmailLink(.signUp(email: "x@example.com", displayName: "Stranger", requestNonce: "theirs-theirs-theirs-theirs"))
+        let token = try #require(await mock.lastEmailLinkToken)
+        await #expect(throws: EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: true, displayName: "Stranger"))) {
+            try await mock.verifyEmailLink(token: token, requestNonce: "mine-mine-mine-mine-mine", confirmed: false)
+        }
+        await #expect(throws: EmailSignInError.invalidCode) {
+            try await mock.verifyEmailCode(email: "x@example.com", code: MockAPIClient.emailCode, requestNonce: "mine-mine-mine-mine-mine")
+        }
+        _ = try await mock.verifyEmailLink(token: token, requestNonce: "theirs-theirs-theirs-theirs", confirmed: false)
+    }
+
+    @Test("Nonce store: one nonce per sign-in, reused for an hour after its last email, new after that or a sign-in")
+    func nonceStore() {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = InMemoryEmailRequestNonceStore()
+        #expect(store.current(now: start) == nil)
+        let first = store.issue(now: start)
+        #expect(store.issue(now: start.addingTimeInterval(50 * 60)) == first)
+        #expect(store.current(now: start.addingTimeInterval(100 * 60)) == first) // the last email slid the hour on
+        #expect(store.current(now: start.addingTimeInterval(111 * 60)) == nil)
+        #expect(store.issue(now: start.addingTimeInterval(111 * 60)) != first)
+        store.clear()
+        #expect(store.current(now: start.addingTimeInterval(111 * 60)) == nil)
+        #expect(EmailRequestNonce.random() != EmailRequestNonce.random())
+    }
+
+    @Test(
+        "Only https links on the app-link host count",
+        arguments: [
+            ("https://stexx.gay/auth/email?token=abc", "abc"),
+            ("https://STEXX.gay/auth/email/?token=abc", "abc"),
+            ("http://stexx.gay/auth/email?token=abc", nil),
+            ("https://evil.example/auth/email?token=abc", nil),
+            ("https://stexx.gay.evil.example/auth/email?token=abc", nil),
+            ("https://stexx.gay/evil/auth/email?token=abc", nil),
+            ("stexx://stexx.gay/auth/email?token=abc", nil),
+            ("https://stexx.gay/auth/email", nil),
+            ("https://stexx.gay/auth/email?token=", nil),
+        ] as [(String, String?)]
+    )
+    func linkHost(url: String, expected: String?) throws {
+        #expect(EmailSignInLink.token(from: try #require(URL(string: url)), host: "stexx.gay") == expected)
     }
 }
