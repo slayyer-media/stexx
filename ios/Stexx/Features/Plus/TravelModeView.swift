@@ -45,9 +45,12 @@ private struct TravelPicker: View {
         if let center = model.center {
             _camera = State(initialValue: .region(Self.region(around: center)))
         } else {
-            // Start where the phone is (shown on this device only); nothing
-            // is sent until "Browse from here".
-            _camera = State(initialValue: .userLocation(fallback: .automatic))
+            // A world view, not the phone's own position: the picker never
+            // uses (or shows) where you are. Search or zoom in to pick.
+            _camera = State(initialValue: .region(MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: 30, longitude: 10),
+                span: MKCoordinateSpan(latitudeDelta: 100, longitudeDelta: 120)
+            )))
         }
     }
 
@@ -102,10 +105,15 @@ private struct TravelPicker: View {
             MapScaleView()
         }
         .onMapCameraChange(frequency: .continuous) { context in
-            let center = context.region.center
-            model.centerChanged(to: .init(latitude: center.latitude, longitude: center.longitude))
+            let region = context.region
+            model.centerChanged(
+                to: .init(latitude: region.center.latitude, longitude: region.center.longitude),
+                spanMeters: region.span.latitudeDelta * 111_320
+            )
         }
-        .overlay { reticle }
+        .overlay {
+            if model.selection != nil { reticle }
+        }
         .accessibilityLabel("Map. Move it to choose where to browse from.")
     }
 
@@ -186,6 +194,7 @@ private struct TravelPicker: View {
 
     private var placeTitle: String {
         if let name = model.placeName { return name }
+        if model.isZoomedOut { return String(localized: "Search or zoom in") }
         if model.selection == nil { return String(localized: "Move the map") }
         return model.isNaming ? String(localized: "Finding the place…") : String(localized: "Somewhere here")
     }
@@ -209,7 +218,7 @@ private struct TravelPicker: View {
             withAnimation(Motion.animation(Motion.settle, reduceMotion: reduceMotion)) {
                 camera = .region(Self.region(around: point))
             }
-            model.centerChanged(to: point)
+            model.centerChanged(to: point, spanMeters: Self.span)
             model.suggestName(suggestion.title)
         }
     }

@@ -17,10 +17,19 @@ final class TravelModeModel {
         var longitude: Double
     }
 
+    /// Picking needs the map zoomed in to at most this height (a city or a
+    /// region), so a cell isn't chosen from a view of a whole continent.
+    static let maxPickingSpanMeters: Double = 60_000
+
     /// Where the map is centered. Stays on this device.
     private(set) var center: Point?
+    /// The map shows too large an area to pick a cell.
+    private(set) var isZoomedOut = false
     /// The name of the selected cell, looked up on this device.
     private(set) var placeName: String?
+    /// The search result the map was moved to, kept for its cell when the
+    /// lookup finds no city there (a river, a park, open land).
+    @ObservationIgnored private var searchedName: (cell: FuzzedLocation, name: String)?
     private(set) var isNaming = false
     private(set) var isSaving = false
     var errorMessage: String?
@@ -53,8 +62,10 @@ final class TravelModeModel {
     // MARK: Selection
 
     /// The cell that would be sent: the map center, snapped on this device.
+    /// `nil` until the map has a position, and while it's zoomed out too far.
     var selection: FuzzedLocation? {
-        center.map { LocationFuzzer.fuzz(latitude: $0.latitude, longitude: $0.longitude) }
+        guard !isZoomedOut, let center else { return nil }
+        return LocationFuzzer.fuzz(latitude: center.latitude, longitude: center.longitude)
     }
 
     /// Travel mode is on (possibly paused by a lapsed Stexx+).
@@ -66,10 +77,12 @@ final class TravelModeModel {
         return appState.isTravelActive && appState.travel?.location == selection
     }
 
-    /// The map moved. A new cell forgets the old cell's name.
-    func centerChanged(to point: Point) {
+    /// The map moved. `spanMeters` is the height of the visible area, when
+    /// known. A new cell forgets the old cell's name.
+    func centerChanged(to point: Point, spanMeters: Double? = nil) {
         let before = selection
         center = point
+        if let spanMeters { isZoomedOut = spanMeters > Self.maxPickingSpanMeters }
         if selection != before {
             placeName = nil
             isNaming = selection != nil
@@ -84,15 +97,18 @@ final class TravelModeModel {
             // Debounce: panning changes the cell many times per second.
             do { try await Task.sleep(for: delay) } catch { return }
         }
-        let name = await naming.name(for: cell)
+        let found = await naming.name(for: cell)
         guard !Task.isCancelled, cell == selection else { return }
-        placeName = name
+        let searched = searchedName?.cell == cell ? searchedName?.name : nil
+        placeName = found?.city ?? searched ?? found?.region
         isNaming = false
     }
 
-    /// Uses a name the user picked from search results until (unless) the
-    /// lookup for the new cell answers.
+    /// The map was moved to a search result: show its name for its cell,
+    /// unless the lookup finds a city there.
     func suggestName(_ name: String) {
+        guard let cell = selection else { return }
+        searchedName = (cell, name)
         placeName = name
     }
 
@@ -141,22 +157,32 @@ final class TravelModeModel {
 
 // MARK: - Place names
 
+/// A looked-up name: the city (with context, e.g. "Lisbon, Portugal") or,
+/// where there is none (water, open land), the region or country.
+struct TravelPlaceName: Hashable, Sendable {
+    var city: String?
+    var region: String?
+}
+
 /// Names a travel cell for display. The name stays on the device.
 protocol TravelPlaceNaming: Sendable {
-    @MainActor func name(for cell: FuzzedLocation) async -> String?
+    @MainActor func name(for cell: FuzzedLocation) async -> TravelPlaceName?
 }
 
 /// Reverse geocoding with MapKit (Apple's built-in service; no third-party
 /// API). Only the already-fuzzed cell center is looked up.
 struct MapKitPlaceNaming: TravelPlaceNaming {
     @MainActor
-    func name(for cell: FuzzedLocation) async -> String? {
+    func name(for cell: FuzzedLocation) async -> TravelPlaceName? {
         let location = CLLocation(latitude: cell.latitude, longitude: cell.longitude)
         guard let request = MKReverseGeocodingRequest(location: location),
               let item = try? await request.mapItems.first
         else { return nil }
         let address = item.addressRepresentations
-        return address?.cityWithContext(.short) ?? address?.cityName ?? address?.regionName ?? item.name
+        return TravelPlaceName(
+            city: address?.cityWithContext(.short) ?? address?.cityName,
+            region: address?.regionName ?? item.name
+        )
     }
 }
 

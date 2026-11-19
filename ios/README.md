@@ -204,6 +204,32 @@ xcrun simctl launch booted gay.stexx.app \
 
 `-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
 
+## Travel mode (Stexx+)
+
+Settings → Travel mode opens a map (`Features/Plus/TravelModeView.swift`,
+logic in `TravelModeModel.swift`); free users get the paywall instead. Pan
+the map or search a city (MapKit's `MKLocalSearchCompleter`; queries go to
+Apple, not to Stexx). The square drawn on the map is the 500 m cell around
+its center: `LocationFuzzer` snaps it on the phone, and only that cell is
+sent (`PUT /me/travel`). The picker starts on a world view, never at your
+own position, and won't pick while zoomed out past ~60 km.
+
+- **State.** `AppState.travel` holds the sent cell and a place name looked
+  up on the device (`MKReverseGeocodingRequest` on the fuzzed cell), in this
+  phone's preferences only; the server never receives the name and never
+  returns coordinates. `GET /me` says whether travel mode is on
+  (`Profile.travel`), and that wins: after a reinstall it shows as on
+  without a place name. Sign-out forgets it.
+- **Stexx+ lapses.** The server keeps the cell but ignores it, so the app
+  shows travel mode as paused (Settings explains it and offers a free
+  "Turn off travel mode", which sends `null`); it resumes on renewal.
+- **Nearby.** While it's on, a "Browsing from …" pill sits above the grid:
+  tap it to change the place, × to turn it off. The grid reloads whenever
+  travel mode changes.
+
+Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
+signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.
+
 ## Configuration
 
 Build settings in `project.yml` are exposed through `Info.plist`:
@@ -283,7 +309,6 @@ ios/
 - Real passkey auth (`AuthenticationServices`, associated domain
   `webcredentials:stexx.gay`); email links are handled in the API layer and
   via `onOpenURL`, but there's no "sign in" screen yet
-- Travel mode UI (`APIClient.setTravelLocation` is ready)
 - Push notifications
 - Discreet alternate app icons, localization
 - Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)

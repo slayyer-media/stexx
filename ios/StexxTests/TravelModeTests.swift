@@ -19,14 +19,14 @@ private actor TravelSpy {
 private final class FakeNaming: TravelPlaceNaming, @unchecked Sendable {
     private let lock = NSLock()
     private var asked: [FuzzedLocation] = []
-    let answer: String?
+    let answer: TravelPlaceName?
 
-    init(answer: String? = "Lisbon, Portugal") { self.answer = answer }
+    init(answer: TravelPlaceName? = TravelPlaceName(city: "Lisbon, Portugal", region: "Portugal")) { self.answer = answer }
 
     var cells: [FuzzedLocation] { lock.withLock { asked } }
 
     @MainActor
-    func name(for cell: FuzzedLocation) async -> String? {
+    func name(for cell: FuzzedLocation) async -> TravelPlaceName? {
         lock.withLock { asked.append(cell) }
         return answer
     }
@@ -96,6 +96,27 @@ struct TravelModeTests {
         #expect(model.placeName == nil)
     }
 
+    @Test("A searched place keeps its name where the lookup finds no city; otherwise the city wins")
+    func searchedNames() async {
+        let state = makeState(plus: true)
+        let water = makeModel(state, spy: TravelSpy(), naming: FakeNaming(answer: TravelPlaceName(city: nil, region: "Portugal")))
+        water.centerChanged(to: precise, spanMeters: 4000)
+        water.suggestName("Lisbon")
+        await water.nameSelection(after: .zero)
+        #expect(water.placeName == "Lisbon")
+
+        // Panned away from the searched cell: the region is all there is.
+        water.centerChanged(to: .init(latitude: precise.latitude - 0.02, longitude: precise.longitude))
+        await water.nameSelection(after: .zero)
+        #expect(water.placeName == "Portugal")
+
+        let city = makeModel(state, spy: TravelSpy(), naming: FakeNaming())
+        city.centerChanged(to: precise, spanMeters: 4000)
+        city.suggestName("Lisbon")
+        await city.nameSelection(after: .zero)
+        #expect(city.placeName == "Lisbon, Portugal")
+    }
+
     @Test("Without a map position nothing is sent")
     func needsASelection() async {
         let state = makeState(plus: true)
@@ -105,6 +126,25 @@ struct TravelModeTests {
         #expect(await !model.browseFromSelection())
         #expect(await spy.sent.isEmpty)
         #expect(state.travel == nil)
+    }
+
+    @Test("Zoomed out to a continent, nothing can be picked or looked up")
+    func zoomGate() async {
+        let state = makeState(plus: true)
+        let spy = TravelSpy()
+        let naming = FakeNaming()
+        let model = makeModel(state, spy: spy, naming: naming)
+        model.centerChanged(to: precise, spanMeters: 5_000_000)
+        #expect(model.isZoomedOut)
+        #expect(model.selection == nil)
+        await model.nameSelection(after: .zero)
+        #expect(naming.cells.isEmpty)
+        #expect(await !model.browseFromSelection())
+        #expect(await spy.sent.isEmpty)
+
+        model.centerChanged(to: precise, spanMeters: 4000)
+        #expect(!model.isZoomedOut)
+        #expect(model.selection == LocationFuzzer.fuzz(latitude: precise.latitude, longitude: precise.longitude))
     }
 
     // MARK: Plus gating
