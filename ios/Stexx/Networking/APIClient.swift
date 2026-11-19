@@ -3,9 +3,13 @@ import SwiftUI
 
 /// Everything the app needs from the Stexx backend. The UI only talks to
 /// this protocol, so the mock and the real HTTP client are interchangeable.
-/// See `docs/api.md` for the wire format.
-protocol APIClient: Sendable {
+/// See `docs/api.md` for the wire format. Passkey sign-up and sign-in
+/// (`PasskeyAPI`) are driven by `PasskeyFlow`.
+protocol APIClient: PasskeyAPI {
     // MARK: Auth & account
+    /// `POST /auth/register`: the dev server's shortcut (a session without
+    /// a credential). Production answers 400 `use_passkey_flow` /
+    /// `use_email_link`.
     func register(_ request: RegistrationRequest) async throws -> Session
     /// Sends a one-time sign-in link. Succeeds whether or not the address exists.
     func requestEmailLink(email: String) async throws
@@ -60,6 +64,12 @@ protocol APIClient: Sendable {
     /// it when the chat is end-to-end encrypted.
     func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message
     func markRead(conversationID: Conversation.ID) async throws
+    /// `POST /conversations/{id}/messages/{messageID}/open`: the recipient
+    /// is looking at a view-once photo. The server deletes it about 30 s
+    /// later. Idempotent; returns the message with `attachment.openedAt`
+    /// (and the URL while the file still exists). 404 for anyone but the
+    /// recipient.
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message
     func deleteConversation(_ conversationID: Conversation.ID) async throws
 
     // MARK: End-to-end encryption (`docs/api.md`)
@@ -100,6 +110,13 @@ protocol APIClient: Sendable {
     /// `POST /v1/dev/plus`). Debug builds only.
     func debugGrantPlus() async throws
     #endif
+
+    // MARK: Taps
+    /// `GET /me/taps`: taps you received in the retention window, newest
+    /// first, one per sender. `before` is the previous page's `nextCursor`.
+    func taps(before cursor: String?) async throws -> TapsPage
+    /// `POST /me/taps/seen`: everything received so far is no longer new.
+    func markTapsSeen() async throws
 }
 
 extension APIClient {
@@ -162,6 +179,15 @@ struct APIConfiguration: Sendable {
     var baseURL: URL
     var apiVersion = "v1"
     var useMock: Bool
+    /// The passkey relying party this build is associated with
+    /// (`StexxPasskeyRelyingParty` ← `STEXX_PASSKEY_RP_ID`); empty in the
+    /// Local configuration, which has no associated domain.
+    var passkeyRelyingPartyID: String? = nil
+
+    /// Whether the passkey buttons work (see `PasskeyAvailability`).
+    var passkeyAvailability: PasskeyAvailability {
+        PasskeyAvailability.resolve(baseURL: baseURL, relyingPartyID: passkeyRelyingPartyID, useMock: useMock)
+    }
 
     static func fromBundle(_ bundle: Bundle = .main) -> APIConfiguration {
         var urlString = bundle.object(forInfoDictionaryKey: "StexxAPIBaseURL") as? String
@@ -175,7 +201,8 @@ struct APIConfiguration: Sendable {
         #endif
         return APIConfiguration(
             baseURL: urlString.flatMap { URL(string: $0) } ?? defaultBaseURL,
-            useMock: mockFlag?.uppercased() != "NO"
+            useMock: mockFlag?.uppercased() != "NO",
+            passkeyRelyingPartyID: bundle.object(forInfoDictionaryKey: "StexxPasskeyRelyingParty") as? String
         )
     }
 

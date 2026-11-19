@@ -24,6 +24,8 @@ import {
   privacyJson,
   profileColumns,
   profilesFor,
+  travelJson,
+  type OwnProfileJson,
   type PhotoRow,
   type PrivacyRow,
   type ProfileRow,
@@ -54,11 +56,24 @@ const VIEWERS_LIMIT = 200;
 
 // ---- GET /me ---------------------------------------------------------------------
 
-meRoutes.get("/me", async (c) => {
-  const me = c.get("userId");
-  const [profile] = await profilesFor(me, [me]);
+/**
+ * The own profile: a Profile plus `travel`, so the app learns after a relaunch whether travel mode is on
+ * (and whether it is paused because Stexx+ lapsed). No coordinates, as everywhere else on /me.
+ */
+async function ownProfile(me: string): Promise<OwnProfileJson> {
+  const [[profile], [travel]] = await Promise.all([
+    profilesFor(me, [me]),
+    sql<{ is_active: boolean }[]>`
+      SELECT COALESCE(u.plus_expires_at > now(), false) AS is_active
+        FROM travel_locations t JOIN users u ON u.id = t.user_id
+       WHERE t.user_id = ${me}`,
+  ]);
   if (!profile) throw notFound();
-  return c.json(profile);
+  return { ...profile, travel: travelJson(travel) };
+}
+
+meRoutes.get("/me", async (c) => {
+  return c.json(await ownProfile(c.get("userId")));
 });
 
 // ---- PATCH /me -------------------------------------------------------------------
@@ -127,9 +142,7 @@ meRoutes.patch("/me", async (c) => {
        WHERE id = ${me}`;
   });
 
-  const [profile] = await profilesFor(me, [me]);
-  if (!profile) throw notFound();
-  return c.json(profile);
+  return c.json(await ownProfile(me));
 });
 
 // ---- DELETE /me ------------------------------------------------------------------
@@ -395,8 +408,8 @@ meRoutes.get("/me/viewers", async (c) => {
 /**
  * GDPR-style archive of everything we hold about the caller. Other people appear only as opaque ids; no
  * other user's profile, location, blocks-against-you, views-of-you or reports-about-you are included, nor
- * when they read your messages unless they send read receipts. Expired messages are left out, and incoming
- * view-once photos carry no URL (as everywhere outside the messages listing).
+ * when they read your messages (or opened your view-once photos) unless they send read receipts. Expired messages
+ * are left out, and view-once photos carry no URL (as everywhere outside the recipient's messages listing).
  * Secrets (token hashes, passkey public keys) are never included.
  */
 meRoutes.get("/me/export", async (c) => {
@@ -455,8 +468,8 @@ meRoutes.get("/me/export", async (c) => {
   const checks = new Map(
     (
       await sql<
-        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null }[]
-      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels FROM photos WHERE owner_id = ${me}`
+        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null; hidden_at: Date | null }[]
+      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels, hidden_at FROM photos WHERE owner_id = ${me}`
     ).map((r) => [r.id, r]),
   );
 
@@ -474,6 +487,8 @@ meRoutes.get("/me/export", async (c) => {
           attachment_key: string | null;
           attachment_view_once: boolean;
           attachment_encrypted: boolean;
+          attachment_opened_at: Date | null;
+          attachment_open_receipt: boolean;
           sent_at: Date;
           read_at: Date | null;
           read_receipt: boolean;
@@ -482,12 +497,14 @@ meRoutes.get("/me/export", async (c) => {
       >`
         SELECT m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
                m.attachment_kind, m.attachment_key,
-               m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.read_at, m.read_receipt, m.expires_at
+               m.attachment_view_once, m.attachment_encrypted, m.attachment_opened_at, m.attachment_open_receipt,
+               m.sent_at, m.read_at, m.read_receipt, m.expires_at
           FROM messages m
           JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
          WHERE m.conversation_id = ANY(${convs.map((x) => x.id)})
            AND (cm.cleared_before IS NULL OR m.sent_at > cm.cleared_before)
            AND (m.expires_at IS NULL OR m.expires_at > now())
+           AND (m.held_at IS NULL OR m.sender_id = ${me})
          ORDER BY m.sent_at, m.id`
     : [];
   const byConv = new Map<string, (typeof msgRows)[number][]>();
@@ -555,6 +572,7 @@ meRoutes.get("/me/export", async (c) => {
           model: ck?.nsfw_model ?? null,
           explicitScore: ck?.nsfw_score ?? null,
           labels: ck?.nsfw_labels ?? null,
+          hiddenByModeratorAt: isoDate(ck?.hidden_at ?? null),
         },
       };
     }),
@@ -602,10 +620,12 @@ meRoutes.get("/me/export", async (c) => {
       lastReadAt: isoDate(cv.last_read_at),
       messages: (byConv.get(cv.id) ?? []).map((m) => {
         const mine = m.sender_id === me;
-        // Same rules as the chat views: the other person's read time (and the expiry it starts) is theirs, not
-        // ours, unless they send read receipts; a view-once photo is only released (and marked opened) by
-        // GET /conversations/:id/messages, never by the archive.
+        // Same rules as the chat views: the other person's read time (and the expiry it starts) and when they
+        // opened a view-once photo are theirs, not ours, unless they send read receipts; a view-once photo's URL is
+        // only released to its recipient by GET /conversations/:id/messages (and the open route), never by the
+        // archive, and never to its sender.
         const hideRead = mine && m.read_at !== null && !m.read_receipt;
+        const showOpened = m.attachment_view_once && (!mine || m.attachment_open_receipt);
         return {
           id: m.id,
           senderID: m.sender_id,
@@ -616,10 +636,11 @@ meRoutes.get("/me/export", async (c) => {
           attachment: m.attachment_kind
             ? {
                 kind: m.attachment_kind,
-                url: !mine && m.attachment_view_once ? null : mediaUrl(m.attachment_key),
+                url: m.attachment_view_once ? null : mediaUrl(m.attachment_key),
                 isViewOnce: m.attachment_view_once,
                 // The key to an encrypted photo is inside `envelope`; the archive holds only the opaque blob's URL.
                 isEncrypted: m.attachment_encrypted,
+                openedAt: showOpened ? isoDate(m.attachment_opened_at) : null,
               }
             : null,
           sentAt: isoDate(m.sent_at),

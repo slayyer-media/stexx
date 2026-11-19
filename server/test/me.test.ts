@@ -361,6 +361,43 @@ describe("PUT /me/travel", () => {
     await expectError(await as(u).put("/v1/me/travel", { json: { latitude: 200, longitude: 1 } }), 400);
   });
 
+  test("GET/PATCH /me report travel mode (on, paused after Plus lapses, off) without coordinates", async () => {
+    const home = randomCell();
+    const u = await createUser({ plusDays: 3, location: home });
+    expect((await expectJson(await as(u).get("/v1/me"))).travel).toBeNull();
+
+    const away = randomCell();
+    await expectNoContent(await as(u).put("/v1/me/travel", { json: { ...away, precisionMeters: 500 } }));
+    const on = await expectJson(await as(u).get("/v1/me"));
+    expect(on.travel).toEqual({ isActive: true });
+    // Like every /me response: no coordinates, neither the travel cell nor home.
+    const cell = snapToCell(away.latitude, away.longitude);
+    const text = JSON.stringify(on);
+    for (const n of [cell.latitude, cell.longitude, home.latitude, home.longitude]) expect(text).not.toContain(String(n));
+    // PATCH /me answers with the same own-profile shape (the app replaces its copy with it).
+    const patched = await expectJson(await as(u).patch("/v1/me", { json: { headline: "away" } }));
+    expect(patched.travel).toEqual({ isActive: true });
+
+    // Plus lapses: the server keeps the cell but ignores it, and says so.
+    await sql`UPDATE users SET plus_expires_at = now() - interval '1 minute' WHERE id = ${u.id}`;
+    expect((await expectJson(await as(u).get("/v1/me"))).travel).toEqual({ isActive: false });
+    expect(await sql`SELECT 1 FROM effective_locations WHERE user_id = ${u.id} AND cell_lat = ${cell.latitude}`).toHaveLength(0);
+    // Clearing still works without Plus.
+    await expectNoContent(await as(u).put("/v1/me/travel", { body: "null", contentType: "application/json" }));
+    expect((await expectJson(await as(u).get("/v1/me"))).travel).toBeNull();
+  });
+
+  test("nobody else ever sees whether someone is travelling", async () => {
+    const home = randomCell();
+    const traveller = await createUser({ plusDays: 3, location: home });
+    const viewer = await createUser({ location: home });
+    await expectNoContent(await as(traveller).put("/v1/me/travel", { json: { ...near(home, 600), precisionMeters: 500 } }));
+    const seen = await expectJson(await as(viewer).get(`/v1/profiles/${traveller.id}`));
+    expect(seen).not.toHaveProperty("travel");
+    const page = await expectJson(await as(viewer).get("/v1/nearby?limit=100"));
+    for (const p of page.items) expect(p).not.toHaveProperty("travel");
+  });
+
   test("a lapsed subscriber can still clear travel mode (but not set it)", async () => {
     const u = await createUser({ plusDays: -1, location: randomCell() });
     await sql`INSERT INTO travel_locations (user_id, cell_lat, cell_lon) VALUES (${u.id}, 1, 1)`;

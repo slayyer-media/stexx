@@ -36,6 +36,8 @@ export const LIMITS = {
   /** Photo attachments (each one is a new file on disk), per sender: uploads and sends of a profile-photo copy. */
   attachments: { capacity: 30, windowMs: HOUR },
   taps: { capacity: 30, windowMs: HOUR },
+  /** POST /conversations/:id/messages/:messageID/open (view-once photos), per user. */
+  viewOnceOpens: { capacity: 60, windowMs: MINUTE },
   reports: { capacity: 10, windowMs: HOUR },
   photoUploads: { capacity: 20, windowMs: HOUR },
   /** E2E key routes (/keys*), per user: uploads, rotations, status, bundle and identity fetches. */

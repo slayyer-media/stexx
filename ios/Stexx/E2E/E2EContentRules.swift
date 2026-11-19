@@ -6,17 +6,25 @@ import Foundation
 /// them, using `contentRules` from `GET /e2e/config`.
 ///
 /// A port of `containsLink` and `normalizeForDuplicate` in
-/// `server/src/lib/abuse/content.ts`; keep them in step. The messages match
-/// the server's 403 `links_not_allowed` / `duplicate_message`.
+/// `server/src/lib/abuse/content.ts`; keep them in step. The payment, crypto
+/// and redirect handle rules aren't ported by hand: they are read from
+/// `content-rules.json`, a byte-identical copy of the server's table
+/// (`server/src/lib/abuse/content-rules.json`; the server's tests fail if the
+/// two differ, and both test suites run the vectors in it). The messages match
+/// the server's 403 `links_not_allowed` / `handles_not_allowed` /
+/// `duplicate_message`.
 enum E2EContentRules {
     enum Violation: LocalizedError, Equatable {
         case linksNotAllowed
+        case handlesNotAllowed
         case duplicateMessage
 
         var errorDescription: String? {
             switch self {
             case .linksNotAllowed:
                 String(localized: "New accounts can't send links yet. Try again in a day or so.")
+            case .handlesNotAllowed:
+                String(localized: "New accounts can't share payment, crypto or messenger handles yet. Try again in a day or so.")
             case .duplicateMessage:
                 String(localized: "You've sent this exact message to several people already. Try something personal.")
             }
@@ -50,6 +58,70 @@ enum E2EContentRules {
         return linkPattern.firstMatch(in: normalized, range: range) != nil
     }
 
+    // MARK: Handles (shared table)
+
+    /// One row of `content-rules.json`'s `handleRules`.
+    struct HandleRule: Decodable, Sendable, Equatable {
+        enum Kind: String, Decodable, Sendable {
+            case payment, crypto, redirect
+        }
+
+        let id: String
+        let kind: Kind
+        let caseInsensitive: Bool
+        let pattern: String
+    }
+
+    private struct Table: Decodable {
+        let version: Int
+        let handleRules: [HandleRule]
+    }
+
+    private final class BundleToken {}
+
+    /// The shared table, from the app bundle (also when hosted by unit tests).
+    static let tableURL = Bundle(for: BundleToken.self).url(forResource: "content-rules", withExtension: "json")
+
+    /// The handle rules, compiled once. A rule ICU can't compile is left out
+    /// (the tests check none is).
+    static let handleRules: [(rule: HandleRule, regex: NSRegularExpression)] = {
+        guard let url = tableURL, let data = try? Data(contentsOf: url),
+              let table = try? JSONDecoder().decode(Table.self, from: data)
+        else { return [] }
+        return table.handleRules.compactMap { rule in
+            let options: NSRegularExpression.Options = rule.caseInsensitive ? [.caseInsensitive] : []
+            guard let regex = try? NSRegularExpression(pattern: rule.pattern, options: options) else { return nil }
+            return (rule, regex)
+        }
+    }()
+
+    /// NFKC, then zero-width characters (U+200B-U+200D, U+2060, U+FEFF)
+    /// removed: the server's `normalizeForRules`.
+    static func normalizeForRules(_ text: String) -> String {
+        let normalized = text.precomposedStringWithCompatibilityMapping
+        let zeroWidth: Set<UInt32> = [0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF]
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: normalized.unicodeScalars.filter { !zeroWidth.contains($0.value) })
+        return String(scalars)
+    }
+
+    /// Ids of every handle rule that matches `text`, in table order.
+    static func matchingHandleRules(_ text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+        let normalized = normalizeForRules(text)
+        let range = NSRange(normalized.startIndex..., in: normalized)
+        return handleRules
+            .filter { $0.regex.firstMatch(in: normalized, range: range) != nil }
+            .map(\.rule.id)
+    }
+
+    /// True if `text` has a payment or crypto handle or an off-platform
+    /// redirect (Cash App, Venmo, PayPal.me, wallet addresses, Telegram,
+    /// WhatsApp, OnlyFans...).
+    static func containsHandle(_ text: String) -> Bool {
+        !matchingHandleRules(text).isEmpty
+    }
+
     /// Case- and whitespace-insensitive form for duplicate detection.
     static func normalizeForDuplicate(_ text: String) -> String {
         text.lowercased()
@@ -68,6 +140,7 @@ enum E2EContentRules {
     ) throws {
         guard rules.restricted else { return }
         if rules.noLinks && containsLink(text) { throw Violation.linksNotAllowed }
+        if rules.noHandles && containsHandle(text) { throw Violation.handlesNotAllowed }
         let normalized = normalizeForDuplicate(text)
         // The server compares JavaScript string lengths (UTF-16 code units).
         guard normalized.utf16.count >= rules.duplicateMinLength else { return }
