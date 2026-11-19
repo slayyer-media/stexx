@@ -204,7 +204,8 @@ struct NearbyFeedTests {
             Issue.record("expected the error state, got \(content(feed))")
             return
         }
-        #expect(!message.isEmpty)
+        #expect(message == NearbyFeedModel.message(for: URLError(.notConnectedToInternet)))
+        #expect(!message.contains("NSURLErrorDomain"))
         #expect(feed.profiles.isEmpty)
 
         let retry = Task { await feed.reload(key, using: server.fetch) }
@@ -339,6 +340,14 @@ struct NearbyFeedTests {
         await more.value
         #expect(feed.profiles.map(\.id) == profiles[4..<6].map(\.id))
         #expect(feed.nextCursor == nil)
+    }
+
+    @Test("Error text is a sentence, not an error code")
+    func errorMessages() {
+        #expect(NearbyFeedModel.message(for: URLError(.notConnectedToInternet)).contains("offline"))
+        #expect(NearbyFeedModel.message(for: URLError(.timedOut)).contains("too long"))
+        #expect(NearbyFeedModel.message(for: URLError(.cannotFindHost)).contains("Couldn't reach"))
+        #expect(NearbyFeedModel.message(for: APIError.rateLimited(retryAfter: nil)) == APIError.rateLimited(retryAfter: nil).localizedDescription)
     }
 
     // MARK: Accessibility

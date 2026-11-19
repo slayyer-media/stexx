@@ -167,7 +167,7 @@ final class NearbyFeedModel {
             // appearance loads again if needed.
         } catch {
             guard generation == self.generation else { return }
-            let message = error.localizedDescription
+            let message = Self.message(for: error)
             if key == loadedKey, !profiles.isEmpty {
                 refreshFailure = message
             } else {
@@ -199,7 +199,7 @@ final class NearbyFeedModel {
             if generation == self.generation { nextPage = .idle }
         } catch {
             guard generation == self.generation else { return }
-            nextPage = .failed(error.localizedDescription)
+            nextPage = .failed(Self.message(for: error))
         }
     }
 
@@ -219,6 +219,21 @@ final class NearbyFeedModel {
     private static func unique(_ items: [Profile]) -> [Profile] {
         var seen = Set<Profile.ID>()
         return items.filter { seen.insert($0.id).inserted }
+    }
+
+    /// Words for the error states. Network failures get plain sentences
+    /// (a bare `URLError` reads "NSURLErrorDomain error -1009"); API errors
+    /// already carry the server's or the app's message.
+    static func message(for error: any Error) -> String {
+        guard let error = error as? URLError else { return error.localizedDescription }
+        switch error.code {
+        case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
+            return String(localized: "You're offline. Check your connection and try again.")
+        case .timedOut:
+            return String(localized: "Stexx took too long to answer. Try again.")
+        default:
+            return String(localized: "Couldn't reach Stexx. Try again in a moment.")
+        }
     }
 
     private static func isCancellation(_ error: any Error) -> Bool {

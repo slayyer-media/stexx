@@ -396,8 +396,6 @@ struct NearbyView: View {
 struct ProfileTile: View {
     let profile: Profile
 
-    @ScaledMetric(relativeTo: .caption2) private var starSize: CGFloat = 9
-
     private var shape: RoundedRectangle {
         RoundedRectangle(cornerRadius: Theme.Radius.xs, style: .continuous)
     }
@@ -446,7 +444,9 @@ struct ProfileTile: View {
     private var favoriteMark: some View {
         if profile.isFavorite {
             Image(systemName: "star.fill")
-                .font(.system(size: starSize, weight: .semibold))
+                // A text style, so the tile's Dynamic Type cap applies.
+                .font(.caption2.weight(.semibold))
+                .imageScale(.small)
                 .foregroundStyle(Theme.frost)
                 .shadow(color: .black.opacity(0.45), radius: 2)
                 .padding(6)

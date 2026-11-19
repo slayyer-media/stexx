@@ -15,6 +15,8 @@ enum NearbyDebugScenario: String {
     case denied
     /// Location restricted (Screen Time or a device profile).
     case restricted
+    /// Location denied, but the server still has a last known location.
+    case deniedWithGrid
     /// Nobody nearby, with the Online quick filter on.
     case emptyFiltered
     /// Nobody nearby, no filters.
@@ -33,7 +35,7 @@ enum NearbyDebugScenario: String {
     var location: NearbyLocationState {
         switch self {
         case .firstRun: .locating
-        case .denied: .denied
+        case .denied, .deniedWithGrid: .denied
         case .restricted: .restricted
         case .emptyFiltered, .empty, .error, .pageError, .grid: .located
         }
@@ -66,7 +68,7 @@ enum NearbyDebugScenario: String {
                 }
                 return try await base(query)
             }
-        case .grid:
+        case .grid, .deniedWithGrid:
             return base
         }
     }
