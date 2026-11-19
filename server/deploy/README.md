@@ -201,5 +201,5 @@ trusts only Apple's signature, checked against the same root certificates and co
   Logs carry only the notification UUID, type, subtype, original transaction id and outcome.
 - Cloudflare: Apple's servers must reach this path. Don't put a challenge (Bot Fight Mode, "I'm Under Attack", a managed
   challenge rule) on `api.stexx.gay/v1/subscriptions/*`; a WAF rate-limit rule there should allow at least 60 requests a minute.
-- Nothing from Apple's payload is stored: only each notification's UUID and arrival time (`apple_notifications`, purged after
-  30 days by the endpoint itself) and the subscription's auto-renew flag (`subscriptions.auto_renew`). Migration 119 adds both.
+- Nothing from Apple's payload is stored: only each notification's UUID and arrival time (`apple_notifications`, purged once
+  older than 30 days, each time a notification arrives) and the subscription's auto-renew flag (`subscriptions.auto_renew`). Migration 119 adds both.

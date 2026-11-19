@@ -597,5 +597,5 @@ The URL to enter in App Store Connect is in [`server/deploy/README.md`](../serve
   `originalTransactionId`s (e.g. a notification that arrives before the app posted the purchase), and replays. Each
   `notificationUUID` is applied once; a replay is acknowledged without being applied again.
 - Rate limit: its own bucket, 60 a minute per client (429 + `Retry-After`; Apple retries).
-- Stored: the notification UUID and arrival time (deleted after 30 days) and the subscription's auto-renew flag. No
+- Stored: the notification UUID and arrival time (deleted once older than 30 days, as later notifications arrive) and the subscription's auto-renew flag. No
   Apple payload.

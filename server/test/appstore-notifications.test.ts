@@ -456,6 +456,30 @@ describe("POST /subscriptions/apple/notifications: notification types", () => {
     near(new Date(s.expiresAt!).getTime(), expires);
   });
 
+  test("reversing an earlier month's refund doesn't undo a later month's refund", async () => {
+    const id = otid();
+    const now = Date.now();
+    const m1 = { originalTransactionId: id, purchaseDate: now - 50 * DAY, expiresDate: now - 20 * DAY };
+    const m2 = { originalTransactionId: id, purchaseDate: now - 20 * DAY, expiresDate: now + 10 * DAY };
+    const u = await subscriber(id, m1.expiresDate);
+    // (1) Month 1 refunded while it ran; (2) month 2 bought after that refund lifts it.
+    await acked({ type: "REFUND", tx: { ...m1, revocationDate: now - 30 * DAY } });
+    await acked({ type: "DID_RENEW", tx: m2 });
+    expect((await status(u)).isActive).toBe(true);
+    // (3) Month 2 refunded.
+    await acked({ type: "REFUND", tx: { ...m2, revocationDate: now - 2 * DAY } });
+    expect((await status(u)).isActive).toBe(false);
+    // (4) Apple reverses month 1's refund, signed after month 2's: month 2 stays refunded.
+    await acked({ type: "REFUND_REVERSED", tx: m1 });
+    expect((await status(u)).isActive).toBe(false);
+    expect((await subRow(id))!.revoked_at).toBeInstanceOf(Date);
+    // Reversing month 2's refund does bring it back.
+    await acked({ type: "REFUND_REVERSED", tx: m2 });
+    const s = await status(u);
+    expect(s.isActive).toBe(true);
+    near(new Date(s.expiresAt!).getTime(), m2.expiresDate);
+  });
+
   test("after a refund, a renewal bought later (new paid period) brings Stexx+ back; a stale one doesn't", async () => {
     const id = otid();
     const u = await subscriber(id);

@@ -339,8 +339,8 @@ export interface TransactionContext {
  * - Expiry only grows: an older renewal (or an out-of-order notification) never shortens a newer expiry. A grace
  *   period extends it to the grace end.
  * - A revocation (refund, Family Sharing revoke) sticks, so a stale copy of the transaction can't bring Stexx+ back.
- *   It is lifted only by Apple: a refund reversal signed after it, or a transaction purchased after it (a new paid
- *   period).
+ *   It is lifted only by Apple: a refund reversal signed after it for the revoked period (not an earlier one), or a
+ *   transaction purchased after it (a new paid period).
  * - Refunding a period that had already ended before the refund (an earlier month) doesn't revoke a later one.
  */
 export async function applyTransactionInTx(
@@ -362,7 +362,14 @@ export async function applyTransactionInTx(
       !!existing && t.expiresDate <= t.revocationDate && existing.expires_at.getTime() > t.expiresDate;
     if (!refundsEarlierPeriod) revoked ??= new Date(t.revocationDate);
   } else if (revoked) {
-    const reinstated = ctx.reinstatedAt != null && ctx.reinstatedAt > revoked.getTime();
+    // A reversal lifts the revocation only if it is for the revoked period: the reversed transaction was running when
+    // the revocation happened, or it is the latest period. Reversing an earlier month's refund must not undo a later
+    // month's refund (one revoked_at per subscription, so the period is told apart by its dates).
+    const revokedMs = revoked.getTime();
+    const sameRevokedPeriod =
+      ((t.purchaseDate ?? Number.NEGATIVE_INFINITY) <= revokedMs && revokedMs < t.expiresDate) ||
+      (!!existing && t.expiresDate >= existing.expires_at.getTime());
+    const reinstated = ctx.reinstatedAt != null && ctx.reinstatedAt > revokedMs && sameRevokedPeriod;
     const newPeriod = t.purchaseDate != null && t.purchaseDate > revoked.getTime();
     if (reinstated || newPeriod) revoked = null;
   }
