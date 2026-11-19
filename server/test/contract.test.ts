@@ -61,6 +61,10 @@ const Profile = z.strictObject({
   isFavorite: z.boolean(),
 });
 
+// struct Profile, own copy (GET/PATCH /me): `var travel: TravelStatus?` (struct TravelStatus { var isActive: Bool }).
+// Other people's profiles never carry `travel` (Profile is strict above).
+const OwnProfile = Profile.extend({ travel: swiftOptional(z.strictObject({ isActive: z.boolean() })) });
+
 // struct Message.Attachment { var kind: Kind; var url: URL?; var isViewOnce: Bool = false; var isEncrypted: Bool = false }
 // (isEncrypted is decoded with decodeIfPresent, so older servers and the mock may omit it; this server always sends it.)
 const Attachment = z.strictObject({
@@ -241,7 +245,7 @@ describe("contract: REST responses match the Swift models", () => {
       await api.patch("/v1/me", {
         json: { displayName: "Contract", age: 33, heightCm: 178, position: "versBottom", lookingFor: ["chat", "rightNow"], tags: ["Books"] },
       }),
-      Profile,
+      OwnProfile,
       "Profile(PATCH /me)",
     );
     expect(updated.pronouns).toBeNull();
@@ -251,7 +255,8 @@ describe("contract: REST responses match the Swift models", () => {
     const p2 = await body(await api.post("/v1/me/photos", { body: await makeJpeg(), contentType: "image/jpeg" }), Photo, "Photo", 201);
     const order = await body(await api.put("/v1/me/photos/order", { json: { photoIDs: [p2.id, p1.id] } }), z.array(Photo), "[Photo]");
     expect(order.map((p) => p.id)).toEqual([p2.id, p1.id]);
-    const full = await body(await api.get("/v1/me"), Profile, "Profile(GET /me)");
+    const full = await body(await api.get("/v1/me"), OwnProfile, "Profile(GET /me)");
+    expect(full.travel).toBeNull();
     expect(full.photos).toHaveLength(2);
     expect(full.lastActiveAt).toBeString();
 
@@ -401,6 +406,6 @@ describe("contract: realtime frames match RealtimeEvent", () => {
 test("contract: database timestamps are serialized without fractions even when stored with them", async () => {
   const u = await createUser({ lastActiveAt: new Date(Date.UTC(2026, 10, 17, 20, 30, 0, 987)) });
   await sql`UPDATE users SET show_online_status = true WHERE id = ${u.id}`;
-  const me = await body(await as(u).get("/v1/me"), Profile, "Profile");
+  const me = await body(await as(u).get("/v1/me"), OwnProfile, "Profile");
   expect(me.lastActiveAt).toMatch(ISO_DATE);
 });

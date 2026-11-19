@@ -30,6 +30,14 @@ Done; see [`security.md`](security.md) for how each works and how to turn it on 
 - Stexx+ adds a small natural deterrent, since spammers rarely pay, but it is not a control on its own.
 - Every measure must respect the privacy rules in the README: no real names, no phone numbers, no exact location, and minimal retained data.
 
+## Operations
+
+Self-hosted on one VPS, so the server has to watch itself. See [`server/deploy/README.md`](../server/deploy/README.md).
+
+- [x] **Restorable backups.** Nightly backups leave out credentials and short-lived state, so a restore never brings back live sessions, and reports are backed up without their free text. A full encrypted snapshot is taken before every migration and kept on the server for 24 hours. `restore-drill.sh` restores the latest backup into a scratch database and checks it, and the README has a disaster-recovery runbook.
+- [x] **Alerts.** A watchdog checks backup age, health (local and through Cloudflare), disk space, origin certificate expiry and API error lines every 5 minutes, and failed units alert too. Alerts go by email or webhook (a self-hosted ntfy works) and carry check names only. Off until a destination is configured.
+- [ ] **Cloudflare range refresh.** A timer that re-runs `ufw-cloudflare.sh --apply` and regenerates Caddy's `trusted_proxies` from the same list, validating before reload. Today both are refreshed by hand.
+
 ## End-to-end encrypted chat
 
 Chat text and chat photos are end-to-end encrypted with the Signal Protocol, using Signal's official [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0, the same license as Stexx). The server relays ciphertext it can't read.
@@ -52,3 +60,23 @@ Chat text and chat photos are end-to-end encrypted with the Signal Protocol, usi
 - **Server-side limits use metadata only:** rate limits, new-account message caps, and the spam heuristics' fan-out, burst and blocked-after-first-contact rules, which shadow-limit an account the same way whether its chats are encrypted or not. None of them need message content.
 - **Reports carry evidence.** When someone reports a chat, their app decrypts and attaches the reported messages and photos, so moderators see only what the reporter chooses to share.
 - **Trade-off:** the server can't detect identical spam text across many chats. We accept this and rely on metadata and reports rather than sending content hashes.
+
+## Engineering and CI
+
+- [x] **Server CI.** Every pull request and push to `main` lints the migrations, typechecks, migrates a fresh Postgres 18 and runs the server tests ([`server/README.md`](../server/README.md#ci)). Schema guards fail the tests when a new table keeps an account's data after `DELETE /me` (a foreign key to `users` without `ON DELETE CASCADE`, unless allowlisted with a reason).
+- [x] **Advisory checks.** shellcheck on the deploy scripts, `caddy validate` on both Caddyfiles, and a guard that fails while the iOS Release configuration still uses the mock API. They report without failing the run.
+- [ ] **Owner decisions.** Make the server job a required check with branch protection on `main`. Make the Release-config guard blocking once Release talks to the real API. Decide whether the iOS build (manual only today, on a macOS runner) should run on pull requests.
+
+## Launch readiness
+
+What stands between the app and the App Store. Details, answers and owner decisions: [`app-store.md`](app-store.md).
+
+- [x] **Privacy manifest.** `PrivacyInfo.xcprivacy` declares every data type the app collects (all linked to the account, none used for tracking) and the required-reason APIs, including libsignal's `fstat`.
+- [x] **Launch checklist.** App Privacy label answers, age rating, review notes, subscription metadata, TestFlight steps ([`app-store.md`](app-store.md)).
+- [ ] **Legal pages.** Drafts of the Terms, Privacy Policy and Community Guidelines are in [`legal/`](legal/); they still need a lawyer's review, the owner's details, and hosting at `stexx.gay/{terms,privacy,guidelines}`.
+- [ ] **Export compliance.** `ITSAppUsesNonExemptEncryption` is still `false`; owner decision on the mass-market / publicly-available path and France.
+- [ ] **Real backend in Release.** `STEXX_USE_MOCK_API` to `NO` once the API is live; production App Attest and DeviceCheck keys on the server.
+- [ ] **Passkeys on device.** Associated Domains and the `apple-app-site-association` file on `stexx.gay`.
+- [ ] **Sandbox purchases on the production server**, so TestFlight and App Review can buy Stexx+.
+- [ ] **Demo access for App Review** (a review sign-in, labelled team accounts, a screen recording).
+- [ ] **Owner actions:** organization developer account, Sensitive Content Analysis entitlement, Declared Age Range, support contact, final price.

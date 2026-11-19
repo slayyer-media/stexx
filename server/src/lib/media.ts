@@ -1,11 +1,12 @@
-import { mkdir, unlink, copyFile, rename } from "node:fs/promises";
+import { mkdir, unlink, copyFile, readdir, rename, stat, statfs } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import sharp from "sharp";
 import { config } from "../config.ts";
 import { sql } from "../db/sql.ts";
-import { ApiError, badRequest } from "./errors.ts";
+import { ApiError, badRequest, storageUnavailable } from "./errors.ts";
 import { randomBytes } from "node:crypto";
-import { logError } from "./logger.ts";
+import { logError, logInfo } from "./logger.ts";
+import { HOUR, MINUTE, SECOND } from "./time.ts";
 
 /**
  * Media storage: flat directory MEDIA_DIR of `<32 hex>.jpg` files (sanitized JPEGs) and `<32 hex>.bin` files
@@ -65,8 +66,196 @@ export function mediaPath(key: string): string {
 
 let dirReady: Promise<unknown> | null = null;
 function ensureDir() {
-  dirReady ??= mkdir(resolve(config.mediaDir), { recursive: true, mode: 0o755 });
+  dirReady ??= mkdir(resolve(config.mediaDir), { recursive: true, mode: 0o755 }).catch((err) => {
+    dirReady = null; // retry on the next write instead of failing forever
+    throw err;
+  });
   return dirReady;
+}
+
+// ---------------------------------------------------------------------------
+// File I/O seam and disk space
+// ---------------------------------------------------------------------------
+
+interface StatFsLike {
+  bsize: number;
+  blocks: number;
+  bavail: number;
+}
+
+/** The filesystem calls media writes go through, so tests can inject failures (ENOSPC, a crash mid-write). */
+interface MediaIo {
+  write(path: string, bytes: Uint8Array): Promise<unknown>;
+  copy(src: string, dest: string): Promise<void>;
+  statfs(dir: string): Promise<StatFsLike>;
+}
+
+const realIo: MediaIo = {
+  write: (path, bytes) => Bun.write(path, bytes),
+  copy: (src, dest) => copyFile(src, dest),
+  statfs: (dir) => statfs(dir),
+};
+let io: MediaIo = realIo;
+
+/** Tests: replace some media filesystem calls (`null` restores the real ones). Also clears the disk-space cache. */
+export function setMediaIoForTests(overrides: Partial<MediaIo> | null): void {
+  io = overrides ? { ...realIo, ...overrides } : realIo;
+  diskCache = null;
+}
+
+/** How long one free-space reading is reused by writes. */
+export const DISK_CHECK_TTL_MS = 10 * SECOND;
+/** sweepStaleTempFiles logs `disk.low` below this share of free space. */
+export const DISK_LOW_WARN_PERCENT = 15;
+/** A `.tmp` file older than this is left over from a crashed or failed write. */
+export const STALE_TMP_MAX_AGE_MS = 1 * HOUR;
+/** How often the jobs sweep stale temp files (and check for a low disk). */
+export const MEDIA_TMP_INTERVAL_MS = 10 * MINUTE;
+
+const MB = 1024 * 1024;
+let minFree = { ...config.mediaMinFree };
+
+/** Tests: override the free-space floor (`null` restores the configured one). */
+export function setMediaMinFreeForTests(value: { percent?: number; mb?: number } | null): void {
+  minFree = value ? { ...config.mediaMinFree, ...value } : { ...config.mediaMinFree };
+  diskCache = null;
+}
+
+export interface DiskSpace {
+  freeBytes: number;
+  /** 0..100, space available to the service user (statfs `bavail`). */
+  freePercent: number;
+}
+
+function diskSpaceOf(s: StatFsLike): DiskSpace | null {
+  if (!(s.blocks > 0) || !(s.bsize > 0)) return null;
+  return { freeBytes: s.bavail * s.bsize, freePercent: (s.bavail / s.blocks) * 100 };
+}
+
+const round1 = (n: number) => Math.round(n * 10) / 10;
+
+let diskCache: { at: number; value: Promise<DiskSpace | null> } | null = null;
+let lastRefusalLog = 0;
+
+/**
+ * Free space on the media disk, read with one `statfs` at most every DISK_CHECK_TTL_MS. null when it can't be
+ * read (logged); writes then go ahead and a real ENOSPC still becomes a 503.
+ */
+export function mediaDiskSpace(now: number = Date.now()): Promise<DiskSpace | null> {
+  if (diskCache && now >= diskCache.at && now - diskCache.at < DISK_CHECK_TTL_MS) return diskCache.value;
+  const value = (async () => {
+    try {
+      await ensureDir();
+      return diskSpaceOf(await io.statfs(resolve(config.mediaDir)));
+    } catch (err) {
+      logError("disk.check", err);
+      return null;
+    }
+  })();
+  diskCache = { at: now, value };
+  return value;
+}
+
+/** Fail closed before writing: 503 `storage_unavailable` below MEDIA_MIN_FREE_PERCENT or MEDIA_MIN_FREE_MB. */
+export async function assertMediaSpace(now: number = Date.now()): Promise<void> {
+  const space = await mediaDiskSpace(now);
+  if (!space) return;
+  if (space.freePercent >= minFree.percent && space.freeBytes >= minFree.mb * MB) return;
+  if (now - lastRefusalLog >= MINUTE || now < lastRefusalLog) {
+    lastRefusalLog = now;
+    logInfo("disk.refused", { freePercent: round1(space.freePercent), freeMb: Math.floor(space.freeBytes / MB) });
+  }
+  throw storageUnavailable();
+}
+
+/** ENOSPC (disk full) or EDQUOT (quota exceeded), from Node, Bun or libuv. */
+export function isOutOfSpace(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === "ENOSPC" || code === "EDQUOT") return true;
+  return err instanceof Error && /\b(ENOSPC|EDQUOT)\b/.test(err.message);
+}
+
+/** Map a failed media write: out of space → 503 `storage_unavailable` (logged); anything else unchanged. */
+function storageError(err: unknown): unknown {
+  if (!isOutOfSpace(err)) return err;
+  logError("media.no_space", err);
+  diskCache = null; // re-read on the next write
+  return storageUnavailable();
+}
+
+/** Remove a temp file left by a failed write. Never throws (it runs while another error is propagating). */
+async function removeQuietly(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") logError("media.tmp_cleanup", err);
+  }
+}
+
+/**
+ * Create a new file under a fresh random key: `produce` fills `<key>.<hex>.tmp`, which is then renamed into place
+ * (atomic, so a reader never sees a partial file). On any failure the temp file is removed; out-of-space errors
+ * become 503 `storage_unavailable`. The free-space floor is checked first.
+ */
+async function writeNewFile(ext: MediaExt, produce: (tmp: string) => Promise<unknown>): Promise<string> {
+  const key = newStorageKey(ext);
+  const final = mediaPath(key);
+  const tmp = `${final}.${randomBytes(4).toString("hex")}.tmp`;
+  let stored = false;
+  try {
+    await ensureDir();
+    await assertMediaSpace();
+    await produce(tmp);
+    await rename(tmp, final);
+    stored = true;
+    return key;
+  } catch (err) {
+    throw storageError(err);
+  } finally {
+    if (!stored) await removeQuietly(tmp);
+  }
+}
+
+/**
+ * Jobs: unlink `*.tmp` files in the media directory older than STALE_TMP_MAX_AGE_MS (left by a crash, SIGKILL or a
+ * full disk mid-write; the orphan sweep only looks at valid keys). Never touches a storage key. Also logs
+ * `disk.low` with the free share when it is under DISK_LOW_WARN_PERCENT. Returns the number of files removed.
+ */
+export async function sweepStaleTempFiles(
+  now: Date = new Date(),
+  opts: { dir?: string; maxAgeMs?: number } = {},
+): Promise<number> {
+  const dir = opts.dir ?? config.mediaDir;
+  const maxAge = opts.maxAgeMs ?? STALE_TMP_MAX_AGE_MS;
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw err;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.endsWith(".tmp") || isStorageKey(name)) continue;
+    const path = join(dir, name);
+    try {
+      const s = await stat(path);
+      if (!s.isFile() || now.getTime() - s.mtimeMs < maxAge) continue;
+      await unlink(path);
+      removed++;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+  try {
+    const space = diskSpaceOf(await io.statfs(resolve(dir)));
+    if (space && space.freePercent < DISK_LOW_WARN_PERCENT) {
+      logInfo("disk.low", { freePercent: round1(space.freePercent), freeMb: Math.floor(space.freeBytes / MB) });
+    }
+  } catch (err) {
+    logError("disk.check", err);
+  }
+  return removed;
 }
 
 let activeDecodes = 0;
@@ -131,15 +320,12 @@ async function decodeAndReencode(input: Uint8Array): Promise<Buffer> {
   }
 }
 
-/** Write bytes under a new random key (temp file + atomic rename, so a reader never sees a partial file). */
+/**
+ * Write bytes under a new random key (temp file + atomic rename, so a reader never sees a partial file). A failed
+ * write leaves nothing behind; a full disk is 503 `storage_unavailable`.
+ */
 async function storeFile(bytes: Uint8Array, ext: MediaExt): Promise<string> {
-  await ensureDir();
-  const key = newStorageKey(ext);
-  const final = mediaPath(key);
-  const tmp = `${final}.${randomBytes(4).toString("hex")}.tmp`;
-  await Bun.write(tmp, bytes);
-  await rename(tmp, final);
-  return key;
+  return writeNewFile(ext, (tmp) => io.write(tmp, bytes));
 }
 
 /** Write already-sanitized JPEG bytes under a new random `.jpg` key. Returns the key. */
@@ -160,12 +346,14 @@ export async function storeImage(input: Uint8Array): Promise<string> {
   return storeJpeg(await sanitizeImage(input));
 }
 
-/** Copy a stored file to a NEW random key of the same kind (message attachments get their own file). */
+/**
+ * Copy a stored file to a NEW random key of the same kind (message attachments get their own file). Same
+ * guarantees as a store: temp file + rename, nothing left behind on failure, full disk → 503. A missing source
+ * still throws ENOENT (the chat route turns it into 404).
+ */
 export async function copyMedia(key: string): Promise<string> {
-  await ensureDir();
-  const dest = newStorageKey(isEncryptedKey(key) ? "bin" : "jpg");
-  await copyFile(mediaPath(key), mediaPath(dest));
-  return dest;
+  const src = mediaPath(key);
+  return writeNewFile(isEncryptedKey(key) ? "bin" : "jpg", (tmp) => io.copy(src, tmp));
 }
 
 /** Delete a file; missing files are fine. */

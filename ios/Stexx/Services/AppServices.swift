@@ -34,6 +34,11 @@ final class AppServices {
         self.location = location
         self.realtime = realtime
         self.e2e = e2e
+        // Stexx+ looked expired on this device (clock or `GET /me`): ask the
+        // server, which turns it back on after a renewal.
+        appState.recheckEntitlement = { [weak purchases] in
+            Task { await purchases?.refreshEntitlement() }
+        }
         if let realtime {
             // One consumer, so events are decrypted and applied in the order
             // they arrived (a ratchet message decrypts only once, and a
