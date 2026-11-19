@@ -7,9 +7,17 @@
  *
  *   bun scripts/e2e-peer.ts --server http://127.0.0.1:8791 --state /tmp/peer.json init --name Rowan
  *   bun scripts/e2e-peer.ts --state /tmp/peer.json send --to <profileID> --text "Museum this weekend?"
- *   bun scripts/e2e-peer.ts --state /tmp/peer.json read --with <profileID>
+ *   bun scripts/e2e-peer.ts --state /tmp/peer.json send --to <profileID> --photo cat.jpg [--text "caption"] \
+ *       [--expires <seconds>] [--view-once]          # encrypted photo (format v1, docs/api.md), needs E2E_MODE != off
+ *   bun scripts/e2e-peer.ts --state /tmp/peer.json read --with <profileID> [--save-dir /tmp/photos]
  *   bun scripts/e2e-peer.ts --state /tmp/peer.json reinstall        # new identity key → identity.changed
  *   bun scripts/e2e-peer.ts --state /tmp/peer.json session          # prints the session JSON
+ *
+ * The server URL is chosen once, by `init --server <url>` (any local port, e.g. a branch server started with
+ * `PORT=8791`); it's saved in the --state file and used by every later command. Use one state file per peer.
+ * `read` prints `photo: ok <n> bytes` / `photo: tampered` / `photo: gone` for photo messages; `--save-dir` also writes
+ * `<messageID>.jpg`. Photo keys are kept in the state file (a Signal message can only be decrypted once) so a later
+ * `read` can retry a photo that wasn't downloadable yet.
  *
  * `init --no-keys` creates an account without keys (a "not upgraded yet" chat partner). State (session, private
  * keys, sessions) lives in the --state file, readable only by you; delete it when done.
@@ -42,7 +50,9 @@ import {
   signalDecryptPreKey,
   signalEncrypt,
 } from "@signalapp/libsignal-client";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { AttachmentCryptoError, decryptAttachment, encryptAttachment, type AttachmentPointer } from "./e2e-media-crypto";
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 
@@ -55,6 +65,11 @@ const { values: opts, positionals } = parseArgs({
     to: { type: "string" },
     with: { type: "string" },
     text: { type: "string" },
+    photo: { type: "string" },
+    expires: { type: "string" },
+    "view-once": { type: "boolean", default: false },
+    "save-dir": { type: "string" },
+    help: { type: "boolean", default: false },
     "no-keys": { type: "boolean", default: false },
   },
 });
@@ -67,6 +82,34 @@ interface State {
   registrationID?: number;
   records: Record<string, string>; // key → base64
   seen: string[];
+  /** Photo pointers of received messages (message ID → pointer), so `read` can retry a download. */
+  photos?: Record<string, AttachmentPointer>;
+}
+
+const USAGE = `DEV ONLY: scriptable end-to-end encryption chat partner (local dev servers only).
+
+  bun scripts/e2e-peer.ts --server <http://127.0.0.1:PORT> [--state <file>] init [--name <n>] [--no-keys]
+  bun scripts/e2e-peer.ts --state <file> send --to <id> [--text <t>]
+  bun scripts/e2e-peer.ts --state <file> send --to <id> --photo <file.jpg> [--text <caption>] [--expires <sec>] [--view-once]
+  bun scripts/e2e-peer.ts --state <file> plain --to <id> --text <t>
+  bun scripts/e2e-peer.ts --state <file> read --with <id> [--save-dir <dir>]
+  bun scripts/e2e-peer.ts --state <file> reinstall | session
+
+The server URL is set by \`init --server\` (e.g. http://127.0.0.1:8791) and stored in the state file
+(default /tmp/stexx-e2e-peer.json); other commands don't take --server.`;
+
+/** Width/height from a JPEG's SOF marker (layout hint only); undefined if it can't be read. */
+function jpegSize(b: Uint8Array): { width: number; height: number } | undefined {
+  let i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] !== 0xff) return undefined;
+    const marker = b[i + 1]!;
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      return { height: (b[i + 5]! << 8) | b[i + 6]!, width: (b[i + 7]! << 8) | b[i + 8]! };
+    }
+    i += 2 + ((b[i + 2]! << 8) | b[i + 3]!);
+  }
+  return undefined;
 }
 
 const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64");
@@ -114,6 +157,40 @@ async function api(state: State, method: string, path: string, body?: unknown, r
   const text = await res.text();
   if (!res.ok) throw new Error(`${method} ${path} → ${res.status} ${text}`);
   return text ? JSON.parse(text) : null;
+}
+
+/** POST an opaque encrypted blob to /me/attachments (same dev-bypass attestation as `api`). */
+async function uploadBlob(state: State, blob: Uint8Array, retry = true): Promise<{ id: string }> {
+  const res = await fetch(`${state.server}/v1/me/attachments`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      Authorization: `Bearer ${state.session.accessToken}`,
+      "X-Stexx-Attestation": "dev-bypass",
+    },
+    body: blob,
+  });
+  if (res.status === 401 && retry) {
+    await api(state, "GET", "me"); // refreshes the session on 401
+    return uploadBlob(state, blob, false);
+  }
+  const text = await res.text();
+  if (!res.ok) throw new Error(`POST me/attachments → ${res.status} ${text}`);
+  return JSON.parse(text);
+}
+
+/** Download, verify and decrypt a photo; "gone" for 404 / a spent or expired photo. */
+async function fetchPhoto(url: string | null | undefined, pointer: AttachmentPointer): Promise<Buffer | "gone" | "tampered"> {
+  if (!url) return "gone";
+  const res = await fetch(url);
+  if (res.status === 404) return "gone";
+  if (!res.ok) throw new Error(`GET ${url} → ${res.status}`);
+  try {
+    return decryptAttachment(new Uint8Array(await res.arrayBuffer()), pointer);
+  } catch (e) {
+    if (e instanceof AttachmentCryptoError) return "tampered";
+    throw e;
+  }
 }
 
 /** All libsignal stores over `state.records`, persisted by `save`. */
@@ -201,6 +278,10 @@ async function conversationWith(state: State, other: string): Promise<string> {
 }
 
 async function main() {
+  if (opts.help || !command) {
+    console.log(USAGE);
+    process.exit(opts.help ? 0 : 1);
+  }
   if (command === "init") {
     if (!opts.server) throw new Error("--server is required for init");
     assertLocal(opts.server);
@@ -242,15 +323,38 @@ async function main() {
         );
         await processPreKeyBundle(bundle, address(to), me, stores, stores);
       }
-      const payload = new TextEncoder().encode(JSON.stringify({ text: opts.text }));
+      let attachment: AttachmentPointer | undefined;
+      let photoID: string | undefined;
+      if (opts.photo) {
+        const jpeg = readFileSync(opts.photo);
+        const enc = encryptAttachment(jpeg, jpegSize(jpeg));
+        attachment = enc.pointer;
+        photoID = (await uploadBlob(state, enc.blob)).id;
+      } else if (opts.text === undefined) {
+        throw new Error("send needs --text or --photo");
+      }
+      // Photos with a timer also carry it in the payload (integer seconds, 1...2592000), the recipient's key deadline.
+      // The server never learns it from the envelope; older builds ignore the unknown field.
+      const timer = photoID && opts.expires ? Number(opts.expires) : undefined;
+      if (timer !== undefined && !(Number.isInteger(timer) && timer >= 1 && timer <= 2_592_000)) {
+        throw new Error("--expires must be an integer from 1 to 2592000");
+      }
+      const payload = new TextEncoder().encode(
+        JSON.stringify({ text: opts.text, attachment, ...(timer !== undefined && { expiresAfterSeconds: timer }) }),
+      );
       const ct: CiphertextMessage = await signalEncrypt(payload, address(to), me, stores, stores);
       const type = ct.type() === CiphertextMessageType.PreKey ? "prekey" : "signal";
       const msg = await api(state, "POST", `conversations/${conv}/messages`, {
         clientID: randomUUID(),
         envelope: { type, body: b64(ct.serialize()) },
+        ...(photoID && {
+          attachmentPhotoID: photoID,
+          isViewOnce: opts["view-once"],
+          ...(timer !== undefined && { expiresAfterSeconds: timer }),
+        }),
       });
       save(state);
-      console.log(`sent ${msg.id} (${type})`);
+      console.log(`sent ${msg.id} (${type}${photoID ? ", photo" : ""})`);
       return;
     }
     case "plain": {
@@ -269,14 +373,35 @@ async function main() {
           console.log(`${who} [plaintext] ${m.text ?? "(photo)"}`);
           continue;
         }
-        if (who === "me" || state.seen.includes(m.id)) continue;
-        const body = unb64(m.envelope.body);
-        const plain =
-          m.envelope.type === "prekey"
-            ? await signalDecryptPreKey(PreKeySignalMessage.deserialize(body), address(other), me, stores, stores, stores, stores, stores)
-            : await signalDecrypt(SignalMessage.deserialize(body), address(other), me, stores, stores);
-        state.seen.push(m.id);
-        console.log(`${who} [${m.envelope.type}] ${JSON.parse(new TextDecoder().decode(plain)).text}`);
+        if (who === "me") continue;
+        let payload: { text?: string; attachment?: AttachmentPointer; expiresAfterSeconds?: number } | undefined;
+        if (!state.seen.includes(m.id)) {
+          const body = unb64(m.envelope.body);
+          const plain =
+            m.envelope.type === "prekey"
+              ? await signalDecryptPreKey(PreKeySignalMessage.deserialize(body), address(other), me, stores, stores, stores, stores, stores)
+              : await signalDecrypt(SignalMessage.deserialize(body), address(other), me, stores, stores);
+          state.seen.push(m.id);
+          payload = JSON.parse(new TextDecoder().decode(plain));
+          if (payload?.attachment) (state.photos ??= {})[m.id] = payload.attachment;
+          save(state); // a message decrypts once; persist before anything else can fail
+          const t = payload?.expiresAfterSeconds;
+          const timerNote = typeof t === "number" && Number.isInteger(t) && t >= 1 && t <= 2_592_000 ? ` (timer ${t}s)` : "";
+          console.log(`${who} [${m.envelope.type}] ${payload?.text ?? "(no text)"}${timerNote}`);
+        }
+        const pointer = state.photos?.[m.id];
+        if (pointer && m.attachment) {
+          const photo = await fetchPhoto(m.attachment.url, pointer);
+          if (photo === "gone" || photo === "tampered") {
+            console.log(`  photo: ${photo}`);
+          } else {
+            console.log(`  photo: ok ${photo.length} bytes${m.attachment.isViewOnce ? " (view once)" : ""}`);
+            if (opts["save-dir"]) {
+              mkdirSync(opts["save-dir"], { recursive: true });
+              writeFileSync(join(opts["save-dir"], `${m.id}.jpg`), photo);
+            }
+          }
+        }
       }
       save(state);
       return;

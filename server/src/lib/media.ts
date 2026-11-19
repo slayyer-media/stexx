@@ -8,9 +8,11 @@ import { randomBytes } from "node:crypto";
 import { logError } from "./logger.ts";
 
 /**
- * Media storage: flat directory MEDIA_DIR of `<32 hex>.jpg` files (128-bit random names), served
- * read-only by Caddy (prod) or the dev /media route. Rows reference files by `storage_key`.
- * Deleting a photos/messages row queues its file in media_trash (DB trigger); drainMediaTrash() unlinks.
+ * Media storage: flat directory MEDIA_DIR of `<32 hex>.jpg` files (sanitized JPEGs) and `<32 hex>.bin` files
+ * (end-to-end encrypted chat photos: opaque blobs the server can't read), 128-bit random names, served read-only by
+ * Caddy (prod) or the dev /media route. Rows reference files by `storage_key`.
+ * Deleting a photos/messages/attachment_uploads/report_evidence row queues its file in media_trash (DB trigger);
+ * drainMediaTrash() unlinks.
  */
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -26,14 +28,27 @@ export const MAX_QUEUED_DECODES = 16;
 export const MAX_DIMENSION = 2048;
 export const ACCEPTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"] as const;
 
-const KEY_RE = /^[0-9a-f]{32}\.jpg$/;
+/**
+ * Smallest encrypted blob: a 12-byte nonce, at least one byte of ciphertext and a 16-byte tag (AES-256-GCM, see
+ * docs/api.md "Encrypted photos"). The app pads every photo to at least 541 bytes, so real blobs are far larger.
+ */
+export const MIN_ENCRYPTED_BYTES = 29;
+
+const KEY_RE = /^[0-9a-f]{32}\.(jpg|bin)$/;
+
+/** `jpg`: a sanitized JPEG. `bin`: an end-to-end encrypted blob, stored and served verbatim. */
+export type MediaExt = "jpg" | "bin";
 
 export function isStorageKey(key: string): boolean {
   return KEY_RE.test(key);
 }
 
-export function newStorageKey(): string {
-  return `${randomBytes(16).toString("hex")}.jpg`;
+export function isEncryptedKey(key: string): boolean {
+  return isStorageKey(key) && key.endsWith(".bin");
+}
+
+export function newStorageKey(ext: MediaExt = "jpg"): string {
+  return `${randomBytes(16).toString("hex")}.${ext}`;
 }
 
 /** Absolute public URL for a storage key: `${MEDIA_BASE_URL}/${key}`. */
@@ -116,15 +131,28 @@ async function decodeAndReencode(input: Uint8Array): Promise<Buffer> {
   }
 }
 
-/** Write already-sanitized JPEG bytes under a new random key (atomic rename). Returns the key. */
-export async function storeJpeg(jpeg: Uint8Array): Promise<string> {
+/** Write bytes under a new random key (temp file + atomic rename, so a reader never sees a partial file). */
+async function storeFile(bytes: Uint8Array, ext: MediaExt): Promise<string> {
   await ensureDir();
-  const key = newStorageKey();
+  const key = newStorageKey(ext);
   const final = mediaPath(key);
   const tmp = `${final}.${randomBytes(4).toString("hex")}.tmp`;
-  await Bun.write(tmp, jpeg);
+  await Bun.write(tmp, bytes);
   await rename(tmp, final);
   return key;
+}
+
+/** Write already-sanitized JPEG bytes under a new random `.jpg` key. Returns the key. */
+export async function storeJpeg(jpeg: Uint8Array): Promise<string> {
+  return storeFile(jpeg, "jpg");
+}
+
+/**
+ * Write an end-to-end encrypted blob verbatim under a new random `.bin` key. Never decoded, hashed or classified:
+ * the server can't read it, and the receiving app checks it against the digest in the Signal envelope.
+ */
+export async function storeBlob(blob: Uint8Array): Promise<string> {
+  return storeFile(blob, "bin");
 }
 
 /** sanitizeImage + storeJpeg. */
@@ -132,10 +160,10 @@ export async function storeImage(input: Uint8Array): Promise<string> {
   return storeJpeg(await sanitizeImage(input));
 }
 
-/** Copy a stored file to a NEW random key (message attachments get their own file). */
+/** Copy a stored file to a NEW random key of the same kind (message attachments get their own file). */
 export async function copyMedia(key: string): Promise<string> {
   await ensureDir();
-  const dest = newStorageKey();
+  const dest = newStorageKey(isEncryptedKey(key) ? "bin" : "jpg");
   await copyFile(mediaPath(key), mediaPath(dest));
   return dest;
 }

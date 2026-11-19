@@ -21,8 +21,11 @@ import type { AppEnv } from "../types.ts";
  *    not be observable. PUT is an idempotent upsert; DELETE is an idempotent no-op when nothing matches.
  *  - POST /reports works even when the reported user has blocked the reporter (same reason).
  *  - POST /reports may carry `evidence`: messages the reporter chose to share, as plaintext from their app (so it
- *    keeps working with end-to-end encrypted chats). Each report re-runs the auto-hide rules (lib/moderation.ts) in the
- *    same transaction. The response never reveals whether the account was hidden.
+ *    keeps working with end-to-end encrypted chats). An item's `photoID` is one of the reporter's own pending
+ *    plaintext uploads (the app decrypts the ticked photo and uploads it again); the report consumes it and the file
+ *    then belongs to the evidence row. So moderators only ever see photos a reporter chose to share. Each report
+ *    re-runs the auto-hide rules (lib/moderation.ts) in the same transaction. The response never reveals whether the
+ *    account was hidden.
  */
 export const safetyRoutes = new Hono<AppEnv>();
 
@@ -72,9 +75,16 @@ const evidenceItemSchema = z
     /** Sent by the reported person (true) or by the reporter (false). */
     fromReported: z.boolean(),
     text: multilineText(4000).nullish(),
-    hasPhoto: z.boolean().optional().default(false),
+    /** Omitted = false, or true when `photoID` is given. */
+    hasPhoto: z.boolean().optional(),
+    /** One of the reporter's own pending plaintext uploads (POST /me/attachments with an image body). */
+    photoID: z.string().max(64).nullish(),
   })
-  .refine((e) => (e.text != null && e.text !== "") || e.hasPhoto, "each evidence item needs text or hasPhoto");
+  .refine(
+    (e) => (e.text != null && e.text !== "") || e.hasPhoto === true || e.photoID != null,
+    "each evidence item needs text or hasPhoto",
+  )
+  .refine((e) => !(e.photoID != null && e.hasPhoto === false), "photoID needs hasPhoto: true");
 
 export const MAX_EVIDENCE_ITEMS = 20;
 
@@ -110,6 +120,10 @@ safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
   if (evidence.length > 0 && body.conversationID == null) {
     throw badRequest("evidence: messages can only be attached to a report from a chat (conversationID).");
   }
+  const photoIds = evidence.map((e) => e.photoID).filter((id): id is string => id != null);
+  if (new Set(photoIds).size !== photoIds.length) throw badRequest("evidence: each photoID can be attached only once.");
+  // A malformed id can't be one of the reporter's uploads.
+  if (!photoIds.every((id) => isId("photo", id))) throw notFound();
   // Keyed hash of the reporter's connection (never the address): lets auto-hide tell reports from one connection
   // apart. IPv4: the address; IPv6: its /64, since one device rotates privacy addresses inside it.
   const ipHash = abuseKeyHash(connectionOf(clientIp(c)));
@@ -126,6 +140,20 @@ safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
       if (!conv) throw notFound();
       conversationId = conv.id;
     }
+
+    // Evidence photos, checked before anything is written: each must be one of the reporter's own pending PLAINTEXT
+    // uploads (an encrypted blob would be useless to a moderator, and nobody else's upload may be attached). Locked
+    // so a concurrent send can't consume it underneath us.
+    const photoKeys = new Map<string, string>();
+    if (photoIds.length > 0) {
+      const uploads = await tx<{ id: string; storage_key: string }[]>`
+        SELECT id, storage_key FROM attachment_uploads
+         WHERE id = ANY(${photoIds}) AND owner_id = ${me} AND NOT encrypted
+         FOR UPDATE`;
+      if (uploads.length !== photoIds.length) throw notFound();
+      for (const u of uploads) photoKeys.set(u.id, u.storage_key);
+    }
+
     const reportId = newId("report");
     await tx`
       INSERT INTO reports (id, reporter_id, reported_id, reason, details, conversation_id, priority, reporter_ip_hash)
@@ -150,10 +178,18 @@ safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
           from_reported: e.fromReported,
           sent_at: verified ? match.sent_at : e.sentAt ? new Date(e.sentAt) : null,
           text: e.text ? e.text : null,
-          has_photo: e.hasPhoto,
+          has_photo: e.photoID != null || e.hasPhoto === true,
+          photo_key: e.photoID != null ? photoKeys.get(e.photoID)! : null,
           verified,
         };
       });
+      if (photoKeys.size > 0) {
+        // Consume the uploads: the files now belong to the evidence rows. The delete trigger queued them for
+        // unlinking; take them back off the queue in the same transaction (as a photo message send does).
+        const keys = [...photoKeys.values()];
+        await tx`DELETE FROM attachment_uploads WHERE id = ANY(${[...photoKeys.keys()]}) AND owner_id = ${me}`;
+        await tx`DELETE FROM media_trash WHERE storage_key = ANY(${keys})`;
+      }
       await tx`INSERT INTO report_evidence ${tx(rows)}`;
     }
 

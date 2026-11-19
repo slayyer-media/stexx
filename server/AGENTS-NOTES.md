@@ -181,6 +181,27 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `MAX_UPLOAD_BYTES` (10 MB), `ACCEPTED_IMAGE_TYPES`. HEIC: prebuilt sharp lacks HEVC decode, so HEIC → 400.
 - DB triggers queue files into `media_trash` on photo/message delete and when `messages.attachment_key` changes
   (set it to NULL to consume a view-once attachment).
+- Two kinds of file: `<32 hex>.jpg` (sanitized) and `<32 hex>.bin` (end-to-end encrypted chat photo, opaque).
+  `isStorageKey` accepts both; `newStorageKey(ext)`, `storeBlob(bytes) → key` (`.bin`, verbatim), `isEncryptedKey`,
+  `MIN_ENCRYPTED_BYTES` (29). `copyMedia` keeps the extension. **Never decode, hash, classify or re-encode a `.bin`**:
+  the server can't read it, and `sanitizeImage`/`checkPhoto` on it would just fail (or leak work for nothing).
+- Encrypted chat media (migration 111, docs/api.md "Encrypted photos", security.md section 7): `POST /me/attachments`
+  with `application/octet-stream` stores a `.bin` and sets `attachment_uploads.encrypted` (400 `e2e_disabled` when
+  `E2E_MODE=off`, 400 `invalid_attachment` under 29 bytes, 413 above 10 MB); `image/*` stays the plaintext path. Both
+  share the pending cap (10), rate limit and 1 h expiry. A send of an encrypted upload needs an `envelope`
+  (400 `envelope_required`, upload not consumed) and sets `messages.attachment_encrypted` (CHECK: needs
+  `attachment_kind` and `envelope_type`; the flag stays after a spent view-once photo loses its key). Under
+  `E2E_MODE=required` a plaintext attachment (upload or profile photo copy) is 400 `encryption_required`, checked
+  where the attachment is resolved, before any copy. `attachment.isEncrypted` is in every `messageJson`.
+  Retention needs no new code: the existing triggers and jobs delete `.bin` files like `.jpg`.
+- Report evidence photos: `report_evidence.photo_key` (UNIQUE, CHECK `has_photo`), triggers `report_evidence_trash_*`
+  queue the file on delete or key change. `POST /reports` evidence `photoID` = the reporter's own pending **plaintext**
+  upload (consumed in the report tx; encrypted/foreign/unknown id → 404). `accountReview` returns `photoPath`; only
+  `moderation/cli.ts show` prints it. `purgeReportEvidence` drains the trash; the orphan sweep keeps `photo_key`s.
+- Caddy serves `.bin` only after `deploy.sh --sync-config`; do that before switching `E2E_MODE` to `optional`.
+- Dev peer: `scripts/e2e-peer.ts send --to <id> --photo f.jpg [--text …] [--expires s] [--view-once]` encrypts with
+  `scripts/e2e-media-crypto.ts` (the format v1 reference, shared with `test/e2e-media.test.ts` and its shared test
+  vector); `read` decrypts and prints `photo: ok <n> bytes | tampered | gone`. With `--expires`, `send` also puts `expiresAfterSeconds` (integer 1..2592000) in the payload (the recipient key deadline); `read` prints it and tolerates its absence.
 
 ### plus.ts
 - `hasPlus(userId, db?)` · `requirePlus(userId, db?)` (402) · `plusStatus(userId) → {isActive, expiresAt}`.
@@ -214,7 +235,8 @@ messages (attachment_kind/key/view_once/opened_at, delivered_at, read_at, read_r
 expires_at; UNIQUE(sender_id, client_id)), reports (SET NULL FKs, priority normal|high, status), subscriptions
 (PK original_transaction_id), dev_bots (dev seed markers). Migration 107: users.hidden_at/hidden_reason/banned_at/reviewed_at, reports.closed_at/
 reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL). Migration 109:
-e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), messages.envelope_type/envelope_body.
+e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), messages.envelope_type/envelope_body. Migration 111:
+attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers).
 
 ## Tests
 

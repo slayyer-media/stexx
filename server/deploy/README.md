@@ -5,7 +5,7 @@ Nothing in this directory runs automatically; every script is run by a person.
 
 ```
  iOS app ──TLS──> Cloudflare (proxy, WAF) ──TLS──> Caddy :443 ─┬─ api.stexx.gay   -> 127.0.0.1:8787  Bun/Hono (stexx-api.service, user stexx)
-                                                               └─ media.stexx.gay -> file_server /srv/stexx/media (read-only, <32 hex>.jpg only)
+                                                               └─ media.stexx.gay -> file_server /srv/stexx/media (read-only, <32 hex>.jpg|.bin only)
                                                        Postgres 18 on 127.0.0.1:5432 (roles: stexx_app DML only / stexx_owner migrations / stexxbackup read-only)
                                                        nightly: pg_dump | age | rclone -> Backblaze B2, 28-day retention
 ```
@@ -54,7 +54,7 @@ Config-only changes (units, Caddy site file, backup script): `--sync-config`.
 | Edge | Caddy trusts `CF-Connecting-IP` only from Cloudflare's ranges, and overwrites the header it forwards, so clients cannot spoof the address the app hashes for rate limits (verified locally with a spoofed header) | `Caddyfile.main`, `Caddyfile` |
 | Edge | **No access logs.** No `log` directive in any site block; runtime error logs exclude `http.log.error` / `http.log.access` | `Caddyfile`, `Caddyfile.main` |
 | Edge | `/media*` and `/v1/dev*` return 404 on the API host even if the app ever mounted them; request bodies capped at 11 MB | `Caddyfile` |
-| Media | Only `GET`/`HEAD` of `/<32 lowercase hex>.jpg`; everything else is a flat 404 (no listing, no dotfiles, no other extensions, case-sensitive). `nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, no `Last-Modified`/`ETag` (would leak upload time) | `Caddyfile` |
+| Media | Only `GET`/`HEAD` of `/<32 lowercase hex>.jpg` (served `image/jpeg`) and `/<32 lowercase hex>.bin` (end-to-end encrypted chat photos, served `application/octet-stream`); everything else is a flat 404 (no listing, no dotfiles, no other extensions, case-sensitive). `nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, no `Last-Modified`/`ETag` (would leak upload time) | `Caddyfile` |
 | Process | `NoNewPrivileges`, empty `CapabilityBoundingSet`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, kernel/cgroup/clock protections, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `SystemCallFilter=@system-service` minus `@privileged`, `RestrictNamespaces`, `LockPersonality`, memory/task limits. Only `/srv/stexx/media` is writable. **`MemoryDenyWriteExecute` is intentionally absent** (Bun's JIT and libvips need W+X). Release code is root-owned and read-only to the service | `stexx-api.service` |
 | Config | Production refuses to boot with any `STEXX_DEV_*` flag, a missing/short/default `EMAIL_PEPPER`, non-https URLs, `WEBAUTHN_RP_ID=localhost`, or the dev DB password. `deploy.sh` runs this validation as the service user *before* touching the live release, and never uploads `src/dev/` | `src/config.ts`, `deploy.sh` |
 | Database | Loopback only (`listen_addresses='localhost'`), scram-sha-256, `pg_hba` rules per role, `host stexx all all reject` as the catch-all. `stexx_app`: no DDL, cannot read `schema_migrations`, no superuser/createdb/createrole, connection limit 20, 30 s statement timeout. Migrations run as a different role (`stexx_owner`) from the deploy script only | `postgres/` |
@@ -145,6 +145,11 @@ Not run on a real host while writing this: the unit sandbox (no Linux box was to
 Responses are `Cache-Control: private, max-age=31536000, immutable`: devices keep them (the name is a random 128-bit value that is never reused) but **Cloudflare will not**.
 A public/shared cache would keep serving a photo after the server deleted it, which would break the "expiring content is actually deleted" promise.
 The directory is `2750 stexx:stexx` (setgid) and files are created `0640`; Caddy reads them through the `stexx` group (`bootstrap.sh` adds `caddy` to it).
+
+Two kinds of file: `<32 hex>.jpg` (profile photos and plaintext chat photos, sanitized by the API) and `<32 hex>.bin`
+(end-to-end encrypted chat photos: opaque blobs the server can't read, deleted on the same schedule).
+**Before switching `E2E_MODE` to `optional`**, run `deploy.sh --sync-config` so Caddy serves `.bin` files; with an older
+site file every encrypted photo URL is a 404 and recipients see "Photo no longer available".
 
 ## Photo model
 

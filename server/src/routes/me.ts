@@ -3,9 +3,18 @@ import { z } from "zod";
 import { sql, type Sql } from "../db/sql.ts";
 import { forgetTouch, requireAuth } from "../lib/auth.ts";
 import { snapToCell } from "../lib/distance.ts";
-import { badRequest, conflict, notFound } from "../lib/errors.ts";
+import { ApiError, badRequest, conflict, notFound } from "../lib/errors.ts";
 import { newId } from "../lib/ids.ts";
-import { drainMediaTrash, mediaUrl, sanitizeImage, storeJpeg, unlinkMedia } from "../lib/media.ts";
+import {
+  drainMediaTrash,
+  MAX_UPLOAD_BYTES,
+  mediaUrl,
+  MIN_ENCRYPTED_BYTES,
+  sanitizeImage,
+  storeBlob,
+  storeJpeg,
+  unlinkMedia,
+} from "../lib/media.ts";
 import { requirePlus } from "../lib/plus.ts";
 import { rateLimit } from "../lib/ratelimit.ts";
 import { closeUserConnections } from "../lib/realtime.ts";
@@ -25,7 +34,7 @@ import { col, notBlocked, notModerated, val, visibleToViewer } from "../lib/visi
 import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import { envelopeJson } from "../lib/e2e/envelope.ts";
-import { keyStatus } from "../lib/e2e/keys.ts";
+import { e2eMode, keyStatus } from "../lib/e2e/keys.ts";
 import { checkColumns, checkPhoto, flagPhotoMatches, storedPhash } from "../lib/photocheck/index.ts";
 import { phashToHex } from "../lib/photocheck/phash.ts";
 import type { AppEnv } from "../types.ts";
@@ -203,17 +212,27 @@ meRoutes.post("/me/photos", rateLimit("photoUploads"), attest("photo"), async (c
 export const MAX_PENDING_ATTACHMENTS = 10;
 
 /**
- * Private upload for a photo MESSAGE: raw image body, sanitized exactly like a profile photo, but stored as a
- * short-lived attachment upload, NOT a profile photo. So it is never visible on the profile, doesn't count against
- * the 6-photo limit or the profile upload limit, and needs no clean-up delete. Returns a Photo-shaped object whose
- * `id` is passed as `attachmentPhotoID` to POST /conversations/:id/messages (which consumes it). Unsent uploads
+ * Private upload for a photo MESSAGE, stored as a short-lived attachment upload, NOT a profile photo. So it is never
+ * visible on the profile, doesn't count against the 6-photo limit or the profile upload limit, and needs no clean-up
+ * delete. Returns a Photo-shaped object (plus `isEncrypted`) whose `id` is passed as `attachmentPhotoID` to
+ * POST /conversations/:id/messages, or as an evidence `photoID` to POST /reports (either consumes it). Unsent uploads
  * are deleted after an hour.
+ *
+ * Two kinds of body, sharing the limits and the pending cap:
+ *  - `image/*`: a plaintext photo, sanitized exactly like a profile photo (`.jpg`).
+ *  - `application/octet-stream`: an end-to-end encrypted photo (docs/api.md "Encrypted photos"). The server can't read
+ *    it, so it is stored verbatim (`.bin`): no decode, no classifier, no hash. Moderation of encrypted photos happens on
+ *    the recipient's phone; the server's part is the size cap, the rate limits and attestation.
  */
 meRoutes.post("/me/attachments", rateLimit("attachments"), attest("photo"), async (c) => {
   const me = c.get("userId");
   await hitAbuseLimits("photo", subjectOf(c, { deviceId: deviceOf(c).deviceId, userId: me }));
-  const type = (c.req.header("Content-Type") ?? "").toLowerCase();
-  if (!type.startsWith("image/")) throw badRequest("Send the photo as an image body.", "invalid_image");
+  const type = (c.req.header("Content-Type") ?? "").split(";")[0]!.trim().toLowerCase();
+  const encrypted = type === "application/octet-stream";
+  if (!encrypted && !type.startsWith("image/")) throw badRequest("Send the photo as an image body.", "invalid_image");
+  if (encrypted && e2eMode() === "off") {
+    throw badRequest("End-to-end encryption isn't switched on for this server yet.", "e2e_disabled");
+  }
 
   const pending = async (db: Sql) => {
     const [r] = await db<{ n: number }[]>`SELECT count(*)::int AS n FROM attachment_uploads WHERE owner_id = ${me}`;
@@ -223,18 +242,27 @@ meRoutes.post("/me/attachments", rateLimit("attachments"), attest("photo"), asyn
     conflict(`You have too many photos waiting to be sent (max ${MAX_PENDING_ATTACHMENTS}).`, "attachment_limit");
   if ((await pending(sql)) >= MAX_PENDING_ATTACHMENTS) throw tooMany();
 
-  const jpeg = await sanitizeImage(new Uint8Array(await c.req.arrayBuffer()));
-  const key = await storeJpeg(jpeg);
+  const body = new Uint8Array(await c.req.arrayBuffer());
+  let key: string;
+  if (encrypted) {
+    // The route's body limit already refuses more than MAX_UPLOAD_BYTES (413); this is the backstop.
+    if (body.byteLength > MAX_UPLOAD_BYTES) throw new ApiError(413, "payload_too_large", "That upload is too large.");
+    if (body.byteLength < MIN_ENCRYPTED_BYTES) throw badRequest("That encrypted photo is empty.", "invalid_attachment");
+    key = await storeBlob(body);
+  } else {
+    key = await storeJpeg(await sanitizeImage(body));
+  }
   try {
     const id = await sql.begin(async (tx) => {
       await tx`SELECT id FROM users WHERE id = ${me} FOR UPDATE`;
       if ((await pending(tx)) >= MAX_PENDING_ATTACHMENTS) throw tooMany();
       const [row] = await tx<{ id: string }[]>`
-        INSERT INTO attachment_uploads (id, owner_id, storage_key) VALUES (${newId("photo")}, ${me}, ${key})
+        INSERT INTO attachment_uploads (id, owner_id, storage_key, encrypted)
+        VALUES (${newId("photo")}, ${me}, ${key}, ${encrypted})
         RETURNING id`;
       return row!.id;
     });
-    return c.json({ id, url: mediaUrl(key), isExplicit: false }, 201);
+    return c.json({ id, url: mediaUrl(key), isExplicit: false, isEncrypted: encrypted }, 201);
   } catch (err) {
     await unlinkMedia(key).catch(() => {});
     throw err;
@@ -397,8 +425,8 @@ meRoutes.get("/me/export", async (c) => {
   const [photos, uploads, home, travel, favorites, tapsSent, tapsReceived, blocks, views, reports, sessions, passkeys, subs, convs] =
     await Promise.all([
       ownPhotos(me),
-      sql<{ id: string; storage_key: string; created_at: Date }[]>`
-        SELECT id, storage_key, created_at FROM attachment_uploads WHERE owner_id = ${me} ORDER BY created_at`,
+      sql<{ id: string; storage_key: string; encrypted: boolean; created_at: Date }[]>`
+        SELECT id, storage_key, encrypted, created_at FROM attachment_uploads WHERE owner_id = ${me} ORDER BY created_at`,
       sql<{ cell_lat: number; cell_lon: number; updated_at: Date }[]>`SELECT cell_lat, cell_lon, updated_at FROM locations WHERE user_id = ${me}`,
       sql<{ cell_lat: number; cell_lon: number; updated_at: Date }[]>`SELECT cell_lat, cell_lon, updated_at FROM travel_locations WHERE user_id = ${me}`,
       sql<{ target_id: string; created_at: Date }[]>`SELECT target_id, created_at FROM favorites WHERE user_id = ${me} ORDER BY created_at`,
@@ -445,6 +473,7 @@ meRoutes.get("/me/export", async (c) => {
           attachment_kind: string | null;
           attachment_key: string | null;
           attachment_view_once: boolean;
+          attachment_encrypted: boolean;
           sent_at: Date;
           read_at: Date | null;
           read_receipt: boolean;
@@ -453,7 +482,7 @@ meRoutes.get("/me/export", async (c) => {
       >`
         SELECT m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
                m.attachment_kind, m.attachment_key,
-               m.attachment_view_once, m.sent_at, m.read_at, m.read_receipt, m.expires_at
+               m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.read_at, m.read_receipt, m.expires_at
           FROM messages m
           JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
          WHERE m.conversation_id = ANY(${convs.map((x) => x.id)})
@@ -529,7 +558,12 @@ meRoutes.get("/me/export", async (c) => {
         },
       };
     }),
-    pendingChatUploads: uploads.map((u) => ({ id: u.id, url: mediaUrl(u.storage_key), createdAt: isoDate(u.created_at) })),
+    pendingChatUploads: uploads.map((u) => ({
+      id: u.id,
+      url: mediaUrl(u.storage_key),
+      isEncrypted: u.encrypted,
+      createdAt: isoDate(u.created_at),
+    })),
     location: {
       home: home[0] ? { latitude: home[0].cell_lat, longitude: home[0].cell_lon, updatedAt: isoDate(home[0].updated_at) } : null,
       travel: travel[0] ? { latitude: travel[0].cell_lat, longitude: travel[0].cell_lon, updatedAt: isoDate(travel[0].updated_at) } : null,
@@ -584,6 +618,8 @@ meRoutes.get("/me/export", async (c) => {
                 kind: m.attachment_kind,
                 url: !mine && m.attachment_view_once ? null : mediaUrl(m.attachment_key),
                 isViewOnce: m.attachment_view_once,
+                // The key to an encrypted photo is inside `envelope`; the archive holds only the opaque blob's URL.
+                isEncrypted: m.attachment_encrypted,
               }
             : null,
           sentAt: isoDate(m.sent_at),

@@ -5,7 +5,7 @@ import { sql } from "./db/sql.ts";
 import { authenticateAccessToken, bearerToken } from "./lib/auth.ts";
 import { ApiError, onError, onNotFound, tooManyRequests } from "./lib/errors.ts";
 import { requestLogger } from "./lib/logger.ts";
-import { isStorageKey, mediaPath, MAX_UPLOAD_BYTES } from "./lib/media.ts";
+import { isEncryptedKey, isStorageKey, mediaPath, MAX_UPLOAD_BYTES } from "./lib/media.ts";
 import { clientKey, consume, peekLimit } from "./lib/ratelimit.ts";
 import { attestRoutes } from "./routes/attest.ts";
 import { authRoutes } from "./routes/auth.ts";
@@ -39,7 +39,7 @@ const jsonLimit = bodyLimit({ maxSize: JSON_BODY_LIMIT, onError: tooLarge });
 const imageLimit = bodyLimit({ maxSize: MAX_UPLOAD_BYTES, onError: tooLarge });
 const keysLimit = bodyLimit({ maxSize: KEYS_BODY_LIMIT, onError: tooLarge });
 
-/** The only routes that take an image body. Everything else is JSON. */
+/** The only routes that take a raw upload body (an image, or an encrypted photo blob). Everything else is JSON. */
 const IMAGE_UPLOAD_ROUTES = new Set(["POST /v1/me/photos", "POST /v1/me/attachments"]);
 /** JSON routes that carry batches of public keys. */
 const KEY_UPLOAD_ROUTES = new Set(["PUT /v1/keys", "POST /v1/keys/prekeys"]);
@@ -105,7 +105,9 @@ export async function createApp(): Promise<Hono<AppEnv>> {
       if (!isStorageKey(key)) return onNotFound(c);
       const file = Bun.file(mediaPath(key));
       if (!(await file.exists())) return onNotFound(c);
-      return c.body(file.stream(), 200, { "Content-Type": "image/jpeg", "Cache-Control": "private, max-age=60" });
+      // `.bin` is an end-to-end encrypted photo: opaque bytes, never sniffed as an image (same as the Caddy block).
+      const type = isEncryptedKey(key) ? "application/octet-stream" : "image/jpeg";
+      return c.body(file.stream(), 200, { "Content-Type": type, "Cache-Control": "private, max-age=60" });
     });
   }
 

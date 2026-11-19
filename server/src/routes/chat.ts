@@ -39,6 +39,8 @@ import type { AppEnv } from "../types.ts";
  *  - Send is idempotent on (sender, clientID): a replay returns the original message untouched.
  *  - attachmentPhotoID is one of the sender's pending chat uploads (POST /me/attachments; its file moves to the
  *    message) or one of their profile photos (COPIED to a message-owned file). Both count against `attachments`.
+ *    An encrypted upload (an opaque blob) needs an `envelope`, which carries its key. Under E2E_MODE=required a
+ *    plaintext photo (upload or profile photo) is refused.
  *  - expiresAfterSeconds starts counting when the recipient reads (expires_at = read_at + seconds).
  *  - Read receipts: messages.read_receipt records the reader's sendReadReceipts at read time. The sender
  *    only sees `read` (and the resulting expiresAt) if it is true.
@@ -57,7 +59,7 @@ const MAX_PAGE = 100;
 /** Message select list (alias `m`). Matches MessageRow. */
 const MSG_COLS = sql`m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
   m.attachment_kind, m.attachment_key,
-  m.attachment_view_once, m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
+  m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
 
 /** SQL: message `m` is visible to the member row `cm` (not cleared, not expired). */
 const visibleTo = (cmAlias: string): Fragment =>
@@ -356,8 +358,8 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   const conversationId = idParam(c, "id", "conversation");
   const draft = await parseJson(c, draftSchema);
   const text = draft.text ? draft.text : null;
-  // E2E (E2E_MODE): `envelope` carries the text encrypted; plaintext `text` is refused once encryption is required.
-  // Photos are still server-side files until encrypted media lands, so photo-only messages stay allowed.
+  // E2E (E2E_MODE): `envelope` carries the text (and an encrypted photo's key) encrypted; plaintext `text` and plaintext
+  // photos are refused once encryption is required (photos are checked below, where the attachment is resolved).
   const mode = e2eMode();
   if (draft.envelope && mode === "off") {
     throw badRequest("End-to-end encryption isn't switched on for this server yet.", "e2e_disabled");
@@ -394,17 +396,34 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   /** Set when the key belongs to a pending upload: consumed in the insert transaction, never unlinked here. */
   let uploadId: string | null = null;
   let viewOnce = false;
+  /** The attachment is an end-to-end encrypted blob (its key is inside the envelope). */
+  let encryptedPhoto = false;
+  // Checked before any file is copied or any upload consumed, so a refused send leaves the upload pending for a retry.
+  const assertPlaintextPhotoAllowed = () => {
+    if (mode === "required") {
+      throw badRequest("Photos must be end-to-end encrypted. Update the app to keep chatting.", "encryption_required");
+    }
+  };
   if (draft.attachmentPhotoID) {
     if (!isId("photo", draft.attachmentPhotoID)) throw notFound();
-    const [upload] = await sql<{ storage_key: string }[]>`
-      SELECT storage_key FROM attachment_uploads WHERE id = ${draft.attachmentPhotoID} AND owner_id = ${me}`;
+    const [upload] = await sql<{ storage_key: string; encrypted: boolean }[]>`
+      SELECT storage_key, encrypted FROM attachment_uploads WHERE id = ${draft.attachmentPhotoID} AND owner_id = ${me}`;
     if (upload) {
+      if (upload.encrypted) {
+        // Without an envelope nobody could ever decrypt it (the key travels only inside the envelope).
+        if (!envelope) throw badRequest("An encrypted photo must be sent inside an encrypted message.", "envelope_required");
+        encryptedPhoto = true;
+      } else {
+        assertPlaintextPhotoAllowed();
+      }
       uploadId = draft.attachmentPhotoID;
       attachmentKey = upload.storage_key;
     } else {
       const [photo] = await sql<{ storage_key: string }[]>`
         SELECT storage_key FROM photos WHERE id = ${draft.attachmentPhotoID} AND owner_id = ${me}`;
       if (!photo) throw notFound();
+      // Profile photos are public plaintext files: a copy is a plaintext attachment.
+      assertPlaintextPhotoAllowed();
       consume("attachments", me);
       try {
         attachmentKey = await copyMedia(photo.storage_key);
@@ -428,11 +447,11 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
     row = await sql.begin(async (tx) => {
       const [inserted] = await tx<MessageRow[]>`
         INSERT INTO messages AS m (id, conversation_id, sender_id, client_id, text, envelope_type, envelope_body,
-                                   attachment_kind, attachment_key, attachment_view_once, delivered_at,
-                                   expires_after_seconds)
+                                   attachment_kind, attachment_key, attachment_view_once, attachment_encrypted,
+                                   delivered_at, expires_after_seconds)
         VALUES (${newId("message")}, ${conversationId}, ${me}, ${draft.clientID}, ${text},
                 ${envelope?.type ?? null}, ${envelope?.body ?? null},
-                ${attachmentKey ? "photo" : null}, ${attachmentKey}, ${viewOnce},
+                ${attachmentKey ? "photo" : null}, ${attachmentKey}, ${viewOnce}, ${encryptedPhoto},
                 ${recipientOnline ? sql`now()` : null}, ${draft.expiresAfterSeconds ?? null})
         ON CONFLICT (sender_id, client_id) DO NOTHING
         RETURNING ${MSG_COLS}`;
