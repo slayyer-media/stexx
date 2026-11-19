@@ -22,7 +22,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Each route file exports a router `xxxRoutes = new Hono<AppEnv>()` mounted at `/v1`. **Write full paths**:
   `meRoutes.get("/me", ...)`, `chatRoutes.post("/conversations/:id/messages", ...)`.
   Owners: `auth.ts` (/auth/*), `me.ts` (/me, /me/photos*, /me/privacy, /me/location, /me/viewers, /me/export, DELETE /me),
-  `discovery.ts` (/nearby, /profiles/:id[/favorite|/tap]), `chat.ts` (/conversations*), `safety.ts` (/blocks*, /reports),
+  `discovery.ts` (/nearby, /profiles/:id[/favorite|/tap]), `chat.ts` (/conversations*, incl. the view-once
+  `POST /conversations/:id/messages/:messageID/open`), `safety.ts` (/blocks*, /reports),
   `plus.ts` (/subscriptions/*, /me/travel, /boosts), `ws.ts` (/ws; exports `websocket` for Bun.serve).
 - `src/dev/routes.ts` `devRoutes` is dynamically imported only when `config.devAuth`. Keep all dev-only code
   in `src/dev/*` and never import it statically from non-dev code.
@@ -94,7 +95,13 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   Pass `rows` (from your own `profileColumns` query, e.g. nearby) to avoid a second users query.
 - `viewerCell(userId, db?) → Cell|null` (effective cell) · `photosFor(ownerIds, db?)`.
 - `messageJson(row, viewerId)` — status: recipient sees `read` when `read_at`; sender sees `read` only if
-  `read_receipt`; else `delivered` (delivered_at or read_at) else `sent`. Attachment `{kind:"photo", url|null, isViewOnce}`.
+  `read_receipt`; else `delivered` (delivered_at or read_at) else `sent`. Attachment
+  `{kind:"photo", url|null, isViewOnce, isEncrypted, openedAt|null}`. View-once: the sender never gets the `url`, and
+  gets `openedAt` only if `attachment_open_receipt` (the opener's sendReadReceipts at open time, migration 113).
+- View-once photos are opened only by `POST /conversations/:id/messages/:messageID/open` (recipient only, idempotent,
+  `viewOnceOpens` 60/min): it stamps `attachment_opened_at` (retention deletes the file VIEW_ONCE_GRACE_MS later) and
+  pushes `message.updated` (+ `conversation.updated`) to the sender when receipts allow. GET .../messages only marks
+  delivery; it must never stamp the open again.
 - `conversationJson({id, participant, lastMessage, unreadCount, updatedAt, isMuted})` · `privacyJson(row)`.
 - `ONLINE_WINDOW_MS` (5 min).
 
@@ -119,8 +126,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `encodeCursor(value)` base64url JSON · `decodeCursor(raw, zodSchema)` → value | null; 400 `invalid_cursor`.
 
 ### ratelimit.ts
-- `LIMITS`: `auth` 10/min, `emailLink` 3/15 min, `messages` 60/min, `taps` 30/h, `reports` 10/h,
-  `photoUploads` 20/h, `general` 300/min.
+- `LIMITS`: `auth` 10/min, `emailLink` 3/15 min, `messages` 60/min, `taps` 30/h, `viewOnceOpens` 60/min,
+  `reports` 10/h, `photoUploads` 20/h, `general` 300/min.
 - `rateLimit(name, {key?, cost?})` middleware (key = userId if set, else `clientKey(c)`).
 - `consume(name, key, cost?)` throws 429; `tryConsume(...) → retryAfterSec|0`. For per-address email limits:
   `consume("emailLink", emailHmac(email).toString("base64url"))`.
@@ -201,7 +208,7 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Caddy serves `.bin` only after `deploy.sh --sync-config`; do that before switching `E2E_MODE` to `optional`.
 - Dev peer: `scripts/e2e-peer.ts send --to <id> --photo f.jpg [--text …] [--expires s] [--view-once]` encrypts with
   `scripts/e2e-media-crypto.ts` (the format v1 reference, shared with `test/e2e-media.test.ts` and its shared test
-  vector); `read` decrypts and prints `photo: ok <n> bytes | tampered | gone`. With `--expires`, `send` also puts `expiresAfterSeconds` (integer 1..2592000) in the payload (the recipient key deadline); `read` prints it and tolerates its absence.
+  vector); `read` decrypts and prints `photo: ok <n> bytes | tampered | gone`; `read --open` also opens incoming view-once photos. With `--expires`, `send` also puts `expiresAfterSeconds` (integer 1..2592000) in the payload (the recipient key deadline); `read` prints it and tolerates its absence.
 
 ### plus.ts
 - `hasPlus(userId, db?)` · `requirePlus(userId, db?)` (402) · `plusStatus(userId) → {isActive, expiresAt}`.
@@ -236,7 +243,8 @@ expires_at; UNIQUE(sender_id, client_id)), reports (SET NULL FKs, priority norma
 (PK original_transaction_id), dev_bots (dev seed markers). Migration 107: users.hidden_at/hidden_reason/banned_at/reviewed_at, reports.closed_at/
 reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL). Migration 109:
 e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), messages.envelope_type/envelope_body. Migration 111:
-attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers).
+attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers). Migration 113:
+messages.attachment_open_receipt.
 
 ## Tests
 
