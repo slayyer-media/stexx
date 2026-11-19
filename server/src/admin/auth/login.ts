@@ -4,7 +4,8 @@
  *   POST /login/options   JSON: authentication options (discoverable credentials, user verification required)
  *   POST /login/verify    JSON: verifies the assertion, starts a session (cookie), {redirect}
  *   POST /logout          form: revokes the session server-side
- * Every outcome is in staff_audit: login, login_failed (with the staff id when the passkey is known), logout, and
+ * Every outcome is in staff_audit: login, login_failed (with the staff id when the passkey is known, or was removed
+ * from an account: staff_removed_passkeys), logout, and
  * passkey_counter_regression (a verified assertion whose counter went backwards: the passkey is removed and the account
  * signed out everywhere, see lockOutCopiedPasskey).
  */
@@ -12,10 +13,11 @@ import { generateAuthenticationOptions, verifyAuthenticationResponse, type Authe
 import { config } from "../../config.ts";
 import { sql } from "../../db/sql.ts";
 import { ApiError } from "../../lib/errors.ts";
+import { removedPasskeyOwner } from "../../lib/staff/accounts.ts";
 import { staffAudit, staffAuditNow } from "../../lib/staff/audit.ts";
 import type { AdminRoutes } from "../guard.ts";
 import { render } from "../render.ts";
-import { clearedSessionCookie, createStaffSession, revokeStaffSession, sessionCookie } from "../session.ts";
+import { clearedSessionCookie, createStaffSession, lockStaffAccountFirst, revokeStaffSession, sessionCookie } from "../session.ts";
 import { LoginPage } from "../views/pages.tsx";
 import {
   authenticationSchema,
@@ -68,7 +70,10 @@ export function registerLoginRoutes(r: AdminRoutes): void {
         FROM staff_passkeys p JOIN staff_accounts a ON a.id = p.staff_id
        WHERE p.id = ${credential.id}`;
     const fail = async () => {
-      await staffAuditNow({ kind: "event", action: "login_failed", channel: "console", staffId: stored?.staff_id ?? null });
+      // A passkey the console removed (re-invite, copied-passkey lockout) still names its account: attempts with a copy
+      // after the lockout stay with that account's events instead of becoming anonymous rows that retention deletes.
+      const staffId = stored?.staff_id ?? (await removedPasskeyOwner(credential.id));
+      await staffAuditNow({ kind: "event", action: "login_failed", channel: "console", staffId });
       return signInFailed();
     };
     if (!pending || !stored || stored.disabled_at) throw await fail();
@@ -130,6 +135,7 @@ export function registerLoginRoutes(r: AdminRoutes): void {
     const staff = c.get("staff")!;
     const session = c.get("session")!;
     await sql.begin(async (tx) => {
+      await lockStaffAccountFirst(tx, staff.id);
       await revokeStaffSession(tx, staff.id, session.id);
       await staffAudit(tx, { kind: "event", action: "logout", channel: "console", staffId: staff.id, sessionId: session.id });
     });

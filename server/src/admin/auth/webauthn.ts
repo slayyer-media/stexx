@@ -8,6 +8,7 @@ import { z } from "zod";
 import { sql, type Sql } from "../../db/sql.ts";
 import { badRequest } from "../../lib/errors.ts";
 import { clientKey, consume } from "../../lib/ratelimit.ts";
+import { removeStaffPasskeys } from "../../lib/staff/accounts.ts";
 import { staffAudit } from "../../lib/staff/audit.ts";
 import { MINUTE } from "../../lib/time.ts";
 
@@ -136,15 +137,17 @@ export function counterWentBack(newCounter: number, storedCounter: number): bool
 
 /**
  * A verified assertion whose counter went backwards: someone else holds a copy of this passkey, and whoever used it
- * first may already be signed in. In one transaction: remove the passkey (its owner needs a re-invite), sign the
+ * first may already be signed in. In one transaction: remove the passkey (its owner needs a re-invite; its id is kept,
+ * so later attempts with the copy are still recorded against the account), sign the
  * account out everywhere, void its pending step-up proofs, and record passkey_counter_regression (not an ordinary
  * failed attempt, so an admin can see it). The caller then answers like any failed attempt.
  */
 export async function lockOutCopiedPasskey(input: { staffId: string; credentialId: string; sessionId?: string | null }): Promise<void> {
   await sql.begin(async (tx) => {
-    // The account row first, like sign-in and every staff change, so this never deadlocks with them.
+    // The account row first, like sign-in and every staff change, so this never deadlocks with them
+    // (lockStaffAccountFirst in session.ts).
     await tx`SELECT id FROM staff_accounts WHERE id = ${input.staffId} FOR NO KEY UPDATE`;
-    await tx`DELETE FROM staff_passkeys WHERE id = ${input.credentialId} AND staff_id = ${input.staffId}`;
+    await removeStaffPasskeys(tx, input.staffId, input.credentialId);
     await tx`UPDATE staff_sessions SET revoked_at = now() WHERE staff_id = ${input.staffId} AND revoked_at IS NULL`;
     await tx`DELETE FROM staff_challenges WHERE staff_id = ${input.staffId}`;
     await staffAudit(tx, {

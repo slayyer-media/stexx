@@ -233,6 +233,12 @@ export interface Config {
 export interface AdminConfig {
   /** False in production until ADMIN_ORIGIN is set: the console refuses to start (the API is unaffected). */
   configured: boolean;
+  /**
+   * Why the console's settings were refused (ConfigError message), or null. Console-only mistakes never stop the API
+   * or `stexx-mod` (the break-glass moderation path also reads admin.env): they leave the console unconfigured, and
+   * the console process, `staff invite` and the deploy boot check report this.
+   */
+  error: string | null;
   host: string;
   port: number;
   /** No trailing slash, no path. */
@@ -614,7 +620,13 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     devDefaultLocation = loc.data;
   }
 
-  const admin = adminConfig(e, env, isProduction);
+  let admin: AdminConfig;
+  try {
+    admin = adminConfig(e, env, isProduction);
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    admin = unconfiguredAdmin(e, err.message);
+  }
 
   const appleEnabled =
     !!e.APPLE_ROOT_CA_DIR && (e.APPLE_ENVIRONMENT !== "Production" || e.APPLE_APP_APPLE_ID !== undefined);
@@ -737,9 +749,28 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   };
 }
 
+/** The console's settings when they were refused: unconfigured (it won't start), nothing usable, the reason kept. */
+function unconfiguredAdmin(e: z.infer<typeof envSchema>, error: string): AdminConfig {
+  return {
+    configured: false,
+    error,
+    host: "127.0.0.1",
+    port: e.ADMIN_PORT,
+    origin: "",
+    rpId: "",
+    rpName: e.ADMIN_RP_NAME,
+    allowedCidrs: [],
+    idleMs: e.ADMIN_SESSION_IDLE_MINUTES * 60_000,
+    absoluteMs: e.ADMIN_SESSION_ABSOLUTE_HOURS * 3_600_000,
+    stepUpMs: e.ADMIN_STEP_UP_MINUTES * 60_000,
+    devAuth: false,
+  };
+}
+
 /**
  * Staff console settings. When none of ADMIN_* is set the public API boots exactly as before (production then just
- * has an unconfigured console that refuses to start). Values that are set must be consistent, or nothing boots.
+ * has an unconfigured console that refuses to start). Values that are set must be consistent, or this throws and
+ * loadConfig keeps the reason in `admin.error`: the console refuses to start, everything else boots.
  */
 function adminConfig(e: z.infer<typeof envSchema>, env: Record<string, string | undefined>, isProduction: boolean): AdminConfig {
   if (isProduction && !isLoopbackHost(e.ADMIN_HOST)) {
@@ -810,6 +841,7 @@ function adminConfig(e: z.infer<typeof envSchema>, env: Record<string, string | 
   }
   return {
     configured: originText !== null,
+    error: null,
     host: e.ADMIN_HOST,
     port: e.ADMIN_PORT,
     origin,

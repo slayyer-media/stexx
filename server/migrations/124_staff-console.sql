@@ -33,6 +33,16 @@ CREATE TABLE staff_passkeys (
 );
 CREATE INDEX staff_passkeys_staff_idx ON staff_passkeys (staff_id);
 
+-- Passkeys taken off an account (a re-invite, or a copied passkey locked out): the credential id and whose it was.
+-- A later sign-in attempt with one (a copy still in someone's hands) is then recorded as that account's failed login,
+-- kept with its other events, instead of as an unknown passkey (no staff id, deleted after 12 months). Credential ids
+-- only, no key material; kept like the account itself.
+CREATE TABLE staff_removed_passkeys (
+  id          text PRIMARY KEY CHECK (char_length(id) BETWEEN 1 AND 1024),  -- WebAuthn credential ID (base64url)
+  staff_id    text NOT NULL REFERENCES staff_accounts(id) ON DELETE CASCADE,
+  removed_at  timestamptz NOT NULL DEFAULT now()
+);
+
 -- Single-use enrollment links (`stexx-mod staff invite`, or an admin in the console). Only the SHA-256 of the token
 -- is stored; the link is printed once and is valid for 30 minutes.
 CREATE TABLE staff_enrollments (
@@ -91,13 +101,15 @@ CREATE INDEX staff_challenges_expires_idx ON staff_challenges (expires_at);
 --   kind:       'read' (reads and lookups: deleted after 12 months), 'action' (a decision, with its
 --               moderation_actions pointer when there is one) or 'event' (staff events). Actions and events are kept,
 --               except failed logins with an unknown passkey (no staff id: only a count), also deleted after 12 months.
---   staff_id:   NULL only for a failed login with an unknown passkey, or a command-line change made while no active
---               admin exists (bootstrapping the first one).
+--   staff_id:   NULL only for a failed login with a passkey the console never knew (one it removed still names its
+--               account: staff_removed_passkeys), or a command-line change made while no active admin exists
+--               (bootstrapping the first one).
 --   role:       the role granted, on staff_invite and staff_role rows (so privilege history can be rebuilt).
 --   session_id: the console session (no foreign key: sessions are pruned, the record stays).
 --   target_user_id: the account concerned; anonymized (SET NULL) when the account is deleted or purged.
 --   target_ref: a report, photo flag, staff or session id (never an email, its HMAC, or a transaction id).
---   ticket_ref: an opaque support ticket number (never an email).
+--   ticket_ref: an opaque support ticket number (never an email). Cleared with target_user_id when the account goes:
+--               the ticket (in the helpdesk) names the person, so keeping it would undo the anonymization.
 CREATE TABLE staff_audit (
   id                    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   at                    timestamptz NOT NULL DEFAULT now(),
@@ -123,7 +135,8 @@ CREATE INDEX staff_audit_at_idx ON staff_audit (at);
 
 -- Append-only. UPDATE is refused, except the foreign-key action that anonymizes a row: target_user_id set to NULL
 -- because the account it pointed at was deleted (run by Postgres's referential trigger, so one level below a
--- statement, with every other column unchanged). DELETE is refused, except read rows
+-- statement, with every other column unchanged). The trigger clears ticket_ref in that same update (see the column
+-- notes above). DELETE is refused, except read rows
 -- and failed logins with an unknown passkey older than 12 months (the retention job; the trigger checks the row's
 -- age, not the caller). TRUNCATE is refused. INSERT always stamps `at` with now(), so a row can't be backdated (or
 -- made deletable at once).
@@ -133,8 +146,9 @@ BEGIN
   IF TG_OP = 'UPDATE' THEN
     IF pg_trigger_depth() > 1
        AND (to_jsonb(NEW) - 'target_user_id') = (to_jsonb(OLD) - 'target_user_id')
-       AND NEW.target_user_id IS NULL
+       AND NEW.target_user_id IS NULL AND OLD.target_user_id IS NOT NULL
     THEN
+      NEW.ticket_ref := NULL;
       RETURN NEW;
     END IF;
     RAISE EXCEPTION 'staff_audit is append-only' USING ERRCODE = 'insufficient_privilege';

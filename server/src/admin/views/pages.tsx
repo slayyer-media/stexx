@@ -3,7 +3,7 @@ import { minute, day, CsrfField, Layout } from "./layout.tsx";
 import type { SessionContext, StaffContext } from "../env.ts";
 import type { StaffAccount, StaffListItem } from "../../lib/staff/accounts.ts";
 import { STAFF_ROLES, type StaffRole } from "../../lib/staff/permissions.ts";
-import { hasRecentStepUp } from "../session.ts";
+import { stepUpRemainingMs } from "../session.ts";
 
 interface Signed {
   staff: StaffContext;
@@ -156,8 +156,13 @@ function staffStatus(s: StaffListItem): string {
   return "active";
 }
 
+/** data-step-up-fresh-ms for a "recent" step-up form: the time left on the session's step-up, if any (passkey.js). */
+function freshFor(session: Signed["session"]): string | undefined {
+  const ms = stepUpRemainingMs(session.stepUpAt);
+  return ms > 0 ? String(ms) : undefined;
+}
+
 export function StaffPage(props: Signed & { items: StaffListItem[]; flash?: string | null; error?: string | null }) {
-  const fresh = hasRecentStepUp(props.session.stepUpAt);
   return (
     <Layout title="Staff" staff={props.staff} session={props.session} flash={props.flash ?? null} error={props.error ?? null}>
       <table>
@@ -198,7 +203,7 @@ export function StaffPage(props: Signed & { items: StaffListItem[]; flash?: stri
         Creates a single-use link, valid for 30 minutes, to pass on out of band. For an existing handle you are asked to
         confirm first: re-inviting removes its passkeys and signs it out everywhere. Use a handle, never a real name.
       </p>
-      <form method="post" action="/staff/invite" data-step-up="recent" data-step-up-fresh={fresh ? "1" : undefined}>
+      <form method="post" action="/staff/invite" data-step-up="recent" data-step-up-fresh-ms={freshFor(props.session)}>
         <CsrfField session={props.session} />
         <label>
           Handle <input name="handle" required maxlength={64} pattern="[A-Za-z0-9._\-]{1,64}" autocomplete="off" />
@@ -259,7 +264,6 @@ export function ReinviteConfirmPage(props: Signed & { target: StaffAccount; role
  */
 export function DisableConfirmPage(props: Signed & { target: StaffAccount }) {
   const t = props.target;
-  const fresh = hasRecentStepUp(props.session.stepUpAt);
   return (
     <Layout title="Disable?" staff={props.staff} session={props.session}>
       <p>
@@ -272,7 +276,7 @@ export function DisableConfirmPage(props: Signed & { target: StaffAccount }) {
         method="post"
         action={`/staff/${t.id}/disable`}
         data-step-up={t.role === "admin" ? "action" : "recent"}
-        data-step-up-fresh={t.role !== "admin" && fresh ? "1" : undefined}
+        data-step-up-fresh-ms={t.role !== "admin" ? freshFor(props.session) : undefined}
         data-step-up-action="staff_disable"
         data-step-up-target={t.id}
       >

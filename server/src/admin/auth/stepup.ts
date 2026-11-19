@@ -23,6 +23,7 @@ import { sql, type Sql } from "../../db/sql.ts";
 import { ApiError, badRequest } from "../../lib/errors.ts";
 import { staffAudit, staffAuditNow, type AuditTargetKind } from "../../lib/staff/audit.ts";
 import type { AdminRoutes } from "../guard.ts";
+import { lockStaffAccountFirst } from "../session.ts";
 import {
   authenticationSchema,
   challengeOf,
@@ -113,6 +114,9 @@ export function registerStepUpRoutes(r: AdminRoutes): void {
     const challenge = challengeOf(credential.response.clientDataJSON);
 
     const outcome = await sql.begin(async (tx) => {
+      // The account row first (lockStaffAccountFirst), and re-checked: a disable or re-invite that got there first has
+      // signed this session out and voided its challenges.
+      if (!(await lockStaffAccountFirst(tx, staff.id))) return { ok: false as const };
       const [pending] = await tx<ChallengeRow[]>`
         SELECT challenge, kind, staff_id, session_id, enrollment_hash, bound_action, bound_target FROM staff_challenges
          WHERE challenge = ${challenge} AND kind IN ('step_up', 'action') AND session_id = ${session.id}
@@ -161,7 +165,11 @@ export function registerStepUpRoutes(r: AdminRoutes): void {
         await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
         return { ok: false as const };
       }
-      await tx`UPDATE staff_sessions SET step_up_at = now() WHERE id = ${session.id}`;
+      const stepped = await tx`UPDATE staff_sessions SET step_up_at = now() WHERE id = ${session.id} AND revoked_at IS NULL RETURNING id`;
+      if (stepped.length === 0) {
+        await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
+        return { ok: false as const };
+      }
       if (pending.kind === "step_up") {
         await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
       } else {

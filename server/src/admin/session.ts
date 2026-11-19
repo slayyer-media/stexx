@@ -127,6 +127,21 @@ export async function resolveSession(token: string) {
   };
 }
 
+/**
+ * Lock order for staff rows: the staff_accounts row first, then that account's sessions, passkeys and challenges. Every
+ * staff change (disable, re-invite: FOR UPDATE), sign-in and the copied-passkey lockout (FOR NO KEY UPDATE) take the
+ * account row before touching the rest, and staff_audit's foreign key takes a key-share lock on it at the end. A
+ * transaction that wrote a session or passkey row first and then reached that audit insert would wait on the account
+ * row while a staff change held it and waited on that session row: a deadlock, and Postgres aborts one of them (it
+ * could be the incident-response disable). So step-up, sign-out and session revoke call this first. FOR SHARE: they
+ * queue behind a staff change or sign-in, but not behind each other (none of them updates the account row).
+ * Returns whether the account is still active (false when disabled or gone).
+ */
+export async function lockStaffAccountFirst(tx: Sql, staffId: string): Promise<boolean> {
+  const [row] = await tx<{ disabled_at: Date | null }[]>`SELECT disabled_at FROM staff_accounts WHERE id = ${staffId} FOR SHARE`;
+  return !!row && !row.disabled_at;
+}
+
 /** Revoke one session of `staffId`. Returns false when there was no live one. */
 export async function revokeStaffSession(db: Sql, staffId: string, sessionId: string): Promise<boolean> {
   const rows = await db`
@@ -139,6 +154,16 @@ export async function revokeStaffSession(db: Sql, staffId: string, sessionId: st
 /** Whether the session made a fresh passkey assertion within ADMIN_STEP_UP_MINUTES. */
 export function hasRecentStepUp(stepUpAt: Date | null, now = Date.now()): boolean {
   return stepUpAt !== null && now - stepUpAt.getTime() <= config.admin.stepUpMs;
+}
+
+/**
+ * How much longer the session's step-up stays fresh, in ms (0 when it isn't). Pages put it on forms that need a recent
+ * step-up (data-step-up-fresh-ms), and passkey.js skips the passkey prompt only while that much time has not passed
+ * since the page loaded: a page left open past the window asks again instead of submitting into a 403.
+ */
+export function stepUpRemainingMs(stepUpAt: Date | null, now = Date.now()): number {
+  if (!stepUpAt || !hasRecentStepUp(stepUpAt, now)) return 0;
+  return Math.max(0, stepUpAt.getTime() + config.admin.stepUpMs - now);
 }
 
 /**

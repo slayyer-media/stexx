@@ -86,12 +86,16 @@
       location.assign(res.redirect || "/login");
     }));
 
-    // Forms that need a fresh passkey check: data-step-up="recent" (skipped while data-step-up-fresh is set), or
-    // "action" (bound to data-step-up-action + data-step-up-target; the proof goes into the `step_up` field).
+    // Forms that need a fresh passkey check: data-step-up="recent" (skipped while the session's last check is still
+    // fresh: data-step-up-fresh-ms is the time it had left when the page was made, counted from page load with a margin
+    // for the round trip, so a page left open past the window asks again instead of ending in a refusal), or "action"
+    // (bound to data-step-up-action + data-step-up-target; the proof goes into the `step_up` field).
+    const FRESH_MARGIN_MS = 15000;
     for (const form of document.querySelectorAll("form[data-step-up]")) {
       form.addEventListener("submit", guarded(async () => {
         const d = form.dataset;
-        if (d.stepUp === "recent" && d.stepUpFresh === "1") return form.submit();
+        const freshMs = Number(d.stepUpFreshMs || 0);
+        if (d.stepUp === "recent" && performance.now() < freshMs - FRESH_MARGIN_MS) return form.submit();
         const bound = d.stepUp === "action" ? { action: d.stepUpAction, target: d.stepUpTarget } : {};
         const res = await post("/step-up/verify", await assertion(await post("/step-up/options", bound)));
         if (res.token && form.elements.step_up) form.elements.step_up.value = res.token;

@@ -133,12 +133,23 @@ async function checkActorStillAdmin(tx: Sql, actor: StaffActor): Promise<void> {
   }
 }
 
-/** Active admins other than `exceptId`, counted under the caller's lock. */
-async function otherActiveAdmins(tx: Sql, exceptId: string): Promise<number> {
+/**
+ * Active admins other than `exceptId`, counted under the caller's lock. `scope` limits the count to those ids: only
+ * tests pass it (AdminScope), because the shared test database always holds other admins.
+ */
+async function otherActiveAdmins(tx: Sql, exceptId: string, scope: AdminScope): Promise<number> {
+  const ids = scope ? [...scope] : null;
   const [row] = await tx<{ n: number }[]>`
-    SELECT count(*)::int AS n FROM staff_accounts WHERE role = 'admin' AND disabled_at IS NULL AND id <> ${exceptId}`;
+    SELECT count(*)::int AS n FROM staff_accounts
+     WHERE role = 'admin' AND disabled_at IS NULL AND id <> ${exceptId} AND (${ids}::text[] IS NULL OR id = ANY(${ids}::text[]))`;
   return row?.n ?? 0;
 }
+
+/**
+ * Tests only: count admins for the last-admin rule among these account ids instead of the whole table (the test
+ * database is shared and always has other admins, so the refusals could never be reached). Never set in the app.
+ */
+export type AdminScope = readonly string[] | undefined;
 
 /**
  * Called inside the change's transaction, with the target row locked and every rule checked, just before anything
@@ -161,6 +172,7 @@ export async function inviteStaff(input: {
   actor: StaffActor;
   authorizeReinvite?: AuthorizeChange;
   now?: Date;
+  adminScope?: AdminScope;
 }): Promise<InviteResult> {
   checkStaffHandle(input.handle);
   checkStaffRole(input.role);
@@ -182,13 +194,13 @@ export async function inviteStaff(input: {
       if (existing.id === input.actor.staffId && input.actor.channel !== "cli") {
         throw new StaffError("You can't re-invite yourself (it would remove your own passkeys). Ask another admin.");
       }
-      if (existing.role === "admin" && role !== "admin" && (await otherActiveAdmins(tx, existing.id)) === 0) {
+      if (existing.role === "admin" && role !== "admin" && (await otherActiveAdmins(tx, existing.id, input.adminScope)) === 0) {
         throw new StaffError(`${existing.handle} is the only admin; invite another admin first.`);
       }
       if (input.authorizeReinvite) await input.authorizeReinvite(tx, toAccount(existing));
       // Links first, then passkeys: nothing enrolls from an old link after this point.
       await voidPendingEnrollments(tx, existing.id);
-      await tx`DELETE FROM staff_passkeys WHERE staff_id = ${existing.id}`;
+      await removeStaffPasskeys(tx, existing.id);
       await tx`UPDATE staff_sessions SET revoked_at = ${now} WHERE staff_id = ${existing.id} AND revoked_at IS NULL`;
       await tx`DELETE FROM staff_challenges WHERE staff_id = ${existing.id}`;
       if (existing.role !== role) {
@@ -220,6 +232,26 @@ export async function inviteStaff(input: {
   });
 }
 
+/**
+ * Removes passkeys of `staffId` (all of them, or the one `credentialId`), keeping each credential id in
+ * staff_removed_passkeys: a later sign-in attempt with one (a copy still in use) is then recorded as this account's
+ * failed login (removedPasskeyOwner), not as an unknown passkey that carries no staff id and is deleted after a year.
+ */
+export async function removeStaffPasskeys(tx: Sql, staffId: string, credentialId: string | null = null): Promise<void> {
+  await tx`
+    WITH gone AS (
+      DELETE FROM staff_passkeys WHERE staff_id = ${staffId} AND (${credentialId}::text IS NULL OR id = ${credentialId})
+      RETURNING id, staff_id)
+    INSERT INTO staff_removed_passkeys (id, staff_id) SELECT id, staff_id FROM gone
+    ON CONFLICT (id) DO UPDATE SET staff_id = EXCLUDED.staff_id, removed_at = now()`;
+}
+
+/** The account a removed passkey belonged to (removeStaffPasskeys), or null for a credential id never enrolled here. */
+export async function removedPasskeyOwner(credentialId: string, db: Sql = sql): Promise<string | null> {
+  const [row] = await db<{ staff_id: string }[]>`SELECT staff_id FROM staff_removed_passkeys WHERE id = ${credentialId}`;
+  return row?.staff_id ?? null;
+}
+
 /** Unused enrollment links for `staffId` are deleted (not just expired: no clock comparison can let one through). */
 async function voidPendingEnrollments(tx: Sql, staffId: string): Promise<void> {
   await tx`DELETE FROM staff_enrollments WHERE staff_id = ${staffId} AND used_at IS NULL`;
@@ -237,6 +269,7 @@ export async function disableStaff(input: {
   allowLastAdmin?: boolean;
   authorize?: AuthorizeChange;
   now?: Date;
+  adminScope?: AdminScope;
 }): Promise<StaffAccount> {
   const now = input.now ?? new Date();
   return sql.begin(async (tx) => {
@@ -249,7 +282,7 @@ export async function disableStaff(input: {
     if (!row) throw new StaffError(`No staff account ${input.handleOrId}.`);
     if (row.disabled_at) throw new StaffError(`${row.handle} is already disabled.`);
     if (row.id === input.actor.staffId && input.actor.channel !== "cli") throw new StaffError("You can't disable yourself. Ask another admin.");
-    if (row.role === "admin" && !input.allowLastAdmin && (await otherActiveAdmins(tx, row.id)) === 0) {
+    if (row.role === "admin" && !input.allowLastAdmin && (await otherActiveAdmins(tx, row.id, input.adminScope)) === 0) {
       throw new StaffError(`${row.handle} is the only admin.`);
     }
     if (input.authorize) await input.authorize(tx, toAccount(row));

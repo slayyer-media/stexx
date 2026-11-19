@@ -6,7 +6,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import { config, ConfigError, loadConfig } from "../src/config.ts";
+import { config, loadConfig } from "../src/config.ts";
 import { ADMIN_CSP } from "../src/admin/headers.ts";
 import { networkRefusal } from "../src/admin/network.ts";
 import { can, isPermission, PERMISSIONS, STAFF_ROLES, type Permission, type StaffRole } from "../src/lib/staff/permissions.ts";
@@ -209,6 +209,12 @@ describe("config", () => {
     WEBAUTHN_RP_ID: "stexx.gay",
   };
   const console_ = { ADMIN_ORIGIN: "https://stexx-admin.example.ts.net" };
+  /** Why the console's settings were refused (null when they weren't). The rest of the config still loads. */
+  const adminError = (env: Record<string, string>) => {
+    const c = loadConfig(env);
+    if (c.admin.error) expect(c.admin).toMatchObject({ configured: false, origin: "", rpId: "", devAuth: false, allowedCidrs: [] });
+    return c.admin.error;
+  };
 
   test("the public API boots exactly as before with no ADMIN_* set; the console is just unconfigured", () => {
     const c = loadConfig(prod);
@@ -222,35 +228,50 @@ describe("config", () => {
 
   test("production refuses a non-loopback ADMIN_HOST", () => {
     for (const host of ["0.0.0.0", "100.101.102.103", "::", "admin.example"]) {
-      expect(() => loadConfig({ ...prod, ...console_, ADMIN_HOST: host })).toThrow(ConfigError);
+      expect(adminError({ ...prod, ...console_, ADMIN_HOST: host })).toBeString();
     }
     for (const host of ["127.0.0.1", "::1", "localhost"]) {
       expect(loadConfig({ ...prod, ...console_, ADMIN_HOST: host }).admin.host).toBe(host);
     }
     // Outside production a LAN bind is the developer's call (dev login still needs loopback).
     expect(loadConfig({ DATABASE_URL: "postgres://u:p@localhost/x", ADMIN_HOST: "0.0.0.0" }).admin.host).toBe("0.0.0.0");
-    expect(() => loadConfig({ DATABASE_URL: "postgres://u:p@localhost/x", ADMIN_HOST: "0.0.0.0", ADMIN_DEV_AUTH: "1" })).toThrow(ConfigError);
+    expect(adminError({ DATABASE_URL: "postgres://u:p@localhost/x", ADMIN_HOST: "0.0.0.0", ADMIN_DEV_AUTH: "1" })).toBeString();
   });
 
-  test("inconsistent values refuse to boot", () => {
-    expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: "http://stexx-admin.example.ts.net" })).toThrow(/https/);
-    expect(() => loadConfig({ ...prod, ...console_, ADMIN_RP_ID: "other.example" })).toThrow(/host of ADMIN_ORIGIN/);
-    expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: "https://stexx.gay" })).toThrow(/differ from WEBAUTHN_RP_ID/);
-    expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: "https://localhost" })).toThrow(ConfigError);
+  test("a console-only mistake leaves the console unconfigured but never stops the API or stexx-mod", () => {
+    // stexx-mod sources admin.env too (docs/security.md): a typo there must not take away ban and purge.
+    for (const env of [{ ...prod, ADMIN_ORIGIN: "stexx-admin.example.ts.net" }, { ...prod, ...console_, ADMIN_RP_ID: "other.example" }]) {
+      const c = loadConfig(env);
+      expect(c.isProduction).toBe(true);
+      expect(c.databaseUrl).toBe(prod.DATABASE_URL);
+      expect(c.admin.configured).toBe(false);
+      expect(c.admin.error).toBeString();
+    }
+    expect(loadConfig({ ...prod, ADMIN_ORIGIN: "stexx-admin.example.ts.net" }).admin.error).toContain("ADMIN_ORIGIN: not a URL");
+    expect(loadConfig({ ...prod, ...console_ }).admin.error).toBeNull();
+    expect(loadConfig(prod).admin.error).toBeNull();
+  });
+
+  test("inconsistent values refuse to boot the console", () => {
+    expect(adminError({ ...prod, ADMIN_ORIGIN: "http://stexx-admin.example.ts.net" })).toMatch(/https/);
+    expect(adminError({ ...prod, ...console_, ADMIN_RP_ID: "other.example" })).toMatch(/host of ADMIN_ORIGIN/);
+    expect(adminError({ ...prod, ADMIN_ORIGIN: "https://stexx.gay" })).toMatch(/differ from WEBAUTHN_RP_ID/);
+    expect(adminError({ ...prod, ADMIN_ORIGIN: "https://localhost" })).toBeString();
     // WebAuthn can't use an IP address or a single-label name as the relying party: nobody could ever sign in.
     for (const origin of ["https://100.64.1.2:8443", "https://[fd7a:115c:a1e0::1]:8443", "https://stexx-admin:8443"]) {
-      expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: origin })).toThrow(/hostname/);
+      expect(adminError({ ...prod, ADMIN_ORIGIN: origin })).toMatch(/hostname/);
     }
     // Nor one of the public hosts.
     for (const origin of ["https://media.stexx.gay:8443", "https://app.stexx.gay"]) {
-      expect(() => loadConfig({ ...prod, WEBAUTHN_ORIGINS: "https://stexx.gay,https://app.stexx.gay", ADMIN_ORIGIN: origin })).toThrow(/public hosts/);
+      expect(adminError({ ...prod, WEBAUTHN_ORIGINS: "https://stexx.gay,https://app.stexx.gay", ADMIN_ORIGIN: origin })).toMatch(/public hosts/);
     }
-    expect(() => loadConfig({ ...prod, ADMIN_ORIGIN: "https://stexx-admin.example.ts.net/console" })).toThrow(/origin only/);
-    expect(() => loadConfig({ ...prod, ADMIN_RP_ID: "stexx-admin.example.ts.net" })).toThrow(/without ADMIN_ORIGIN/);
-    expect(() => loadConfig({ ...prod, ...console_, ADMIN_ALLOWED_CIDRS: "100.64.0.0/33" })).toThrow(/CIDR/);
-    expect(() => loadConfig({ ...prod, ...console_, ADMIN_ALLOWED_CIDRS: "" })).toThrow(ConfigError);
-    expect(() => loadConfig({ ...prod, ...console_, ADMIN_PORT: "8787" })).toThrow(/ADMIN_PORT/);
-    expect(() => loadConfig({ ...prod, ...console_, ADMIN_SESSION_IDLE_MINUTES: "120", ADMIN_SESSION_ABSOLUTE_HOURS: "1" })).toThrow(ConfigError);
+    expect(adminError({ ...prod, ADMIN_ORIGIN: "https://stexx-admin.example.ts.net/console" })).toMatch(/origin only/);
+    expect(adminError({ ...prod, ADMIN_RP_ID: "stexx-admin.example.ts.net" })).toMatch(/without ADMIN_ORIGIN/);
+    expect(adminError({ ...prod, ...console_, ADMIN_ALLOWED_CIDRS: "100.64.0.0/33" })).toMatch(/CIDR/);
+    expect(adminError({ ...prod, ...console_, ADMIN_ALLOWED_CIDRS: "" })).toBeString();
+    expect(adminError({ ...prod, ...console_, ADMIN_PORT: "8787" })).toMatch(/ADMIN_PORT/);
+    expect(adminError({ ...prod, ...console_, ADMIN_SESSION_IDLE_MINUTES: "120", ADMIN_SESSION_ABSOLUTE_HOURS: "1" })).toBeString();
+    // Dev flags in production still refuse the whole process (the API too), whatever else is set.
     expect(() => loadConfig({ ...prod, ...console_, ADMIN_DEV_AUTH: "1" })).toThrow(/dev flags/);
     const ok = loadConfig({ ...prod, ...console_ });
     expect(ok.admin).toMatchObject({ configured: true, origin: console_.ADMIN_ORIGIN, rpId: "stexx-admin.example.ts.net", devAuth: false });

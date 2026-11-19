@@ -277,7 +277,18 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   passkey ceremonies pass SimpleWebAuthn counter 0 and check `counterWentBack` themselves after the signature: a
   regression locks the passkey out (`lockOutCopiedPasskey`). Sign-in locks the account row FOR NO KEY UPDATE (FOR SHARE
   deadlocked two overlapping sign-ins). Look up keyed tables with a `Map` or `Object.hasOwn`, never `obj[userInput]`.
+- Lock order: a transaction that writes a staff member's sessions, passkeys or challenges takes the staff_accounts row
+  FIRST (staff changes FOR UPDATE, sign-in and lockout FOR NO KEY UPDATE, step-up/logout/session revoke
+  `lockStaffAccountFirst` = FOR SHARE), because the closing `staffAudit` insert takes a key-share lock on that row and
+  would otherwise close a cycle with a concurrent disable or re-invite. New staff routes follow it; the "lock order"
+  tests race the real `disableStaff`/`inviteStaff` (their `authorize` hook) against a request.
+- Passkeys are removed only through `removeStaffPasskeys` (re-invite, lockout), which keeps the credential id in
+  `staff_removed_passkeys`; login's failure path resolves unknown credential ids there (`removedPasskeyOwner`), so a
+  copied key keeps showing up under its account. The last-admin rule's count takes a test-only `adminScope` (the shared
+  database always has other admins); the app never passes it.
 - Config is `config.admin` (`ADMIN_*`, docs/security.md section 9); `test/setup.ts` strips `ADMIN_*` from the environment.
+  A console-only mistake never throws from `loadConfig`: it sets `config.admin.error` (and `configured: false`), so the
+  API and `stexx-mod` keep working; `src/admin/index.ts`, `staff invite` and the deploy boot check report it.
   Test helpers: `test/admin-helpers.ts` (`adminGet`/`adminPost`, `makeStaff(role)`, `signInDirect`, `enrolledStaff`, `auditActions`), `test/soft-authenticator.ts` (software passkey).
 - Production runs it as `stexx-admin.service` with settings in `/etc/stexx/admin.env`; `deploy.sh` leaves `src/admin/dev.ts`
   (the passkey-less dev login, `ADMIN_DEV_AUTH`) out of the upload.

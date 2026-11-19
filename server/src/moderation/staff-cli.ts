@@ -159,8 +159,18 @@ export async function runStaffCli(
       case "list": {
         const actor = await actorOf(p.flags, env);
         const handle = p.positional[0];
+        // Looking up one account is a read of that account (targeted, as in the console), so `staff audit <handle>`
+        // lists it.
+        const subject = handle ? await findStaff(handle) : null;
         const items = await sql.begin(async (tx) => {
-          await staffAudit(tx, { kind: "read", action: "staff_list", channel: "cli", staffId: actor.staffId });
+          await staffAudit(tx, {
+            kind: "read",
+            action: "staff_list",
+            channel: "cli",
+            staffId: actor.staffId,
+            targetKind: subject ? "staff" : null,
+            targetRef: subject?.id ?? null,
+          });
           return listStaff(tx, handle ? { handle } : {});
         });
         if (json) {
@@ -209,6 +219,7 @@ export async function runStaffCli(
         if (!handle) throw new StaffError("Missing <handle>.");
         const role = p.flags.get("--role");
         if (typeof role !== "string") throw new StaffError("Pass --role support|moderator|admin.");
+        if (config.admin.error) throw new StaffError(`The console's settings are refused (${config.admin.error}), so there is no console to enroll at. Fix /etc/stexx/admin.env.`);
         if (!config.admin.configured) throw new StaffError("ADMIN_ORIGIN is not set, so there is no console to enroll at.");
         const actor = await actorOf(p.flags, env);
         const existing = await findStaff(handle);

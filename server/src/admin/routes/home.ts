@@ -9,7 +9,7 @@ import { staffAudit } from "../../lib/staff/audit.ts";
 import { can } from "../../lib/staff/permissions.ts";
 import type { AdminRoutes } from "../guard.ts";
 import { render } from "../render.ts";
-import { clearedSessionCookie, revokeStaffSession } from "../session.ts";
+import { clearedSessionCookie, lockStaffAccountFirst, revokeStaffSession } from "../session.ts";
 import { DashboardPage, SessionsPage, type DashboardCounts } from "../views/pages.tsx";
 
 const SESSION_ID_RE = /^ss_[a-z2-7]{26}$/;
@@ -59,6 +59,7 @@ export function registerHomeRoutes(r: AdminRoutes): void {
     const id = c.req.param("id") ?? "";
     if (!SESSION_ID_RE.test(id)) throw notFound();
     const revoked = await sql.begin(async (tx) => {
+      await lockStaffAccountFirst(tx, staff.id);
       if (!(await revokeStaffSession(tx, staff.id, id))) return false;
       await staffAudit(tx, {
         kind: "event",

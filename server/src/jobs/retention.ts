@@ -397,9 +397,10 @@ export interface StaffPurgeResult {
 /**
  * Staff console housekeeping: old staff_audit read rows (12 months, measured by the database clock like the trigger),
  * console sessions that ended (revoked or expired) a week ago, enrollment links used or expired a week ago, and
- * expired WebAuthn challenges. Every cutoff is clamped to the database clock: a `now` ahead of it (tests move the clock
- * forward) never deletes a live session, a pending link, an in-flight ceremony or a young read row. Staff accounts
- * and every other audit row are kept.
+ * expired WebAuthn challenges (a verified per-action proof is kept while it can still be spent: ADMIN_STEP_UP_MINUTES
+ * after its verification, which can outlast the challenge's own 5 minutes). Every cutoff is clamped to the database
+ * clock: a `now` ahead of it (tests move the clock forward) never deletes a live session, a pending link, an in-flight
+ * ceremony or a young read row. Staff accounts and every other audit row are kept.
  */
 export async function purgeStaffConsole(now: Date = new Date()): Promise<StaffPurgeResult> {
   const graceSecs = STAFF_CREDENTIAL_GRACE_MS / 1000;
@@ -433,7 +434,11 @@ export async function purgeStaffConsole(now: Date = new Date()): Promise<StaffPu
   const challenges = await inBatches(async () => {
     const r = await sql`
       DELETE FROM staff_challenges WHERE challenge IN (
-        SELECT challenge FROM staff_challenges WHERE expires_at <= LEAST(${now}::timestamptz, now()) LIMIT ${BATCH})`;
+        SELECT challenge FROM staff_challenges
+         WHERE expires_at <= LEAST(${now}::timestamptz, now())
+           AND (verified_at IS NULL
+                OR verified_at <= LEAST(${now}::timestamptz, now()) - make_interval(secs => ${config.admin.stepUpMs / 1000}))
+         LIMIT ${BATCH})`;
     return r.count;
   });
   return { auditReads, sessions, enrollments, challenges };

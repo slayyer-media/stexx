@@ -8,6 +8,11 @@ import { sql } from "../db/sql.ts";
 import { logInfo } from "../lib/logger.ts";
 import { createAdminApp } from "./app.ts";
 
+if (config.admin.error) {
+  // config.ts keeps console-only mistakes from stopping the API and stexx-mod; the console itself refuses here.
+  console.error(`Refusing to start the staff console: ${config.admin.error}`);
+  process.exit(1);
+}
 if (!config.admin.configured) {
   console.error("Refusing to start the staff console: set ADMIN_ORIGIN (and ADMIN_RP_ID if it differs) first.");
   process.exit(1);
