@@ -34,14 +34,19 @@ struct ChatListView: View {
                 VStack(spacing: 0) {
                     if let error = chatStore.errorMessage, !visible.isEmpty {
                         ChatListErrorBanner(message: error) {
-                            Task { await chatStore.load() }
+                            Task { await chatStore.refresh() }
                         }
                     }
                     Button {
                         openCount += 1
                         path.append(TapsRoute())
                     } label: {
-                        TapsRow(taps: tapsPreview, unseen: chatStore.tapsUnseen)
+                        TapsRow(
+                            taps: tapsPreview,
+                            unseen: chatStore.tapsUnseen,
+                            hasLoaded: chatStore.hasLoadedTaps,
+                            failed: chatStore.tapsErrorMessage != nil
+                        )
                     }
                     .buttonStyle(ConversationRowButtonStyle())
                     .overlay(alignment: .bottom) {
@@ -93,7 +98,7 @@ struct ChatListView: View {
                             .font(.stexxSub)
                             .foregroundStyle(Theme.steel)
                     } actions: {
-                        Button("Try again") { Task { await chatStore.load() } }
+                        Button("Try again") { Task { await chatStore.refresh() } }
                             .stexxSecondaryButton()
                     }
                     .padding(.top, headerRowsHeight)
@@ -155,15 +160,13 @@ struct ChatListView: View {
 private struct TapsRow: View {
     let taps: [ReceivedTap]
     let unseen: Int
+    /// A taps load has succeeded at least once.
+    let hasLoaded: Bool
+    /// The last taps fetch failed.
+    let failed: Bool
 
     private var summary: String {
-        guard let first = taps.first else { return String(localized: "No taps yet") }
-        if unseen > 0 {
-            return unseen == 1
-                ? String(localized: "\(first.from.displayName) tapped you")
-                : String(localized: "\(unseen) people tapped you")
-        }
-        return String(localized: "Latest: \(first.from.displayName)")
+        TapsCopy.rowSummary(latest: taps.first, unseen: unseen, hasLoaded: hasLoaded, failed: failed)
     }
 
     var body: some View {

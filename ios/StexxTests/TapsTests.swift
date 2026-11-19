@@ -285,3 +285,73 @@ struct ChatStoreTapsTests {
         #expect(store.conversations == cached)
     }
 }
+
+/// What the Taps row in Chats and the taps screen's label say.
+@MainActor
+struct TapsCopyTests {
+    private func summary(_ store: ChatStore) -> String {
+        TapsCopy.rowSummary(
+            latest: store.taps.first,
+            unseen: store.tapsUnseen,
+            hasLoaded: store.hasLoadedTaps,
+            failed: store.tapsErrorMessage != nil
+        )
+    }
+
+    @Test("Server down on a cold launch: the Taps row says taps failed, not \"No taps yet\"")
+    func coldLaunchOffline() async {
+        let api = MockAPIClient(latency: .zero)
+        await api.setFailsConversationList(true)
+        await api.setFailsTaps(true)
+        let store = ChatStore(api: api)
+        await store.loadIfNeeded()
+        #expect(store.errorMessage != nil)
+        #expect(store.tapsErrorMessage != nil)
+        #expect(store.taps.isEmpty)
+        #expect(summary(store) == "Couldn't load taps")
+
+        // Back online: the real summary returns.
+        await api.setFailsConversationList(false)
+        await api.setFailsTaps(false)
+        await store.refresh()
+        #expect(store.tapsErrorMessage == nil)
+        #expect(summary(store) == "3 people tapped you")
+    }
+
+    @Test("A failed refresh keeps the cached latest tap in the Taps row")
+    func failedRefreshKeepsCachedTap() async throws {
+        let api = MockAPIClient(latency: .zero)
+        let store = ChatStore(api: api)
+        await store.loadIfNeeded()
+        await store.markTapsSeen()
+        let latest = try #require(store.taps.first)
+        await api.setFailsTaps(true)
+        await store.loadTaps()
+        #expect(store.tapsErrorMessage != nil)
+        #expect(store.taps.first == latest)
+        #expect(summary(store) == "Latest: \(latest.from.displayName)")
+    }
+
+    @Test("Empty inbox: neutral while the first load runs, \"No taps yet\" only once it succeeded")
+    func emptyStates() {
+        #expect(TapsCopy.rowSummary(latest: nil, unseen: 0, hasLoaded: false, failed: false) == "See who tapped you")
+        #expect(TapsCopy.rowSummary(latest: nil, unseen: 0, hasLoaded: true, failed: false) == "No taps yet")
+        #expect(TapsCopy.rowSummary(latest: nil, unseen: 0, hasLoaded: true, failed: true) == "Couldn't load taps")
+    }
+
+    @Test("New taps name a single sender or count several")
+    func unseenSummaries() {
+        let tap = ReceivedTap(RealtimeEvent.Tap(from: MockData.profiles[0], sentAt: .now))
+        let name = MockData.profiles[0].displayName
+        #expect(TapsCopy.rowSummary(latest: tap, unseen: 1, hasLoaded: true, failed: false) == "\(name) tapped you")
+        #expect(TapsCopy.rowSummary(latest: tap, unseen: 2, hasLoaded: true, failed: true) == "2 people tapped you")
+    }
+
+    @Test("The taps screen's count label is pluralized")
+    func countLabel() {
+        #expect(TapsCopy.countLabel(count: 1, new: 0) == "1 tap")
+        #expect(TapsCopy.countLabel(count: 1, new: 1) == "1 tap, 1 new")
+        #expect(TapsCopy.countLabel(count: 8, new: 0) == "8 taps")
+        #expect(TapsCopy.countLabel(count: 8, new: 3) == "8 taps, 3 new")
+    }
+}

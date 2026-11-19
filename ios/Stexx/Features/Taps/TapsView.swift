@@ -3,6 +3,35 @@ import SwiftUI
 /// Pushed from the Taps row at the top of the Chats list.
 struct TapsRoute: Hashable {}
 
+/// Copy for the Taps row in Chats and the taps screen's count label, kept
+/// out of the views so every state can be tested.
+enum TapsCopy {
+    /// The Taps row's one-line summary. With nothing to show it only says
+    /// "No taps yet" once a load has succeeded: a failed load says so, and
+    /// a first load still in flight gets a neutral line. Cached taps keep
+    /// their summary even if a refresh failed.
+    static func rowSummary(latest: ReceivedTap?, unseen: Int, hasLoaded: Bool, failed: Bool) -> String {
+        guard let latest else {
+            if failed { return String(localized: "Couldn't load taps") }
+            if !hasLoaded { return String(localized: "See who tapped you") }
+            return String(localized: "No taps yet")
+        }
+        if unseen > 0 {
+            return unseen == 1
+                ? String(localized: "\(latest.from.displayName) tapped you")
+                : String(localized: "\(unseen) people tapped you")
+        }
+        return String(localized: "Latest: \(latest.from.displayName)")
+    }
+
+    /// "1 tap", "8 taps", "8 taps, 3 new" above the taps list.
+    static func countLabel(count: Int, new: Int) -> String {
+        let taps = count == 1 ? String(localized: "1 tap") : String(localized: "\(count) taps")
+        guard new > 0 else { return taps }
+        return String(localized: "\(taps), \(new) new")
+    }
+}
+
 /// Who tapped you (`GET /me/taps`): newest first, one row per sender, with
 /// infinite scroll. Opening it marks every tap seen (`POST /me/taps/seen`),
 /// which clears them from the Chats badge; the senders that were new keep
@@ -124,11 +153,7 @@ struct TapsView: View {
 
     private func summary(count: Int, new: Int) -> some View {
         Group {
-            if new > 0 {
-                SectionLabel("\(count) taps, \(new) new")
-            } else {
-                SectionLabel("\(count) taps")
-            }
+            SectionLabel(verbatim: TapsCopy.countLabel(count: count, new: new))
         }
         .padding(.top, Theme.Spacing.s)
     }

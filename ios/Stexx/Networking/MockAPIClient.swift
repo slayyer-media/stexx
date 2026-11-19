@@ -441,6 +441,11 @@ actor MockAPIClient: APIClient {
 
     func taps(before cursor: String?) async throws -> TapsPage {
         try await pause()
+        #if DEBUG
+        if failsTaps {
+            throw URLError(.notConnectedToInternet, userInfo: [NSLocalizedDescriptionKey: "The Internet connection appears to be offline."])
+        }
+        #endif
         let all = receivedTaps
             .filter { !blocked.contains($0.from) }
             .sorted { $0.sentAt > $1.sentAt }
@@ -471,6 +476,14 @@ actor MockAPIClient: APIClient {
 
     func setFailsConversationList(_ fails: Bool) {
         failsConversationList = fails
+    }
+
+    /// Screenshots and tests: `taps(before:)` fails like a dropped
+    /// connection while this is on.
+    private var failsTaps = false
+
+    func setFailsTaps(_ fails: Bool) {
+        failsTaps = fails
     }
 
     /// Tests: a smaller taps page, to exercise infinite scroll.

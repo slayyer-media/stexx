@@ -46,8 +46,9 @@ via `.previewEnvironment()`.
 Debug builds also open single screens on a fresh mock backend for
 screenshots: `xcrun simctl launch booted gay.stexx.app -StexxScreenshotRoute <name>`
 with `chatList`, `tabs` (the Chats badge counts new taps), `taps`, `tapsEmpty`,
-`chatListError` (load failed, nothing cached) or `chatListStale` (refresh
-failed, cached chats with a banner); see `App/ScreenshotRoute.swift`.
+`chatListError` (load failed, nothing cached), `chatListStale` (refresh
+failed, cached chats with a banner) or `chatListOffline` (chats and taps both
+failed, as on a cold launch with the server down); see `App/ScreenshotRoute.swift`.
 
 ## End-to-end encryption
 

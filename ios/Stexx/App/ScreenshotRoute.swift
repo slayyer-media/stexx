@@ -17,8 +17,9 @@ enum ScreenshotRoute: String {
     /// Taps inbox: the tab bar (Chats badge counts new taps), the chat list
     /// with its Taps row, the list failing with nothing cached / with cached
     /// chats, and the taps screen with and without taps. Each gets its own
-    /// fresh mock backend.
-    case tabs, chatList, chatListError, chatListStale, taps, tapsEmpty
+    /// fresh mock backend. `chatListOffline` fails chats and taps both, as
+    /// on a cold launch with the server down.
+    case tabs, chatList, chatListError, chatListStale, chatListOffline, taps, tapsEmpty
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -52,6 +53,11 @@ struct ScreenshotRouteView: View {
             MockChatsRoute { ChatListView() }
         case .chatListError:
             MockChatsRoute(setup: { api, _ in await api.setFailsConversationList(true) }) { ChatListView() }
+        case .chatListOffline:
+            MockChatsRoute(setup: { api, _ in
+                await api.setFailsConversationList(true)
+                await api.setFailsTaps(true)
+            }) { ChatListView() }
         case .chatListStale:
             MockChatsRoute(setup: { api, store in
                 await store.load()
