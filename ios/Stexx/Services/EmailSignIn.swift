@@ -164,14 +164,8 @@ final class EmailSignInModel {
     private(set) var resendAvailableAt: Date?
     /// Emails accepted by the server in this flow.
     private(set) var sentCount = 0
-    /// The typed code: digits only, at most 8 (paste and AutoFill included).
-    var code = "" {
-        didSet {
-            let digits = String(code.filter(\.isASCIIDigit).prefix(Self.codeLength))
-            if digits != code { code = digits }
-            if problem == .wrongCode { problem = nil }
-        }
-    }
+    /// The typed code: digits only, at most 8 (set through `updateCode`).
+    private(set) var code = ""
 
     @ObservationIgnored private let api: any APIClient
     @ObservationIgnored private let now: () -> Date
@@ -183,6 +177,17 @@ final class EmailSignInModel {
     }
 
     var isBusy: Bool { phase == .sending || phase == .verifying }
+
+    /// What the code field typed, pasted or AutoFilled: keeps digits only,
+    /// at most 8, and clears a "wrong code" message.
+    func updateCode(_ raw: String) {
+        code = Self.sanitizedCode(raw)
+        if problem == .wrongCode { problem = nil }
+    }
+
+    nonisolated static func sanitizedCode(_ raw: String) -> String {
+        String(raw.filter { ("0"..."9").contains($0) }.prefix(codeLength))
+    }
     var isCodeComplete: Bool { code.count == Self.codeLength }
 
     /// Seconds until a resend is allowed (0 = now).
@@ -277,10 +282,6 @@ final class EmailSignInModel {
         let domain = value[value.index(after: at)...]
         return domain.contains(".") && !domain.hasPrefix(".") && !domain.hasSuffix(".") && !domain.contains("@")
     }
-}
-
-private extension Character {
-    var isASCIIDigit: Bool { ("0"..."9").contains(self) }
 }
 
 /// Email sign-in links that reach the app (universal links): what to do

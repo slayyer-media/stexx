@@ -4,13 +4,14 @@ import SwiftUI
 /// in it opens the app (`EmailLinkRedeemer`); the 8-digit code works here
 /// on any device. Resending follows the server's limit.
 struct CheckEmailView: View {
-    @Bindable var model: EmailSignInModel
+    let model: EmailSignInModel
     /// Called with the session from a correct code.
     var onSignedIn: (Session) async -> Void
     /// "Use a different email": back to the form.
     var onChangeAddress: () -> Void
 
     @FocusState private var isCodeFocused: Bool
+    @State private var autoSubmittedCode: String?
 
     private var explanation: String {
         switch model.purpose {
@@ -45,7 +46,7 @@ struct CheckEmailView: View {
 
                 VStack(alignment: .leading, spacing: Theme.Spacing.s) {
                     SectionLabel("Code")
-                    CodeField(code: $model.code, isFocused: $isCodeFocused, onSubmit: submit)
+                    CodeField(code: codeBinding, isFocused: $isCodeFocused, onSubmit: submit)
                 }
 
                 VStack(spacing: Theme.Spacing.m) {
@@ -97,11 +98,26 @@ struct CheckEmailView: View {
         }
     }
 
+    /// Typing, paste or AutoFill of all 8 digits submits on its own (once
+    /// per code; a wrong one is resubmitted only after an edit).
+    private var codeBinding: Binding<String> {
+        Binding(
+            get: { model.code },
+            set: { raw in
+                model.updateCode(raw)
+                guard model.isCodeComplete, model.code != autoSubmittedCode else { return }
+                autoSubmittedCode = model.code
+                submit()
+            }
+        )
+    }
+
     private func submit() {
         guard model.isCodeComplete, !model.isBusy else { return }
-        isCodeFocused = false
         Task {
+            // The field keeps focus after a wrong code, ready for a fix.
             if let session = await model.submitCode() {
+                isCodeFocused = false
                 await onSignedIn(session)
             }
         }
@@ -117,16 +133,14 @@ private struct CodeField: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
         TextField("8-digit code", text: $code)
-            .font(.system(.title2, design: .monospaced).weight(.semibold))
-            .tracking(6)
+            .font(code.isEmpty ? .stexxBody : .system(.title2, design: .monospaced).weight(.semibold))
+            // Spaced digits; the placeholder stays normal text.
+            .tracking(code.isEmpty ? 0 : 6)
             .keyboardType(.numberPad)
             .textContentType(.oneTimeCode)
             .focused(isFocused)
             .submitLabel(.go)
             .onSubmit(onSubmit)
-            .onChange(of: code) { _, new in
-                if new.count == EmailSignInModel.codeLength { onSubmit() }
-            }
             .foregroundStyle(Theme.frost)
             .tint(Theme.ice)
             .padding(.horizontal, Theme.Spacing.l)

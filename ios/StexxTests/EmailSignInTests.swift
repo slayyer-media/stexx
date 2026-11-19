@@ -245,12 +245,12 @@ struct EmailSignInModelTests {
     @Test("The code field keeps digits only, at most 8 (paste, AutoFill, spaces)")
     func codeSanitizing() {
         let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .zero))
-        model.code = "1234 5678"
+        model.updateCode("1234 5678")
         #expect(model.code == "12345678")
         #expect(model.isCodeComplete)
-        model.code = "12-34-56-78-90"
+        model.updateCode("12-34-56-78-90")
         #expect(model.code == "12345678")
-        model.code = "abc12"
+        model.updateCode("abc12")
         #expect(model.code == "12")
         #expect(!model.isCodeComplete)
     }
@@ -265,18 +265,18 @@ struct EmailSignInModelTests {
         #expect(await model.submitCode() == nil) // nothing sent yet
         await model.send(to: "otter@example.com")
 
-        model.code = "1111111"
+        model.updateCode("1111111")
         #expect(await model.submitCode() == nil) // incomplete: not sent
         #expect(await server.count(codePath) == 0)
 
-        model.code = "11111111"
+        model.updateCode("11111111")
         #expect(await model.submitCode() == nil)
         #expect(model.problem == .wrongCode)
         #expect(model.phase == .sent)
-        model.code = "2222222"
+        model.updateCode("2222222")
         #expect(model.problem == nil)
 
-        model.code = "22222222"
+        model.updateCode("22222222")
         let session = try #require(await model.submitCode())
         #expect(session.accessToken == "acc")
         #expect(await server.bodies(codePath).last?["email"] as? String == "otter@example.com")
@@ -289,7 +289,7 @@ struct EmailSignInModelTests {
         await server.queue(codePath, error(400, "registration_required"))
         let model = EmailSignInModel(purpose: .signIn, api: client(for: server))
         await model.send(to: "new@example.com")
-        model.code = "12345678"
+        model.updateCode("12345678")
         #expect(await model.submitCode() == nil)
         #expect(model.problem == .noAccount)
     }
@@ -298,7 +298,7 @@ struct EmailSignInModelTests {
     func reset() async {
         let model = EmailSignInModel(purpose: .signIn, api: MockAPIClient(latency: .zero))
         await model.send(to: "otter@example.com")
-        model.code = "123"
+        model.updateCode("123")
         model.reset()
         #expect(model.phase == .idle)
         #expect(model.code.isEmpty)
@@ -309,10 +309,10 @@ struct EmailSignInModelTests {
         let mock = MockAPIClient(latency: .zero)
         let model = EmailSignInModel(purpose: .signUp(displayName: "MockOtter"), api: mock)
         await model.send(to: "otter@example.com")
-        model.code = "87654321"
+        model.updateCode("87654321")
         #expect(await model.submitCode() == nil)
         #expect(model.problem == .wrongCode)
-        model.code = MockAPIClient.emailCode
+        model.updateCode(MockAPIClient.emailCode)
         #expect(await model.submitCode() != nil)
         #expect(try await mock.fetchMe().displayName == "MockOtter")
 
