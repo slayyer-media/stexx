@@ -46,6 +46,12 @@ const TOKEN_RE = /[A-Za-z0-9+/=_-]{20,}/g;
 /** Decimals with 3+ fractional digits (coordinates), then any run of 7+ digits (phone numbers, ids, amounts). */
 const DECIMAL_RE = /\d+[.,]\d{3,}/g;
 const LONG_NUMBER_RE = /\d{7,}/g;
+/**
+ * Digit groups joined by one or two separators (space, dot, dash, slash, parentheses), optionally led by "+": phone
+ * numbers like "+1 555 123 4567" or "(555) 123-4567", and dates like "1990-01-31". Redacted when the groups hold
+ * 7+ digits in all, so short pairs ("port 5432", "v1.2") stay.
+ */
+const DIGIT_GROUPS_RE = /\+?\(?\d+\)?(?:[ .\/-]{1,2}\(?\d+\)?)+/g;
 
 /**
  * Strip quoted spans. A quoted span runs from the first opening quote to the LAST matching closing quote, so a
@@ -73,7 +79,8 @@ function stripQuoted(text: string): string {
 /**
  * An error message that is safe to log: Postgres and system errors can echo user input
  * (`invalid input syntax for type uuid: "<value>"`, a file path, an address). Removes quoted literals, emails,
- * long tokens, coordinates and numbers longer than 6 digits, collapses whitespace and truncates to
+ * long tokens, coordinates, numbers longer than 6 digits and digit groups of 7+ digits in all (phone numbers,
+ * dates), collapses whitespace and truncates to
  * MAX_LOGGED_MESSAGE characters. The error class and the Postgres `code`/`routine` are logged as separate fields by
  * logError (they never contain input).
  */
@@ -82,6 +89,7 @@ export function redactMessage(err: unknown): string {
   let s = stripQuoted(raw);
   s = s.replace(EMAIL_RE, "<email>");
   s = s.replace(TOKEN_RE, (m) => (/\d/.test(m) || m.length >= 32 ? "<token>" : m));
+  s = s.replace(DIGIT_GROUPS_RE, (m) => ((m.match(/\d/g)?.length ?? 0) >= 7 ? "#" : m));
   s = s.replace(DECIMAL_RE, "#").replace(LONG_NUMBER_RE, "#");
   s = s.replace(/\s+/g, " ").trim();
   return s.length > MAX_LOGGED_MESSAGE ? `${s.slice(0, MAX_LOGGED_MESSAGE - 1)}\u2026` : s;

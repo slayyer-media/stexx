@@ -119,6 +119,11 @@ describe("error log redaction", () => {
     expect(redactMessage(`ENOENT: no such file or directory, open '/srv/stexx/media/${"a".repeat(32)}.jpg'`)).toBe(
       `ENOENT: no such file or directory, open '?'`,
     );
+    // Phone numbers and dates written with separators (7+ digits in all) go; short digit groups stay.
+    expect(redactMessage(`near +1 555 123 4567 today`)).toBe(`near # today`);
+    expect(redactMessage(`call (555) 123-4567 or 555.123.4567`)).toBe(`call # or #`);
+    expect(redactMessage(`born 1990-01-31, ok`)).toBe(`born #, ok`);
+    expect(redactMessage(`listen 0.0.0.0 port 5432 v1.2 at 10 50`)).toBe(`listen 0.0.0.0 port 5432 v1.2 at 10 50`);
     const long = redactMessage(new Error("word ".repeat(100)));
     expect(long.length).toBeLessThanOrEqual(MAX_LOGGED_MESSAGE);
     expect(long.endsWith("…")).toBe(true);
