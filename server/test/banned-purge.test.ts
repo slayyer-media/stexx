@@ -194,7 +194,7 @@ describe("schema guard", () => {
   test("every foreign key to users cascades, except the known anonymizing SET NULLs", async () => {
     // A new table that references users must either go with the account (CASCADE) or be added here on purpose,
     // with a reason it may outlive it. Both DELETE /me and the banned-account purge rely on this.
-    const setNull = ["moderation_actions.user_id", "photo_flags.matched_owner_id", "reports.reported_id", "reports.reporter_id"];
+    const setNull = ["moderation_actions.user_id", "photo_flags.matched_owner_id", "reports.reported_id", "reports.reporter_id", "staff_audit.target_user_id"];
     const fks = await userForeignKeys();
     expect(fks.length).toBeGreaterThan(20);
     for (const fk of fks) {
