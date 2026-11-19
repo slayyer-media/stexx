@@ -526,9 +526,6 @@ describe("moderation CLI", () => {
     await hideAccount({ actor: "mod-a", userId: hidden.id });
     const minor = await user();
     await expectNoContent(await report(await veteran(), minor, { reason: "underage" }));
-    // Each bucket is oldest report first, and the shared test DB keeps every run's open reports: date these first so
-    // the test doesn't depend on how many other accounts are waiting.
-    await sql`UPDATE reports SET created_at = '2001-01-01' WHERE reported_id IN (${plain.id}, ${minor.id})`;
 
     const queue = await reviewQueue({ limit: 1000 });
     const pos = (id: string) => queue.findIndex((q) => q.userId === id);
