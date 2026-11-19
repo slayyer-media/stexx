@@ -402,24 +402,27 @@ describe("attachments", () => {
 
     const vo = await send(on, c1, "once", { attachmentPhotoID: p1.id });
     expect(vo.attachment.isViewOnce).toBe(true);
-    expect(vo.attachment.url).not.toBeNull(); // the sender may see their own
+    expect(vo.attachment.url).toBeNull(); // never to the sender (its deletion would reveal the open)
     const plain = await send(off, c2, "normal", { attachmentPhotoID: p2.id });
     expect(plain.attachment.isViewOnce).toBe(false);
+    expect(plain.attachment.url).not.toBeNull();
     const forced = await send(off, c2, "forced", { attachmentPhotoID: p2.id, isViewOnce: true });
     expect(forced.attachment.isViewOnce).toBe(true);
 
     // conversation list for the recipient never carries a view-once URL, and does not open it
     const list = await expectJson(await as(rcpt).get("/v1/conversations"));
     const mine = list.find((c: any) => c.id === c1);
-    expect(mine.lastMessage.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
+    expect(mine.lastMessage.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false, openedAt: null });
     const [untouched] = await sql`SELECT attachment_opened_at FROM messages WHERE id = ${vo.id}`;
     expect(untouched!.attachment_opened_at).toBeNull();
 
-    // the listing releases the URL and stamps the open (so the expiry job can delete it after the grace window)
+    // the listing releases the URL but no longer opens the photo (only POST .../open does; see view-once.test.ts)
     const msgs = await expectJson(await as(rcpt).get(`/v1/conversations/${c1}/messages`));
     expect(msgs.items[0].attachment.url).not.toBeNull();
-    const [opened] = await sql`SELECT attachment_opened_at FROM messages WHERE id = ${vo.id}`;
-    expect(opened!.attachment_opened_at).not.toBeNull();
+    expect(msgs.items[0].attachment.openedAt).toBeNull();
+    const [listed] = await sql`SELECT attachment_opened_at, delivered_at FROM messages WHERE id = ${vo.id}`;
+    expect(listed!.attachment_opened_at).toBeNull();
+    expect(listed!.delivered_at).not.toBeNull();
 
     // sender listing does not stamp anything
     await expectJson(await as(off).get(`/v1/conversations/${c2}/messages`));
@@ -435,7 +438,7 @@ describe("attachments", () => {
     await sql`UPDATE messages SET attachment_key = NULL WHERE id = ${msg.id}`;
     await drainMediaTrash();
     const again = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
-    expect(again.items[0].attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
+    expect(again.items[0].attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false, openedAt: null });
   });
 });
 
@@ -652,14 +655,15 @@ describe("realtime (/v1/ws)", () => {
     const created = await cb.waitFor((f) => f.type === "message.created");
     expect(created.data.id).toBe(msg.id);
     expect(created.data.text).toBe("live!");
-    expect(created.data.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
+    expect(created.data.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false, openedAt: null });
     expect(created.data.status).toBe("delivered");
     const upd = await cb.waitFor((f) => f.type === "conversation.updated");
     expect(upd.data.id).toBe(conv);
     expect(upd.data.participant.id).toBe(a.id);
     expect(upd.data.unreadCount).toBe(1);
     const own = await ca.waitFor((f) => f.type === "message.created");
-    expect(own.data.attachment.url).not.toBeNull();
+    expect(own.data.id).toBe(msg.id);
+    expect(own.data.attachment.url).toBeNull(); // a view-once URL never goes to its sender
     // pushing a view-once message must not count as opening it
     const [row] = await sql`SELECT attachment_opened_at, delivered_at FROM messages WHERE id = ${msg.id}`;
     expect(row!.attachment_opened_at).toBeNull();

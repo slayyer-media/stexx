@@ -65,7 +65,7 @@ export async function trustState(userId: string, db: Sql = sql, now = new Date()
               JOIN messages r ON r.conversation_id = mine.conversation_id
                              AND r.sender_id <> ${userId} AND r.sent_at > mine.sent_at
              WHERE mine.sender_id = ${userId}) AS repliers,
-           (SELECT count(*)::int FROM reports WHERE reported_id = ${userId} AND status = 'open') AS open_reports
+           (SELECT count(*)::int FROM reports WHERE reported_id = ${userId} AND status = 'open' AND source = 'user') AS open_reports
       FROM users u WHERE u.id = ${userId}`;
   if (!row) return { restricted: false, ageMs: 0, repliers: 0, openReports: 0 };
   const ageMs = now.getTime() - new Date(row.created_at).getTime();
@@ -102,12 +102,24 @@ export async function assertMessageAllowed(
                                            AND sender_id = ${opts.senderId}
                                            AND sent_at > now() - interval '24 hours') AS i_wrote_recently`;
   if (!conv?.they_wrote && !conv?.i_wrote_recently) {
+    // Also from the spam heuristics' ledger (spam_contacts, lib/abuse/spam.ts), which a message that expires right
+    // after it is read doesn't erase; `messages` alone covers the time the heuristics are off.
     const [n] = await db<{ n: number }[]>`
-      SELECT count(DISTINCT m.conversation_id)::int AS n
-        FROM messages m
-       WHERE m.sender_id = ${opts.senderId} AND m.sent_at > now() - interval '24 hours'
-         AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.conversation_id = m.conversation_id
-                                                    AND r.sender_id <> ${opts.senderId})`;
+      SELECT count(*)::int AS n FROM (
+        SELECT m.conversation_id
+          FROM messages m
+         WHERE m.sender_id = ${opts.senderId} AND m.sent_at > now() - interval '24 hours'
+           AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.conversation_id = m.conversation_id
+                                                      AND r.sender_id <> ${opts.senderId})
+        UNION
+        SELECT sc.conversation_id
+          FROM spam_contacts sc
+         WHERE sc.sender_id = ${opts.senderId} AND sc.last_at > now() - interval '24 hours'
+           AND NOT EXISTS (SELECT 1 FROM spam_contacts o WHERE o.conversation_id = sc.conversation_id
+                                                           AND o.sender_id = sc.other_id)
+           AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.conversation_id = sc.conversation_id
+                                                      AND r.sender_id <> ${opts.senderId})
+      ) t`;
     if ((n?.n ?? 0) >= s.firstMessagesPerDay) {
       throw policy(
         "new_account_limit",

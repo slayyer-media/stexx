@@ -8,7 +8,9 @@ enum EncryptedPhotoContent: Hashable {
     case load(URL, E2EAttachmentPointer)
     /// A view-once photo: not fetched until the recipient opens it.
     case viewOnce(canOpen: Bool)
-    /// A view-once photo this phone opened (its key is gone).
+    /// A view-once photo the recipient opened: here (its key is gone), or,
+    /// for the sender, as reported by the server (only with the
+    /// recipient's read receipts on).
     case opened
     /// Expired or spent on the server.
     case gone
@@ -27,9 +29,12 @@ enum EncryptedPhotoContent: Hashable {
         default: break
         }
         if attachment?.isViewOnce == true {
-            // The sender can't know whether it was opened: always the plain tile.
-            if isMine { return message.e2eAttachment == nil && message.e2eAttachmentRemoval == nil ? .unavailable : .viewOnce(canOpen: false) }
-            if message.e2eAttachmentRemoval == .opened { return .opened }
+            if isMine {
+                // The server says so only if the recipient sends read receipts.
+                if attachment?.openedAt != nil { return .opened }
+                return message.e2eAttachment == nil && message.e2eAttachmentRemoval == nil ? .unavailable : .viewOnce(canOpen: false)
+            }
+            if message.isViewOnceOpened { return .opened }
         }
         if message.e2eAttachmentRemoval != nil { return .gone }
         guard let pointer = message.e2eAttachment else { return .unavailable }
@@ -245,18 +250,25 @@ struct PhotoTileNotice: View {
     }
 }
 
-/// Full-screen viewer for an end-to-end encrypted view-once photo. Downloads
-/// and decrypts on open, keeps nothing (no cache); closing it ends the photo
-/// on this phone (`onClose`).
+/// Full-screen viewer for a view-once photo, end-to-end encrypted or
+/// plaintext. Downloads (and decrypts) on open and keeps nothing (no cache,
+/// memory only). Once the photo is actually on screen (unblurred), or turned
+/// out unreadable, `onOpened` fires once: the app then tells the server,
+/// which deletes the photo about 30 s later. Closing the viewer ends the
+/// photo on this phone (`onClose`).
 struct ViewOnceViewer: View {
     let message: Message
-    /// Called once when the viewer goes away, with what it ended up showing.
-    let onClose: (ChatMediaLoader.Outcome?) -> Void
+    /// The photo was shown: it counts as opened.
+    var onOpened: () -> Void = {}
+    /// Called once when the viewer goes away, with what it ended up showing
+    /// and whether the photo was opened.
+    let onClose: (ChatMediaLoader.Outcome?, _ opened: Bool) -> Void
 
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
     @State private var outcome: ChatMediaLoader.Outcome?
     @State private var isRevealed = false
+    @State private var hasOpened = false
 
     var body: some View {
         ZStack {
@@ -266,12 +278,7 @@ struct ViewOnceViewer: View {
                 ProgressView().tint(Theme.frost)
                     .accessibilityLabel("Loading photo")
             case .image(let image, let verdict)?:
-                let blurred = !isRevealed && ChatPhotoModeration.presentation(
-                    verdict: verdict,
-                    blurExplicitPhotos: appState.privacy.blurExplicitPhotos,
-                    systemWarningsEnabled: ChatPhotoModeration.analyzer.systemWarningsEnabled,
-                    isOwnPhoto: false
-                ) == .blurUntilTap
+                let blurred = isBlurred(verdict)
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
@@ -279,11 +286,11 @@ struct ViewOnceViewer: View {
                     .overlay {
                         if blurred { BlurredPhotoLabel() }
                     }
-                    .onTapGesture { if blurred { isRevealed = true } }
+                    .onTapGesture { if blurred { reveal() } }
                     .accessibilityElement()
                     .accessibilityLabel(blurred ? Text("Photo hidden, may be sensitive") : Text("View-once photo"))
                     .accessibilityAddTraits(blurred ? .isButton : .isImage)
-                    .accessibilityAction { if blurred { isRevealed = true } }
+                    .accessibilityAction { if blurred { reveal() } }
             case .gone?:
                 PhotoTileNotice(systemImage: "hourglass", detail: "Photo no longer available")
             case .tampered?:
@@ -317,20 +324,63 @@ struct ViewOnceViewer: View {
             }
         }
         .task { await load() }
-        .onDisappear { onClose(outcome) }
+        .onDisappear { onClose(outcome, hasOpened) }
+    }
+
+    private func isBlurred(_ verdict: ChatPhotoVerdict) -> Bool {
+        !isRevealed && ChatPhotoModeration.presentation(
+            verdict: verdict,
+            blurExplicitPhotos: appState.privacy.blurExplicitPhotos,
+            systemWarningsEnabled: ChatPhotoModeration.analyzer.systemWarningsEnabled,
+            isOwnPhoto: false
+        ) == .blurUntilTap
+    }
+
+    private func reveal() {
+        isRevealed = true
+        markOpened()
+    }
+
+    /// Once per viewer: the photo is (or can't ever be) seen.
+    private func markOpened() {
+        guard !hasOpened else { return }
+        hasOpened = true
+        onOpened()
     }
 
     private func load() async {
-        guard let url = message.attachment?.url, let pointer = message.e2eAttachment else {
+        guard let url = message.attachment?.url else {
             outcome = .gone
             return
         }
-        outcome = await ChatMediaLoader.shared.photo(
-            messageID: message.id,
-            url: url,
-            pointer: pointer,
-            analyzer: ChatPhotoModeration.analyzer,
-            caches: false
-        )
+        let result: ChatMediaLoader.Outcome
+        if message.attachment?.isEncrypted == true {
+            guard let pointer = message.e2eAttachment else {
+                outcome = .gone
+                return
+            }
+            result = await ChatMediaLoader.shared.photo(
+                messageID: message.id,
+                url: url,
+                pointer: pointer,
+                analyzer: ChatPhotoModeration.analyzer,
+                caches: false
+            )
+        } else {
+            result = await ChatMediaLoader.shared.plaintextPhoto(url: url, analyzer: ChatPhotoModeration.analyzer)
+        }
+        // Closed while loading: it was never seen.
+        guard !Task.isCancelled else { return }
+        outcome = result
+        switch result {
+        case .image(_, let verdict):
+            // A blurred photo counts once the user taps to see it.
+            if !isBlurred(verdict) { markOpened() }
+        case .tampered, .unreadable:
+            // It can never be shown: let the server delete it.
+            markOpened()
+        case .gone, .failed:
+            break
+        }
     }
 }

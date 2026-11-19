@@ -1,0 +1,44 @@
+[Unit]
+Description=Stexx watchdog (backup age, health, disk, TLS, API errors, pre-migrate snapshot TTL)
+Documentation=https://github.com/stexx/stexx/blob/main/server/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+# A broken watchdog (bad config, alert delivery failing) alerts too.
+OnFailure=stexx-alert@%n.service
+
+[Service]
+Type=oneshot
+# Root: reads the journal, /etc/stexx/stexx.env (SMTP relay) and the backup state, and deletes expired pre-migrate
+# snapshots (root-only files). No capabilities beyond a plain root process's file ownership; everything else is
+# read-only.
+ExecStart=/usr/local/sbin/stexx-watch
+SyslogIdentifier=stexx-watch
+TimeoutStartSec=3min
+StateDirectory=stexx-watch
+StateDirectoryMode=0700
+ReadWritePaths=-/var/lib/stexx-premigrate
+Nice=5
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+UMask=0077

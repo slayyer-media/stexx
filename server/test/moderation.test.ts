@@ -527,12 +527,22 @@ describe("moderation CLI", () => {
     const minor = await user();
     await expectNoContent(await report(await veteran(), minor, { reason: "underage" }));
 
-    const queue = await reviewQueue({ limit: 1000 });
-    const pos = (id: string) => queue.findIndex((q) => q.userId === id);
-    expect(pos(minor.id)).toBeGreaterThanOrEqual(0);
-    expect(pos(minor.id)).toBeLessThan(pos(hidden.id));
-    expect(pos(hidden.id)).toBeLessThan(pos(plain.id));
-    expect(queue[pos(minor.id)]).toMatchObject({ highPriority: true, state: "hidden", openReports: 1, reasons: { underage: 1 } });
+    // The shared queue holds every other suite's leftovers (well over the 1,000-entry cap, and a new plain report
+    // sorts last), so the order is checked on just these three accounts: inside one transaction, temp copies of
+    // `users` and `reports` holding only their rows shadow the shared tables (pg_temp is searched first for
+    // unqualified names), and the real reviewQueue query runs against them. ON COMMIT DROP; nothing shared is written.
+    const ours = [plain.id, hidden.id, minor.id];
+    const queue = await sql.begin(async (tx) => {
+      await tx`CREATE TEMP TABLE users (LIKE public.users INCLUDING ALL) ON COMMIT DROP`;
+      await tx`CREATE TEMP TABLE reports (LIKE public.reports INCLUDING ALL) ON COMMIT DROP`;
+      await tx`INSERT INTO pg_temp.users SELECT * FROM public.users WHERE id IN ${tx(ours)}`;
+      await tx`INSERT INTO pg_temp.reports SELECT * FROM public.reports WHERE reported_id IN ${tx(ours)}`;
+      return reviewQueue({ limit: 1000, db: tx });
+    });
+    expect(queue.map((q) => q.userId)).toEqual([minor.id, hidden.id, plain.id]);
+    expect(queue[0]).toMatchObject({ highPriority: true, state: "hidden", openReports: 1, reasons: { underage: 1 } });
+    expect(queue[1]).toMatchObject({ highPriority: false, state: "hidden", openReports: 0 });
+    expect(queue[2]).toMatchObject({ highPriority: false, state: "visible", openReports: 1 });
 
     const { code, out } = await cli("list", "--limit", "1000");
     expect(code).toBe(0);

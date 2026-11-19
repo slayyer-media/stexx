@@ -4,7 +4,12 @@ import Foundation
 /// tests. Behaves like the API contract in `docs/api.md`, including small
 /// artificial latency so loading states are visible.
 actor MockAPIClient: APIClient {
+    #if DEBUG
+    /// `-StexxScreenshotPlus YES` starts the mock with Stexx+ (screenshots).
+    static let shared = MockAPIClient(plusActive: ScreenshotRoute.startsWithPlus)
+    #else
     static let shared = MockAPIClient()
+    #endif
 
     private var me: Profile
     /// Private chat uploads (`uploadAttachment`), consumed by `send`.
@@ -167,7 +172,7 @@ actor MockAPIClient: APIClient {
 
     func fetchMe() async throws -> Profile {
         try await pause()
-        return me
+        return ownProfile
     }
 
     func updateMe(_ update: ProfileUpdate) async throws -> Profile {
@@ -181,7 +186,15 @@ actor MockAPIClient: APIClient {
         me.position = update.position
         me.lookingFor = update.lookingFor
         me.tags = update.tags
-        return me
+        return ownProfile
+    }
+
+    /// `GET`/`PATCH /me`: the profile plus travel mode, like the server
+    /// (paused while Stexx+ is off; never any coordinates).
+    private var ownProfile: Profile {
+        var profile = me
+        profile.travel = travelLocation.map { _ in TravelStatus(isActive: currentPlusStatus.isActive) }
+        return profile
     }
 
     func uploadPhoto(jpegData: Data) async throws -> Photo {
@@ -347,7 +360,11 @@ actor MockAPIClient: APIClient {
         }
         // Like the server, an attachment is a copy of an uploaded photo.
         let attachment = draft.attachmentPhotoID.map { photoID in
-            Message.Attachment(kind: .photo, url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url)
+            Message.Attachment(
+                kind: .photo,
+                url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url,
+                isViewOnce: draft.isViewOnce ?? false
+            )
         }
         // The mock backend behaves like a server with `E2E_MODE=off`.
         if draft.envelope != nil {
@@ -376,6 +393,27 @@ actor MockAPIClient: APIClient {
 
     func markRead(conversationID: Conversation.ID) async throws {
         conversationStore[conversationID]?.unreadCount = 0
+    }
+
+    /// Like the server: only the recipient of a view-once photo, idempotent,
+    /// and a photo that's already gone isn't marked opened late.
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        try await pause()
+        guard let conversation = conversationStore[conversationID],
+              !blocked.contains(conversation.participant.id),
+              let index = messageStore[conversationID]?.firstIndex(where: { $0.id == messageID }),
+              var message = messageStore[conversationID]?[index],
+              message.senderID != MockData.myID,
+              message.attachment?.isViewOnce == true
+        else { throw APIError.notFound }
+        if message.attachment?.openedAt == nil, message.attachment?.url != nil {
+            message.attachment?.openedAt = .now
+            messageStore[conversationID]?[index] = message
+            if conversationStore[conversationID]?.lastMessage?.id == messageID {
+                conversationStore[conversationID]?.lastMessage = message
+            }
+        }
+        return message
     }
 
     func deleteConversation(_ conversationID: Conversation.ID) async throws {
@@ -454,7 +492,8 @@ actor MockAPIClient: APIClient {
 
     func setTravelLocation(_ location: FuzzedLocation?) async throws {
         try await pause()
-        guard currentPlusStatus.isActive else { throw APIError.requiresPlus }
+        // Like the server: turning it off is always allowed.
+        guard location == nil || currentPlusStatus.isActive else { throw APIError.requiresPlus }
         travelLocation = location
     }
 

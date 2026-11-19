@@ -23,6 +23,9 @@ struct Profile: Identifiable, Hashable, Codable, Sendable {
     var lastActiveAt: Date?
     /// Whether the current user has favorited this profile.
     var isFavorite: Bool
+    /// Travel mode. Only on your own profile (`GET`/`PATCH /me`); `nil` on
+    /// everyone else's and when travel mode is off.
+    var travel: TravelStatus? = nil
 
     var primaryPhotoURL: URL? { photos.first?.url }
 
@@ -34,6 +37,15 @@ struct Profile: Identifiable, Hashable, Codable, Sendable {
     /// The photos other people see, in order. The server hides photos it
     /// labelled explicit from everyone but their owner.
     var publicPhotos: [Photo] { photos.filter { !$0.isExplicit } }
+}
+
+/// The server's view of your travel mode (`Profile.travel`). It never
+/// carries coordinates; the app keeps the place it picked (`TravelPlace`).
+struct TravelStatus: Codable, Hashable, Sendable {
+    /// `false` while Stexx+ has lapsed: the server keeps the travel cell but
+    /// ignores it, so others see you at home until Stexx+ is back or you turn
+    /// travel mode off.
+    var isActive: Bool
 }
 
 struct Photo: Identifiable, Hashable, Codable, Sendable {

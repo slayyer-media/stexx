@@ -130,7 +130,10 @@ Stexx/E2E/
   E2ESecretStorage.swift   Keychain items (this device only, not synced) / in-memory for tests
   E2EProtocolStore.swift   libsignal's identity, prekey, signed, Kyber and session stores over it
   E2EHistoryStore.swift    Decrypted text, kept in an AES-GCM sealed file (key in the Keychain)
-  E2EContentRules.swift    Port of the server's link and duplicate-text rules
+  E2EContentRules.swift    Port of the server's link and duplicate-text rules; payment/crypto/redirect handle rules
+                           read from content-rules.json
+  content-rules.json       Byte-identical copy of server/src/lib/abuse/content-rules.json (patterns + test vectors).
+                           Edit the server file and copy it here; server/test/spam-content.test.ts fails if they differ
   E2EEngine.swift          Keys (register, top up, rotate), PQXDH, encrypt/decrypt, identity holds
   E2EAPIClient.swift       APIClient wrapper: encrypts sends, decrypts conversations and messages
   E2EStatus.swift          Main-actor state for the UI; realtime identity.changed / keys.low
@@ -193,8 +196,9 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   when it marks the chat read. The history is pruned on load, on foreground and
   (at most once a minute) while messages are revealed, and the decrypted images
   of dropped keys leave memory too. A view-once photo's key is
-  dropped when the viewer closes (`forgetAttachmentKey`), and the bubble shows
-  "Opened". The viewer downloads and decrypts on tap, never earlier.
+  dropped as soon as the server confirms the open, and again when the viewer
+  closes (`forgetAttachmentKey`), and the bubble shows "Opened". The viewer
+  downloads and decrypts on tap, never earlier (see View-once photos below).
 - **Payload timer.** Sent photos with a timer put `expiresAfterSeconds` (integer
   seconds) in the encrypted payload, because the server doesn't tell the
   recipient the timer. The recipient uses it only when it is 1 to 2592000 and
@@ -205,10 +209,35 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   `attachment_limit` stops further uploads (those items keep `hasPhoto: true`
   without a `photoID`). If the report fails with not-found, the sheet forgets the
   IDs and the next attempt uploads afresh.
-- **Known limitations.** A decrypted photo on screen can show up in iOS's
-  app-switcher snapshot (plaintext photos already can); a privacy cover is a
-  follow-up. The app never sends view-once photos; see docs/security.md for the
-  open-on-list rule that affects ones from other clients.
+- **View-once photos** (encrypted and plaintext). Listing a thread never opens
+  one. Tapping the "View once · Tap to open" tile opens `ViewOnceViewer`,
+  which downloads (and decrypts) the photo into memory only. Once it is on
+  screen (unblurred; a blurred one counts when the user taps to see it), or
+  turned out unreadable, `ChatStore.openViewOnce` calls
+  `POST …/messages/{id}/open`; the server deletes the photo about 30 s later.
+  An encrypted photo's key goes as soon as the server answers
+  (`E2EAPIClient.openViewOnce`), and on close in any case. `ChatStore` records
+  the open before the call, in `UserDefaults` (message IDs and dates only,
+  wiped at sign-out and after 15 days), so a photo opened here is never shown
+  again on this phone, and a failed open (offline, an error, the app killed)
+  is retried on the next resync or list load, also after a relaunch. Both
+  sides then show "Opened": the recipient always, the sender when
+  `attachment.openedAt` arrives (only if the recipient sends read receipts;
+  live via `message.updated`). The attachment menu has a **View once** toggle
+  (exclusive with **Expiring photos**) to send one. Never-opened photos go
+  after the server's 3-day cap.
+- **App-switcher cover.** `PrivacyCover` puts a separate window with the logo
+  over the whole app when the scene deactivates or goes to the background, so
+  the app switcher (live card and saved snapshot) shows no grid, chats or
+  photos. On by default; **Settings › Privacy › Hide Stexx in the app
+  switcher** turns it off (`UserDefaults`, this phone only). iOS can't say why
+  the app went inactive, so Notification Center, Control Center and system
+  alerts get the cover too; prompts the app starts itself (location
+  permission, the purchase sheet) call `expectSystemPrompt()` first and don't
+  flash it, but the background always does. The exemption is single-use and
+  `endSystemPrompt()` drops it when the purchase call returns; while such a
+  prompt is up, the switcher's live card isn't covered (no new scene event),
+  only the saved snapshot. The photo picker doesn't deactivate the app.
 - **Moderation hook.** Incoming decrypted photos go through
   `ChatPhotoAnalyzer` (`ChatPhotoModeration`). The real analyzer is Apple's
   Sensitive Content Analysis, which needs the
@@ -251,6 +280,46 @@ xcrun simctl launch booted gay.stexx.app \
 ```
 
 `-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
+More debug-only screenshot switches: `-StexxScreenshotSendPhoto viewOnce`
+(liveChat: sends a generated test photo as view-once), `-StexxScreenshotViewOnce
+open|openAndClose` (liveChat: opens the newest incoming view-once photo, as a
+tap would), `-StexxShowPrivacyCover YES` (keeps the app-switcher cover up, since
+the real app switcher can't be captured with `simctl`), and
+`-StexxScreenshotRoute settings`. Pair with `e2e-peer.ts read --open` to open
+the app's view-once photo from the other side.
+
+## Travel mode (Stexx+)
+
+Settings → Travel mode opens a map (`Features/Plus/TravelModeView.swift`,
+logic in `TravelModeModel.swift`); free users get the paywall instead. Pan
+the map or search a city (MapKit's `MKLocalSearchCompleter`; queries go to
+Apple, not to Stexx). The square drawn on the map is the 500 m cell around
+its center: `LocationFuzzer` snaps it on the phone, and only that cell is
+sent (`PUT /me/travel`). The picker starts on a world view, never at your
+own position, and won't pick while zoomed out past ~60 km.
+
+- **State.** `AppState.travel` holds the sent cell and a place name looked
+  up on the device (`MKReverseGeocodingRequest` on the fuzzed cell), on this
+  phone only: a small file in Application Support, excluded from backups
+  and protected until first unlock (`FileTravelPlaceStore`), not the
+  backed-up preferences plist. The server never receives the name and never
+  returns coordinates. `GET /me` says whether travel mode is on
+  (`Profile.travel`), and that wins: after a reinstall it shows as on
+  without a place name. Sign-out forgets it.
+- **Stexx+ lapses.** The server keeps the cell but ignores it, so the app
+  shows travel mode as paused (Settings explains it and offers a free
+  "Turn off travel mode", which sends `null`); it resumes on renewal. The
+  app notices without waiting for the next foreground: a timer drops
+  Stexx+ at `plusExpiresAt`, and `GET /me` reporting `travel.isActive:
+  false` does the same; both then re-check with the server, which turns
+  Stexx+ back on after a renewal.
+- **Nearby.** While it's on, a "Browsing from …" pill sits above the grid:
+  tap it to change the place, × to turn it off. While paused it says
+  "Travel paused · You're shown near home" instead (tap for the paywall, ×
+  to turn it off). The grid reloads whenever travel mode changes.
+
+Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
+signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.
 
 ## Configuration
 
@@ -336,10 +405,8 @@ ios/
 - Email links open the app (universal links through `applinks:stexx.gay`,
   Debug and Release) only once `stexx.gay` serves the AASA file; until then
   they open in the browser
-- Travel mode UI (`APIClient.setTravelLocation` is ready)
 - Push notifications
 - Discreet alternate app icons, localization
-- Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)
 - End-to-end encryption for chat photos (they're still sent as plain
   attachments), the safety-number comparison screen, and multi-device
 - A run of the E2E client on a physical iPhone (Keychain classes, App Attest

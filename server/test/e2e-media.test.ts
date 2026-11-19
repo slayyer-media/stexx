@@ -17,8 +17,8 @@ import {
   purgeUnopenedViewOnceAttachments,
   purgeViewedOnceAttachments,
   sweepOrphanMedia,
-  UNREAD_EXPIRING_CAP_MS,
   VIEW_ONCE_GRACE_MS,
+  VIEW_ONCE_UNOPENED_CAP_MS,
 } from "../src/jobs/retention.ts";
 import { resetAbuseLimits } from "../src/lib/abuse/limits.ts";
 import { setE2eModeForTests } from "../src/lib/e2e/keys.ts";
@@ -248,7 +248,7 @@ describe("sending an encrypted photo", () => {
     const [a, b] = await Promise.all([createUser(), createUser()]);
     const conv = await conversation(a, b);
     const { msg, blob, upload } = await sendEncryptedPhoto(a, conv);
-    expect(msg.attachment).toEqual({ kind: "photo", url: upload.url, isViewOnce: false, isEncrypted: true });
+    expect(msg.attachment).toEqual({ kind: "photo", url: upload.url, isViewOnce: false, isEncrypted: true, openedAt: null });
     expect(msg.text).toBeNull();
     expect(await pendingUpload(upload.id)).toBeUndefined();
     expect(await sql`SELECT 1 FROM media_trash WHERE storage_key = ${keyOf(upload.url)}`).toHaveLength(0);
@@ -257,7 +257,7 @@ describe("sending an encrypted photo", () => {
 
     const page = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
     const got = page.items.find((m: any) => m.id === msg.id);
-    expect(got.attachment).toEqual({ kind: "photo", url: upload.url, isViewOnce: false, isEncrypted: true });
+    expect(got.attachment).toEqual({ kind: "photo", url: upload.url, isViewOnce: false, isEncrypted: true, openedAt: null });
     const res = await mediaRoute(got.attachment.url);
     expect(Buffer.compare(Buffer.from(await res.arrayBuffer()), blob)).toBe(0);
     const list = await expectJson(await as(b).get("/v1/conversations"));
@@ -401,35 +401,54 @@ describe("encrypted blobs are deleted on the same schedule", () => {
   test("view-once: opened + grace, and the 14-day cap when never opened; the message stays with url null", async () => {
     const [a, b] = await Promise.all([createUser(), createUser()]);
     const conv = await conversation(a, b);
-    const { msg: opened } = await sendEncryptedPhoto(a, conv, { isViewOnce: true });
-    const { msg: unopened } = await sendEncryptedPhoto(a, conv, { isViewOnce: true });
-    // Realtime / list never carry the URL to the recipient; the messages listing does (and stamps the open).
+    const { msg: opened, upload: openedUpload } = await sendEncryptedPhoto(a, conv, { isViewOnce: true });
+    const { msg: unopened, upload: unopenedUpload } = await sendEncryptedPhoto(a, conv, { isViewOnce: true });
+    expect(opened.attachment.url).toBeNull(); // never to the sender
+    // Realtime / list never carry the URL to the recipient; the messages listing does, without opening it.
     const listed = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
-    expect(listed.items.find((m: any) => m.id === opened.id).attachment.url).toBe(opened.attachment.url);
+    // A view-once send gives the message its own file name; the sender's upload URL is dead at once.
+    const openedUrl: string = listed.items.find((m: any) => m.id === opened.id).attachment.url;
+    const unopenedUrl: string = listed.items.find((m: any) => m.id === unopened.id).attachment.url;
+    expect(openedUrl).toEndWith(".bin");
+    expect(openedUrl).not.toBe(openedUpload.url);
+    expect(onDisk(openedUpload.url)).toBe(false);
+    expect(onDisk(unopenedUpload.url)).toBe(false);
+    expect((await mediaRoute(openedUpload.url)).status).toBe(404);
+    expect(await sql`SELECT 1 FROM messages WHERE id = ${opened.id} AND attachment_opened_at IS NULL`).toHaveLength(1);
+    // The recipient's app opens the first one; re-dated to T0 so the purge clock stays in 2000.
+    const open = await expectJson(await as(b).post(`/v1/conversations/${conv}/messages/${opened.id}/open`));
+    expect(open.attachment).toMatchObject({ url: openedUrl, isEncrypted: true, openedAt: expect.any(String) });
     await sql`UPDATE messages SET attachment_opened_at = ${T0} WHERE id = ${opened.id}`;
     // The second one counts as never opened, sent long ago.
-    await sql`UPDATE messages SET attachment_opened_at = NULL, sent_at = ${T0} WHERE id = ${unopened.id}`;
+    await sql`UPDATE messages SET sent_at = ${T0} WHERE id = ${unopened.id}`;
 
     await purgeViewedOnceAttachments(at(T0, VIEW_ONCE_GRACE_MS - 1000));
-    expect(onDisk(opened.attachment.url)).toBe(true);
+    expect(onDisk(openedUrl)).toBe(true);
     await purgeViewedOnceAttachments(at(T0, VIEW_ONCE_GRACE_MS + 1000));
-    expect(onDisk(opened.attachment.url)).toBe(false);
-    expect((await mediaRoute(opened.attachment.url)).status).toBe(404);
+    expect(onDisk(openedUrl)).toBe(false);
+    expect((await mediaRoute(openedUrl)).status).toBe(404);
+    expect(onDisk(unopenedUrl)).toBe(true); // listed, never opened: not touched by the grace purge
 
-    await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS - 1000));
-    expect(onDisk(unopened.attachment.url)).toBe(true);
-    await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS + 1000));
-    expect(onDisk(unopened.attachment.url)).toBe(false);
+    await purgeUnopenedViewOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS - 1000));
+    expect(onDisk(unopenedUrl)).toBe(true);
+    await purgeUnopenedViewOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS + 1000));
+    expect(onDisk(unopenedUrl)).toBe(false);
 
     const after = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
-    for (const id of [opened.id, unopened.id]) {
-      expect(after.items.find((m: any) => m.id === id).attachment).toEqual({
-        kind: "photo",
-        url: null,
-        isViewOnce: true,
-        isEncrypted: true,
-      });
-    }
+    expect(after.items.find((m: any) => m.id === opened.id).attachment).toEqual({
+      kind: "photo",
+      url: null,
+      isViewOnce: true,
+      isEncrypted: true,
+      openedAt: "2000-02-03T04:05:06Z",
+    });
+    expect(after.items.find((m: any) => m.id === unopened.id).attachment).toEqual({
+      kind: "photo",
+      url: null,
+      isViewOnce: true,
+      isEncrypted: true,
+      openedAt: null,
+    });
   });
 
   test("conversation deleted by both, and account deletion", async () => {
@@ -572,7 +591,7 @@ describe("data export", () => {
     const jpegUpload = await expectJson(await uploadJpeg(a), 201);
     const archive = await expectJson(await as(a).get("/v1/me/export"));
     const exported = archive.conversations.find((c: any) => c.id === conv).messages.find((m: any) => m.id === msg.id);
-    expect(exported.attachment).toEqual({ kind: "photo", url: msg.attachment.url, isViewOnce: false, isEncrypted: true });
+    expect(exported.attachment).toEqual({ kind: "photo", url: msg.attachment.url, isViewOnce: false, isEncrypted: true, openedAt: null });
     expect(exported.envelope).toEqual(msg.envelope);
     const uploads = new Map(archive.pendingChatUploads.map((u: any) => [u.id, u.isEncrypted]));
     expect(uploads.get(blobUpload.id)).toBe(true);

@@ -1,13 +1,16 @@
 # Deploying the Stexx API (OVH VPS, Ubuntu 24.04, behind Cloudflare)
 
 Same shape as the owner's other app: **Caddy + systemd + native Postgres 18**, one box, no containers in production.
-Nothing in this directory runs automatically; every script is run by a person.
+Scripts here are run by a person, except what the timers run once enabled: the nightly backup (`stexx-backup.timer`) and the
+watchdog every 5 minutes (`stexx-watch.timer`).
 
 ```
  iOS app ──TLS──> Cloudflare (proxy, WAF) ──TLS──> Caddy :443 ─┬─ api.stexx.gay   -> 127.0.0.1:8787  Bun/Hono (stexx-api.service, user stexx)
                                                                └─ media.stexx.gay -> file_server /srv/stexx/media (read-only, <32 hex>.jpg|.bin only)
                                                        Postgres 18 on 127.0.0.1:5432 (roles: stexx_app DML only / stexx_owner migrations / stexxbackup read-only)
                                                        nightly: pg_dump | age | rclone -> Backblaze B2, 28-day retention
+                                                       before each migration: full age-encrypted snapshot on the box, 24 h
+                                                       every 5 min: stexx-watch (backup age, health, disk, TLS, errors) -> email / webhook
 ```
 
 | File | Purpose |
@@ -16,13 +19,17 @@ Nothing in this directory runs automatically; every script is run by a person.
 | `Caddyfile.apex` | Optional: `stexx.gay` serving only `/.well-known/apple-app-site-association` (passkeys), when the apex points at this box. Installed by hand as `/etc/caddy/sites/stexx-apex.caddy` (step 8). |
 | `Caddyfile.main` | Global options (Cloudflare trusted proxies, log filtering) + `import sites/*.caddy`. The whole `/etc/caddy/Caddyfile` on a dedicated box. |
 | `stexx-api.service` | The API, with strong systemd sandboxing. |
-| `stexx-backup.service` / `.timer` / `backup.sh` | Encrypted nightly backup. |
+| `stexx-backup.service` / `.timer` / `backup.sh` | Encrypted nightly backup; `backup.sh --pre-migrate` is the snapshot `deploy.sh` takes before migrating. |
+| `restore-drill.sh` | Runs on your laptop: fetch, decrypt, restore into a scratch database, sanity checks. Also the real restore. |
+| `stexx-watch.service` / `.timer` / `stexx-watch.sh` | Watchdog every 5 minutes, and the alert sender. |
+| `stexx-alert@.service` | `OnFailure=` target of the API, backup and watchdog units: alerts with the unit name. |
+| `selftest.sh` | Rehearses all of the above on a laptop (stubs, a fake SMTP/webhook, and a real database if you give it one). |
 | `postgres/` | `90-stexx.conf` (settings), `pg_hba-stexx.conf` (access), `roles.sql` (roles, once), `grants.sql` (re-applied each deploy). |
 | `system/` | journald retention, unattended-upgrades, fail2ban, sshd key-only, tmpfiles. |
 | `ufw-cloudflare.sh` | Firewall: ssh + Cloudflare-only 80/443. |
 | `bootstrap.sh` | One-time provisioning. Idempotent. |
 | `deploy.sh` | Release, migrate, flip, health-check, roll back. |
-| `*.example` | `stexx.env`, `migrate.env`, `backup.env`, `rclone.conf` references. |
+| `*.example` | `stexx.env`, `migrate.env`, `backup.env`, `watch.env`, `rclone.conf` references. |
 
 ## First-time setup
 
@@ -39,8 +46,12 @@ Nothing in this directory runs automatically; every script is run by a person.
    If the Postgres cluster hosts other databases, bootstrap refuses to install the cluster-wide `90-stexx.conf` unless you pass `INSTALL_PG_CONF=1` (read the file first).
 4. **Firewall.** On the server: `sudo ./ufw-cloudflare.sh` (dry run), then `--apply`. Re-run monthly to follow Cloudflare's published ranges.
 5. **Mail** (optional): set `SMTP_URL` in `/etc/stexx/stexx.env`. Without it, email sign-in returns 503 `email_unavailable` (passkeys still work).
+   **Moderator alerts** (optional): set `MODERATOR_ALERT_EMAIL` (needs `SMTP_URL`) and/or `MODERATOR_ALERT_WEBHOOK_URL` there too, then
+   `systemctl restart stexx-api` and check with `stexx-mod alerts test` (docs/security.md section 5, "Alerts").
 6. **Backups** (below), then `systemctl enable --now stexx-backup.timer`.
 7. **First deploy:** `DEPLOY_HOST=you@host ./deploy/deploy.sh --no-backup` (no data yet), then `--status`.
+   **Alerts** ([Monitoring and alerts](#monitoring-and-alerts)): fill `/etc/stexx/watch.env`, then `sudo stexx-watch --test-alert`.
+   **Restore drill** from your laptop once the first nightly backup exists ([Restore drill](#restore-drill)).
 8. **Apple app-site-association (passkeys).** The iOS app can only create or use passkeys for `stexx.gay` (`WEBAUTHN_RP_ID`) once Apple's CDN
    has fetched `https://stexx.gay/.well-known/apple-app-site-association` (HTTPS, `Content-Type: application/json`, **no redirect**).
    The API builds that file from `APPLE_TEAM_ID` + `APPLE_BUNDLE_ID` (`webcredentials` for passkeys, `applinks` for `/auth/email` sign-in links;
@@ -55,7 +66,8 @@ Nothing in this directory runs automatically; every script is run by a person.
      re-checks on install and app update). Cloudflare must not redirect, challenge (bot fight mode, WAF) or rewrite that path.
 
 Day to day: `DEPLOY_HOST=you@host ./deploy/deploy.sh` (runs `bun run check` locally first), `--status`, `--list-releases`, `--rollback`.
-Config-only changes (units, Caddy site file, backup script): `--sync-config`.
+Config-only changes (units, Caddy site file, backup and watchdog scripts, tmpfiles rule): `--sync-config`. It also enables
+`stexx-watch.timer`.
 
 ## What each control protects
 
@@ -104,21 +116,42 @@ Not run on a real host while writing this: the unit sandbox (no Linux box was to
 
 `docs/api.md` promises account data is gone "within 30 days, including backups".
 
-- **What:** `backup.sh` streams `pg_dump` (custom format, zstd) into `age` and into `rclone rcat`: the plaintext never touches disk. One object per night, `stexx-<UTC stamp>.dump.age`.
+- **What:** `backup.sh` streams `pg_dump` (custom format, zstd) into `age` and into `rclone rcat`: the plaintext never touches disk. Each night writes
+  `stexx-<UTC stamp>.dump.age` (the archive) and `stexx-<UTC stamp>.reports.csv.age` (the reports, see below), both from **one database snapshot**.
 - **Encryption keys:** generate the pair **on your laptop**: `age-keygen -o stexx-backup.key` (store the file in your password manager, ideally a second recipient too). Only the
   public key (`age1...`) goes on the server, in `/etc/stexx/backup-recipients.txt`. A compromised server cannot decrypt backups.
 - **B2:** private bucket, **no Object Lock**, and an application key limited to that bucket with `listBuckets, listFiles, writeFiles, deleteFiles` and **no `readFiles`**
   (a stolen server key cannot download old backups). Bucket lifecycle: "keep only the last version" (hide-to-delete 1 day) as a backstop. Put the key in `/etc/stexx/rclone.conf`
-  (`root:stexxbackup 0640`, template in `rclone.conf.example`).
+  (`root:stexxbackup 0640`, template in `rclone.conf.example`). The restore drill needs a **second** key with `readFiles`, kept on your laptop only.
 - **Retention:** every run first hard-deletes everything older than 28 days (`rclone delete --min-age 28d`, `hard_delete = true`), *before* and independently of the new dump,
   so a failing upload (expired key, missing recipient) never stops pruning; it refuses to run with a value above 28. A user deleted at any moment is therefore absent from all
-  backups within 30 days (28 + timer jitter margin). A failed upload removes its own partial object and exits non-zero (unit shows `failed`); so does a failed prune.
-- **Left out of the dump (rows only, schema kept):** `messages`, `email_link_tokens`, `auth_challenges`, `media_trash`, `locations`, `travel_locations`, `profile_views`.
-  Without this, "expiring" and view-once messages would sit in backups for 30 days after their timer, and 28 nightly snapshots of every user's cell would be exactly the
-  location history the app promises not to keep (after a restore, people's next location update repopulates the grid). **Trade-off:** restoring a backup gives you accounts, profiles, photos' rows, favorites, blocks, reports and subscriptions, but empty
-  conversations. Override with `STEXX_BACKUP_EXCLUDE_DATA=""` in `/etc/stexx/backup.env` if you decide chat history should survive a disaster more than the ephemerality promise.
+  backups within 30 days (28 + timer jitter margin). A failed upload removes its own partial objects and exits non-zero (unit shows `failed`, `OnFailure=` alerts); so does a failed prune.
+
+### What is in a nightly backup
+
+| Rows | In the backup? | Why |
+| --- | --- | --- |
+| `sessions`, `email_link_tokens`, `auth_challenges`, `attest_challenges` | **never** (fixed in `backup.sh`) | Credentials. A restore must not bring back live sessions or sign-in links, including those of accounts deleted after the backup. |
+| `abuse_counters` | **never** | Rate-limit windows keyed by IP HMACs; they expire within two windows anyway. |
+| `e2e_one_time_prekeys` | **never** | A restored one-time prekey may already have been handed out and used. Bundles fall back to the last-resort prekey (in `e2e_devices`) until apps top up on launch. |
+| `report_evidence` | **never** | Plaintext a reporter chose to share, on its own 30-day clock; a restore never needs it. Fixed rather than configurable, so an older `backup.env` that sets `STEXX_BACKUP_EXCLUDE_DATA` can't put it back. |
+| `spam_message_features` | **never** | One row per message (sender, conversation, time, link/payment flags, a keyed MinHash) on a 48 h clock for the spam rules. 28 nightly copies would be a month of who wrote into which chat and when, outliving the expiring and view-once timers that keep `messages` out. The rules only look at the last 48 h, so a restore loses nothing useful. |
+| `spam_contacts` | **never** | The spam rules' content-free ledger: who first wrote to whom in which conversation and when, on a 7-day clock. 28 nightly copies would keep a month of that contact graph. The rules only look back 7 days, so a restore loses nothing useful. |
+| `taps` | **never** | Who tapped whom and when, a history with its own retention clock (`TAP_RETENTION_DAYS`, 30 days, from the taps inbox). In backups each tap would live up to 28 days longer (about 58 in all). After a restore the taps inbox starts empty, as profile views do. |
+| `messages`, `media_trash`, `locations`, `travel_locations`, `profile_views` | no (default `STEXX_BACKUP_EXCLUDE_DATA`) | Expiring and view-once messages must not outlive their timer; 28 nightly snapshots of location cells and views would be exactly the history the app promises not to keep. |
+| `reports` | yes, **redacted**: separate `.reports.csv.age` with `details` and `reporter_ip_hash` set to NULL | `pg_dump` can't leave out one column, so the archive keeps the table's schema but not its rows, and the rows go to the sidecar (same snapshot). Reason, priority, status, dates and the accounts involved survive; the free text and the IP hash don't. `STEXX_BACKUP_REDACT_REPORTS=0` puts them back in the archive unchanged; listing `reports` in `STEXX_BACKUP_EXCLUDE_DATA` drops them. |
+| everything else (accounts, profiles, photo rows, favorites, blocks, conversations, subscriptions, moderation history, devices, E2E identity keys, ...) | yes | |
+
+The schema of every table is always in the archive. A fixed exclusion may name a table an older schema doesn't have yet (`spam_message_features` arrives with
+migration 112): `pg_dump` ignores an exclusion that matches nothing (`backup.sh` doesn't pass `--strict-names`), and `selftest.sh` checks both.
+
+**Trade-off (owner decision, the default chosen here):** after restoring a nightly backup **everyone is signed out** (they sign in again with their passkey or an email link), conversations are
+**empty**, nobody has a location until their app sends one, and **reports lose their free text and evidence** (moderators still see who reported whom, why and when).
+Override `STEXX_BACKUP_EXCLUDE_DATA` in `/etc/stexx/backup.env` if you decide chat history should survive a disaster more than the ephemerality promise; the credential tables,
+report evidence, spam-detection features and taps can't be put back by configuration (the backup log prints `backup note: rows of messages ARE included` while messages are in). An older `backup.env` that still sets
+`STEXX_BACKUP_EXCLUDE_DATA` to the previous default keeps working: the fixed list covers what it lacks.
+
 - **Media files are not backed up** (and are deleted on schedule). After a restore, `photos` rows whose files are gone show as broken images until users re-upload.
-- **Pre-deploy:** `deploy.sh` runs the same backup unit before migrating, so a bad migration can be undone. There is no unencrypted dump anywhere.
 - **Setup:**
   ```sh
   # on the server
@@ -128,21 +161,137 @@ Not run on a real host while writing this: the unit sandbox (no Linux box was to
   sudo systemctl enable --now stexx-backup.timer && sudo systemctl start stexx-backup.service
   journalctl -u stexx-backup -n 20 --no-pager ; DEPLOY_HOST=you@host ./deploy/deploy.sh --status
   ```
-- **Restore drill (do this once before launch, then quarterly):**
-  ```sh
-  rclone copy b2:stexx-backups/db/stexx-<stamp>.dump.age .          # with a key that has readFiles
-  age -d -i stexx-backup.key stexx-<stamp>.dump.age > stexx.dump
-  createdb stexx_restore && pg_restore -d stexx_restore --no-owner --exit-on-error stexx.dump
-  # restore into a fresh `stexx` database as stexx_owner for a real recovery, then run grants.sql and restart stexx-api
-  ```
-  A real restore reintroduces accounts that were deleted *after* that backup was taken. Until those people delete again, they exist again; keep a note of deletion requests received
-  since the backup date and re-run them. (A deletion ledger is deliberately not kept: it would be a record of who used the app.)
-- Alert on failure: `systemctl is-failed stexx-backup.service`, and `--status` shows `last backup`. Wire that into the existing health check you use for the other app.
+
+### Before a migration: the pre-migrate snapshot
+
+The nightly backup can't undo a migration: it has no sessions, messages or locations. So `deploy.sh` runs `sudo stexx-backup --pre-migrate` right before `migrate.ts`, which writes
+a **full** dump (no exclusions at all) to `/var/lib/stexx-premigrate/stexx-premigrate-<stamp>.dump.age`:
+
+- encrypted to the same age recipients (the server still can't read it), `0600` in a `0700` directory, both owned by root; `pg_dump` itself runs as the read-only `stexxbackup` role;
+- the directory is deliberately **not** inside `/var/lib/stexx-backup`, which `stexxbackup` owns: a user who can write the parent could swap the directory for a symlink and have root
+  write through it. `backup.sh` refuses a snapshot directory that is a symlink, isn't owned by root, or sits in a directory anyone but root can write to, and creates its partial file
+  with `mktemp`, so an existing name is never followed;
+- **never uploaded**, and deleted after `STEXX_PREMIGRATE_TTL_HOURS` (24, the maximum) by the watchdog, with a `systemd-tmpfiles` age rule as the backstop if the watchdog isn't running;
+- **bounded on disk:** the directory usually shares a filesystem with `/var/lib/postgresql`, and a full disk stops the database. Before writing, `backup.sh` estimates the snapshot
+  (the newest existing one plus a quarter, or the database size if there is none) and refuses unless `STEXX_PREMIGRATE_MIN_FREE_PCT` (15, the watchdog's warning level) of the
+  filesystem stays free; the deploy then stops before migrating. After a new snapshot is in place it deletes all but the newest `STEXX_PREMIGRATE_KEEP` (2), so a migration
+  retried several times in a day can't stack dumps;
+- a deploy refuses to migrate if the snapshot fails (`--no-backup` skips it: only for the very first deploy) or if the server still has the old `backup.sh` (run `--sync-config`).
+
+So for up to 24 hours after a deploy, the box holds one complete encrypted copy, including messages and locations, readable only with the age private key that isn't on it.
+`stexxbackup` has a connection limit of 2 and the nightly run uses both: don't deploy during the backup window (03:17 UTC + up to 15 minutes).
+
+**Undoing a bad migration** (the box is live, so keep the API down until the restored database is safe to serve):
+
+1. `sudo systemctl stop stexx-api`. The watchdog alerts on health while it's down; that's expected.
+2. Copy the snapshot to your laptop (`ssh host sudo cat /var/lib/stexx-premigrate/<file> > <file>`; it's encrypted).
+3. Export what happened after the snapshot from the old database, **before** dropping it: `SELECT * FROM blocks WHERE created_at > '<snapshot time>'`,
+   `SELECT * FROM moderation_actions WHERE created_at > '<snapshot time>'`, and the ids of accounts that exist in the snapshot but not in the old database (deleted since).
+4. Drop and re-create an empty `stexx` database as `postgres` (`roles.sql`), then restore: `restore-drill.sh --file <file> --restore-into stexx` (steps 4 and 8 of the
+   [runbook](#disaster-recovery-runbook)). A real restore always revokes every session and deletes pending sign-in links (sessions revoked after the snapshot, by
+   "sign out everywhere" or a ban, would otherwise work again), and because the snapshot is a full dump it also empties `e2e_one_time_prekeys` (prekeys handed out since the
+   snapshot would otherwise be handed out a second time), `attest_challenges` and `abuse_counters`; apps upload new prekeys on launch.
+5. Re-apply the exported blocks, bans (moderation CLI) and deletions against the restored database (runbook step 6). Everything else written after the snapshot is lost.
+6. Only then roll the code back and start the API: `deploy.sh --rollback` (it restarts `stexx-api` and checks health).
+
+### Restore drill
+
+Run it **once before launch, then monthly**, from your laptop (needs the age private key, an rclone remote with a **readFiles** key, and PostgreSQL 18 client tools built with zstd,
+for example PGDG's `postgresql-client-18`; Homebrew's `libpq` lacks zstd and the drill says so):
+
+```sh
+# a local scratch Postgres 18 (any server you can CREATE DATABASE on)
+PGHOST=127.0.0.1 PGUSER=postgres ./deploy/restore-drill.sh --identity ~/stexx-backup.key --remote b2read:stexx-backups/db
+```
+
+It fetches the newest `stexx-*.dump.age` and its sidecar, decrypts into a private temp dir (removed on exit), creates `stexx_drill_<stamp>_<pid>`, restores schema and rows, loads the
+reports, restores indexes, keys and triggers, then checks: row counts (users, photos, subscriptions, reports, conversations), `max(schema_migrations)` against the newest file in your
+checkout, that the always-excluded tables are empty, and that `grants.sql` applies (for real if the role `stexx_app` exists on that server, otherwise inside a rolled-back
+transaction). It drops the scratch database and prints `RESULT: PASS` or `RESULT: FAIL` (exit 0/1). `--file` takes a local file instead, `--keep` keeps the database,
+`--min-users 0` accepts an empty install. `./deploy/selftest.sh` runs the same drill against any database you point it at. With `--restore-into` (a real restore) it always
+revokes every restored session and deletes pending sign-in links, as `--revoke-sessions` does; there is no opt-out.
+
+## Disaster recovery runbook
+
+For a lost or compromised VPS. Expect about an hour. What you need: the age private key and the B2 read key (password manager), `EMAIL_PEPPER` (password manager), DNS/Cloudflare
+access, and this repo.
+
+1. **New VPS** (Ubuntu 24.04). Install PostgreSQL 18 (PGDG) and Caddy as in [First-time setup](#first-time-setup), step 2. Create your user with an ssh key.
+2. **Bootstrap:** `DEPLOY_HOST=you@new-host ./deploy/deploy.sh --bootstrap`. It creates the roles, an empty `stexx` database and a fresh `/etc/stexx/stexx.env`.
+3. **`EMAIL_PEPPER`:** replace the freshly generated one in `/etc/stexx/stexx.env` with the value from the password manager. **Without the old pepper every email account and every
+   keyed hash (rate limits, report IPs) stops matching**: email sign-in creates new, empty accounts. Copy the other secrets you set by hand (SMTP, Apple, DeviceCheck) back too.
+4. **Restore** from your laptop through an ssh tunnel, as the schema owner (password in the new box's `/etc/stexx/migrate.env`; put it in `~/.pgpass` rather than the command
+   line), into the empty `stexx` database:
+   ```sh
+   ssh -N -L 5433:127.0.0.1:5432 you@new-host &
+   PGHOST=127.0.0.1 PGPORT=5433 PGUSER=stexx_owner \
+     ./deploy/restore-drill.sh --identity ~/stexx-backup.key --remote b2read:stexx-backups/db --restore-into stexx
+   ```
+   It refuses a database that already has tables (a half-finished attempt: drop it as `postgres`, re-run `roles.sql`, retry). `grants.sql` is applied as part of it because
+   `stexx_app` exists there; the age key never touches the server.
+5. **Deploy, with no traffic yet:** put the age **public** key in `/etc/stexx/backup-recipients.txt` first (the pre-migrate snapshot needs it), then
+   `DEPLOY_HOST=you@new-host ./deploy/deploy.sh` (migrates forward if the backup predates the latest migration, applies grants again, starts the API). Then the firewall
+   (`ufw-cloudflare.sh --apply`), backups (a new B2 **write** key on the box, `systemctl enable --now stexx-backup.timer`) and alerts (`watch.env`, `stexx-watch --test-alert`).
+   DNS still points elsewhere, so nobody reaches this API yet. **If the new box has the old IP** (a reinstall), DNS already points here: run `sudo systemctl stop stexx-api`
+   right after `deploy.sh` and keep it stopped until step 6 is done.
+6. **Re-apply what happened after the backup, before any traffic:** a restore silently undoes everything written since, and three kinds of change are safety-critical. Until
+   all three are re-applied, banned accounts are live again, blocked people can see and message each other, and deleted profiles are back (and someone who deleted their account
+   and signs in again lands in the old profile), so the API must not take traffic before this step is finished:
+   - **account deletions:** deleted accounts come back (profile, photo rows, last location cell for a pre-migrate snapshot, chats) and show up in nearby. Re-run the deletion
+     requests received since the backup date (in-app deletions leave no trace by design; check support mail). A deletion ledger is deliberately not kept: it would be a record of who
+     used the app.
+   - **blocks:** a block placed after the backup is gone, so the two people can see and message each other again. Re-block.
+   - **moderation bans:** a ban placed after the backup is gone and the account is live again. Re-run the ban through the moderation CLI (`bun run moderate`, on the box).
+
+   If the old database is still reachable (undoing a migration, or a box that is broken but readable), compare before dropping it:
+   `SELECT * FROM blocks WHERE created_at > '<backup time>'` and `SELECT * FROM moderation_actions WHERE created_at > '<backup time>'`, then re-apply them and re-run deletions
+   for accounts that are gone there but present in the restore. If it isn't reachable, go through the moderation queue and support mail since the backup date.
+7. **DNS, only now:** point the `api` and `media` records in Cloudflare at the new IP (still proxied, Full strict). Caddy gets certificates on the first requests; `--status` and
+   `curl -sI https://api.stexx.gay/healthz` should show 204. (Same IP: `sudo systemctl start stexx-api` instead.)
+8. **Sessions and keys:** `--restore-into` already revoked every restored session and deleted pending sign-in links, and emptied the one-time prekeys, attestation challenges and
+   rate-limit counters. Nightly backups contain none of these, so this matters for a pre-migrate snapshot or an older backup, but it happens on every real restore: a restore must
+   never bring back a live login or a used prekey. If the old box may be compromised, also follow "Suspected key leak" below (B2 key, age recipient, database passwords).
+
+**What is lost:** everything after the backup (up to about a day with the nightly schedule), all **messages and chat photos**, all **media files** (profile photos show as broken until
+re-uploaded), every **location** (repopulates as apps report in), profile views, **taps**, report **free text and evidence**, and every **login** (people sign in again). One-time prekeys are
+gone too; apps upload new ones on launch. **Account deletions, blocks and moderation bans made after the backup are undone** until you re-apply them (step 6).
+
+## Monitoring and alerts
+
+`stexx-watch.timer` runs `/usr/local/sbin/stexx-watch` every 5 minutes (as root, sandboxed, no capabilities). Each run logs one line per check to the journal
+(`journalctl -u stexx-watch`) and writes a summary to `/var/lib/stexx-watch/last-run`, which `deploy.sh --status` prints:
+
+| Check | Fails when |
+| --- | --- |
+| `backup_age` | `/var/lib/stexx-backup/last-success` is missing or older than 30 h |
+| `health_local`, `health_public` | `GET /healthz` on `127.0.0.1:8787`, and through Cloudflare, is not 204. If Cloudflare's bot protection challenges the box's own request, add a WAF skip rule for `/healthz` or set `WATCH_PUBLIC_HEALTH_URL=` |
+| `disk:<path>` | free space on `/srv/stexx/media` or `/var/lib/postgresql` under 15 % (warn), under 5 % (fail) |
+| `tls:<host>` | the **origin** certificate Caddy serves for `api.stexx.gay` / `media.stexx.gay` (read on `127.0.0.1:443`, not Cloudflare's edge certificate) expires within 14 days (warn), 3 days (fail) |
+| `api_errors` | more than 20 `level:"error"` lines from `stexx-api` since the previous run (a journal cursor makes each line count once) |
+| `premigrate_ttl` | deletes pre-migrate snapshots (and leftover partial files) older than 24 h; fails if any can't be deleted or the directory is a symlink, warns if it is readable by anyone but root |
+
+`stexx-api.service`, `stexx-backup.service` and `stexx-watch.service` have `OnFailure=stexx-alert@%n.service`, which sends "unit failed: <name>". For the API that means it ran
+out of restarts (6 in 120 s); an API that keeps restarting is caught by the health checks instead.
+
+**Alerts are off until configured** (⚠️ owner decision: the destination). In `/etc/stexx/watch.env` (root 0600, template `watch.env.example`):
+
+- `ALERT_EMAIL=you@example.org` sends through the API's relay (`SMTP_URL`, `MAIL_FROM` in `stexx.env`; or `ALERT_SMTP_URL` / `ALERT_MAIL_FROM`). TLS is required except for a relay on
+  the box itself.
+- `ALERT_WEBHOOK_URL=https://ntfy.example.org/<random topic>` (+ `ALERT_WEBHOOK_TOKEN`) POSTs the text with a `Title` header; a self-hosted ntfy works as is, and the phone app shows it.
+- Both may be set. Test with `sudo stexx-watch --test-alert`.
+
+Alert text names checks and units only (`[stexx] FAIL backup_age health_public`): no user data, no addresses, no numbers from the database, and a label (`ALERT_LABEL`) instead of the
+hostname. Credentials go to curl through its stdin, never the command line. Repeats are debounced with `/var/lib/stexx-watch/alert-state`: a problem set alerts once, again when it
+changes, every `ALERT_REPEAT_HOURS` (6) while it lasts, and once more when everything passes ("recovered"). Unit-failure alerts repeat at most every 6 h per unit. A run whose alert
+can't be delivered exits 2, so the watchdog unit itself fails and is listed under `failed units` in `--status`.
+
+Rehearse it all on your laptop with `./deploy/selftest.sh` (fake HTTP, SMTP, TLS and journal; prints the pass, fail, debounce and recovery output).
 
 ## Logs and what they contain
 
 | Source | Contains | Retention |
 | --- | --- | --- |
+| `stexx-watch`, `stexx-alert` (journald) | check names, statuses, counts, paths and certificate dates. No user data | 7 days / 500 MB |
 | `stexx-api` (journald) | method, route *pattern*, status, duration; job counters; error events without request data. No bodies, query strings, tokens, IPs, user agents, emails, coordinates or message text | 7 days / 500 MB |
 | Caddy | startup/warning events only. No access log, no error-request log | 7 days |
 | Postgres | connection-less, statement-less, `terse` error lines | weekly rotation (see above) |
@@ -178,13 +327,14 @@ loading a missing model every 5 minutes) or restart. A malformed `PHOTO_HASH_BLO
 - **Bun:** change `BUN_VERSION` and re-run `bootstrap.sh` (it verifies the release checksum), then `systemctl restart stexx-api`.
 - **Dependencies:** `bun.lock` is installed with `--frozen-lockfile --ignore-scripts`; bump versions in a PR, run `bun run check`, deploy.
 - **OS / Postgres minors:** unattended. Majors: manual, with a backup first.
-- **Caddy site file / units / backup script:** edit in the repo, `deploy.sh --sync-config` (validates the Caddy config and restores the previous site file if invalid).
+- **Caddy site file / units / backup and watchdog scripts:** edit in the repo, `deploy.sh --sync-config` (validates the Caddy config and restores the previous site file if invalid).
 - **Secrets:** `/etc/stexx/stexx.env` edits take effect on `systemctl restart stexx-api`. Rotating a database password: `ALTER ROLE ... PASSWORD`, edit the env file, restart.
   `EMAIL_PEPPER` cannot be rotated without orphaning email accounts.
 
 ## Incident notes
 
 - API unhealthy after a deploy: `deploy.sh` already flipped back; read `journalctl -u stexx-api -n 100`.
+- A migration went wrong: [Undoing a bad migration](#before-a-migration-the-pre-migrate-snapshot). Lost box: [Disaster recovery runbook](#disaster-recovery-runbook).
 - Suspected key leak: rotate the B2 key and age recipient (new `backup-recipients.txt`; old dumps stay readable only with the old private key until they age out in 30 days),
   rotate `stexx_app`/`stexx_owner` passwords, revoke all sessions (`UPDATE sessions SET revoked_at = now()` as `stexx_owner`).
 - Report handling lives in the `reports` table (`priority = 'high'` for under-18 reports); there is no admin UI in this repo yet.

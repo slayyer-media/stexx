@@ -9,7 +9,11 @@ struct SettingsView: View {
     @State private var isDeleting = false
     @State private var errorMessage: String?
     @State private var isShowingViewers = false
+    @State private var isShowingTravel = false
+    @State private var isTurningOffTravel = false
     @State private var boostEndsAt: Date?
+    /// Local to this phone (`PrivacyCover`), never sent to the server.
+    @AppStorage(PrivacyCover.enabledKey) private var coversAppSwitcher = true
 
     private var version: String {
         let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
@@ -25,6 +29,7 @@ struct SettingsView: View {
                 Toggle("Hide my distance", isOn: $bindable.privacy.hideDistance)
                 Toggle("Show when I'm online", isOn: $bindable.privacy.showOnlineStatus)
                 Toggle("Send read receipts", isOn: $bindable.privacy.sendReadReceipts)
+                Toggle("Hide Stexx in the app switcher", isOn: $coversAppSwitcher)
                 LabeledContent("Location precision") {
                     Text("About \(StexxFormat.distance(LocationFuzzer.defaultCellMeters))")
                         .stexxLabelStyle()
@@ -32,7 +37,7 @@ struct SettingsView: View {
             } header: {
                 SectionLabel("Privacy")
             } footer: {
-                SettingsFooter("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map.")
+                SettingsFooter("Your location is rounded on this device before it's sent. Others only ever see an approximate distance, never a pin on a map. Read receipts also tell people when you open their view-once photos. Hiding Stexx in the app switcher covers the screen with the logo whenever you leave the app; this setting stays on this phone.")
             }
             .settingsRows()
 
@@ -58,7 +63,19 @@ struct SettingsView: View {
 
             Section {
                 PlusToggle("Incognito", isOn: $bindable.privacy.incognito)
-                PlusRow("Travel mode", systemImage: "airplane")
+                PlusRow("Travel mode", systemImage: "airplane", value: travelValue) { isShowingTravel = true }
+                if appState.isTravelPaused {
+                    Button {
+                        Task { await turnOffTravel() }
+                    } label: {
+                        Label {
+                            Text("Turn off travel mode")
+                        } icon: {
+                            Image(systemName: "airplane.arrival").foregroundStyle(Theme.steel)
+                        }
+                    }
+                    .disabled(isTurningOffTravel)
+                }
                 PlusRow("Who viewed you", systemImage: "eyes") { isShowingViewers = true }
                 PlusRow("Boosts", systemImage: "bolt.fill") { Task { await boost() } }
             } header: {
@@ -70,6 +87,10 @@ struct SettingsView: View {
                             .stexxLabelStyle(.micro, color: Theme.ice)
                     }
                     Spacer(minLength: 0)
+                }
+            } footer: {
+                if appState.isTravelPaused {
+                    SettingsFooter("Travel mode is paused while you don't have Stexx+: others see you near your real location again. It resumes if you renew, or turn it off here.")
                 }
             }
             .settingsRows()
@@ -130,6 +151,7 @@ struct SettingsView: View {
         }
         .toolbarVisibility(.hidden, for: .tabBar)
         .navigationDestination(isPresented: $isShowingViewers) { ViewersView() }
+        .navigationDestination(isPresented: $isShowingTravel) { TravelModeView() }
         .alert("Boosted", isPresented: Binding(get: { boostEndsAt != nil }, set: { if !$0 { boostEndsAt = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -143,6 +165,20 @@ struct SettingsView: View {
         } message: {
             Text("Your profile, photos, messages and location history are permanently deleted from our servers. This can't be undone.")
         }
+    }
+
+    /// Trailing value of the travel row: where you browse from, when on.
+    private var travelValue: Text? {
+        guard appState.isTravelActive else { return nil }
+        return Text(appState.travel?.name ?? String(localized: "On"))
+    }
+
+    /// Turning travel mode off is free, so a lapsed subscriber can do it.
+    private func turnOffTravel() async {
+        isTurningOffTravel = true
+        defer { isTurningOffTravel = false }
+        let model = TravelModeModel(appState: appState, api: api)
+        if await !model.turnOff() { errorMessage = model.errorMessage }
     }
 
     private func boost() async {
@@ -167,24 +203,26 @@ struct SettingsView: View {
     }
 }
 
-/// A Stexx+ feature row that opens the paywall (or the feature, later).
+/// A Stexx+ feature row: opens the feature with Stexx+, the paywall without.
 private struct PlusRow: View {
     let title: LocalizedStringKey
     let systemImage: String
+    /// Trailing mono-caps value (e.g. where travel mode is), Stexx+ only.
+    var value: Text?
     /// Runs when the user has Stexx+ (otherwise the paywall opens).
     var action: (() -> Void)?
     @Environment(AppState.self) private var appState
 
-    init(_ title: LocalizedStringKey, systemImage: String, action: (() -> Void)? = nil) {
+    init(_ title: LocalizedStringKey, systemImage: String, value: Text? = nil, action: (() -> Void)? = nil) {
         self.title = title
         self.systemImage = systemImage
+        self.value = value
         self.action = action
     }
 
     var body: some View {
         Button {
             if appState.requirePlus() { action?() }
-            // TODO: Travel mode UI (API: `setTravelLocation`).
         } label: {
             HStack {
                 Label {
@@ -193,7 +231,13 @@ private struct PlusRow: View {
                     Image(systemName: systemImage).foregroundStyle(Theme.steel)
                 }
                 Spacer()
-                if !appState.hasPlus { PlusBadge() }
+                if !appState.hasPlus {
+                    PlusBadge()
+                } else if let value {
+                    value
+                        .stexxLabelStyle(color: Theme.ice)
+                        .lineLimit(1)
+                }
             }
         }
     }
