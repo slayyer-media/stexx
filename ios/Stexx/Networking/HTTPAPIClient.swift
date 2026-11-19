@@ -64,14 +64,18 @@ struct HTTPAPIClient: APIClient {
 
     // MARK: Email
 
-    func requestEmailLink(email: String) async throws {
-        struct Body: Encodable { let email: String }
-        try await callVoid("POST", "auth/email/link", body: Body(email: email), auth: .none)
+    func requestEmailLink(_ request: EmailLinkRequest) async throws {
+        try await callVoid("POST", "auth/email/link", body: request, auth: .none)
     }
 
     func verifyEmailLink(token: String) async throws -> Session {
         struct Body: Encodable { let token: String }
         return try await call("POST", "auth/email/verify", body: Body(token: token), auth: .none)
+    }
+
+    func verifyEmailCode(email: String, code: String) async throws -> Session {
+        struct Body: Encodable { let email: String; let code: String }
+        return try await call("POST", "auth/email/code", body: Body(email: email, code: code), auth: .none)
     }
 
     func refreshSession(refreshToken: String) async throws -> Session {
@@ -413,7 +417,7 @@ struct HTTPAPIClient: APIClient {
     /// `attest(...)` middleware in `server/src/routes`).
     static func attestedRoute(_ method: String, _ path: String) -> AttestedRoute? {
         switch (method, path) {
-        case ("POST", "auth/register"), ("POST", "auth/email/link"), ("POST", "auth/email/verify"),
+        case ("POST", "auth/register"), ("POST", "auth/email/link"), ("POST", "auth/email/verify"), ("POST", "auth/email/code"),
              ("POST", "auth/passkey/register/finish"), ("POST", "auth/passkey/login/finish"), ("DELETE", "me"):
             return .account
         case ("POST", "me/photos"), ("POST", "me/attachments"):
@@ -504,6 +508,8 @@ struct HTTPAPIClient: APIClient {
             if let code = body?.code, E2EErrorCode.all.contains(code) {
                 throw APIError.e2e(code: code, message: body?.message)
             }
+            // Email sign-in answers the app acts on (expired link, wrong code, no account yet, mail down).
+            if let error = EmailSignInError(code: body?.code) { throw error }
             // 403 anti-spam codes (new_account_limit, links_not_allowed, duplicate_message, device_account_limit,
             // disposable_email, ...) carry a message written for people; it is shown as is.
             throw APIError.server(status: http.statusCode, message: body?.message)

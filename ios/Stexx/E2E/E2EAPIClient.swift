@@ -230,8 +230,11 @@ struct E2EAPIClient: APIClient {
     func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session {
         try await base.finishPasskeyLogin(credential)
     }
-    func requestEmailLink(email: String) async throws { try await base.requestEmailLink(email: email) }
+    func requestEmailLink(_ request: EmailLinkRequest) async throws { try await base.requestEmailLink(request) }
     func verifyEmailLink(token: String) async throws -> Session { try await base.verifyEmailLink(token: token) }
+    func verifyEmailCode(email: String, code: String) async throws -> Session {
+        try await base.verifyEmailCode(email: email, code: code)
+    }
     func refreshSession(refreshToken: String) async throws -> Session { try await base.refreshSession(refreshToken: refreshToken) }
     func logout(_ session: Session) async throws { try await base.logout(session) }
     func fetchMe() async throws -> Profile { try await base.fetchMe() }

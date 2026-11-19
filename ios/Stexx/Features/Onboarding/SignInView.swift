@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// Back into an existing account: the passkey made at sign-up, or a fresh
-/// email sign-in link (opened on this iPhone, it lands in `RootView`).
+/// Back into an existing account: the passkey made at sign-up, or an email
+/// with a sign-in link (opened on this iPhone, it lands in `RootView`) and a
+/// code to type on the next screen.
 struct SignInView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
@@ -12,15 +13,11 @@ struct SignInView: View {
     @State private var errorMessage: String?
     /// After a closed sheet: maybe there is no passkey on this iPhone.
     @State private var showsNoPasskeyHint = false
-    @State private var sentLinkTo: String?
+    @State private var emailFlow: EmailSignInModel?
+    @State private var showsCheckEmail = false
     @FocusState private var isEmailFocused: Bool
 
-    private var trimmedEmail: String { email.trimmingCharacters(in: .whitespaces) }
-
-    private var isEmailValid: Bool {
-        guard let at = trimmedEmail.firstIndex(of: "@") else { return false }
-        return trimmedEmail[trimmedEmail.index(after: at)...].contains(".") && at != trimmedEmail.startIndex
-    }
+    private var isEmailValid: Bool { EmailSignInModel.looksLikeEmail(email) }
 
     var body: some View {
         ScrollView {
@@ -63,7 +60,7 @@ struct SignInView: View {
                 }
 
                 VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-                    SectionLabel("Email sign-in link")
+                    SectionLabel("Email")
                     TextField("you@example.com", text: $email)
                         .font(.stexxBody)
                         .keyboardType(.emailAddress)
@@ -79,7 +76,7 @@ struct SignInView: View {
                         .frame(minHeight: 52)
                         .background(RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous).fill(Theme.ink1))
                         .hairlineBorder(RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous), strong: isEmailFocused)
-                    Text("For accounts made with email. Open the link on this iPhone.")
+                    Text("For accounts made with email. We'll send a sign-in link and a code.")
                         .font(.footnote)
                         .foregroundStyle(Theme.slate)
                 }
@@ -89,12 +86,6 @@ struct SignInView: View {
                 }
                 .stexxSecondaryButton()
                 .disabled(!isEmailValid || isWorking)
-
-                if let sentLinkTo {
-                    Label("If \(sentLinkTo) has a Stexx account, a sign-in link is on its way. It works for 15 minutes.", systemImage: "envelope.badge")
-                        .font(.stexxSub)
-                        .foregroundStyle(Theme.steel)
-                }
 
                 if let errorMessage {
                     Text(errorMessage)
@@ -108,6 +99,14 @@ struct SignInView: View {
         .scrollDismissesKeyboard(.interactively)
         .stexxBackground()
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(isPresented: $showsCheckEmail) {
+            if let emailFlow {
+                CheckEmailView(model: emailFlow, onSignedIn: finishSignIn, onChangeAddress: {
+                    showsCheckEmail = false
+                    isEmailFocused = true
+                })
+            }
+        }
         .overlay {
             if isWorking {
                 ProgressView()
@@ -129,9 +128,7 @@ struct SignInView: View {
         Task {
             defer { isWorking = false }
             do {
-                let session = try await flow.signIn()
-                appState.signIn(session)
-                appState.me = try? await api.fetchMe()
+                await finishSignIn(try await flow.signIn())
             } catch PasskeyError.canceled {
                 // Closed by the user, or iOS had no passkey to offer.
                 showsNoPasskeyHint = true
@@ -141,23 +138,28 @@ struct SignInView: View {
         }
     }
 
+    /// Same answer whether or not the address has an account (no
+    /// enumeration); an address without one finds out from the link.
     private func sendLink() {
         guard isEmailValid, !isWorking else { return }
-        let address = trimmedEmail
+        let flow = EmailSignInModel(purpose: .signIn, api: api)
+        emailFlow = flow
         isEmailFocused = false
         isWorking = true
         errorMessage = nil
-        sentLinkTo = nil
         Task {
             defer { isWorking = false }
-            do {
-                // Same answer whether or not the address has an account.
-                try await api.requestEmailLink(email: address)
-                sentLinkTo = address
-            } catch {
-                errorMessage = error.localizedDescription
+            if await flow.send(to: email) {
+                showsCheckEmail = true
+            } else {
+                errorMessage = flow.problem?.message()
             }
         }
+    }
+
+    private func finishSignIn(_ session: Session) async {
+        appState.signIn(session)
+        appState.me = try? await api.fetchMe()
     }
 }
 

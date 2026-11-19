@@ -290,8 +290,9 @@ struct FakeE2EClient: APIClient {
     func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session { throw Self.unused }
     func passkeyLoginOptions() async throws -> PasskeyRequestOptions { throw Self.unused }
     func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session { throw Self.unused }
-    func requestEmailLink(email: String) async throws { throw Self.unused }
+    func requestEmailLink(_ request: EmailLinkRequest) async throws { throw Self.unused }
     func verifyEmailLink(token: String) async throws -> Session { throw Self.unused }
+    func verifyEmailCode(email: String, code: String) async throws -> Session { throw Self.unused }
     func refreshSession(refreshToken: String) async throws -> Session { throw Self.unused }
     func logout(_ session: Session) async throws { throw Self.unused }
     func fetchMe() async throws -> Profile { throw Self.unused }
