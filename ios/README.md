@@ -165,13 +165,16 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   turned out unreadable, `ChatStore.openViewOnce` calls
   `POST …/messages/{id}/open`; the server deletes the photo about 30 s later.
   An encrypted photo's key goes as soon as the server answers
-  (`E2EAPIClient.openViewOnce`), and on close in any case. A failed open
-  (offline) is retried on the next resync or list load, in memory only. Both
+  (`E2EAPIClient.openViewOnce`), and on close in any case. `ChatStore` records
+  the open before the call, in `UserDefaults` (message IDs and dates only,
+  wiped at sign-out and after 15 days), so a photo opened here is never shown
+  again on this phone, and a failed open (offline, an error, the app killed)
+  is retried on the next resync or list load, also after a relaunch. Both
   sides then show "Opened": the recipient always, the sender when
   `attachment.openedAt` arrives (only if the recipient sends read receipts;
   live via `message.updated`). The attachment menu has a **View once** toggle
-  (exclusive with **Expiring photos**) to send one. Never-opened photos still
-  go after the server's 14-day cap.
+  (exclusive with **Expiring photos**) to send one. Never-opened photos go
+  after the server's 3-day cap.
 - **App-switcher cover.** `PrivacyCover` puts a separate window with the logo
   over the whole app when the scene deactivates or goes to the background, so
   the app switcher (live card and saved snapshot) shows no grid, chats or

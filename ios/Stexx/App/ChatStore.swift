@@ -13,9 +13,11 @@ final class ChatStore {
     var errorMessage: String?
     /// The most recent tap someone sent you (from `tap.received`).
     private(set) var latestTap: RealtimeEvent.Tap?
-    /// View-once photos opened on this phone since launch: shown as
-    /// "Opened" right away, even if telling the server failed.
-    private(set) var openedViewOnce: Set<Message.ID> = []
+    /// View-once photos opened on this phone, with when: shown as "Opened"
+    /// right away, and never shown again, even if telling the server failed.
+    /// Kept across launches in `defaults` (message IDs and dates only, never
+    /// content), forgotten after `viewOnceMemory` and at sign-out.
+    private(set) var openedViewOnce: [Message.ID: Date] = [:]
 
     /// Change to a thread pushed to its open view.
     enum ThreadUpdate: Hashable, Sendable {
@@ -39,14 +41,31 @@ final class ChatStore {
     /// Bumped by `reset()` (sign-out).
     @ObservationIgnored private var epoch = 0
     @ObservationIgnored private let defaults: UserDefaults
-    /// View-once opens the server hasn't confirmed yet (offline), retried on
-    /// the next resync or list load. Memory only: if the app quits first,
-    /// the server's 14-day cap deletes the photo instead.
+    /// View-once opens the server hasn't confirmed yet (offline, an error,
+    /// the app quit before the call finished), retried on the next resync or
+    /// list load, including after a relaunch (kept in `defaults`, IDs only).
     @ObservationIgnored private var pendingViewOnceOpens: [Message.ID: Conversation.ID] = [:]
 
-    init(api: any APIClient, defaults: UserDefaults = .standard) {
+    /// How long this phone remembers a view-once open: past the server's cap
+    /// on unopened photos (3 days; 14 on servers from before that), plus a
+    /// day of margin, the server has deleted the photo anyway.
+    static let viewOnceMemory: TimeInterval = 15 * 24 * 3600
+
+    private enum Keys {
+        static let openedViewOnce = "chat.viewOnce.opened"
+        static let pendingViewOnceOpens = "chat.viewOnce.pendingOpens"
+    }
+
+    init(api: any APIClient, defaults: UserDefaults = .standard, now: Date = .now) {
         self.api = api
         self.defaults = defaults
+        let opened = defaults.dictionary(forKey: Keys.openedViewOnce) as? [Message.ID: Date] ?? [:]
+        openedViewOnce = opened.filter { now.timeIntervalSince($0.value) < Self.viewOnceMemory }
+        let pending = defaults.dictionary(forKey: Keys.pendingViewOnceOpens) as? [Message.ID: Conversation.ID] ?? [:]
+        pendingViewOnceOpens = pending.filter { openedViewOnce[$0.key] != nil }
+        if openedViewOnce.count != opened.count || pendingViewOnceOpens.count != pending.count {
+            persistViewOnce()
+        }
     }
 
     var unreadTotal: Int {
@@ -145,8 +164,10 @@ final class ChatStore {
         errorMessage = nil
         latestTap = nil
         pendingPhotos = [:]
-        openedViewOnce = []
+        openedViewOnce = [:]
         pendingViewOnceOpens = [:]
+        defaults.removeObject(forKey: Keys.openedViewOnce)
+        defaults.removeObject(forKey: Keys.pendingViewOnceOpens)
     }
 
     // MARK: View-once photos
@@ -155,16 +176,24 @@ final class ChatStore {
     /// (`POST …/open`, which deletes it about 30 s later and, if they send
     /// read receipts, tells the sender). Returns the server's copy, or nil
     /// if that didn't work; a network failure is retried later
-    /// (`retryPendingViewOnceOpens`), a 404 (gone, blocked) never.
+    /// (`retryPendingViewOnceOpens`, also after a relaunch), a 404 (gone,
+    /// blocked) never. The open is recorded on this phone before the call,
+    /// so a plaintext photo isn't shown again even if the call never lands.
     @discardableResult
     func openViewOnce(_ messageID: Message.ID, in conversationID: Conversation.ID) async -> Message? {
-        openedViewOnce.insert(messageID)
+        if openedViewOnce[messageID] == nil { openedViewOnce[messageID] = .now }
         pendingViewOnceOpens[messageID] = conversationID
+        persistViewOnce()
         return await sendViewOnceOpen(messageID, in: conversationID)
     }
 
     func hasOpenedViewOnce(_ messageID: Message.ID) -> Bool {
-        openedViewOnce.contains(messageID)
+        openedViewOnce[messageID] != nil
+    }
+
+    private func persistViewOnce() {
+        defaults.set(openedViewOnce, forKey: Keys.openedViewOnce)
+        defaults.set(pendingViewOnceOpens, forKey: Keys.pendingViewOnceOpens)
     }
 
     private func sendViewOnceOpen(_ messageID: Message.ID, in conversationID: Conversation.ID) async -> Message? {
@@ -173,6 +202,7 @@ final class ChatStore {
             let opened = try await api.openViewOnce(messageID: messageID, in: conversationID)
             guard epoch == self.epoch else { return nil }
             pendingViewOnceOpens[messageID] = nil
+            persistViewOnce()
             if let index = conversations.firstIndex(where: { $0.id == conversationID }),
                let last = conversations[index].lastMessage, last.id == messageID {
                 conversations[index].lastMessage = Self.updating(last, with: opened)
@@ -181,6 +211,7 @@ final class ChatStore {
         } catch APIError.notFound {
             guard epoch == self.epoch else { return nil }
             pendingViewOnceOpens[messageID] = nil
+            persistViewOnce()
             return nil
         } catch {
             return nil

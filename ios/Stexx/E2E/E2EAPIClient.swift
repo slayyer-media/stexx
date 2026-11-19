@@ -109,7 +109,7 @@ struct E2EAPIClient: APIClient {
             if opened.attachment?.openedAt != nil {
                 await engine.forgetAttachmentKey(messageID: messageID)
             } else if opened.attachment?.url == nil {
-                // Gone before it was opened (the 14-day cap).
+                // Gone before it was opened (the server's cap on unopened ones).
                 await engine.attachmentsGone(messageIDs: [messageID])
             }
         }
