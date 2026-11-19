@@ -29,6 +29,7 @@ import {
 } from "../lib/moderation.ts";
 import { isId } from "../lib/ids.ts";
 import { isoDate } from "../lib/time.ts";
+import { runSpamCommand, SPAM_ALLOWED, SPAM_USAGE } from "./spam-cli.ts";
 
 export const USAGE = `Stexx moderation
 
@@ -40,7 +41,7 @@ export const USAGE = `Stexx moderation
   unhide <profileID>                            make visible again (only reports filed later count towards auto-hide)
   ban <profileID>                               remove everywhere, revoke sessions, ban its devices
   unban <profileID>                             undo a ban
-  log [<profileID>] [--limit N] [--json]        audit log
+  log [<profileID>] [--limit N] [--json]        audit log${SPAM_USAGE}
 
 Write commands need --as <handle> (or STEXX_MODERATOR) and take an optional --note "...".`;
 
@@ -64,6 +65,7 @@ const ALLOWED: Record<string, string[]> = {
   unhide: WRITE_FLAGS,
   ban: WRITE_FLAGS,
   unban: WRITE_FLAGS,
+  ...SPAM_ALLOWED,
 };
 
 function parse(argv: string[]): Parsed {
@@ -279,10 +281,13 @@ export async function runModerationCli(
         else printResult(res, out);
         return 0;
       }
-      default:
+      default: {
+        const spam = await runSpamCommand(p, out, env, now);
+        if (spam !== null) return spam;
         out(`error: unknown command "${p.command}"`);
         out(USAGE);
         return 2;
+      }
     }
   } catch (err) {
     if (err instanceof ModerationError) {

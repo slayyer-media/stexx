@@ -1,0 +1,409 @@
+{
+  "_about": [
+    "Stexx content rules shared by the server (server/src/lib/abuse/handles.ts, content.ts) and the iOS app",
+    "(ios/Stexx/E2E/E2EContentRules.swift). Edit server/src/lib/abuse/content-rules.json, then copy it to",
+    "ios/Stexx/E2E/content-rules.json; server/test/spam-content.test.ts fails while the two differ, and both test",
+    "suites run every vector below. Patterns must work in JavaScript (no 'u' flag) and ICU (NSRegularExpression):",
+    "spell word boundaries as lookarounds, use ASCII classes, never start a class with ':'.",
+    "Text is normalized first: NFKC, then zero-width characters (U+200B-U+200D, U+2060, U+FEFF) are removed."
+  ],
+  "version": 1,
+  "handleRules": [
+    {
+      "id": "cashapp",
+      "kind": "payment",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])cash(?:\\s*(?:\\.|dot|\\(dot\\)|\\[dot\\])\\s*|\\s*)app(?:\\s*(?:\\.|dot|\\(dot\\)|\\[dot\\])\\s*com)?[^A-Za-z0-9\\$]{0,5}(?:[@:]\\s*\\$?|\\$)[A-Za-z][A-Za-z0-9_-]{1,19}"
+    },
+    {
+      "id": "cashtag",
+      "kind": "payment",
+      "caseInsensitive": false,
+      "pattern": "(?<![A-Za-z0-9_\\$])\\$[A-Za-z][A-Za-z0-9_]{2,19}(?![A-Za-z0-9_])"
+    },
+    {
+      "id": "venmo",
+      "kind": "payment",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])venmo(?:\\s*(?:\\.|dot|\\(dot\\)|\\[dot\\])\\s*com\\s*/\\s*(?:u/)?|[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:])\\s*@?[A-Za-z0-9_-]{3,30}"
+    },
+    {
+      "id": "paypal",
+      "kind": "payment",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])paypal(?:\\s*(?:\\.|dot|\\(dot\\)|\\[dot\\])\\s*me\\s*/?|[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:])\\s*@?[A-Za-z0-9_.-]{2,40}"
+    },
+    {
+      "id": "zelle",
+      "kind": "payment",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])zelle[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:]\\s*\\S{3,}"
+    },
+    {
+      "id": "btc_address",
+      "kind": "crypto",
+      "caseInsensitive": false,
+      "pattern": "(?<![A-Za-z0-9])(?:bc1[ac-hj-np-z02-9]{11,71}|[13](?=[a-km-zA-HJ-NP-Z1-9]*[A-HJ-NP-Z])(?=[a-km-zA-HJ-NP-Z1-9]*[a-km-z])[a-km-zA-HJ-NP-Z1-9]{25,34})(?![A-Za-z0-9])"
+    },
+    {
+      "id": "eth_address",
+      "kind": "crypto",
+      "caseInsensitive": false,
+      "pattern": "(?<![A-Za-z0-9])0x[a-fA-F0-9]{40}(?![A-Za-z0-9])"
+    },
+    {
+      "id": "tron_address",
+      "kind": "crypto",
+      "caseInsensitive": false,
+      "pattern": "(?<![A-Za-z0-9])T(?=[a-km-zA-HJ-NP-Z1-9]*[A-HJ-NP-Z])(?=[a-km-zA-HJ-NP-Z1-9]*[a-km-z])[a-km-zA-HJ-NP-Z1-9]{33}(?![A-Za-z0-9])"
+    },
+    {
+      "id": "ltc_address",
+      "kind": "crypto",
+      "caseInsensitive": false,
+      "pattern": "(?<![A-Za-z0-9])(?:ltc1[ac-hj-np-z02-9]{11,71}|[LM](?=[a-km-zA-HJ-NP-Z1-9]*[A-HJ-NP-Z])(?=[a-km-zA-HJ-NP-Z1-9]*[a-km-z])[a-km-zA-HJ-NP-Z1-9]{26,33})(?![A-Za-z0-9])"
+    },
+    {
+      "id": "xmr_address",
+      "kind": "crypto",
+      "caseInsensitive": false,
+      "pattern": "(?<![A-Za-z0-9])4[0-9AB][a-km-zA-HJ-NP-Z1-9]{93}(?![A-Za-z0-9])"
+    },
+    {
+      "id": "crypto_wallet",
+      "kind": "crypto",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])(?:bitcoin|btc|eth|ethereum|usdt|crypto|solana|sol)\\s*(?:wallet|address|addy)(?![A-Za-z0-9_])"
+    },
+    {
+      "id": "telegram",
+      "kind": "redirect",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])(?:telegram|tg)[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:]\\s*@?[A-Za-z0-9_]{4,32}|(?<![A-Za-z0-9_])t\\s*(?:\\.|dot|\\(dot\\)|\\[dot\\])\\s*me\\s*/\\s*[A-Za-z0-9_+]{3,}"
+    },
+    {
+      "id": "whatsapp",
+      "kind": "redirect",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])(?:whats\\s*app|wa)[^A-Za-z0-9+]{0,5}(?:me\\s*)?(?:[@:]\\s*)?\\+?[0-9][0-9 ().-]{6,18}[0-9]|(?<![A-Za-z0-9_])wa\\s*(?:\\.|dot|\\(dot\\)|\\[dot\\])\\s*me\\s*/\\s*\\+?[0-9]{6,}"
+    },
+    {
+      "id": "snapchat",
+      "kind": "redirect",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])snap(?:chat)?[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:]\\s*@?[A-Za-z0-9_.-]{3,15}"
+    },
+    {
+      "id": "instagram",
+      "kind": "redirect",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])(?:insta|instagram|ig)[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:]\\s*@?[A-Za-z0-9_.]{3,30}"
+    },
+    {
+      "id": "kik",
+      "kind": "redirect",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])kik[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:]\\s*@?[A-Za-z0-9_.]{3,30}"
+    },
+    {
+      "id": "signal_username",
+      "kind": "redirect",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])signal[^A-Za-z0-9@]{0,5}(?:me\\s*)?[@:]\\s*@?[A-Za-z][A-Za-z0-9_]{2,31}\\.[0-9]{2,9}(?![A-Za-z0-9_])"
+    },
+    {
+      "id": "onlyfans",
+      "kind": "redirect",
+      "caseInsensitive": true,
+      "pattern": "(?<![A-Za-z0-9_])only\\s*fans(?:\\s*(?:\\.|dot|\\(dot\\)|\\[dot\\])\\s*com|[^A-Za-z0-9@]{0,5}[@/:])|(?<![A-Za-z0-9_])(?:my|subscribe to|sub to|check out|link to my|link in my)\\s+(?:my\\s+)?only\\s*fans(?![A-Za-z0-9_])"
+    }
+  ],
+  "vectors": {
+    "handles": [
+      {
+        "text": "send it to my cashapp $JakeB99",
+        "matches": [
+          "cashapp",
+          "cashtag"
+        ]
+      },
+      {
+        "text": "Cash App: jakeb",
+        "matches": [
+          "cashapp"
+        ]
+      },
+      {
+        "text": "cash.app/$jakeb is the fastest",
+        "matches": [
+          "cashapp",
+          "cashtag"
+        ]
+      },
+      {
+        "text": "$jakeb_x for the deposit",
+        "matches": [
+          "cashtag"
+        ]
+      },
+      {
+        "text": "venmo me @jake-b",
+        "matches": [
+          "venmo"
+        ]
+      },
+      {
+        "text": "VENMO: jakeb",
+        "matches": [
+          "venmo"
+        ]
+      },
+      {
+        "text": "venmo.com/u/jakeb",
+        "matches": [
+          "venmo"
+        ]
+      },
+      {
+        "text": "paypal.me/jakeb",
+        "matches": [
+          "paypal"
+        ]
+      },
+      {
+        "text": "PayPal: jake.b@mail.example",
+        "matches": [
+          "paypal"
+        ]
+      },
+      {
+        "text": "zelle: 555 010 0123",
+        "matches": [
+          "zelle"
+        ]
+      },
+      {
+        "text": "btc: 1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+        "matches": [
+          "btc_address"
+        ]
+      },
+      {
+        "text": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        "matches": [
+          "btc_address"
+        ]
+      },
+      {
+        "text": "eth 0x52908400098527886E0F7030069857D2E4169EE7 thx",
+        "matches": [
+          "eth_address"
+        ]
+      },
+      {
+        "text": "usdt trc20 TJCnKsPa7y5okkXvQAidZBzqx3QyQ6sxMW",
+        "matches": [
+          "tron_address"
+        ]
+      },
+      {
+        "text": "LaMT348PWRnrqeeWArpwQPbuanpXDZGEUz",
+        "matches": [
+          "ltc_address"
+        ]
+      },
+      {
+        "text": "xmr 4A8888888888bcdefghijkbcdefghijkbcdefghijkbcdefghijkbcdefghijkbcdefghijkbcdefghijkbcdefghijkLMN",
+        "matches": [
+          "xmr_address"
+        ]
+      },
+      {
+        "text": "send to my BTC wallet",
+        "matches": [
+          "crypto_wallet"
+        ]
+      },
+      {
+        "text": "telegram @jakeb_x",
+        "matches": [
+          "telegram"
+        ]
+      },
+      {
+        "text": "tg: jakebee",
+        "matches": [
+          "telegram"
+        ]
+      },
+      {
+        "text": "find me at t.me/jakeb",
+        "matches": [
+          "telegram"
+        ]
+      },
+      {
+        "text": "whatsapp +44 7700 900123",
+        "matches": [
+          "whatsapp"
+        ]
+      },
+      {
+        "text": "WA: 5550100123",
+        "matches": [
+          "whatsapp"
+        ]
+      },
+      {
+        "text": "wa.me/447700900123",
+        "matches": [
+          "whatsapp"
+        ]
+      },
+      {
+        "text": "snapchat @jake.b",
+        "matches": [
+          "snapchat"
+        ]
+      },
+      {
+        "text": "ig: jake.b",
+        "matches": [
+          "instagram"
+        ]
+      },
+      {
+        "text": "insta @jakeb",
+        "matches": [
+          "instagram"
+        ]
+      },
+      {
+        "text": "kik: jakeb",
+        "matches": [
+          "kik"
+        ]
+      },
+      {
+        "text": "signal: jakeb.42",
+        "matches": [
+          "signal_username"
+        ]
+      },
+      {
+        "text": "check out my onlyfans",
+        "matches": [
+          "onlyfans"
+        ]
+      },
+      {
+        "text": "onlyfans.com/jakeb",
+        "matches": [
+          "onlyfans"
+        ]
+      },
+      {
+        "text": "OnlyFans: jakeb",
+        "matches": [
+          "onlyfans"
+        ]
+      },
+      {
+        "text": "ｖｅｎｍｏ: jakeb",
+        "matches": [
+          "venmo"
+        ]
+      },
+      {
+        "text": "tele​gram @jake​b_x",
+        "matches": [
+          "telegram"
+        ]
+      },
+      {
+        "text": "hey, how's it going?",
+        "matches": []
+      },
+      {
+        "text": "drinks are $5 at happy hour",
+        "matches": []
+      },
+      {
+        "text": "it was US$30 and $20.50 with tip",
+        "matches": []
+      },
+      {
+        "text": "do you use venmo?",
+        "matches": []
+      },
+      {
+        "text": "venmo me later for the pizza",
+        "matches": []
+      },
+      {
+        "text": "paypal is fine",
+        "matches": []
+      },
+      {
+        "text": "my cash app is broken lol",
+        "matches": []
+      },
+      {
+        "text": "I don't have onlyfans",
+        "matches": []
+      },
+      {
+        "text": "follow me on insta sometime",
+        "matches": []
+      },
+      {
+        "text": "do you have telegram?",
+        "matches": []
+      },
+      {
+        "text": "I'm on whatsapp too",
+        "matches": []
+      },
+      {
+        "text": "<3hahahahahahahahahahahahahahahahaha",
+        "matches": []
+      },
+      {
+        "text": "Toooooooooooooooooooooooooooooooooo much",
+        "matches": []
+      },
+      {
+        "text": "6ft, 80kg, 0x fun",
+        "matches": []
+      },
+      {
+        "text": "",
+        "matches": []
+      }
+    ],
+    "links": {
+      "match": [
+        "see https://x.co/a",
+        "www.spam.example",
+        "add me on spam-site.com",
+        "t.me/someone",
+        "cash.app/$me",
+        "my site: hot-pics . xyz",
+        "onlyfans(dot)com/x",
+        "HTTP://SHOUT.NET",
+        "insta[dot]me",
+        "ｗｗｗ.example.com"
+      ],
+      "noMatch": [
+        "hey, how's it going?",
+        "I'm 6.2 ft lol",
+        "e.g. coffee at 5.30",
+        "ok... sure",
+        "3.14159",
+        "u.s. army vet",
+        "café.com",
+        ""
+      ]
+    }
+  }
+}

@@ -488,6 +488,7 @@ meRoutes.get("/me/export", async (c) => {
          WHERE m.conversation_id = ANY(${convs.map((x) => x.id)})
            AND (cm.cleared_before IS NULL OR m.sent_at > cm.cleared_before)
            AND (m.expires_at IS NULL OR m.expires_at > now())
+           AND (m.held_at IS NULL OR m.sender_id = ${me})
          ORDER BY m.sent_at, m.id`
     : [];
   const byConv = new Map<string, (typeof msgRows)[number][]>();

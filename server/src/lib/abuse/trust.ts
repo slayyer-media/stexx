@@ -65,7 +65,7 @@ export async function trustState(userId: string, db: Sql = sql, now = new Date()
               JOIN messages r ON r.conversation_id = mine.conversation_id
                              AND r.sender_id <> ${userId} AND r.sent_at > mine.sent_at
              WHERE mine.sender_id = ${userId}) AS repliers,
-           (SELECT count(*)::int FROM reports WHERE reported_id = ${userId} AND status = 'open') AS open_reports
+           (SELECT count(*)::int FROM reports WHERE reported_id = ${userId} AND status = 'open' AND source = 'user') AS open_reports
       FROM users u WHERE u.id = ${userId}`;
   if (!row) return { restricted: false, ageMs: 0, repliers: 0, openReports: 0 };
   const ageMs = now.getTime() - new Date(row.created_at).getTime();
