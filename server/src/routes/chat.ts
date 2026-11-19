@@ -31,7 +31,7 @@ import type { AppEnv } from "../types.ts";
 /**
  * chat routes, mounted at /v1. Paths are written in full relative to /v1 (e.g. "/me", not "/").
  * Owns: /conversations, /conversations/:id/messages, /conversations/:id/messages/:messageID/open,
- * /conversations/:id/read, DELETE /conversations/:id
+ * /conversations/:id/read, /conversations/:id/mute, DELETE /conversations/:id
  * See server/AGENTS-NOTES.md for helpers and conventions.
  *
  * Rules implemented here (each has a test in test/chat.test.ts):
@@ -50,6 +50,8 @@ import type { AppEnv } from "../types.ts";
  *    recipient's app calls POST .../messages/:messageID/open when the photo is actually shown, which stamps
  *    attachment_opened_at (the retention job deletes the file a grace window later) and, if the opener sends read
  *    receipts, tells the sender (`message.updated`). Never-opened ones fall under the 14-day cap.
+ *  - Mute (PUT/DELETE /conversations/:id/mute) is the caller's own flag (conversation_members.muted): idempotent,
+ *    never visible to the other person, and only the caller's other connections get `conversation.updated`.
  *  - DELETE /conversations/:id hides the thread for the caller only (cleared_before = now); a new message
  *    un-hides it. Once both people have cleared it, the rows (and files) are physically deleted.
  */
@@ -627,6 +629,35 @@ chatRoutes.post("/conversations/:id/read", requireAuth, async (c) => {
       }
     })();
   }
+  return c.body(null, 204);
+});
+
+// ---- PUT / DELETE /conversations/:id/mute ----------------------------------------------------------
+
+/**
+ * Mutes (PUT) or unmutes (DELETE) a conversation for the caller only. Idempotent: muting a muted thread is a 204 that
+ * changes nothing. 404 like every other route on the thread (not a participant, blocked either way, banned partner).
+ * The other person is never told; the caller's own connections (another device or tab) get `conversation.updated`.
+ * A muted thread still counts its unread messages (`unreadCount`); clients leave it out of their badge.
+ */
+async function setMuted(me: string, conversationId: string, muted: boolean): Promise<void> {
+  await requireConversation(me, conversationId);
+  const changed = await sql`
+    UPDATE conversation_members SET muted = ${muted}
+     WHERE conversation_id = ${conversationId} AND user_id = ${me} AND muted IS DISTINCT FROM ${muted}
+    RETURNING 1`;
+  if (changed.length > 0) {
+    void pushConversationUpdated(me, conversationId).catch((err) => logError("chat.fanout", err));
+  }
+}
+
+chatRoutes.put("/conversations/:id/mute", requireAuth, async (c) => {
+  await setMuted(currentUserId(c), idParam(c, "id", "conversation"), true);
+  return c.body(null, 204);
+});
+
+chatRoutes.delete("/conversations/:id/mute", requireAuth, async (c) => {
+  await setMuted(currentUserId(c), idParam(c, "id", "conversation"), false);
   return c.body(null, 204);
 });
 

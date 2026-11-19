@@ -117,6 +117,10 @@ Non-2xx responses carry:
 }
 ```
 
+`isMuted` is the caller's own setting (`PUT`/`DELETE /conversations/{id}/mute`);
+the other person never sees it. `unreadCount` still counts a muted thread's
+unread messages; the app leaves muted threads out of its tab badge.
+
 ### Message
 
 ```json
@@ -206,10 +210,12 @@ Non-2xx responses carry:
 | --- | --- | --- | --- |
 | GET | `/conversations` | → `[Conversation]` | Most recent first. |
 | POST | `/conversations` | `{ participantID }` → `Conversation` | Returns the existing conversation if there is one. |
-| GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100). Oldest-first within the page; `nextCursor` is the ID to pass as `before`. |
-| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
+| GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100, default 50). Newest page first: without `before` you get the latest messages; each page is oldest-first; `nextCursor` (the oldest message on the page) is the ID to pass as `before` for the page before it, `null` at the start of the thread. A `before` that isn't a message of this thread is 400 `invalid_cursor`. The iOS app loads older pages as you scroll up. |
+| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS photo timer sends Keep as `isViewOnce: false`, View once as `isViewOnce: true`, and 10 s / 1 min / 1 h / 1 day as `expiresAfterSeconds` 10 / 60 / 3600 / 86400 with `isViewOnce: false` (the timer starts when the recipient reads the thread). |
 | POST | `/conversations/{id}/messages/{messageID}/open` | → `Message` | The recipient opened a view-once photo ([View-once photos](#view-once-photos)). Idempotent. 404 for anyone else. 60/min (429). |
 | POST | `/conversations/{id}/read` | → 204 | Ignored for read receipts if the reader disabled them. |
+| PUT | `/conversations/{id}/mute` | → 204 | Mutes the thread for the caller only (`isMuted: true`). Idempotent. 404 unless you're in it (also when either of you blocked the other, or they're banned). Your other connections get `conversation.updated`; the other person is never told. |
+| DELETE | `/conversations/{id}/mute` | → 204 | Unmutes. Idempotent, same 404 rules. |
 | DELETE | `/conversations/{id}` | → 204 | Deletes for the caller only. |
 
 Realtime: `wss://api.stexx.gay/v1/ws` with the bearer token (header, or a
