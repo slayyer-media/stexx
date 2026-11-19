@@ -14,7 +14,9 @@ export const ADMIN_CSP =
 export const ADMIN_HEADERS: Readonly<Record<string, string>> = {
   "Content-Security-Policy": ADMIN_CSP,
   "Cache-Control": "no-store",
-  "Referrer-Policy": "no-referrer",
+  // Not no-referrer: under it browsers send `Origin: null` on the console's own form POSTs, which originGuard refuses.
+  // same-origin still sends nothing to any other site.
+  "Referrer-Policy": "same-origin",
   "X-Robots-Tag": "noindex, nofollow",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",

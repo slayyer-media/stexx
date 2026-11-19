@@ -30,7 +30,8 @@
 (admin_security_headers) {
 	header {
 		X-Content-Type-Options "nosniff"
-		Referrer-Policy "no-referrer"
+		# same-origin, not no-referrer: under no-referrer browsers send `Origin: null` on the console's own forms.
+		Referrer-Policy "same-origin"
 		Strict-Transport-Security "max-age=31536000"
 		-Server
 	}

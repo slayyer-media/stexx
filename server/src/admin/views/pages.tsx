@@ -1,8 +1,8 @@
 /** The PR 1 screens: login, enrollment, dashboard, my sessions, staff list and invite, errors, dev login. */
 import { minute, day, CsrfField, Layout } from "./layout.tsx";
 import type { SessionContext, StaffContext } from "../env.ts";
-import type { StaffListItem } from "../../lib/staff/accounts.ts";
-import { STAFF_ROLES } from "../../lib/staff/permissions.ts";
+import type { StaffAccount, StaffListItem } from "../../lib/staff/accounts.ts";
+import { STAFF_ROLES, type StaffRole } from "../../lib/staff/permissions.ts";
 import { hasRecentStepUp } from "../session.ts";
 
 interface Signed {
@@ -59,16 +59,10 @@ export interface DashboardCounts {
   staffActive?: number | undefined;
 }
 
-export function DashboardPage(props: Signed & { counts: DashboardCounts; passkeys: number }) {
+export function DashboardPage(props: Signed & { counts: DashboardCounts }) {
   const c = props.counts;
   return (
     <Layout title="Dashboard" staff={props.staff} session={props.session}>
-      {props.passkeys < 2 ? (
-        <p class="notice">
-          You have {props.passkeys} passkey{props.passkeys === 1 ? "" : "s"}. Keep at least two (on different devices) so
-          losing one doesn't lock you out; ask an admin to re-invite you to add another.
-        </p>
-      ) : null}
       <table class="counts">
         <tbody>
           <tr>
@@ -214,8 +208,8 @@ export function StaffPage(props: Signed & { items: StaffListItem[]; flash?: stri
 
       <h2>Invite</h2>
       <p>
-        Creates a single-use link, valid for 30 minutes, to pass on out of band. Re-inviting an existing handle removes its
-        passkeys and signs it out everywhere. Use a handle, never a real name.
+        Creates a single-use link, valid for 30 minutes, to pass on out of band. For an existing handle you are asked to
+        confirm first: re-inviting removes its passkeys and signs it out everywhere. Use a handle, never a real name.
       </p>
       <form method="post" action="/staff/invite" data-step-up="recent" data-step-up-fresh={fresh ? "1" : undefined}>
         <CsrfField session={props.session} />
@@ -233,6 +227,39 @@ export function StaffPage(props: Signed & { items: StaffListItem[]; flash?: stri
         <button type="submit" class="primary">
           Create invite link
         </button>
+      </form>
+      <p id="passkey-error" class="error" role="alert" hidden></p>
+    </Layout>
+  );
+}
+
+/** Shown instead of re-inviting when the handle already exists: the consequence, then a step-up bound to the account. */
+export function ReinviteConfirmPage(props: Signed & { target: StaffAccount; role: StaffRole; passkeys: number }) {
+  const t = props.target;
+  const roleChange = t.role !== props.role;
+  return (
+    <Layout title="Re-invite?" staff={props.staff} session={props.session}>
+      <p>
+        <strong>{t.handle}</strong> ({t.role}, {t.id}) already exists. Re-inviting removes{" "}
+        {props.passkeys === 1 ? "its passkey" : `its ${props.passkeys} passkeys`}, signs it out everywhere and voids any
+        earlier link{roleChange ? `, and changes its role from ${t.role} to ${props.role}` : ""}. Whoever opens the new link
+        signs in as {t.handle}, so only do this for a person who lost their passkey, and pass the link to them alone.
+      </p>
+      <form
+        method="post"
+        action="/staff/invite"
+        data-step-up="action"
+        data-step-up-action="staff_reinvite"
+        data-step-up-target={t.id}
+      >
+        <CsrfField session={props.session} />
+        <input type="hidden" name="handle" value={t.handle} />
+        <input type="hidden" name="role" value={props.role} />
+        <input type="hidden" name="step_up" value="" />
+        <button type="submit" class="danger">
+          Re-invite {t.handle}
+        </button>{" "}
+        <a href="/staff">Cancel</a>
       </form>
       <p id="passkey-error" class="error" role="alert" hidden></p>
     </Layout>

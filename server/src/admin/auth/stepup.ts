@@ -9,6 +9,9 @@
  *                                                  this session, on that action and target (spendActionStepUp).
  *   POST /step-up/verify  (assertion)            → {ok, token?}; `token` is the per-action proof to submit with
  *                                                  the form (field `step_up`).
+ * Either kind is a fresh assertion with user verification, so either marks the session as recently stepped up: a
+ * form that runs only the bound ceremony (disabling or re-inviting another admin) also passes the route guard's
+ * "recent" check.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { generateAuthenticationOptions, verifyAuthenticationResponse, type AuthenticationResponseJSON } from "@simplewebauthn/server";
@@ -23,6 +26,8 @@ import { authenticationSchema, challengeOf, jsonBody, limitCeremony, storeChalle
 /** Per-action step-up targets: the actions that need one, and the shape of their target ids. */
 export const ACTION_STEP_UPS = {
   staff_disable: { target: /^st_[a-z2-7]{26}$/, targetKind: "staff" },
+  /** Re-inviting an existing account: removes its passkeys and hands the inviter a link to enroll as it. */
+  staff_reinvite: { target: /^st_[a-z2-7]{26}$/, targetKind: "staff" },
 } as const satisfies Record<string, { target: RegExp; targetKind: AuditTargetKind }>;
 export type ActionStepUp = keyof typeof ACTION_STEP_UPS;
 
@@ -130,10 +135,19 @@ export function registerStepUpRoutes(r: AdminRoutes): void {
         await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
         return { ok: false as const };
       }
-      await tx`UPDATE staff_passkeys SET counter = ${verified.authenticationInfo.newCounter}, last_used_at = now() WHERE id = ${credential.id}`;
+      // The counter only moves forward, as at sign-in: a concurrent sign-in that stored a higher value wins, and this
+      // assertion fails rather than rolling the counter back.
+      const moved = await tx`
+        UPDATE staff_passkeys SET counter = ${verified.authenticationInfo.newCounter}, last_used_at = now()
+         WHERE id = ${credential.id} AND (counter < ${verified.authenticationInfo.newCounter} OR counter = 0)
+        RETURNING id`;
+      if (moved.length === 0) {
+        await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
+        return { ok: false as const };
+      }
+      await tx`UPDATE staff_sessions SET step_up_at = now() WHERE id = ${session.id}`;
       if (pending.kind === "step_up") {
         await tx`DELETE FROM staff_challenges WHERE challenge = ${challenge}`;
-        await tx`UPDATE staff_sessions SET step_up_at = now() WHERE id = ${session.id}`;
       } else {
         await tx`UPDATE staff_challenges SET verified_at = now() WHERE challenge = ${challenge}`;
       }

@@ -5,7 +5,7 @@
  * table, so a route added without going through here fails the build.
  *
  * Writes (anything but GET/HEAD) are checked twice for cross-site requests: `Origin` must equal ADMIN_ORIGIN on every
- * write (originGuard, before routing), and signed-in writes must carry the session's synchronizer token. The session
+ * write (originGuard, before routing; or be "null" from a same-origin page), and signed-in writes must carry the session's synchronizer token. The session
  * cookie is SameSite=Strict as a third layer.
  */
 import type { Context, Handler, Hono, MiddlewareHandler } from "hono";
@@ -27,11 +27,20 @@ export interface RouteSpec {
 
 const isWrite = (method: string) => method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 
-/** Refuses any write whose Origin isn't the console's own (missing Origin included), and cross-site fetches. */
+/**
+ * Refuses any write whose Origin isn't the console's own (missing Origin included), and cross-site fetches.
+ *
+ * `Origin: null` is accepted only together with `Sec-Fetch-Site: same-origin`: a browser sends a serialized null Origin
+ * on a plain form POST when the page's referrer policy hides the origin (Fetch: "append a request Origin header"). The
+ * console's own Referrer-Policy (same-origin) keeps the real Origin on its forms, so this only covers a stricter policy
+ * applied in front of it; Sec-Fetch-Site is set by the browser and can't be forged by a page.
+ */
 export const originGuard: MiddlewareHandler<AdminEnv> = async (c, next) => {
   if (isWrite(c.req.method)) {
-    if (c.req.header("Origin") !== config.admin.origin) throw forbidden("Cross-site request refused.", "bad_origin");
+    const origin = c.req.header("Origin");
     const site = c.req.header("Sec-Fetch-Site");
+    const sameOriginNull = origin === "null" && site === "same-origin";
+    if (origin !== config.admin.origin && !sameOriginNull) throw forbidden("Cross-site request refused.", "bad_origin");
     if (site !== undefined && site !== "same-origin") throw forbidden("Cross-site request refused.", "bad_origin");
   }
   await next();

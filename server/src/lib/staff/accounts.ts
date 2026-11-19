@@ -5,6 +5,9 @@
  * 'system') and a role. No names, emails or phone numbers. Accounts are never deleted: disabling one revokes its
  * sessions and pending enrollment links at once. Lost passkeys are replaced by re-inviting, which removes the old
  * passkeys; there is no self-service recovery.
+ *
+ * Every staff change takes one advisory lock and then the account row (FOR UPDATE); enrollment takes the account row
+ * FOR SHARE (consumeEnrollment), so a re-invite or disable and an in-flight enrollment from an old link never overlap.
  */
 import { randomBytes } from "node:crypto";
 import { sql, type Sql } from "../../db/sql.ts";
@@ -53,7 +56,13 @@ const toAccount = (r: StaffRow): StaffAccount => ({
   lastLoginAt: r.last_login_at,
 });
 
-/** The handle rule of moderation_actions.actor (checkActor), so a staff handle is always a valid actor. */
+/** Shaped like an id (newId: a 1-2 letter prefix, `_`, 26 base32 characters), e.g. another account's st_... id. */
+const ID_SHAPED_RE = /^[a-z]{1,2}_[a-z2-7]{26}$/i;
+
+/**
+ * The handle rule of moderation_actions.actor (checkActor), so a staff handle is always a valid actor; and never
+ * shaped like an id, so a handle can't read as (or be looked up as) another account's id.
+ */
 export function checkStaffHandle(handle: string): void {
   try {
     checkActor(handle);
@@ -63,20 +72,29 @@ export function checkStaffHandle(handle: string): void {
     }
     throw err;
   }
+  if (ID_SHAPED_RE.test(handle)) throw new StaffError("A staff handle can't look like an id (st_...). Pick a plain handle.");
 }
 
 export function checkStaffRole(role: string): asserts role is StaffRole {
   if (!isStaffRole(role)) throw new StaffError("Role must be support, moderator or admin.");
 }
 
+/** By id or handle; an exact id match wins (handles can't be id-shaped today, but older rows aren't re-checked). */
 export async function findStaff(handleOrId: string, db: Sql = sql): Promise<StaffAccount | null> {
   const [row] = await db<StaffRow[]>`
     SELECT id, handle, role, created_at, created_by, disabled_at, last_login_at FROM staff_accounts
-     WHERE id = ${handleOrId} OR lower(handle) = lower(${handleOrId})`;
+     WHERE id = ${handleOrId} OR lower(handle) = lower(${handleOrId})
+     ORDER BY (id = ${handleOrId}) DESC LIMIT 1`;
   return row ? toAccount(row) : null;
 }
 
-/** Who did it: a staff account (console, or a CLI --as handle that is one), or nobody yet (first admin over SSH). */
+/** Active admins (the command line allows a non-staff --as only while there are none: bootstrapping). */
+export async function countActiveAdmins(db: Sql = sql): Promise<number> {
+  const [row] = await db<{ n: number }[]>`SELECT count(*)::int AS n FROM staff_accounts WHERE role = 'admin' AND disabled_at IS NULL`;
+  return row?.n ?? 0;
+}
+
+/** Who did it: a staff account (console, or the CLI's --as admin), or nobody yet (first admin over SSH). */
 export interface StaffActor {
   staffId: string | null;
   channel: AuditChannel;
@@ -102,11 +120,27 @@ async function otherActiveAdmins(tx: Sql, exceptId: string): Promise<number> {
 }
 
 /**
+ * Called inside the change's transaction, with the target row locked and every rule checked, just before anything
+ * changes. Throwing aborts the change. The console spends its per-action step-up here, so the proof and the change
+ * commit (or roll back) together and the target's role is the one the proof was required for.
+ */
+export type AuthorizeChange = (tx: Sql, target: StaffAccount) => Promise<void>;
+
+/**
  * Invite a new staff member, or re-invite an existing one (lost passkeys, or a role change): a fresh single-use
  * enrollment link valid for ENROLLMENT_TTL_MS. Re-inviting removes every passkey, signs out every session and voids
- * any earlier link. A disabled account stays disabled (invite a new handle). Writes staff_invite (and staff_role).
+ * any earlier link; `authorizeReinvite` runs first (the console requires a step-up bound to that account). A disabled
+ * account stays disabled (invite a new handle). Writes staff_invite (and staff_role), with the role granted.
+ * Re-inviting yourself is refused in the console; on the command line (SSH, break glass) it is how a locked-out sole
+ * admin gets back in.
  */
-export async function inviteStaff(input: { handle: string; role: string; actor: StaffActor; now?: Date }): Promise<InviteResult> {
+export async function inviteStaff(input: {
+  handle: string;
+  role: string;
+  actor: StaffActor;
+  authorizeReinvite?: AuthorizeChange;
+  now?: Date;
+}): Promise<InviteResult> {
   checkStaffHandle(input.handle);
   checkStaffRole(input.role);
   const role = input.role;
@@ -123,15 +157,17 @@ export async function inviteStaff(input: { handle: string; role: string; actor: 
     let previousRole: StaffRole | null = null;
     if (existing) {
       if (existing.disabled_at) throw new StaffError(`${existing.handle} is disabled. Invite a new handle instead.`);
-      if (existing.id === input.actor.staffId) {
+      if (existing.id === input.actor.staffId && input.actor.channel !== "cli") {
         throw new StaffError("You can't re-invite yourself (it would remove your own passkeys). Ask another admin.");
       }
       if (existing.role === "admin" && role !== "admin" && (await otherActiveAdmins(tx, existing.id)) === 0) {
         throw new StaffError(`${existing.handle} is the only admin; invite another admin first.`);
       }
+      if (input.authorizeReinvite) await input.authorizeReinvite(tx, toAccount(existing));
+      // Links first, then passkeys: nothing enrolls from an old link after this point.
+      await voidPendingEnrollments(tx, existing.id);
       await tx`DELETE FROM staff_passkeys WHERE staff_id = ${existing.id}`;
       await tx`UPDATE staff_sessions SET revoked_at = ${now} WHERE staff_id = ${existing.id} AND revoked_at IS NULL`;
-      await tx`UPDATE staff_enrollments SET expires_at = ${now} WHERE staff_id = ${existing.id} AND used_at IS NULL AND expires_at > ${now}`;
       await tx`DELETE FROM staff_challenges WHERE staff_id = ${existing.id}`;
       if (existing.role !== role) {
         previousRole = existing.role;
@@ -156,33 +192,47 @@ export async function inviteStaff(input: { handle: string; role: string; actor: 
       targetKind: "staff" as const,
       targetRef: row.id,
     };
-    await staffAudit(tx, { ...common, action: "staff_invite" });
-    if (previousRole) await staffAudit(tx, { ...common, action: "staff_role" });
+    await staffAudit(tx, { ...common, action: "staff_invite", role });
+    if (previousRole) await staffAudit(tx, { ...common, action: "staff_role", role });
     return { staff: toAccount(row), token, expiresAt, created: !existing, previousRole };
   });
 }
 
+/** Unused enrollment links for `staffId` are deleted (not just expired: no clock comparison can let one through). */
+async function voidPendingEnrollments(tx: Sql, staffId: string): Promise<void> {
+  await tx`DELETE FROM staff_enrollments WHERE staff_id = ${staffId} AND used_at IS NULL`;
+}
+
 /**
  * Disable a staff account: it can't sign in again, and every session and pending link is revoked at once. The row
- * stays (the audit log points at it). Refuses disabling yourself, and the last active admin unless `allowLastAdmin`
- * (the command line, which is the break-glass path).
+ * stays (the audit log points at it). Refuses disabling yourself in the console, and the last active admin unless
+ * `allowLastAdmin` (the command line, which is the break-glass path). `authorize` runs inside the transaction once
+ * the account is locked and checked (the console spends its admin-target step-up there).
  */
-export async function disableStaff(input: { handleOrId: string; actor: StaffActor; allowLastAdmin?: boolean; now?: Date }): Promise<StaffAccount> {
+export async function disableStaff(input: {
+  handleOrId: string;
+  actor: StaffActor;
+  allowLastAdmin?: boolean;
+  authorize?: AuthorizeChange;
+  now?: Date;
+}): Promise<StaffAccount> {
   const now = input.now ?? new Date();
   return sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtext('stexx staff accounts'))`;
     const [row] = await tx<StaffRow[]>`
       SELECT id, handle, role, created_at, created_by, disabled_at, last_login_at FROM staff_accounts
-       WHERE id = ${input.handleOrId} OR lower(handle) = lower(${input.handleOrId}) FOR UPDATE`;
+       WHERE id = ${input.handleOrId} OR lower(handle) = lower(${input.handleOrId})
+       ORDER BY (id = ${input.handleOrId}) DESC LIMIT 1 FOR UPDATE`;
     if (!row) throw new StaffError(`No staff account ${input.handleOrId}.`);
     if (row.disabled_at) throw new StaffError(`${row.handle} is already disabled.`);
-    if (row.id === input.actor.staffId) throw new StaffError("You can't disable yourself. Ask another admin.");
+    if (row.id === input.actor.staffId && input.actor.channel !== "cli") throw new StaffError("You can't disable yourself. Ask another admin.");
     if (row.role === "admin" && !input.allowLastAdmin && (await otherActiveAdmins(tx, row.id)) === 0) {
       throw new StaffError(`${row.handle} is the only admin.`);
     }
+    if (input.authorize) await input.authorize(tx, toAccount(row));
     await tx`UPDATE staff_accounts SET disabled_at = ${now} WHERE id = ${row.id}`;
+    await voidPendingEnrollments(tx, row.id);
     await tx`UPDATE staff_sessions SET revoked_at = ${now} WHERE staff_id = ${row.id} AND revoked_at IS NULL`;
-    await tx`UPDATE staff_enrollments SET expires_at = ${now} WHERE staff_id = ${row.id} AND used_at IS NULL AND expires_at > ${now}`;
     await tx`DELETE FROM staff_challenges WHERE staff_id = ${row.id}`;
     await staffAudit(tx, {
       kind: "event",
@@ -206,8 +256,12 @@ export interface StaffListItem extends StaffAccount {
   invitePending: boolean;
 }
 
-/** Every staff account, admins first, then by handle. Counts and dates only (no credential data). */
-export async function listStaff(db: Sql = sql): Promise<StaffListItem[]> {
+/**
+ * Every staff account (or the one matching `filter.handle`, case-insensitively), admins first, then by handle.
+ * Counts and dates only (no credential data).
+ */
+export async function listStaff(db: Sql = sql, filter: { handle?: string } = {}): Promise<StaffListItem[]> {
+  const handle = filter.handle ?? null;
   const rows = await db<(StaffRow & {
     created_by_handle: string | null;
     passkeys: number;
@@ -224,6 +278,7 @@ export async function listStaff(db: Sql = sql): Promise<StaffListItem[]> {
            EXISTS (SELECT 1 FROM staff_enrollments e
                     WHERE e.staff_id = a.id AND e.used_at IS NULL AND e.expires_at > now()) AS invite_pending
       FROM staff_accounts a LEFT JOIN staff_accounts c ON c.id = a.created_by
+     WHERE ${handle}::text IS NULL OR lower(a.handle) = lower(${handle})
      ORDER BY (a.disabled_at IS NOT NULL), CASE a.role WHEN 'admin' THEN 0 WHEN 'moderator' THEN 1 ELSE 2 END, lower(a.handle)
      LIMIT 1000`;
   return rows.map((r) => ({
@@ -268,9 +323,16 @@ export async function pendingEnrollment(token: string, db: Sql = sql): Promise<P
     : null;
 }
 
-/** Use up the enrollment for `token` (single use, inside the caller's transaction). Returns the staff id, or null. */
+/**
+ * Use up the enrollment for `token` (single use, inside the caller's transaction). Returns the staff id, or null.
+ * Takes the account row FOR SHARE first and holds it until the caller commits (its passkey insert included), so a
+ * concurrent re-invite or disable (FOR UPDATE) runs entirely before or after this enrollment, never in between.
+ */
 export async function consumeEnrollment(tx: Sql, token: string): Promise<string | null> {
   if (!isEnrollmentToken(token)) return null;
+  await tx`
+    SELECT a.id FROM staff_enrollments e JOIN staff_accounts a ON a.id = e.staff_id
+     WHERE e.token_hash = ${hashToken(token)} FOR SHARE OF a`;
   const [row] = await tx<{ staff_id: string }[]>`
     UPDATE staff_enrollments e SET used_at = now()
       FROM staff_accounts a

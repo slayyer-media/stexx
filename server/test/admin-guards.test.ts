@@ -242,6 +242,29 @@ describe("network check", () => {
     }
   });
 
+  test("a peer that can't be read is refused in production (fail closed), allowed only for socketless test requests", () => {
+    expect(networkRefusal(undefined, "100.64.1.1", true)).toBe("no_peer");
+    expect(networkRefusal("", "100.64.1.1", true)).toBe("no_peer");
+    expect(networkRefusal(undefined, "100.64.1.1", false)).toBeNull();
+  });
+
+  test("under Bun.serve (the real entry point's wiring) the TCP peer is read and seen as loopback", async () => {
+    const { app } = await getAdmin();
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+    const prev = config.isProduction;
+    config.isProduction = true; // an unreadable peer would now be refused with 403 (no_peer)
+    try {
+      const url = `http://127.0.0.1:${server.port}/static/console.css`;
+      const ok = await fetch(url, { headers: { "X-Forwarded-For": "100.64.3.4" } });
+      expect(ok.status).toBe(200);
+      const outside = await fetch(url, { headers: { "X-Forwarded-For": "198.51.100.4" } });
+      expect(outside.status).toBe(403);
+    } finally {
+      config.isProduction = prev;
+      server.stop(true);
+    }
+  });
+
   test("requests from outside the allowed ranges get 403 on every route", async () => {
     for (const path of ["/login", "/static/passkey.js", "/"]) {
       const res = await adminGet(path, { headers: { "X-Forwarded-For": "198.51.100.4" } });
@@ -259,7 +282,8 @@ describe("headers", () => {
     expect(h("Content-Security-Policy")).toEqual({ what, "Content-Security-Policy": ADMIN_CSP });
     expect(h("Cache-Control")).toEqual({ what, "Cache-Control": "no-store" });
     expect(h("X-Robots-Tag")).toEqual({ what, "X-Robots-Tag": "noindex, nofollow" });
-    expect(h("Referrer-Policy")).toEqual({ what, "Referrer-Policy": "no-referrer" });
+    // same-origin, not no-referrer: under no-referrer a browser sends `Origin: null` on the console's own form posts.
+    expect(h("Referrer-Policy")).toEqual({ what, "Referrer-Policy": "same-origin" });
     expect(h("X-Content-Type-Options")).toEqual({ what, "X-Content-Type-Options": "nosniff" });
     expect(h("X-Frame-Options")).toEqual({ what, "X-Frame-Options": "DENY" });
   }

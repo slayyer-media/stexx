@@ -17,19 +17,18 @@ const SESSION_ID_RE = /^ss_[a-z2-7]{26}$/;
 export function registerHomeRoutes(r: AdminRoutes): void {
   r.get("/", "dashboard", async (c) => {
     const staff = c.get("staff")!;
-    const [row] = await sql<{ report_queue: number; open_photo_flags: number; spam_limited: number; staff_active: number; passkeys: number }[]>`
+    const [row] = await sql<{ report_queue: number; open_photo_flags: number; spam_limited: number; staff_active: number }[]>`
       SELECT (SELECT count(DISTINCT reported_id)::int FROM reports WHERE status = 'open' AND reported_id IS NOT NULL) AS report_queue,
              (SELECT count(*)::int FROM photo_flags WHERE status = 'open') AS open_photo_flags,
              (SELECT count(*)::int FROM users WHERE spam_limited_at IS NOT NULL) AS spam_limited,
-             (SELECT count(*)::int FROM staff_accounts WHERE disabled_at IS NULL) AS staff_active,
-             (SELECT count(*)::int FROM staff_passkeys WHERE staff_id = ${staff.id}) AS passkeys`;
+             (SELECT count(*)::int FROM staff_accounts WHERE disabled_at IS NULL) AS staff_active`;
     const counts: DashboardCounts = {
       reportQueue: row!.report_queue,
       openPhotoFlags: row!.open_photo_flags,
       spamLimited: row!.spam_limited,
       staffActive: can(staff.role, "staff_view") ? row!.staff_active : undefined,
     };
-    return render(c, DashboardPage({ staff, session: c.get("session")!, counts, passkeys: row!.passkeys }));
+    return render(c, DashboardPage({ staff, session: c.get("session")!, counts }));
   });
 
   r.get("/me/sessions", "own_sessions", async (c) => {

@@ -86,14 +86,17 @@ export function registerLoginRoutes(r: AdminRoutes): void {
     if (!verified.verified) throw await fail();
 
     const session = await sql.begin(async (tx) => {
+      // Lock the account first (whatever its state) and re-check it: a concurrent disable (FOR UPDATE) then either
+      // finishes before this (and the check fails) or waits for it (and revokes the session made here).
+      const [account] = await tx<{ disabled_at: Date | null }[]>`
+        SELECT disabled_at FROM staff_accounts WHERE id = ${stored.staff_id} FOR SHARE`;
+      if (!account || account.disabled_at) return null;
       // The counter only moves forward (two concurrent sign-ins with one counter value: the second fails).
       const moved = await tx`
         UPDATE staff_passkeys SET counter = ${verified.authenticationInfo.newCounter}, last_used_at = now()
          WHERE id = ${credential.id} AND (counter < ${verified.authenticationInfo.newCounter} OR counter = 0)
         RETURNING id`;
       if (moved.length === 0) return null;
-      const disabled = await tx`SELECT 1 FROM staff_accounts WHERE id = ${stored.staff_id} AND disabled_at IS NOT NULL FOR SHARE`;
-      if (disabled.length > 0) return null;
       await tx`UPDATE staff_accounts SET last_login_at = now() WHERE id = ${stored.staff_id}`;
       const s = await createStaffSession(tx, stored.staff_id, c.req.header("User-Agent"));
       await staffAudit(tx, { kind: "event", action: "login", channel: "console", staffId: stored.staff_id, sessionId: s.id });

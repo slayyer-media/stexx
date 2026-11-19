@@ -21,12 +21,20 @@ function tcpPeer(c: Parameters<MiddlewareHandler>[0]): string | undefined {
   }
 }
 
-/** Why a request is refused, or null when it may proceed. Exported for tests. */
-export function networkRefusal(peer: string | undefined, forwardedFor: string | undefined): string | null {
-  if (peer !== undefined && !isLoopbackHost(peer)) return "not_loopback";
+/**
+ * Why a request is refused, or null when it may proceed. Exported for tests. In production a peer that can't be read
+ * is refused (fail closed: a changed server entry point must not silently drop this layer); elsewhere it is a test's
+ * app.request(), which has no socket.
+ */
+export function networkRefusal(peer: string | undefined, forwardedFor: string | undefined, production = config.isProduction): string | null {
+  if (peer === undefined || peer === "") {
+    if (production) return "no_peer";
+  } else if (!isLoopbackHost(peer)) {
+    return "not_loopback";
+  }
   const hops = (forwardedFor ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const last = hops[hops.length - 1];
-  if (last === undefined) return config.isProduction ? "no_forwarded_address" : null;
+  if (last === undefined) return production ? "no_forwarded_address" : null;
   return ipInCidrs(last, config.admin.allowedCidrs) ? null : "outside_allowed_cidrs";
 }
 
