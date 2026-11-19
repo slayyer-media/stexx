@@ -30,8 +30,9 @@ These aren't optional implementation details; they are product promises.
 3. **Blocks are symmetric and immediate.** A blocked or blocking user never
    appears in `nearby`, `profiles/{id}` (404), `conversations` or `viewers`
    for the other party, and messages are rejected with 404.
-4. **Incognito** (Stexx+) users don't appear in `nearby` or `viewers` for
-   others, except people they've messaged.
+4. **Incognito** (Stexx+) users don't appear in `nearby`, `viewers` or the
+   taps inbox (`me/taps`) for others, except people they've messaged. (A live
+   `tap.received` still names the sender at the moment of the tap.)
 5. **Accounts hidden after reports** don't appear in `nearby` or `viewers`,
    and `profiles/{id}` and `conversations` show them only to people who have
    written to them. Banned accounts appear nowhere (404). A hidden account is
@@ -66,6 +67,7 @@ Non-2xx responses carry:
 | 404 | Not found, or hidden because of a block |
 | 409 | Conflict (e.g. nickname taken, if we ever enforce uniqueness) |
 | 429 | Rate limited; `Retry-After` header set |
+| 503 | Temporarily unavailable; show `message` and let the user retry. `storage_unavailable`: the server's disk is full or below its free-space floor, so a photo upload or photo attachment wasn't saved (`Retry-After: 60`). Other 503 codes: `busy` (too many photos being processed, `Retry-After`), `email_unavailable`, `subscriptions_unavailable` |
 
 ## Models
 
@@ -119,6 +121,13 @@ Non-2xx responses carry:
   out. The owner can still send it in a chat. Photos the classifier hasn't seen
   yet (model not installed or busy) come back with `isExplicit: false` and are
   re-checked in the background, so `isExplicit` can turn `true` later.
+- A moderator can also hide a profile photo (after a duplicate or stock-photo
+  flag). It is treated like an explicit one: left out of everyone else's view
+  and returned to its owner with `isExplicit: true`, so the app badges it
+  "Hidden". So `isExplicit: true` on your own photo means "not shown to others".
+  A moderator-hidden photo can't be sent as a chat attachment (400
+  `photo_hidden`), and hiding moves it to a new `url` (the old one stops
+  working).
 
 ### Conversation
 
@@ -142,7 +151,7 @@ Non-2xx responses carry:
   "senderID": "p_7f3a",
   "text": "Museum this weekend?",
   "envelope": null,
-  "attachment": { "kind": "photo", "url": "https://media.stexx.gay/…", "isViewOnce": false, "isEncrypted": false },
+  "attachment": { "kind": "photo", "url": "https://media.stexx.gay/…", "isViewOnce": false, "isEncrypted": false, "openedAt": null },
   "sentAt": "2026-11-17T20:30:00Z",
   "status": "delivered",
   "expiresAt": null,
@@ -160,8 +169,13 @@ Non-2xx responses carry:
 - `attachment.isEncrypted` is `true` for an end-to-end encrypted photo: `url`
   points at an opaque blob, and the key to it is inside `envelope`
   ([Encrypted photos](#encrypted-photos)). `url` is `null` once the photo is
-  gone (expired, or a view-once photo already opened), and for the recipient
-  of a view-once photo everywhere except `GET …/messages`.
+  gone (expired, or a view-once photo already opened), for the recipient
+  of a view-once photo everywhere except `GET …/messages` and the open call,
+  and always for the sender of a view-once photo.
+- `attachment.openedAt` is when the recipient opened a view-once photo
+  ([View-once photos](#view-once-photos)), `null` until then and for every
+  other photo. The recipient always sees it; the sender only if the
+  recipient's `sendReadReceipts` was on when they opened it.
 
 ### Session
 
@@ -175,16 +189,36 @@ Non-2xx responses carry:
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| POST | `/auth/register` | `RegistrationRequest` → `Session` | `{ displayName, method: "passkey"\|"email", email?, confirmedAdult: true }`. No real name or phone number, ever. Birth dates are never sent. |
-| POST | `/auth/passkey/register/options` | `{ displayName }` → WebAuthn creation options | RP ID `stexx.gay` |
-| POST | `/auth/passkey/register/finish` | attestation → `Session` | |
-| POST | `/auth/passkey/login/options` | → WebAuthn request options | |
-| POST | `/auth/passkey/login/finish` | assertion → `Session` | |
-| POST | `/auth/email/link` | `{ email }` → 204 | Sends a one-time sign-in link. Same response whether or not the address exists. |
-| POST | `/auth/email/verify` | `{ token }` → `Session` | Token from the link (universal link to the app). |
+| POST | `/auth/register` | `RegistrationRequest` → `Session` | **Dev servers only** (`config.devAuth`): a session without a credential, for local testing. `{ displayName, method: "passkey"\|"email", email?, confirmedAdult: true }`. Production answers 400 `use_email_link` (email) or `use_passkey_flow` (passkey). Attested (`signup`). |
+| POST | `/auth/passkey/register/options` | `{ displayName, confirmedAdult? }` → WebAuthn creation options | RP ID `stexx.gay` (`WEBAUTHN_RP_ID`). SimpleWebAuthn `PublicKeyCredentialCreationOptionsJSON`: binary fields base64url, `user.id` is an opaque handle (not the user ID); `user.name` and `user.displayName` are the fixed label `Stexx account`, never the nickname (the passkey syncs to the password manager, where others may see its label). Challenge single use, 5 min. |
+| POST | `/auth/passkey/register/finish` | `RegistrationResponseJSON` + `confirmedAdult?` → `Session` | `{ id, rawId, type: "public-key", authenticatorAttachment?, clientExtensionResults, response: { clientDataJSON, attestationObject, transports? } }`, all base64url. 18+ must be confirmed at options or here. Attested (`signup`). 400 `invalid_challenge` / `invalid_credential`, 409 `credential_exists`. |
+| POST | `/auth/passkey/login/options` | → WebAuthn request options | `{ rpId, challenge, timeout, userVerification }`; no `allowCredentials` (discoverable passkeys pick the account). Body ignored. |
+| POST | `/auth/passkey/login/finish` | `AuthenticationResponseJSON` → `Session` | `response: { clientDataJSON, authenticatorData, signature, userHandle? }`. Attested (`login`). 401 `invalid_credential` for an unknown passkey, a bad signature, a used or expired challenge. |
+| POST | `/auth/email/link` | `{ email, displayName?, confirmedAdult?, requestNonce? }` → 204 | Emails a one-time sign-in link **and** an 8-digit code (same sign-in, either works, 15 min, once). Sign-up sends `displayName` + `confirmedAdult: true` together (both or neither; the account is created only when the link or code comes back); sign-in sends `{ email }` alone. `requestNonce` (base64url, 20–200 chars; the app sends 32 random bytes and keeps them while it waits) binds the email to the app install that asked: only its SHA-256 is stored. The code only works with it, and a link opened without it asks first (see `verify`). Same 204 whether or not the address has an account. Attested (`login`). 400 `disposable_email` / `validation_error`, 429 + `Retry-After` (3 per address per client per 15 min, 8 per address overall), 503 `email_unavailable`. |
+| POST | `/auth/email/verify` | `{ token, requestNonce?, confirmed? }` → `Session` | The token from the link `${APP_LINK_BASE}/auth/email?token=…`, a universal link to the app (`applinks:stexx.gay`). Signs in, or creates the account from the pending sign-up. The app always sends its current `requestNonce`. If the link was asked for with that nonce, it is used at once. Otherwise (another install's link, e.g. one someone sent to get this phone into their account) the answer is **409 `confirm_link`** `{ code, message, account: "existing"\|"new", displayName }`: the link is left unused, the app asks "Sign in as *displayName*?" (or "Create the account *displayName*?"), and sends it again with `confirmed: true` only on yes. Without `requestNonce` there is no check (scripts, older clients). Attested (`login`). 400 `invalid_link` (used, expired, unknown: never says whose account), 400 `registration_required` (no account and the link was requested without `displayName`; the link stays unused). Using the link burns its code. |
+| POST | `/auth/email/code` | `{ email, code, requestNonce }` → `Session` | The 8-digit code from the same email (`^[0-9]{8}$`), typed into the app that asked for the email (for a link read on another device). Only works with the `requestNonce` the email was asked for with; any other nonce (or an email asked for without one) gets 400 `invalid_code`. Same outcome and errors as `verify` otherwise. A wrong code is a strike on the live codes asked for with that nonce only: after 5, those codes stop working (the links still do). Other installs' codes are never touched, so a stranger can't use up or lock someone else's code. 10 attempts per address per client per hour (429 + `Retry-After`). Attested (`login`). Using the code burns its link. |
 | POST | `/auth/refresh` | `{ refreshToken }` → `Session` | Rotates the refresh token. |
 | POST | `/auth/logout` | → 204 | Revokes the current session. |
 | DELETE | `/me` | → 204 | Deletes the account and all data. |
+
+The attested routes need the device attestation headers (`X-Stexx-Attestation`
+and friends, see [`security.md`](security.md#1-device-attestation-app-attest-devicecheck-fallback)); without them
+they answer 403 `attestation_required` when `ATTESTATION_MODE` enforces it.
+
+Outside `/v1`:
+
+- `GET /.well-known/apple-app-site-association` → the
+  apple-app-site-association JSON for `APPLE_TEAM_ID.APPLE_BUNDLE_ID`
+  (`webcredentials` for passkeys; `applinks` for `/auth/email` with a `token`
+  query item only), served as `application/json` with
+  `Cache-Control: public, max-age=3600`; 404 while `APPLE_TEAM_ID` is unset. The
+  relying-party domain (`stexx.gay`) must serve the same file
+  ([`server/deploy/README.md`](../server/deploy/README.md), step 8).
+- `GET /auth/email` → a static HTML page for a sign-in link that did not open
+  the app (another device, no app, universal links turned off): it says to open
+  the link on the iPhone or type the code. It never reads or redeems the token,
+  so mail scanners that fetch links can't use them up. `no-store`, `noindex`,
+  inline styles only.
 
 ### Me
 
@@ -195,7 +229,7 @@ Non-2xx responses carry:
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
-| POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
+| POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send; a view-once send moves the file to a new name, so the upload's `url` stops working), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
 | PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito`, all six required (a full replacement). Turning incognito on → 402 without Stexx+; a lapsed subscriber who sends it back on just has it switched off. Read back with `GET /me` (`privacy`). The app sends one change at a time and rolls the toggle back if this fails. |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
@@ -213,7 +247,7 @@ ids.
 | `exportedAt`, `notes` | When, and plain-language notes on what's in it and what isn't. |
 | `account` | `id, createdAt, lastActiveAt, confirmedAdult, hasEmailSignIn, stexxPlusExpiresAt, boostEndsAt`, and moderation state: `hiddenPendingReviewSince`, `hiddenReason` (`reports \| underage \| moderator`), `lastModeratorReviewAt`, and `newAccountLimitsApply` (worked out when exported, not stored). |
 | `profile`, `privacy` | The profile fields and the six privacy settings. |
-| `photos` | Each photo plus its `checks`: `perceptualHash`, `checkedAt`, `model`, `explicitScore`, `labels`. |
+| `photos` | Each photo plus its `checks`: `perceptualHash`, `checkedAt`, `model`, `explicitScore`, `labels`, `hiddenByModeratorAt` (null unless a moderator hid the photo). |
 | `pendingChatUploads` | Chat photo uploads not sent yet. |
 | `location` | `home` and `travel`: the 500 m cell centre kept (no history). |
 | `favorites`, `tapsSent`, `tapsReceived`, `blocked`, `profilesViewed` | Profile ids with dates. |
@@ -243,6 +277,26 @@ as a keyed hash that isn't linked to the account).
 | DELETE | `/profiles/{id}/favorite` | → 204 | |
 | POST | `/profiles/{id}/tap` | → 204 | One "tap" per pair per 24 h. |
 
+### Taps
+
+| Method | Path | Body → Response | Notes |
+| --- | --- | --- | --- |
+| GET | `/me/taps` | → `TapsPage` | Taps you received in the last `TAP_RETENTION_DAYS` (30), newest first, **one entry per sender** (their latest tap). Query: `before` (the previous page's `nextCursor`), `limit` (1–100, default 30). Blocked senders (either direction), incognito senders (unless they've messaged you, rule 4), accounts hidden after reports and banned accounts are left out. A sender who taps again while you page moves to the top, so a later page can repeat them: dedupe by `from.id`. |
+| POST | `/me/taps/seen` | → 204 | Marks everything received so far as seen (moves `taps_seen_at` to now; never back). Idempotent. Call it when the taps screen opens. |
+
+```json
+{
+  "items": [{ "from": { "...": "Profile" }, "sentAt": "2026-11-17T20:30:00Z", "isNew": true }],
+  "nextCursor": "…" ,
+  "unseenCount": 3
+}
+```
+
+- `isNew`: sent after you last called `POST /me/taps/seen` (everything is new before the first call).
+- `unseenCount`: how many entries (senders) are new across the whole window, not just this page. The app adds it to the Chats badge.
+- `from` is built exactly like the `tap.received` profile (bucketed distance, no coordinates).
+- Both routes use the general rate limit (300/min).
+
 ### Chat
 
 | Method | Path | Body → Response | Notes |
@@ -250,21 +304,76 @@ as a keyed hash that isn't linked to the account).
 | GET | `/conversations` | → `[Conversation]` | Most recent first. |
 | POST | `/conversations` | `{ participantID }` → `Conversation` | Returns the existing conversation if there is one. |
 | GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100). Oldest-first within the page; `nextCursor` is the ID to pass as `before`. |
-| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
+| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied; 400 `photo_hidden` if a moderator hid it). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
+| POST | `/conversations/{id}/messages/{messageID}/open` | → `Message` | The recipient opened a view-once photo ([View-once photos](#view-once-photos)). Idempotent. 404 for anyone else. 60/min (429). |
 | POST | `/conversations/{id}/read` | → 204 | Ignored for read receipts if the reader disabled them. |
 | DELETE | `/conversations/{id}` | → 204 | Deletes for the caller only. |
 
 Realtime: `wss://api.stexx.gay/v1/ws` with the bearer token (header, or a
 first frame `{ "type": "auth", "token": "…" }` within 5 s; never the query string),
-pushing `message.created`, `message.read`, `conversation.updated`, `tap.received`
+pushing `message.created`, `message.updated`, `message.read`, `conversation.updated`, `tap.received`
 events using the same JSON models. Each frame is `{ "type": "…", "data": … }`:
-`message.created` → `Message`, `conversation.updated` → `Conversation`,
+`message.created` → `Message`, `message.updated` → `Message` (a message you
+already have changed; today only the sender of a view-once photo gets it, when
+it was opened and the recipient sends read receipts), `conversation.updated` → `Conversation`,
 `message.read` → `{ conversationID, readerID, messageIDs, readAt }`,
-`tap.received` → `{ from: Profile, sentAt }`, and for end-to-end encryption
+`tap.received` → `{ from: Profile, sentAt }` (a live hint only: the tap is stored and
+listed by `GET /me/taps`, so someone offline when you tapped sees it there), and for end-to-end encryption
 `identity.changed` → `{ userID, identityKeyChangedAt }` and
 `keys.low` → `{ preKeyCount, pqPreKeyCount }`. Control frames (`ready`, `pong`,
 `error`) carry no `data`; clients ignore unknown types. APNs pushes carry no message content,
 only a conversation ID, and the app fetches the rest.
+
+Close codes: 4401 unauthorized or session revoked (refresh, then reconnect), 4408 no auth frame
+within 5 s, 4009 too many sockets for the account, 1008 policy (frame flood), 1013 busy.
+When the server restarts (deploy, reboot) it closes every socket with **1012 `restarting`**
+before it stops: reconnect with the usual backoff and refetch what may have been missed,
+exactly as after a dropped connection. Expect the first attempts to fail for a few seconds
+while the new process starts.
+
+### View-once photos
+
+A view-once photo (`isViewOnce: true`) can be looked at once by the
+recipient, then the server deletes it.
+
+- **Receiving.** Realtime events and the conversation list never carry its
+  `url` to the recipient; `GET …/messages` does. Listing the thread does
+  **not** open the photo (it used to: an app that only listed the thread
+  started the deletion timer before the user ever tapped the photo).
+- **Opening.** When the photo is actually shown, the recipient's app calls
+  `POST /conversations/{id}/messages/{messageID}/open` (no body) → the
+  `Message` as the recipient sees it, with `attachment.openedAt` set and the
+  `url` while the file still exists. The server deletes the file about 30 s
+  after the first open (`VIEW_ONCE_GRACE_MS`, so a download started at the
+  open can finish; the job runs every 15 s), for plaintext and end-to-end
+  encrypted photos alike. The message stays, with `url: null`.
+  - Idempotent: calling it again returns the same message and changes
+    nothing. A photo already gone unopened (3-day cap) comes back with
+    `url: null` and `openedAt: null` and is not marked opened.
+  - **404 `not_found`** for anyone but the recipient: the sender, other
+    users, a block either way, a banned sender, a thread the recipient
+    deleted, an expired message, or a message that isn't a view-once photo.
+  - 60 per minute per account (**429** with `Retry-After`).
+- **Never opened.** 3 days after sending, the file is deleted anyway
+  (shorter than the 14 days for unread expiring messages). Until it is
+  opened or capped, the `url` works for anyone who has it, like any chat
+  photo's: media is served without auth and protected only by its
+  unguessable name.
+- **The sender** never gets the `url` of their own view-once photo (seeing
+  the file disappear would tell them it was opened). The upload's `url` from
+  `POST /me/attachments` stops working when the photo is sent view-once: the
+  message gets its own, new file name and the upload's name is deleted, so
+  the sender has no URL to watch. They learn that it was
+  opened only through `attachment.openedAt`, and only if the recipient's
+  `sendReadReceipts` was on at the moment they opened it (recorded then, like
+  read receipts; turning receipts on later doesn't reveal an earlier open).
+  In that case the sender also gets `message.updated` (the `Message`) and
+  `conversation.updated`.
+- **Older apps** that predate the open call still see the `url` in
+  `GET …/messages` and can show the photo, but never mark it opened: their
+  view-once photos stay on the server until the 3-day cap, and the sender
+  never sees "Opened". That's the safe direction (nothing is deleted before
+  the recipient saw it, nothing is revealed).
 
 ### End-to-end encryption
 
@@ -329,7 +438,7 @@ everything else stays at 64 KB.
   "preKeyLowWatermark": 20,
   "pqPreKeyLowWatermark": 5,
   "envelopeMaxBytes": 32768,
-  "contentRules": { "restricted": true, "noLinks": true, "duplicateRecipients": 3, "duplicateMinLength": 16 }
+  "contentRules": { "restricted": true, "noLinks": true, "noHandles": true, "duplicateRecipients": 3, "duplicateMinLength": 16 }
 }
 ```
 
@@ -337,7 +446,10 @@ everything else stays at 64 KB.
 encrypting, because the server can't read ciphertext
 ([`security.md`](security.md#with-end-to-end-encrypted-chats)): while
 `restricted`, refuse links (`noLinks`, same rule as `containsLink` in
-`server/src/lib/abuse/content.ts`) and refuse sending the same text (case and
+`server/src/lib/abuse/content.ts`), refuse payment and crypto handles and
+off-platform redirects (`noHandles`, the rules in
+`server/src/lib/abuse/content-rules.json`, which the app bundles as is; absent
+from older servers, treat as `false`) and refuse sending the same text (case and
 spacing ignored, at least `duplicateMinLength` characters) to more than
 `duplicateRecipients` people in 24 h. Re-read it on launch and after a 403.
 
@@ -461,7 +573,10 @@ last-resort `pqPreKey`, so nobody can drain someone else's one-time prekeys.
   `lastMessage`, `message.created`).
 - Everything else is unchanged: blocks (404), hidden accounts
   (`account_under_review`), rate limits, `new_account_limit`, expiry, read
-  receipts, idempotent `clientID`. The text rules (`links_not_allowed`,
+  receipts, idempotent `clientID`, and the spam heuristics' metadata rules
+  (a shadow-limited sender's envelope can be held like a plaintext message,
+  see [`security.md`](security.md#8-spam-heuristics-on-messages-shadow-limits)).
+  The text rules (`links_not_allowed`, `handles_not_allowed`,
   `duplicate_message`) aren't run on ciphertext: the app runs them
   (`contentRules`).
 - `attachmentPhotoID` next to an `envelope` should be an encrypted upload
@@ -533,23 +648,18 @@ server stores bytes it can't read.
 
 View-once and expiring photos work as for plaintext ones: the server deletes
 the blob on the same schedule (an expiring photo at `expiresAt`; a view-once
-photo 30 s after the recipient's first `GET …/messages`, or 14 days after
-sending if never opened; an unsent upload after 1 h; with the conversation or
-the account), and the app drops the key when the photo expires or once a
-view-once photo has been viewed. Spent photos have `attachment.url: null`.
-
-Known limitation: the server marks a view-once photo opened when the
-recipient's app first lists the thread, not when they tap it (same rule as
-plaintext), and deletes the blob about 30 s later. An encrypted view-once photo
-that isn't tapped right away becomes "no longer available". The iOS app never
-sends view-once photos; other clients can. A fix needs a dedicated open
-endpoint (follow-up).
+photo about 30 s after the recipient opens it with
+`POST …/messages/{messageID}/open` ([View-once photos](#view-once-photos)), or
+3 days after sending if never opened; an unsent upload after 1 h; with the
+conversation or the account), and the app drops the key when the photo
+expires, as soon as a view-once photo has been opened, or when the server says
+it's gone. Spent photos have `attachment.url: null`.
 Blobs are served as `application/octet-stream` from `<32 hex>.bin`.
 
 **What the server can still see** about an encrypted photo: that a photo was
 sent, who sent it to whom and when, the blob's size bucket (not the exact
-size), the `isViewOnce` flag and the expiry timer, when the recipient first
-loaded it, and when it was deleted. It can't see the image, the caption, the
+size), the `isViewOnce` flag and the expiry timer, when the recipient
+opened a view-once photo (the open call), and when the blob was deleted. It can't see the image, the caption, the
 dimensions or the key, and it doesn't run any image check on it. Explicit
 photos are blurred by the receiving app, not filtered by the server.
 
@@ -608,7 +718,42 @@ A banned account's sessions stop working (401) and sign-in returns
 
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
-| POST | `/subscriptions/apple` | `{ signedTransaction }` → `{ isActive, expiresAt }` | StoreKit 2 JWS, verified server-side. Product `gay.stexx.app.plus.monthly` ($10/month). |
-| GET | `/subscriptions/status` | → `{ isActive, expiresAt }` | |
+| POST | `/subscriptions/apple` | `{ signedTransaction }` → `SubscriptionStatus` | StoreKit 2 JWS, verified server-side. Product `gay.stexx.app.plus.monthly` ($10/month). |
+| GET | `/subscriptions/status` | → `SubscriptionStatus` | |
+| POST | `/subscriptions/apple/notifications` | `{ signedPayload }` → 200, empty body | Called by Apple (App Store Server Notifications V2), not the app. No auth. |
 | PUT | `/me/travel` | `{ latitude, longitude, precisionMeters }` \| `null` → 204 | Travel mode: you browse, and others see you, from this cell instead of your home cell while Stexx+ is active. Already fuzzed on device (500 m) and re-snapped by the server; overwrites, no history. Setting it needs Stexx+ (402); `null` turns it off and always works, so a lapsed subscriber can still clear it. `GET /me` reports the state (`travel`). |
 | POST | `/boosts` | → `{ endsAt }` | One hour. |
+
+`SubscriptionStatus` is `{ isActive, expiresAt, willRenew, boostEndsAt }`:
+
+- `expiresAt`: end of the current entitlement (the latest expiry over the user's non-revoked subscriptions, extended
+  through a billing grace period), or `null` if the user never subscribed or the subscription was refunded.
+- `willRenew`: `true` if the subscription behind `expiresAt` renews then ("Stexx+ renews on …"), `false` if auto-renew
+  is off ("Stexx+ ends on …"), `null` when not active or not known yet. The server learns it only from Apple's
+  notifications, so it stays `null` until the first one arrives for that subscription.
+- `boostEndsAt`: end of the running boost, `null` when no boost is running (so the app can show a boost after a relaunch).
+
+Older apps ignore the two new fields; the app treats them as optional.
+
+#### App Store Server Notifications
+
+`POST /subscriptions/apple/notifications` with Apple's body `{ "signedPayload": "<JWS>" }` (extra fields are ignored).
+The URL to enter in App Store Connect is in [`server/deploy/README.md`](../server/deploy/README.md#app-store-server-notifications-stexx).
+
+- The payload and the `signedTransactionInfo` / `signedRenewalInfo` inside it are verified like a purchase: signature,
+  certificate chain to Apple's root, bundle id, environment (and app Apple ID in Production). Renewal info must be for
+  the same original transaction. Any failure is **400 `invalid_notification`** with one fixed message ("The notification
+  could not be verified."), whatever the reason. **503 `subscriptions_unavailable`** when verification isn't configured
+  (or `APPLE_ENVIRONMENT` is `Xcode`/`LocalTesting`) or Apple's certificate status check is unreachable; Apple retries.
+- The subscription is looked up by `originalTransactionId`; a notification never creates one or moves it to another
+  account. Handled types: `SUBSCRIBED`, `DID_RENEW`, `DID_CHANGE_RENEWAL_STATUS`, `DID_FAIL_TO_RENEW` (with
+  `GRACE_PERIOD`, Stexx+ lasts until the grace period ends), `EXPIRED`, `GRACE_PERIOD_EXPIRED`, `REFUND` and `REVOKE`
+  (Stexx+ from that subscription ends at once; a refund of an earlier month that had already ended doesn't touch the
+  current one), `REFUND_REVERSED` (restores it, unless a later refund happened). Expiry only ever grows, so a late or
+  repeated notification can't shorten it, and a renewal bought after a refund lifts the refund.
+- **200** (empty body) for everything accepted: applied, `TEST`, unknown types, other products, unknown
+  `originalTransactionId`s (e.g. a notification that arrives before the app posted the purchase), and replays. Each
+  `notificationUUID` is applied once; a replay is acknowledged without being applied again.
+- Rate limit: its own bucket, 60 a minute per client (429 + `Retry-After`; Apple retries).
+- Stored: the notification UUID and arrival time (deleted once older than 30 days, as later notifications arrive) and the subscription's auto-renew flag. No
+  Apple payload.

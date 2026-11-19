@@ -4,6 +4,7 @@ import { sql } from "../db/sql.ts";
 import { currentUserId, requireAuth } from "../lib/auth.ts";
 import { badRequest, notFound } from "../lib/errors.ts";
 import { abuseKeyHash } from "../lib/abuse/limits.ts";
+import { reassessAfterSafetyEvent } from "../lib/abuse/spam.ts";
 import { assertReportable, evaluateAutoHide } from "../lib/moderation.ts";
 import { isId, newId } from "../lib/ids.ts";
 import { clientIp, rateLimit } from "../lib/ratelimit.ts";
@@ -57,6 +58,8 @@ safetyRoutes.put("/blocks/:id", requireAuth, async (c) => {
   await sql`
     INSERT INTO blocks (blocker_id, blocked_id) VALUES (${me}, ${target})
     ON CONFLICT (blocker_id, blocked_id) DO NOTHING`;
+  // Being blocked soon after a first message is a spam signal (lib/abuse/spam.ts). Never fails the block.
+  await reassessAfterSafetyEvent(target);
   return c.body(null, 204);
 });
 
@@ -201,6 +204,8 @@ safetyRoutes.post("/reports", requireAuth, rateLimit("reports"), async (c) => {
     // Several independent reports (or an underage one) hide the account until a moderator reviews it.
     await evaluateAutoHide(reported, tx);
   });
+  // Being reported soon after a first message is a spam signal too (lib/abuse/spam.ts). Never fails the report.
+  await reassessAfterSafetyEvent(reported);
   // Same response whatever happened to the reported account: the reporter learns nothing about other reports.
   return c.body(null, 204);
 });

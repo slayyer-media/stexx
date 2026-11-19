@@ -3,6 +3,12 @@ import SwiftUI
 import UIKit
 
 /// Edit your public profile. Everything except the nickname is optional.
+///
+/// Shown in a sheet. With unsaved changes (or a photo still uploading)
+/// swipe-down is disabled and Cancel asks "Discard changes?" first; a failed
+/// save keeps the sheet open with the error in a toast. If the details saved
+/// but the photos didn't, the details count as saved from then on and the
+/// toast says so.
 struct EditProfileView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
@@ -14,6 +20,11 @@ struct EditProfileView: View {
     @State private var isSaving = false
     @State private var newTag = ""
     @State private var errorMessage: String?
+    @State private var isConfirmingDiscard = false
+    /// What's saved on the server: the profile as it was when editing
+    /// started, or after a save whose details went through but whose photos
+    /// didn't.
+    @State private var baseline: Profile
 
     private let maxPhotos = 6
     private let maxTags = 10
@@ -21,8 +32,31 @@ struct EditProfileView: View {
     @State private var photoSync: ProfilePhotoSync
 
     init(profile: Profile) {
+        _baseline = State(initialValue: profile)
         _draft = State(initialValue: profile)
         _photoSync = State(initialValue: ProfilePhotoSync(photos: profile.photos))
+    }
+
+    private var isDirty: Bool {
+        Self.hasUnsavedChanges(initial: baseline, draft: draft, pendingTag: newTag, isUploading: isUploading)
+    }
+
+    /// Whether leaving now would lose something: any field, the photo set
+    /// or order (uploads count, they're removed again on discard), a tag
+    /// typed but not yet added, or a photo still uploading (it lands on the
+    /// server, and is deleted again if the edit is discarded).
+    nonisolated static func hasUnsavedChanges(
+        initial: Profile, draft: Profile, pendingTag: String, isUploading: Bool = false
+    ) -> Bool {
+        if isUploading { return true }
+        var before = ProfileUpdate(initial)
+        var after = ProfileUpdate(draft)
+        // The order of "looking for" toggles doesn't matter.
+        before.lookingFor = before.lookingFor.sorted { $0.rawValue < $1.rawValue }
+        after.lookingFor = after.lookingFor.sorted { $0.rawValue < $1.rawValue }
+        return before != after
+            || initial.photos.map(\.id) != draft.photos.map(\.id)
+            || !pendingTag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var isValid: Bool {
@@ -120,15 +154,6 @@ struct EditProfileView: View {
                 EditFooter("Up to \(maxTags). Nerd out.")
             }
             .editRows()
-
-            if let errorMessage {
-                Section {
-                    Text(errorMessage)
-                        .font(.stexxSub)
-                        .foregroundStyle(Theme.danger)
-                }
-                .editRows()
-            }
         }
         .listSectionSpacing(Theme.Spacing.xl)
         .foregroundStyle(Theme.frost)
@@ -136,8 +161,25 @@ struct EditProfileView: View {
         .stexxBackground(intensity: 0.5)
         .navigationTitle("Edit profile")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarVisibility(.hidden, for: .tabBar)
+        .errorToast($errorMessage)
+        // Swipe-down only closes a sheet with nothing to lose. With unsaved
+        // changes or an upload in flight the sheet springs back and Cancel
+        // asks "Discard changes?". (SwiftUI on iOS 26 doesn't report the
+        // refused swipe, so it can't open the dialog itself.)
+        .interactiveDismissDisabled(isDirty || isSaving)
+        .confirmationDialog("Discard changes?", isPresented: $isConfirmingDiscard, titleVisibility: .visible) {
+            Button("Discard changes", role: .destructive) { dismiss() }
+            Button("Keep editing", role: .cancel) {}
+        } message: {
+            Text("Your edits to your profile won't be saved.")
+        }
         .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel", role: .cancel) {
+                    if isDirty { isConfirmingDiscard = true } else { dismiss() }
+                }
+                .disabled(isSaving)
+            }
             ToolbarItem(placement: .principal) {
                 Text(verbatim: "edit profile")
                     .font(.stexxHeadline.weight(.heavy))
@@ -151,7 +193,8 @@ struct EditProfileView: View {
                     ProgressView()
                 } else {
                     Button("Save", role: .confirm) { Task { await save() } }
-                        .disabled(!isValid)
+                        // Wait for uploads, so the saved photo order is complete.
+                        .disabled(!isValid || isUploading)
                 }
             }
         }
@@ -160,7 +203,8 @@ struct EditProfileView: View {
             Task { await upload(items) }
         }
         .onDisappear {
-            // Left without saving: remove photos uploaded during this edit.
+            // Left without saving: remove photos uploaded during this edit,
+            // and any still uploading once they land.
             let photoSync = photoSync, api = api
             Task { await photoSync.discardUnsavedUploads(using: api) }
         }
@@ -283,25 +327,23 @@ struct EditProfileView: View {
             isUploading = false
             photoSelection = []
         }
+        // Held directly: this keeps running if the sheet closes mid-upload.
+        let photoSync = photoSync, api = api
         for item in items {
+            // The edit was discarded: don't upload the rest.
+            guard !photoSync.isAbandoned else { break }
             do {
                 guard let data = try await item.loadTransferable(type: Data.self),
                       let jpeg = ImageSanitizer.strippedJPEG(from: data)
                 else { continue }
                 let photo = try await api.uploadPhoto(jpegData: jpeg)
-                photoSync.didUpload(photo)
+                // Discarded while this one was uploading: it's deleted again.
+                guard await photoSync.didUpload(photo, using: api) else { break }
                 draft.photos.append(photo)
             } catch {
-                errorMessage = error.localizedDescription
+                errorMessage = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't add that photo."))
             }
         }
-    }
-
-    /// Applies photo removals and reordering on the server (uploads already
-    /// happened when they were picked). Safe to retry. Returns the server's
-    /// photo order.
-    private func syncPhotos() async throws -> [Photo] {
-        try await photoSync.apply(draft.photos, using: api)
     }
 
     // MARK: Helpers
@@ -340,14 +382,62 @@ struct EditProfileView: View {
         isSaving = true
         defer { isSaving = false }
         draft.displayName = draft.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            var updated = try await api.updateMe(ProfileUpdate(draft))
-            updated.photos = try await syncPhotos()
-            appState.me = updated
+        switch await Self.saveChanges(draft, photoSync: photoSync, using: api) {
+        case .saved(let saved):
+            appState.me = saved
             dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
+        case .detailsOnly(let saved, let error):
+            // The details are live now: show them everywhere and stop
+            // counting them as unsaved, so "Discard changes?" only covers
+            // the photo changes, which stay in the draft for another Save.
+            appState.me = saved
+            baseline = saved
+            errorMessage = Self.detailsOnlyMessage(for: error)
+        case .failed(let error):
+            // Nothing changed on the server. Stay open with the edits intact;
+            // Save can be tried again.
+            errorMessage = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't save your profile."))
         }
+    }
+
+    // MARK: Saving
+
+    enum SaveOutcome {
+        /// Details and photos are saved; this is the profile now.
+        case saved(Profile)
+        /// The details saved (they're public now) but the photo removals or
+        /// order didn't. The profile has the server's details and the photos
+        /// it still has from before this edit.
+        case detailsOnly(Profile, error: any Error)
+        /// Nothing was saved.
+        case failed(any Error)
+    }
+
+    /// Saves the details, then applies photo removals and order (uploads
+    /// already happened when they were picked). Safe to retry.
+    static func saveChanges(_ draft: Profile, photoSync: ProfilePhotoSync, using api: any APIClient) async -> SaveOutcome {
+        let details: Profile
+        do {
+            details = try await api.updateMe(ProfileUpdate(draft))
+        } catch {
+            return .failed(error)
+        }
+        var saved = details
+        do {
+            saved.photos = try await photoSync.apply(draft.photos, using: api)
+            return .saved(saved)
+        } catch {
+            saved.photos = photoSync.committedPhotos
+            return .detailsOnly(saved, error: error)
+        }
+    }
+
+    /// Says the details went through, so nobody discards believing they
+    /// didn't, and then why the photos didn't.
+    static func detailsOnlyMessage(for error: any Error) -> String {
+        let lead = String(localized: "Your details were saved, but your photo changes weren't.")
+        guard let reason = UserFacingError.message(for: error, failedAction: lead) else { return lead }
+        return reason.hasPrefix(lead) ? reason : "\(lead) \(reason)"
     }
 }
 
@@ -395,8 +485,11 @@ enum ImageSanitizer {
 }
 
 #Preview {
-    NavigationStack {
-        EditProfileView(profile: MockData.profiles[0])
-    }
-    .previewEnvironment()
+    Color.clear
+        .sheet(isPresented: .constant(true)) {
+            NavigationStack {
+                EditProfileView(profile: MockData.profiles[0])
+            }
+        }
+        .previewEnvironment()
 }

@@ -4,6 +4,7 @@ import { isoCBOR } from "@simplewebauthn/server/helpers";
 import { config } from "../src/config.ts";
 import { emailHmac, hashToken } from "../src/lib/auth.ts";
 import { lastDevLinkFor } from "../src/lib/mailer.ts";
+import { PASSKEY_ACCOUNT_LABEL } from "../src/routes/auth.ts";
 import { as, createUser, expectError, expectJson, expectNoContent, post, sql, uniq } from "./helpers.ts";
 
 // ---- helpers ---------------------------------------------------------------
@@ -361,7 +362,10 @@ describe("passkeys", () => {
     const o = await passkeyOptions(dn);
     expect(o.rp.id).toBe(config.webauthn.rpId);
     expect(o.rp.name).toBe(config.webauthn.rpName);
-    expect(o.user.name).toBe(dn);
+    // the passkey is labelled neutrally, never with the nickname (it syncs to the password manager)
+    expect(o.user.name).toBe(PASSKEY_ACCOUNT_LABEL);
+    expect(o.user.displayName).toBe(PASSKEY_ACCOUNT_LABEL);
+    expect(JSON.stringify(o)).not.toContain(dn);
     expect(typeof o.challenge).toBe("string");
     expect(o.attestation).toBe("none");
     expect(o.authenticatorSelection.residentKey).toBe("required");
@@ -478,6 +482,43 @@ describe("passkeys", () => {
     await passkeyRegister(auth);
     const o = await passkeyOptions();
     await expectError(await post("/v1/auth/passkey/register/finish", { json: auth.register(o) }), 409, "credential_exists");
+  });
+
+  test("the iOS app's payloads: platform attachment, transports, userHandle, sign count always 0", async () => {
+    // What ios/Stexx/Services/Passkeys.swift sends (PasskeyWire): iCloud Keychain passkeys report counter 0 on every
+    // use, and the app adds authenticatorAttachment, the transports and (on sign-in) the userHandle.
+    const auth = new SoftAuthenticator();
+    const o = await passkeyOptions();
+    const reg = auth.register(o);
+    const session = await expectJson(
+      await post("/v1/auth/passkey/register/finish", {
+        json: {
+          ...reg,
+          authenticatorAttachment: "platform",
+          response: { ...reg.response, transports: ["hybrid", "internal"] },
+          confirmedAdult: true,
+        },
+      }),
+      200,
+    );
+    const [cred] = await sql`SELECT transports FROM passkey_credentials WHERE id = ${auth.credentialId.toString("base64url")}`;
+    expect(cred!.transports).toEqual(["hybrid", "internal"]);
+
+    for (let i = 0; i < 2; i++) {
+      const lo = await expectJson(await post("/v1/auth/passkey/login/options"), 200);
+      const assertion = auth.assert(lo, { counter: 0 });
+      const login = await expectJson(
+        await post("/v1/auth/passkey/login/finish", {
+          json: {
+            ...assertion,
+            authenticatorAttachment: "platform",
+            response: { ...assertion.response, userHandle: o.user.id },
+          },
+        }),
+        200,
+      );
+      expect(login.userID).toBe(session.userID);
+    }
   });
 
   test("malformed bodies are 400", async () => {

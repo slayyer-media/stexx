@@ -12,13 +12,25 @@ import Foundation
 /// - is safe to retry after a partial failure: a photo whose delete already
 ///   went through is not deleted again (and a 404 counts as deleted);
 ///
-/// and leaving without saving removes the photos uploaded during the edit.
+/// and leaving without saving removes the photos uploaded during the edit,
+/// including any upload still in flight when the editor closed: once the
+/// edit is abandoned, a photo that finishes uploading is deleted straight
+/// away instead of joining the gallery.
 @MainActor
 final class ProfilePhotoSync {
     /// Photos on the server, in server order.
     private(set) var serverPhotos: [Photo]
     /// Uploaded during this edit and not saved yet.
     private(set) var unsavedUploads: [Photo.ID] = []
+    /// The editor closed without saving. Uploads that land after this are
+    /// deleted again, and the upload loop stops picking up more photos.
+    private(set) var isAbandoned = false
+
+    /// Photos that were on the server before this edit and still are (the
+    /// gallery as people see it if this edit's uploads are discarded).
+    var committedPhotos: [Photo] {
+        serverPhotos.filter { !unsavedUploads.contains($0.id) }
+    }
 
     init(photos: [Photo]) {
         serverPhotos = photos
@@ -28,6 +40,22 @@ final class ProfilePhotoSync {
     func didUpload(_ photo: Photo) {
         serverPhotos.append(photo)
         unsavedUploads.append(photo.id)
+    }
+
+    /// Records a finished upload, unless the edit was abandoned while it was
+    /// uploading: then the photo is deleted again (best effort) so it never
+    /// stays on the public profile, and this returns `false`.
+    func didUpload(_ photo: Photo, using api: any APIClient) async -> Bool {
+        guard isAbandoned else {
+            didUpload(photo)
+            return true
+        }
+        do {
+            try await api.deletePhoto(id: photo.id)
+        } catch {
+            // Offline: it stays; the user can remove it next edit.
+        }
+        return false
     }
 
     /// Makes the server's gallery exactly `wanted`, in that order, and
@@ -53,6 +81,7 @@ final class ProfilePhotoSync {
 
     /// The edit was abandoned: delete what it uploaded. Best effort.
     func discardUnsavedUploads(using api: any APIClient) async {
+        isAbandoned = true
         let uploads = unsavedUploads
         unsavedUploads = []
         for id in uploads {

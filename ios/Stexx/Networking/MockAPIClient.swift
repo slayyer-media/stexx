@@ -34,6 +34,30 @@ actor MockAPIClient: APIClient {
     private var nextID = 1
     private var plusExpiresAt: Date?
     private var travelLocation: FuzzedLocation?
+    /// Passkey sign-up in progress: challenge → nickname (like `auth_challenges`).
+    private var pendingPasskeySignUps: [String: String] = [:]
+    private var pendingPasskeyLogins: Set<String> = []
+    /// Injected failures and delays, by method name (see `inject(_:for:)`).
+    private var injectedOutcomes: [String: InjectedOutcome] = [:]
+    /// Auto-renew status reported with an active subscription.
+    private var plusWillRenew: Bool? = true
+    private var boostEndsAt: Date?
+    /// Email sign-in links "sent" (token → address), like `email_link_tokens`.
+    private var emailLinks: [String: String] = [:]
+    /// The request nonce each link was asked for with (token → nonce).
+    private var emailLinkNonces: [String: String] = [:]
+    /// Addresses with a live code (address → pending nickname, if a sign-up).
+    private var emailCodes: [String: String?] = [:]
+    /// Send times per address, for the server's 3-per-15-minutes limit.
+    private var emailSends: [String: [Date]] = [:]
+    /// The token in the newest fake email (tests open it as a link).
+    private(set) var lastEmailLinkToken: String?
+
+    /// Every fake sign-in email carries this code (Debug builds: type it on
+    /// the "check your email" screen).
+    static let emailCode = "12345678"
+    /// See `verifyEmailLink`.
+    static let someoneElsesLinkPrefix = "someone-else"
 
     init(latency: Duration = .milliseconds(250), plusActive: Bool = false, meLatency: Duration = .zero, failsPrivacySaves: Bool = false) {
         self.meLatency = meLatency
@@ -87,12 +111,125 @@ actor MockAPIClient: APIClient {
         return MockData.session
     }
 
-    func requestEmailLink(email: String) async throws {
+    /// Like the server: one email with a link and a code; 3 per address in
+    /// 15 minutes, then 429 with the wait.
+    func requestEmailLink(_ request: EmailLinkRequest) async throws {
         try await pause()
+        let address = request.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard address.contains("@") else { throw APIError.server(status: 400, message: "email: must be a valid email address") }
+        guard (request.displayName == nil) == (request.confirmedAdult == nil), request.confirmedAdult != false else {
+            throw APIError.server(status: 400, message: "displayName and confirmedAdult must be sent together")
+        }
+        let now = Date.now
+        let window: TimeInterval = 15 * 60
+        let recent = (emailSends[address] ?? []).filter { now.timeIntervalSince($0) < window }
+        if recent.count >= 3, let oldest = recent.first {
+            emailSends[address] = recent
+            throw APIError.rateLimited(retryAfter: window - now.timeIntervalSince(oldest))
+        }
+        emailSends[address] = recent + [now]
+        let token = Self.randomBase64URL(32)
+        emailLinks[token] = address
+        emailLinkNonces[token] = request.requestNonce
+        lastEmailLinkToken = token
+        emailCodes.updateValue(request.displayName, forKey: address)
     }
 
-    func verifyEmailLink(token: String) async throws -> Session {
+    /// Like the server: only in the app install that asked for the email.
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session {
         try await pause()
+        let address = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let askedHere = emailLinks.contains { $0.value == address && emailLinkNonces[$0.key] == requestNonce }
+        guard code == Self.emailCode, askedHere, let pending = emailCodes.removeValue(forKey: address) else {
+            throw EmailSignInError.invalidCode
+        }
+        emailLinks = emailLinks.filter { $0.value != address }
+        emailLinkNonces = emailLinkNonces.filter { emailLinks[$0.key] != nil }
+        if let pending { me.displayName = pending }
+        return MockData.session
+    }
+
+    // MARK: Passkeys (simulated: pairs with `SimulatedPasskeyAuthenticator`)
+
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions {
+        try await pause()
+        let challenge = Self.randomBase64URL(32)
+        pendingPasskeySignUps[challenge] = displayName
+        return PasskeyCreationOptions(
+            challenge: challenge,
+            rp: .init(id: PasskeyAvailability.defaultRelyingPartyID, name: "Stexx"),
+            // Like the server: a neutral label, never the nickname.
+            user: .init(id: Self.randomBase64URL(32), name: "Stexx account", displayName: "Stexx account"),
+            timeout: 300_000,
+            attestation: "none",
+            excludeCredentials: [],
+            authenticatorSelection: .init(residentKey: "required", userVerification: "required")
+        )
+    }
+
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session {
+        try await pause()
+        guard credential.confirmedAdult else {
+            throw APIError.server(status: 400, message: "You must confirm that you are 18 or older.")
+        }
+        guard let challenge = Self.challenge(in: credential.response.clientDataJSON, type: "webauthn.create"),
+              let displayName = pendingPasskeySignUps.removeValue(forKey: challenge),
+              Data(base64URLEncoded: credential.rawId) != nil,
+              Data(base64URLEncoded: credential.response.attestationObject) != nil
+        else { throw APIError.server(status: 400, message: "This sign-up expired. Please start again.") }
+        me.displayName = displayName
+        return MockData.session
+    }
+
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions {
+        try await pause()
+        let challenge = Self.randomBase64URL(32)
+        pendingPasskeyLogins.insert(challenge)
+        return PasskeyRequestOptions(challenge: challenge, rpId: PasskeyAvailability.defaultRelyingPartyID, timeout: 300_000, userVerification: "required", allowCredentials: [])
+    }
+
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session {
+        try await pause()
+        guard let challenge = Self.challenge(in: credential.response.clientDataJSON, type: "webauthn.get"),
+              pendingPasskeyLogins.remove(challenge) != nil
+        else { throw APIError.unauthorized }
+        return MockData.session
+    }
+
+    private static func randomBase64URL(_ count: Int) -> String {
+        Data((0..<count).map { _ in UInt8.random(in: .min ... .max) }).base64URLEncodedString()
+    }
+
+    /// The challenge inside a base64url `clientDataJSON` of the given type.
+    private static func challenge(in clientDataJSON: String, type: String) -> String? {
+        struct ClientData: Decodable { let type: String; let challenge: String }
+        guard let data = Data(base64URLEncoded: clientDataJSON),
+              let parsed = try? JSONDecoder().decode(ClientData.self, from: data),
+              parsed.type == type
+        else { return nil }
+        return parsed.challenge
+    }
+
+    /// Links from `requestEmailLink` work once; anything else is expired.
+    /// A link asked for with another nonce asks first, like the server.
+    /// A link token starting with `someone-else` stands for a link another
+    /// install asked for (Debug: `-StexxOpenURL` shows "sign in as …?").
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session {
+        try await pause()
+        if token.hasPrefix(Self.someoneElsesLinkPrefix) {
+            guard confirmed else {
+                throw EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: false, displayName: "NightOwl"))
+            }
+            return MockData.session
+        }
+        guard let address = emailLinks[token] else { throw EmailSignInError.invalidLink }
+        if !confirmed, emailLinkNonces[token] != requestNonce {
+            let pending = emailCodes[address] ?? nil
+            throw EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: pending != nil, displayName: pending ?? me.displayName))
+        }
+        emailLinks.removeValue(forKey: token)
+        emailLinkNonces.removeValue(forKey: token)
+        if let pending = emailCodes.removeValue(forKey: address), let pending { me.displayName = pending }
         return MockData.session
     }
 
@@ -113,6 +250,7 @@ actor MockAPIClient: APIClient {
         blocked.removeAll()
         plusExpiresAt = nil
         travelLocation = nil
+        boostEndsAt = nil
         privacy = PrivacySettings()
     }
 
@@ -277,6 +415,12 @@ actor MockAPIClient: APIClient {
 
     func conversations() async throws -> [Conversation] {
         try await pause()
+        #if DEBUG
+        if failsConversationList {
+            // What URLSession reports when the phone is offline.
+            throw URLError(.notConnectedToInternet, userInfo: [NSLocalizedDescriptionKey: "The Internet connection appears to be offline."])
+        }
+        #endif
         return conversationStore.values
             .filter { !blocked.contains($0.participant.id) }
             .sorted { $0.updatedAt > $1.updatedAt }
@@ -319,7 +463,11 @@ actor MockAPIClient: APIClient {
         }
         // Like the server, an attachment is a copy of an uploaded photo.
         let attachment = draft.attachmentPhotoID.map { photoID in
-            Message.Attachment(kind: .photo, url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url)
+            Message.Attachment(
+                kind: .photo,
+                url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url,
+                isViewOnce: draft.isViewOnce ?? false
+            )
         }
         // The mock backend behaves like a server with `E2E_MODE=off`.
         if draft.envelope != nil {
@@ -348,6 +496,27 @@ actor MockAPIClient: APIClient {
 
     func markRead(conversationID: Conversation.ID) async throws {
         conversationStore[conversationID]?.unreadCount = 0
+    }
+
+    /// Like the server: only the recipient of a view-once photo, idempotent,
+    /// and a photo that's already gone isn't marked opened late.
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        try await pause()
+        guard let conversation = conversationStore[conversationID],
+              !blocked.contains(conversation.participant.id),
+              let index = messageStore[conversationID]?.firstIndex(where: { $0.id == messageID }),
+              var message = messageStore[conversationID]?[index],
+              message.senderID != MockData.myID,
+              message.attachment?.isViewOnce == true
+        else { throw APIError.notFound }
+        if message.attachment?.openedAt == nil, message.attachment?.url != nil {
+            message.attachment?.openedAt = .now
+            messageStore[conversationID]?[index] = message
+            if conversationStore[conversationID]?.lastMessage?.id == messageID {
+                conversationStore[conversationID]?.lastMessage = message
+            }
+        }
+        return message
     }
 
     func deleteConversation(_ conversationID: Conversation.ID) async throws {
@@ -434,7 +603,11 @@ actor MockAPIClient: APIClient {
     func startBoost() async throws -> Boost {
         try await pause()
         guard currentPlusStatus.isActive else { throw APIError.requiresPlus }
-        return Boost(endsAt: Date.now.addingTimeInterval(3600))
+        // Not stackable, like the server: a running boost keeps its end time.
+        if let boostEndsAt, boostEndsAt > .now { return Boost(endsAt: boostEndsAt) }
+        let endsAt = Date.now.addingTimeInterval(3600)
+        boostEndsAt = endsAt
+        return Boost(endsAt: endsAt)
     }
 
     #if DEBUG
@@ -445,18 +618,162 @@ actor MockAPIClient: APIClient {
     #endif
 
     private var currentPlusStatus: SubscriptionStatus {
-        guard let plusExpiresAt, plusExpiresAt > .now else { return .inactive }
-        return SubscriptionStatus(isActive: true, expiresAt: plusExpiresAt)
+        let boost = boostEndsAt.flatMap { $0 > .now ? $0 : nil }
+        guard let plusExpiresAt, plusExpiresAt > .now else {
+            return SubscriptionStatus(isActive: false, expiresAt: nil, boostEndsAt: boost)
+        }
+        return SubscriptionStatus(isActive: true, expiresAt: plusExpiresAt, willRenew: plusWillRenew, boostEndsAt: boost)
     }
 
     // MARK: Helpers
 
-    private func pause() async throws {
+    private func pause(_ function: String = #function) async throws {
         try await Task.sleep(for: latency)
+        try await injectedOutcome(for: function)
     }
 
     private func makeID(_ prefix: String) -> String {
         defer { nextID += 1 }
         return "\(prefix)-\(nextID)-\(UUID().uuidString.prefix(8))"
+    }
+
+    // MARK: Taps
+
+    /// Taps received: sender and time, newest first (one per sender, like
+    /// the server's list).
+    private var receivedTaps: [(from: Profile.ID, sentAt: Date)] = MockData.seedTaps.map {
+        ($0.0, Date.now.addingTimeInterval(-$0.1 * 60))
+    }
+    private var tapsSeenAt: Date? = Date.now.addingTimeInterval(-MockData.tapsSeenMinutesAgo * 60)
+    private var tapsPageSize = 30
+
+    func taps(before cursor: String?) async throws -> TapsPage {
+        try await pause()
+        #if DEBUG
+        if failsTaps {
+            throw URLError(.notConnectedToInternet, userInfo: [NSLocalizedDescriptionKey: "The Internet connection appears to be offline."])
+        }
+        #endif
+        let all = receivedTaps
+            .filter { !blocked.contains($0.from) }
+            .sorted { $0.sentAt > $1.sentAt }
+            .compactMap { tap in
+                profiles[tap.from].map { profile in
+                    ReceivedTap(from: profile, sentAt: tap.sentAt, isNew: tapsSeenAt.map { tap.sentAt > $0 } ?? true)
+                }
+            }
+        let start = cursor.flatMap(Int.init) ?? 0
+        let end = min(all.count, start + tapsPageSize)
+        let page = start < end ? Array(all[start..<end]) : []
+        return TapsPage(
+            items: page,
+            nextCursor: end < all.count ? String(end) : nil,
+            unseenCount: all.filter(\.isNew).count
+        )
+    }
+
+    func markTapsSeen() async throws {
+        try await pause()
+        tapsSeenAt = .now
+    }
+
+    #if DEBUG
+    /// Screenshots and tests: `conversations()` fails like a dropped
+    /// connection while this is on.
+    private var failsConversationList = false
+
+    func setFailsConversationList(_ fails: Bool) {
+        failsConversationList = fails
+    }
+
+    /// Screenshots and tests: `taps(before:)` fails like a dropped
+    /// connection while this is on.
+    private var failsTaps = false
+
+    func setFailsTaps(_ fails: Bool) {
+        failsTaps = fails
+    }
+
+    /// Tests: a smaller taps page, to exercise infinite scroll.
+    func setTapsPageSize(_ size: Int) {
+        tapsPageSize = max(1, size)
+    }
+
+    /// Screenshots and tests: nobody has tapped you.
+    func removeAllTaps() {
+        receivedTaps = []
+    }
+
+    /// Tests: someone taps you now (what `tap.received` reports live).
+    func receiveTap(from profileID: Profile.ID, at date: Date = .now) {
+        receivedTaps.removeAll { $0.from == profileID }
+        receivedTaps.insert((profileID, date), at: 0)
+    }
+    #endif
+}
+
+// MARK: - Failure injection
+
+/// Lets tests, previews and Debug screenshots make one mock endpoint fail (or
+/// hang) without a server. Keys are the method's base name, as in
+/// `"fetchMe"`, `"sendTap"` or `"setFavorite"`; every method that calls
+/// `pause()` honours them.
+extension MockAPIClient {
+    /// What an injected endpoint does instead of answering.
+    enum InjectedOutcome: Sendable {
+        case fail(any Error)
+        /// Waits this long before answering normally (loading states).
+        case delay(Duration)
+    }
+
+    /// Makes `method` fail (or hang) until cleared with `nil`.
+    func inject(_ outcome: InjectedOutcome?, for method: String) {
+        injectedOutcomes[method] = outcome
+    }
+
+    fileprivate func injectedOutcome(for function: String) async throws {
+        let method = String(function.prefix { $0 != "(" })
+        switch injectedOutcomes[method] ?? Self.launchOutcomes[method] {
+        case .fail(let error)?:
+            throw error
+        case .delay(let duration)?:
+            try await Task.sleep(for: duration)
+        case nil:
+            break
+        }
+    }
+
+    /// Debug builds only: `-StexxMockFail "fetchMe=offline,sendTap=429"`.
+    /// Values: `offline`, `429` (Retry-After 10 min), `402`, `403` (account
+    /// under review), `500`, or `hang` (answers after 10 minutes).
+    static let launchOutcomes: [String: InjectedOutcome] = {
+        #if DEBUG
+        guard let spec = UserDefaults.standard.string(forKey: "StexxMockFail") else { return [:] }
+        return parseLaunchOutcomes(spec)
+        #else
+        return [:]
+        #endif
+    }()
+
+    static func parseLaunchOutcomes(_ spec: String) -> [String: InjectedOutcome] {
+        var outcomes: [String: InjectedOutcome] = [:]
+        for entry in spec.split(separator: ",") {
+            let parts = entry.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2, !parts[0].isEmpty else { continue }
+            let outcome: InjectedOutcome? = switch parts[1] {
+            case "offline": .fail(URLError(.notConnectedToInternet))
+            case "429": .fail(APIError.rateLimited(retryAfter: 600))
+            case "402": .fail(APIError.requiresPlus)
+            case "403": .fail(APIError.server(
+                status: 403,
+                message: "Your account is being reviewed by our moderators. Until then you can keep chatting with people who've written to you, but you can't start new chats."
+            ))
+            case "500": .fail(APIError.server(status: 500, message: nil))
+            case "hang": .delay(.seconds(600))
+            default: nil
+            }
+            if let outcome { outcomes[parts[0]] = outcome }
+        }
+        return outcomes
     }
 }

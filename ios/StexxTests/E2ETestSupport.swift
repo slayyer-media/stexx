@@ -35,6 +35,8 @@ actor FakeE2EServer {
     private(set) var media: [URL: Data] = [:]
     /// Makes the next send fail as if the network dropped it (nothing stored).
     var failNextSend = false
+    /// Makes the next view-once open fail as if the phone were offline.
+    var failNextOpen = false
     /// `GET /e2e/config` fails as if the network dropped it.
     var failConfig = false
     /// Applied right after the next plaintext upload (the server's mode
@@ -48,6 +50,7 @@ actor FakeE2EServer {
     func set(status: KeyStatus?, for user: Profile.ID) { statusOverride[user] = status }
     func failNextRegister(_ failure: Failure) { nextRegisterFailure = failure }
     func failNextSendOnce() { failNextSend = true }
+    func failNextOpenOnce() { failNextOpen = true }
     func set(failConfig: Bool) { self.failConfig = failConfig }
     func afterNextPlaintextUpload(mode: E2EConfig.Mode, failConfig: Bool) { afterNextPlaintextUpload = (mode, failConfig) }
     func count(_ call: String) -> Int { calls.filter { $0 == call }.count }
@@ -253,7 +256,35 @@ actor FakeE2EServer {
         return message
     }
 
-    func page() -> Page<Message> { Page(items: messages, nextCursor: nil) }
+    /// `GET …/messages` as `user` sees it: like the server, the sender of a
+    /// view-once photo never gets its URL.
+    func page(for user: Profile.ID) -> Page<Message> {
+        Page(items: messages.map { view($0, for: user) }, nextCursor: nil)
+    }
+
+    private func view(_ message: Message, for user: Profile.ID) -> Message {
+        var copy = message
+        if message.senderID == user, message.attachment?.isViewOnce == true { copy.attachment?.url = nil }
+        return copy
+    }
+
+    /// `POST …/messages/{id}/open`: recipient only (else 404), idempotent;
+    /// a photo already gone isn't marked opened late.
+    func open(_ messageID: Message.ID, as user: Profile.ID) throws -> Message {
+        calls.append("open")
+        if failNextOpen {
+            failNextOpen = false
+            throw URLError(.notConnectedToInternet)
+        }
+        guard let index = messages.firstIndex(where: { $0.id == messageID }),
+              messages[index].senderID != user,
+              messages[index].attachment?.isViewOnce == true
+        else { throw APIError.notFound }
+        if messages[index].attachment?.openedAt == nil, messages[index].attachment?.url != nil {
+            messages[index].attachment?.openedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        }
+        return view(messages[index], for: user)
+    }
 }
 
 /// `APIClient` as one user of `FakeE2EServer`.
@@ -272,7 +303,10 @@ struct FakeE2EClient: APIClient {
         [Conversation(id: FakeE2EServer.conversationID, participant: Self.profile(peerID), lastMessage: await server.messages.last, unreadCount: 0, updatedAt: .now)]
     }
     func openConversation(with profileID: Profile.ID) async throws -> Conversation { try await conversations()[0] }
-    func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message> { await server.page() }
+    func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message> { await server.page(for: userID) }
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        try await server.open(messageID, as: userID)
+    }
     func send(_ draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message { try await server.send(draft, as: userID) }
     func e2eConfig() async throws -> E2EConfig { try await server.e2eConfig(as: userID) }
     func registerKeys(_ registration: KeyRegistration) async throws -> KeyStatus { try await server.registerKeys(registration, as: userID) }
@@ -286,8 +320,13 @@ struct FakeE2EClient: APIClient {
     func deleteAccount() async throws {}
 
     func register(_ request: RegistrationRequest) async throws -> Session { throw Self.unused }
-    func requestEmailLink(email: String) async throws { throw Self.unused }
-    func verifyEmailLink(token: String) async throws -> Session { throw Self.unused }
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions { throw Self.unused }
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session { throw Self.unused }
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions { throw Self.unused }
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session { throw Self.unused }
+    func requestEmailLink(_ request: EmailLinkRequest) async throws { throw Self.unused }
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session { throw Self.unused }
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session { throw Self.unused }
     func refreshSession(refreshToken: String) async throws -> Session { throw Self.unused }
     func logout(_ session: Session) async throws { throw Self.unused }
     func fetchMe() async throws -> Profile { throw Self.unused }
@@ -316,6 +355,8 @@ struct FakeE2EClient: APIClient {
     #if DEBUG
     func debugGrantPlus() async throws { throw Self.unused }
     #endif
+    func taps(before cursor: String?) async throws -> TapsPage { throw Self.unused }
+    func markTapsSeen() async throws { throw Self.unused }
 }
 
 /// One person's app: engine + E2E-wrapped client, with in-memory secrets

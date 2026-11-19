@@ -44,6 +44,18 @@ export function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
+/**
+ * Key for email sign-in code hashes, derived from EMAIL_PEPPER (never stored in the database). An 8-digit code has
+ * only 10^8 values, so a plain hash next to the address's HMAC could be reversed offline in about a second by anyone
+ * who can read the row (backup, replica). Keyed, it can't be tested without the pepper.
+ */
+const EMAIL_CODE_KEY = createHmac("sha256", config.emailPepper).update("stexx email sign-in codes v1").digest();
+
+/** What is stored for an email sign-in code: keyed, and bound to the address so equal codes never match across addresses. */
+export function emailCodeHash(hmac: Buffer, code: string): Buffer {
+  return createHmac("sha256", EMAIL_CODE_KEY).update(`${hmac.toString("base64url")}:${code}`, "utf8").digest();
+}
+
 /** HMAC-SHA256(EMAIL_PEPPER, normalized email). The ONLY form of an email we ever store. */
 export function emailHmac(email: string): Buffer {
   return createHmac("sha256", config.emailPepper).update(normalizeEmail(email), "utf8").digest();

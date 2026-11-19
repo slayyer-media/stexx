@@ -32,15 +32,28 @@ export const LIMITS = {
    * (3/15 min) refills slower than this, so draining it takes several distinct clients.
    */
   emailLinkAddress: { capacity: 8, windowMs: 15 * MINUTE },
+  /**
+   * One-time code attempts per (address, client) (POST /auth/email/code). Keyed on the client too, so a stranger
+   * guessing at an address can't use up the owner's attempts. A code only works in the app install that asked for
+   * its email and takes at most 5 wrong guesses (routes/auth.ts), so guessing stays hopeless across clients.
+   */
+  emailCode: { capacity: 10, windowMs: HOUR },
   messages: { capacity: 60, windowMs: MINUTE },
   /** Photo attachments (each one is a new file on disk), per sender: uploads and sends of a profile-photo copy. */
   attachments: { capacity: 30, windowMs: HOUR },
   taps: { capacity: 30, windowMs: HOUR },
+  /** POST /conversations/:id/messages/:messageID/open (view-once photos), per user. */
+  viewOnceOpens: { capacity: 60, windowMs: MINUTE },
   reports: { capacity: 10, windowMs: HOUR },
   photoUploads: { capacity: 20, windowMs: HOUR },
   /** E2E key routes (/keys*), per user: uploads, rotations, status, bundle and identity fetches. */
   keys: { capacity: 30, windowMs: MINUTE },
   general: { capacity: 300, windowMs: MINUTE },
+  /**
+   * POST /subscriptions/apple/notifications (App Store Server Notifications, unauthenticated), per client. Each request
+   * verifies up to three JWS chains, so it gets its own bucket; Apple retries anything we turn away.
+   */
+  appleNotifications: { capacity: 60, windowMs: MINUTE },
   /**
    * Requests whose bearer token did not resolve to a live session, per client. Checked BEFORE the session lookup,
    * so a flood of made-up tokens cannot buy itself fresh buckets or unlimited database lookups.

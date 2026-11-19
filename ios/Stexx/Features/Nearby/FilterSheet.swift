@@ -2,6 +2,11 @@ import SwiftUI
 
 /// Stexx+ advanced filters. The server enforces the entitlement too; this
 /// sheet is only reachable with Stexx+.
+///
+/// Edits a draft: Apply applies it, Cancel discards it, and "Reset filters"
+/// clears the draft without closing. Swipe-down is the same as Cancel (it
+/// discards without asking): a filter draft is quick to redo, so a prompt
+/// would cost more than it saves.
 struct FilterSheet: View {
     @Binding var query: NearbyQuery
     @Environment(\.dismiss) private var dismiss
@@ -103,6 +108,17 @@ struct FilterSheet: View {
                     SectionLabel("Tags")
                 }
                 .listRowBackground(Theme.ink1)
+
+                Section {
+                    Button("Reset filters", systemImage: "arrow.counterclockwise", role: .destructive, action: resetDraft)
+                        .frame(maxWidth: .infinity)
+                        .disabled(!hasFiltersInDraft)
+                } footer: {
+                    Text("Clears these filters. Nothing changes until you tap Apply.")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.slate)
+                }
+                .listRowBackground(Theme.ink1)
             }
             .listRowSeparatorTint(Theme.line)
             .stexxBackground(intensity: 0.4)
@@ -115,8 +131,8 @@ struct FilterSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Reset", role: .destructive) {
-                        query = NearbyQuery()
+                    Button("Cancel", role: .cancel) {
+                        // Discards the draft; the applied filters stay as they were.
                         dismiss()
                     }
                 }
@@ -163,6 +179,31 @@ struct FilterSheet: View {
             limitsDistance = true
             maxDistanceKm = meters / 1000
         }
+    }
+
+    /// Whether anything in the draft would filter the grid.
+    private var hasFiltersInDraft: Bool {
+        limitsAge || limitsDistance || !draft.positions.isEmpty || !draft.lookingFor.isEmpty
+            || !draft.tags.isEmpty || !tagText.isEmpty
+    }
+
+    private func resetDraft() {
+        draft = Self.cleared(draft)
+        limitsAge = false
+        ageRange = 18...99
+        limitsDistance = false
+        maxDistanceKm = 25
+        tagText = ""
+    }
+
+    /// The query with every filter this sheet shows cleared; the quick
+    /// filters it doesn't show (online, favorites) are kept.
+    nonisolated static func cleared(_ query: NearbyQuery) -> NearbyQuery {
+        var cleared = NearbyQuery()
+        cleared.onlineOnly = query.onlineOnly
+        cleared.favoritesOnly = query.favoritesOnly
+        cleared.limit = query.limit
+        return cleared
     }
 
     private func apply() {

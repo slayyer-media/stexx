@@ -4,9 +4,10 @@
  *
  * These sit ON TOP of the per-route token buckets in lib/ratelimit.ts (which smooth bursts per minute): the
  * windows here cap volume over hours and days, so they live in Postgres (`abuse_counters`, migration 105) and
- * survive restarts and deploys without an extra service. Keys are opaque ids (devices, accounts) or keyed
- * hashes of the IP / network (`abuseKeyHash`, HMAC with a key derived from EMAIL_PEPPER); no raw IP is stored,
- * and rows are deleted by the retention job once both of their windows have passed.
+ * survive restarts and deploys without an extra service. Every key is `<limit name>:` plus a keyed hash
+ * (`abuseKeyHash`, HMAC with a key derived from EMAIL_PEPPER) of the IP, network, device id, account id or
+ * (fetcher, target) pair; no raw IP or id is stored, and rows are deleted by the retention job once both of their
+ * windows have passed.
  *
  * Defaults below; override any of them with RATE_LIMIT_<NAME>=<count>/<window>, e.g. RATE_LIMIT_SIGNUP_IP=5/1h
  * (window units s, m, h, d). docs/security.md lists them.
@@ -286,9 +287,12 @@ export function setLimiterStoreForTests(next: LimiterStore): () => void {
 const ABUSE_KEY = createHmac("sha256", config.emailPepper).update("stexx abuse-limit keys v1").digest();
 
 /**
- * Keyed hash for IP and network keys that go to the database. Stable across restarts (unlike the in-memory
- * salt in ratelimit.ts) so windows survive a deploy; without EMAIL_PEPPER (never in the database or backups) the
- * stored value can't be turned back into an address.
+ * Keyed hash for every value that becomes an `abuse_counters` key: IPs and networks, but also account ids, device
+ * ids and (fetcher, target) pairs, so the table (which backups include) holds no plaintext address or social-graph
+ * edge. Stable across restarts (unlike the in-memory salt in ratelimit.ts) so windows survive a deploy. Without
+ * EMAIL_PEPPER (never in the database or backups) a stored key can't be linked back to an address or account; with
+ * it, small spaces such as IPv4 can be enumerated, so this protects a leaked database or backup, not against the
+ * operator.
  */
 export function abuseKeyHash(value: string): string {
   return createHmac("sha256", ABUSE_KEY).update(value).digest("base64url").slice(0, 22);
@@ -350,7 +354,7 @@ export async function tryAbuseLimits(action: AbuseAction, subject: AbuseSubject,
   for (const [name, field] of PLAN[action]) {
     const value = subject[field];
     if (!value) continue;
-    keys.push([`${name}:${value}`, limits[name]]);
+    keys.push([`${name}:${abuseKeyHash(value)}`, limits[name]]);
   }
   return store.hit(keys, now);
 }
@@ -388,12 +392,15 @@ export async function accountCounters(userId: string): Promise<AccountCounter[]>
   });
 }
 
-/** The subject for a request: keyed hashes of the IP and network, the attested device (if any) and the signed-in user. */
+/**
+ * The subject for a request: the IP and network, the attested device (if any) and the signed-in user. Plain values
+ * in memory; tryAbuseLimits hashes each one with abuseKeyHash before it becomes a database key.
+ */
 export function subjectOf(c: Context, extra: { deviceId?: string | null; userId?: string | null } = {}): AbuseSubject {
   const ip = clientIp(c);
   return {
-    ip: abuseKeyHash(ip),
-    network: abuseKeyHash(networkOf(ip)),
+    ip,
+    network: networkOf(ip),
     deviceId: extra.deviceId ?? null,
     userId: extra.userId ?? null,
   };
