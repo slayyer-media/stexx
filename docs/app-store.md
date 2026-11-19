@@ -54,7 +54,7 @@ For **every** type below the follow-up answers are the same:
 | Crash data, performance data, other diagnostics | No crash reporter or analytics SDK. (Crash logs users share with developers through Apple are Apple's collection, not the app's) |
 | Advertising data, other usage data | No ads, no analytics |
 | IP address | Not an Apple category. Raw IPs are never stored; keyed HMACs of IPs live up to two days in `abuse_counters` and in a report's `reporter_ip_hash` until its evidence is purged. Cloudflare sees IPs as the proxy. Both are described in the privacy policy |
-| Data processed only on the phone | Decrypted chat history, E2E private keys, the session tokens in the Keychain, the birth date entered at the age gate (only "is 18+" is kept, and only on the phone) |
+| Data processed only on the phone | Decrypted chat history, E2E private keys, the session tokens in the Keychain, the birth date entered at the age gate (the phone keeps an "is 18+" flag; the server only gets `confirmedAdult: true` at sign-up) |
 | End-to-end encrypted content | Encrypted chat text and encrypted photo blobs are unreadable by the server. They are still covered by the two User Content rows above because plaintext chats exist during the rollout and the metadata is always readable |
 
 ### Required-reason API audit (Stexx 0.1.0, libsignal 0.108.1)
