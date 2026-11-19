@@ -282,6 +282,14 @@ struct ChatThreadView: View {
                 }
             }
         }
+        .task(id: history.nextExpiry()) {
+            // Timed messages go when their timer runs out, as the server
+            // deletes them, without waiting for a refetch.
+            guard let expiry = history.nextExpiry() else { return }
+            try? await Task.sleep(for: .seconds(max(0, expiry.timeIntervalSinceNow)))
+            guard !Task.isCancelled else { return }
+            await pruneExpired()
+        }
         .fullScreenCover(item: $viewOnceMessage) { message in
             ViewOnceViewer(message: message, onOpened: { markViewOnceOpened(message) }) { outcome, opened in
                 Task { await closeViewOnce(message, outcome: outcome, opened: opened) }
@@ -517,7 +525,10 @@ struct ChatThreadView: View {
     private func refreshMessages(in conversationID: Conversation.ID) async throws {
         let page = try await api.messages(in: conversationID, before: nil)
         noteSpentViewOnce(in: page.items)
-        history.applyLatest(page, myID: appState.myID)
+        let now = Date.now
+        let expired = messages.filter { ThreadHistory.hasExpired($0, at: now) }
+        history.applyLatest(page, myID: appState.myID, now: now)
+        await evictPhotos(of: expired)
     }
 
     /// Loads the page before the oldest message shown. Runs when the top
@@ -546,6 +557,20 @@ struct ChatThreadView: View {
             try? await refreshMessages(in: id)
         } catch {
             olderState = .failed
+        }
+    }
+
+    /// Removes messages whose timer ran out, and their decoded photos.
+    private func pruneExpired() async {
+        let now = Date.now
+        let expired = messages.filter { ThreadHistory.hasExpired($0, at: now) }
+        history.pruneExpired(now: now)
+        await evictPhotos(of: expired)
+    }
+
+    private func evictPhotos(of removed: [Message]) async {
+        for message in removed where message.attachment != nil {
+            await ChatMediaLoader.shared.evict(message.id)
         }
     }
 
@@ -713,10 +738,33 @@ struct ChatThreadView: View {
         deliver(MessageDraft(clientID: clientID, text: message.text), pendingID: message.id, in: conversation)
     }
 
-    /// Removes a failed message from the thread (it never reached the
-    /// server, as far as this phone knows) and forgets its photo.
+    /// Removes a failed message from this phone and forgets its photo.
+    ///
+    /// When the send may have arrived anyway (a timeout, a dropped
+    /// connection: `SendFailure.mayHaveSent`), the newest page is checked
+    /// first. If the server has it (same client ID), the bubble turns into
+    /// the sent message and stays, with a note: removing it here wouldn't
+    /// unsend it. If the check can't reach the server either, it's removed
+    /// from this phone, which is all the button promises.
     private func deleteFailed(_ message: Message) {
         guard message.status == .failed else { return }
+        guard failure(for: message).mayHaveSent, let id = conversation?.id else {
+            removeFailed(message)
+            return
+        }
+        Task {
+            try? await refreshMessages(in: id)
+            if ThreadHistory.deliveredCopy(of: message, in: messages) != nil {
+                failures[message.bubbleKey] = nil
+                if let clientID = message.clientID { chatStore.discardPendingPhoto(clientID: clientID) }
+                sendNotice = String(localized: "That message was sent after all, so it stays in the chat.")
+            } else if messages.contains(where: { $0.id == message.id && $0.status == .failed }) {
+                removeFailed(message)
+            }
+        }
+    }
+
+    private func removeFailed(_ message: Message) {
         failures[message.bubbleKey] = nil
         messages.removeAll { $0.id == message.id }
         if let clientID = message.clientID { chatStore.discardPendingPhoto(clientID: clientID) }
@@ -1003,7 +1051,7 @@ struct MessageBubble: View {
                 .accessibilityActions {
                     if message.status == .failed {
                         if canRetry { Button("Retry", action: onRetry) }
-                        Button("Delete", action: onDelete)
+                        Button(FailedSendRow.removeLabel(mayHaveSent: failure?.mayHaveSent == true), action: onDelete)
                     }
                 }
 
@@ -1013,6 +1061,7 @@ struct MessageBubble: View {
             if isMine, message.status == .failed {
                 FailedSendRow(
                     reason: failure?.reason ?? String(localized: "Not sent."),
+                    mayHaveSent: failure?.mayHaveSent == true,
                     canRetry: canRetry,
                     onRetry: onRetry,
                     onDelete: onDelete
@@ -1230,9 +1279,12 @@ struct MessageBubble: View {
     }
 }
 
-/// Under a failed bubble of mine: why it wasn't sent, then Retry and Delete.
+/// Under a failed bubble of mine: why it wasn't sent, then Retry and
+/// Delete. When the send may have arrived anyway (`SendFailure.mayHaveSent`)
+/// Delete says "Remove": it can't unsend anything, only clear this phone.
 private struct FailedSendRow: View {
     let reason: String
+    let mayHaveSent: Bool
     let canRetry: Bool
     let onRetry: () -> Void
     let onDelete: () -> Void
@@ -1251,7 +1303,7 @@ private struct FailedSendRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel(Text("Not sent. \(reason)"))
+            .accessibilityLabel(Text(mayHaveSent ? reason : String(localized: "Not sent. \(reason)")))
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: Theme.Spacing.m) { buttons }
                 VStack(alignment: .trailing, spacing: 0) { buttons }
@@ -1276,14 +1328,19 @@ private struct FailedSendRow: View {
             .accessibilityLabel("Retry sending")
         }
         Button(role: .destructive, action: onDelete) {
-            Text("Delete")
+            Text(mayHaveSent ? "Remove" : "Delete")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Theme.danger)
                 .frame(minHeight: 44)
                 .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Delete unsent message")
+        .accessibilityLabel(Self.removeLabel(mayHaveSent: mayHaveSent))
+    }
+
+    /// VoiceOver's name for Delete / Remove.
+    static func removeLabel(mayHaveSent: Bool) -> String {
+        mayHaveSent ? String(localized: "Remove from this phone") : String(localized: "Delete unsent message")
     }
 }
 

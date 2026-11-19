@@ -59,6 +59,10 @@ protocol APIClient: Sendable {
     /// default uploads it as a plaintext attachment; `E2EAPIClient` encrypts
     /// it when the chat is end-to-end encrypted.
     func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message
+    /// The user removed a failed photo send (`clientID`) for good: drop
+    /// anything kept to retry it. Only `E2EAPIClient` keeps something (the
+    /// encrypted blob and its key).
+    func discardUnsentPhoto(clientID: String) async
     func markRead(conversationID: Conversation.ID) async throws
     /// `POST /conversations/{id}/messages/{messageID}/open`: the recipient
     /// is looking at a view-once photo. The server deletes it about 30 s
@@ -119,6 +123,9 @@ extension APIClient {
         wire.attachmentPhotoID = upload.id
         return try await send(wire, in: conversationID)
     }
+
+    /// Nothing is kept for a plaintext photo outside `ChatStore`.
+    func discardUnsentPhoto(clientID: String) async {}
 }
 
 enum APIError: LocalizedError, Equatable, Sendable {

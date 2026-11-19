@@ -243,9 +243,12 @@ final class ChatStore {
         pendingPhotos[clientID]?.timer
     }
 
-    /// The user deleted a failed photo message: forget its JPEG.
+    /// The user deleted a failed photo message: forget its JPEG, and (for
+    /// an encrypted chat) the encrypted blob and key kept to retry it.
     func discardPendingPhoto(clientID: String) {
         pendingPhotos[clientID] = nil
+        let api = self.api
+        Task { await api.discardUnsentPhoto(clientID: clientID) }
     }
 
     // MARK: Mute

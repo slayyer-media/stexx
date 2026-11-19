@@ -142,6 +142,11 @@ struct E2EAPIClient: APIClient {
         return try await sendPhoto(jpegData, draft: draft, to: peer, in: conversationID, isRetry: false)
     }
 
+    /// The encrypted blob and key kept for retries of this send go too.
+    func discardUnsentPhoto(clientID: String) async {
+        await engine.didSendPhoto(clientID: clientID)
+    }
+
     /// Routes first (nothing is uploaded until it's clear how the photo goes
     /// out), then sends the photo either way.
     private func sendPhoto(_ jpeg: Data, draft: MessageDraft, to peer: Profile.ID, in conversationID: Conversation.ID, isRetry: Bool) async throws -> Message {

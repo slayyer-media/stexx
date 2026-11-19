@@ -120,6 +120,9 @@ Non-2xx responses carry:
 `isMuted` is the caller's own setting (`PUT`/`DELETE /conversations/{id}/mute`);
 the other person never sees it. `unreadCount` still counts a muted thread's
 unread messages; the app leaves muted threads out of its tab badge.
+There are no push notifications yet. Whatever adds them must read the
+recipient's `conversation_members.muted` before sending: no push, no badge bump
+and no preview for a muted thread (a requirement, not a client nicety).
 
 ### Message
 
@@ -140,6 +143,10 @@ unread messages; the app leaves muted threads out of its tab badge.
 
 - `status`: `sent | delivered | read` from the server (`sending` and
   `failed` are client-only).
+- `expiresAt`: when set, the server deletes the message at that time and
+  sends no event for it. Clients drop it from an open thread at `expiresAt`
+  themselves (and from older pages they keep across a refetch), rather than
+  waiting for a refetch to notice it's gone.
 - `clientID` is the idempotency key from the sender. Re-sending the same
   `clientID` must return the original message, not a duplicate.
 - `envelope` is an end-to-end encrypted message (see

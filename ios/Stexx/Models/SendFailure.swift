@@ -30,6 +30,11 @@ struct SendFailure: Hashable, Sendable {
     var reason: String
     /// When a rate-limited send can go again (`Retry-After`).
     var retryAfter: Date?
+    /// The request may have reached the server before it failed (a
+    /// timeout, a dropped connection, a 5xx): the message may already be
+    /// delivered. Retry is safe (same client ID, deduplicated); removing the
+    /// bubble only removes it from this phone, and the thread says so.
+    var mayHaveSent: Bool = false
 
     /// Server error codes (`docs/api.md`, anti-spam) the app explains itself.
     enum Code {
@@ -39,11 +44,20 @@ struct SendFailure: Hashable, Sendable {
         static let accountUnderReview = "account_under_review"
     }
 
-    init(kind: Kind, reason: String, retryAfter: Date? = nil) {
+    init(kind: Kind, reason: String, retryAfter: Date? = nil, mayHaveSent: Bool = false) {
         self.kind = kind
         self.reason = reason
         self.retryAfter = retryAfter
+        self.mayHaveSent = mayHaveSent
     }
+
+    /// Transport failures after which the request may have been handled
+    /// (sent, then the answer was lost). The others mean it never left.
+    private static let uncertainURLErrors: Set<URLError.Code> = [
+        .timedOut, .networkConnectionLost, .badServerResponse, .cannotParseResponse,
+    ]
+
+    private static let mayHaveSentReason = String(localized: "May not have been sent. Check your connection and retry.")
 
     init(_ error: any Error, now: Date = .now) {
         switch error {
@@ -61,6 +75,8 @@ struct SendFailure: Hashable, Sendable {
             self.init(kind: violation == .linksNotAllowed ? .linksNotAllowed : .duplicate, reason: violation.localizedDescription)
         case let error as APIError:
             self.init(api: error, now: now)
+        case let error as URLError where Self.uncertainURLErrors.contains(error.code):
+            self.init(kind: .other, reason: Self.mayHaveSentReason, mayHaveSent: true)
         case is URLError:
             self.init(kind: .other, reason: String(localized: "Not sent. Check your connection and retry."))
         default:
@@ -94,6 +110,9 @@ struct SendFailure: Hashable, Sendable {
             self.init(kind: .unavailable, reason: String(localized: "This chat isn't available any more."))
         case .unauthorized:
             self.init(kind: .other, reason: error.localizedDescription)
+        case .server(let status, _, _) where status >= 500:
+            // The server may have stored it before failing.
+            self.init(kind: .other, reason: Self.mayHaveSentReason, mayHaveSent: true)
         case .requiresPlus, .server, .invalidResponse:
             self.init(kind: .other, reason: String(localized: "Not sent. Try again in a moment."))
         }

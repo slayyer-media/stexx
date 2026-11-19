@@ -81,7 +81,7 @@ enum MessageAccessibility {
         case .sent: String(localized: "Sent")
         case .delivered: String(localized: "Delivered")
         case .read: String(localized: "Read")
-        case .failed: String(localized: "Not sent")
+        case .failed: String(localized: "Send failed")
         }
     }
 }

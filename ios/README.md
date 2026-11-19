@@ -52,7 +52,9 @@ via `.previewEnvironment()`.
   never the first layout; the "Earlier messages" button at the top does the
   same for VoiceOver and Switch Control, and turns into Retry if a page
   fails. Loaded pages survive a resync (the socket reconnecting refetches
-  only the newest page). Encrypted messages need nothing extra: every page
+  only the newest page), minus anything whose timer has run out: an open
+  thread drops a timed message at its `expiresAt` (when the server deletes
+  it), with its decoded photo, without waiting for a refetch. Encrypted messages need nothing extra: every page
   goes through `E2EAPIClient`, so messages decrypted or sent on this phone
   come from its local history and older ones (before a reinstall) show the
   usual "not available on this phone" placeholder. If the thread can't load
@@ -73,11 +75,18 @@ via `.previewEnvironment()`.
   `new_account_limit`, `links_not_allowed`, `duplicate_message`,
   `account_under_review`, a pending key change, or no connection. Retry
   re-sends with the same client ID, so a send that did arrive isn't
-  duplicated. Delete only removes it from this phone (and forgets the photo).
+  duplicated. Delete only removes it from this phone (and forgets the photo,
+  including an encrypted photo's blob and key). When the outcome is unknown
+  (a timeout, a dropped connection, a 5xx) the reason says "May not have
+  been sent" and the button says Remove ("Remove from this phone"):
+  tapping it first refetches the newest page, and if the message did
+  arrive the bubble becomes the sent one and stays, with a note. Failed
+  bubbles live only in memory: closing the thread forgets them.
 - **Accessibility.** Each bubble is one VoiceOver element that reads the
   sender, the text or the photo's kind, state and timer, the time and, for
-  your own messages, Sending / Sent / Delivered / Read / Not sent
-  (`MessageAccessibility`); a failed bubble has Retry and Delete actions.
+  your own messages, Sending / Sent / Delivered / Read / Send failed
+  (`MessageAccessibility`); a failed bubble has Retry and Delete (or
+  Remove) actions.
   The composer's buttons are labelled (the + button also reads the photo
   timer), and text and icons follow Dynamic Type.
 

@@ -114,6 +114,68 @@ struct ThreadHistoryTests {
         #expect(!ThreadHistory.isNearTop(contentOffsetY: 2000, topInset: 100))
     }
 
+    private func expiring(_ id: String, at seconds: TimeInterval, expiresAt: TimeInterval?, status: Message.Status = .read) -> Message {
+        var m = message(id, at: seconds, status: status)
+        m.expiresAt = expiresAt.map { Self.base.addingTimeInterval($0) }
+        return m
+    }
+
+    @Test("A resync keeps older pages but not messages whose timer ran out")
+    func resyncDropsExpiredOlderMessages() {
+        var history = ThreadHistory()
+        history.applyLatest(page([message("m3", at: 3), message("m4", at: 4)], next: "m3"), myID: "me", now: Self.base)
+        // An older page with a read photo on a 1-hour timer.
+        history.applyOlder(page([message("m1", at: 1), expiring("m2", at: 2, expiresAt: 3602)], next: "m1"), now: Self.base)
+        #expect(history.messages.map(\.id) == ["m1", "m2", "m3", "m4"])
+
+        // The app comes back two hours later: the server deleted m2; the newest page doesn't cover it.
+        let later = Self.base.addingTimeInterval(7200)
+        history.applyLatest(page([message("m4", at: 4), message("m5", at: 5)], next: "m4"), myID: "me", now: later)
+        #expect(history.messages.map(\.id) == ["m1", "m3", "m4", "m5"])
+        #expect(history.olderCursor == "m1")
+    }
+
+    @Test("An older page never brings in a message whose timer already ran out")
+    func olderPageSkipsExpired() {
+        var history = ThreadHistory(messages: [message("m3", at: 3)], olderCursor: "m3")
+        history.applyOlder(page([expiring("m1", at: 1, expiresAt: 10), message("m2", at: 2)], next: nil), now: Self.base.addingTimeInterval(10))
+        #expect(history.messages.map(\.id) == ["m2", "m3"])
+    }
+
+    @Test("An open thread prunes at the next expiry; unsent messages never expire")
+    func pruneAtNextExpiry() {
+        let unsent = expiring("local-k", at: 6, expiresAt: 1, status: .failed)
+        var history = ThreadHistory(messages: [
+            expiring("m1", at: 1, expiresAt: 100), expiring("m2", at: 2, expiresAt: 50), message("m3", at: 3), unsent,
+        ])
+        #expect(history.nextExpiry(after: Self.base) == Self.base.addingTimeInterval(50))
+        let prunedEarly = history.pruneExpired(now: Self.base.addingTimeInterval(49))
+        #expect(!prunedEarly)
+        let prunedOnTime = history.pruneExpired(now: Self.base.addingTimeInterval(50))
+        #expect(prunedOnTime)
+        #expect(history.messages.map(\.id) == ["m1", "m3", "local-k"])
+        #expect(history.nextExpiry(after: Self.base.addingTimeInterval(50)) == Self.base.addingTimeInterval(100))
+        history.pruneExpired(now: Self.base.addingTimeInterval(100))
+        #expect(history.messages.map(\.id) == ["m3", "local-k"])
+        #expect(history.nextExpiry(after: Self.base.addingTimeInterval(100)) == nil)
+    }
+
+    @Test("A failed send the server did get turns into the sent message on refetch")
+    func failedSendDeliveredAfterAll() {
+        let failed = message("local-k", at: 9, from: "me", status: .failed, clientID: "k")
+        var history = ThreadHistory(messages: [message("m1", at: 1), failed])
+        #expect(ThreadHistory.deliveredCopy(of: failed, in: history.messages) == nil)
+
+        // The timeout hid a send that landed: the newest page has it under its client ID.
+        history.applyLatest(page([message("m1", at: 1), message("m9", at: 9, from: "me", status: .sent, clientID: "k")], next: nil), myID: "me")
+        #expect(history.messages.map(\.id) == ["m1", "m9"])
+        #expect(ThreadHistory.deliveredCopy(of: failed, in: history.messages)?.id == "m9")
+
+        // A retry still in flight isn't "delivered".
+        let retrying = message("local-k", at: 9, from: "me", status: .sending, clientID: "k")
+        #expect(ThreadHistory.deliveredCopy(of: failed, in: [retrying]) == nil)
+    }
+
     @Test("Paging through the mock's long thread loads every message once, in order")
     func mockPaging() async throws {
         let api = MockAPIClient(latency: .zero)
@@ -324,6 +386,24 @@ struct FailedSendTests {
         #expect(!gone.canRetry)
         #expect(SendFailure(URLError(.notConnectedToInternet)).kind == .other)
     }
+
+    @Test("A failure that may have reached the server says so; one that never left doesn't")
+    func mayHaveSent() {
+        for code: URLError.Code in [.timedOut, .networkConnectionLost] {
+            let failure = SendFailure(URLError(code))
+            #expect(failure.mayHaveSent)
+            #expect(failure.reason.hasPrefix("May not have been sent"))
+            #expect(failure.canRetry)
+        }
+        #expect(SendFailure(APIError.server(status: 502, message: nil)).mayHaveSent)
+        for error: any Error in [
+            URLError(.notConnectedToInternet), URLError(.cannotConnectToHost),
+            APIError.rateLimited(retryAfter: 5), APIError.server(status: 403, message: nil, code: "links_not_allowed"),
+            APIError.notFound, E2EError.identityChanged(peer: "p1"),
+        ] {
+            #expect(!SendFailure(error).mayHaveSent)
+        }
+    }
 }
 
 @Suite("Chat: mute")
@@ -406,7 +486,7 @@ struct MessageAccessibilityTests {
         let mine = MessageAccessibility.label(for: message(text: "Hey", status: .read), isMine: true, senderName: "Alex", now: now, calendar: calendar)
         #expect(mine == "You, Hey, \(time), Read")
         let failed = MessageAccessibility.label(for: message(text: "Hey", status: .failed), isMine: true, senderName: "Alex", now: now, calendar: calendar)
-        #expect(failed.hasSuffix("Not sent"))
+        #expect(failed.hasSuffix("Send failed"))
     }
 
     @Test("Photos read their kind, state and timer")

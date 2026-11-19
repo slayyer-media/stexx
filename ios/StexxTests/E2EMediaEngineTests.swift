@@ -253,6 +253,17 @@ struct E2EMediaEngineTests {
         #expect(history.messages["capped"]?.hadAttachment == true)
         #expect(history.messages["live"]?.attachment == pointer)
     }
+
+    @Test("Removing a failed encrypted photo drops the blob and key kept for its retries")
+    func discardUnsentPhoto() async throws {
+        let (_, alice, _) = await pair()
+        let first = try await alice.engine.encryptedPhoto(jpeg, clientID: "k1")
+        // A retry reuses the same blob and key.
+        #expect(try await alice.engine.encryptedPhoto(jpeg, clientID: "k1").pointer == first.pointer)
+        await alice.client.discardUnsentPhoto(clientID: "k1")
+        // Gone: the same client ID now gets a fresh key.
+        #expect(try await alice.engine.encryptedPhoto(jpeg, clientID: "k1").pointer.key != first.pointer.key)
+    }
 }
 
 /// How `E2EAPIClient.sendPhoto` routes a photo under each `E2E_MODE`: never

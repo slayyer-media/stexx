@@ -33,7 +33,7 @@ Done; see [`security.md`](security.md) for how each works and how to turn it on 
 ## Chat
 
 - [x] **Older history.** Threads load earlier messages as you scroll up, keeping your place; encrypted history before a reinstall shows a placeholder. Load errors have an inline Retry.
-- [x] **Mute.** Mute a chat for yourself (`PUT`/`DELETE /conversations/{id}/mute`); muted chats stay out of the badge. Push notifications don't exist yet, so muting them comes with push.
+- [x] **Mute.** Mute a chat for yourself (`PUT`/`DELETE /conversations/{id}/mute`); muted chats stay out of the badge. Push notifications don't exist yet; whatever adds them must skip muted threads (no push, no preview), as `docs/api.md` requires.
 - [x] **Photo timers.** Keep, view once, or gone 10 s / 1 min / 1 h / 1 day after reading, for plaintext and encrypted photos.
 - [x] **Send errors.** Failed messages and photos stay as failed bubbles with the reason (rate limits, new-account limits, links, review, key changes) and Retry / Delete.
 - [x] **Chat accessibility.** VoiceOver reads each bubble's sender, content or photo kind and timer, time and status; the composer is labelled; Dynamic Type works up to the accessibility sizes.

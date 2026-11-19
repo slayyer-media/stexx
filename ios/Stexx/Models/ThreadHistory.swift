@@ -43,7 +43,11 @@ struct ThreadHistory: Equatable, Sendable {
     /// thread and anything missing from it is gone. The cursor only moves
     /// when nothing older than this page is on screen: otherwise it already
     /// points before the oldest loaded message.
-    mutating func applyLatest(_ page: Page<Message>, myID: Profile.ID) {
+    ///
+    /// A kept older page isn't re-checked against the server, so anything
+    /// whose timer ran out by `now` goes here (`pruneExpired`): the server
+    /// has deleted it, and a resync mustn't keep it on screen.
+    mutating func applyLatest(_ page: Page<Message>, myID: Profile.ID, now: Date = .now) {
         let merged = ChatStore.reconcile(
             snapshot: page.items,
             with: messages,
@@ -56,6 +60,7 @@ struct ThreadHistory: Equatable, Sendable {
         } ?? false
         if !showsOlder { olderCursor = page.nextCursor }
         messages = merged
+        pruneExpired(now: now)
     }
 
     /// An older page arrived (fetched with `before: olderCursor`). Messages
@@ -65,12 +70,40 @@ struct ThreadHistory: Equatable, Sendable {
     /// Returns the message that was at the top before, which the thread
     /// keeps in place (`scrollAnchor`), so the screen doesn't jump.
     @discardableResult
-    mutating func applyOlder(_ page: Page<Message>) -> Message? {
+    mutating func applyOlder(_ page: Page<Message>, now: Date = .now) -> Message? {
         let anchor = messages.first
-        let fresh = page.items.filter { !Self.contains($0, in: messages) }
+        let fresh = page.items.filter { !Self.contains($0, in: messages) && !Self.hasExpired($0, at: now) }
         messages = fresh + messages
         olderCursor = page.nextCursor
         return anchor
+    }
+
+    /// Drops messages whose timer ran out by `now` (`expiresAt`): the
+    /// server deletes them then, with their media. Lets an open thread hide
+    /// them on time without a refetch (`ChatThreadView` calls it at
+    /// `nextExpiry`). Returns whether anything went.
+    @discardableResult
+    mutating func pruneExpired(now: Date = .now) -> Bool {
+        let count = messages.count
+        messages.removeAll { Self.hasExpired($0, at: now) }
+        return messages.count != count
+    }
+
+    /// The soonest `expiresAt` still ahead of `now`, if any: when the
+    /// thread next has to prune.
+    func nextExpiry(after now: Date = .now) -> Date? {
+        messages.lazy
+            .filter { $0.status != .sending && $0.status != .failed }
+            .compactMap(\.expiresAt)
+            .filter { $0 > now }
+            .min()
+    }
+
+    /// A message the server has deleted by `now` because its timer ran
+    /// out. Unsent ones never had a timer running.
+    static func hasExpired(_ message: Message, at now: Date) -> Bool {
+        guard message.status != .sending, message.status != .failed, let expiresAt = message.expiresAt else { return false }
+        return expiresAt <= now
     }
 
     /// The older page's cursor no longer exists on the server (that message
@@ -79,6 +112,16 @@ struct ThreadHistory: Equatable, Sendable {
     mutating func restart() {
         messages = messages.filter { $0.status == .sending || $0.status == .failed }
         olderCursor = nil
+    }
+
+    /// The server's copy of a send that failed on this phone, if a refetch
+    /// shows it arrived after all: the same client ID, a server ID and a
+    /// settled status. `nil` while it's still only the local failed copy
+    /// (or a retry of it is in flight).
+    static func deliveredCopy(of failed: Message, in messages: [Message]) -> Message? {
+        messages.first {
+            isSame($0, failed) && $0.id != failed.id && $0.status != .sending && $0.status != .failed
+        }
     }
 
     /// The bubble to keep at the top after older messages were prepended:

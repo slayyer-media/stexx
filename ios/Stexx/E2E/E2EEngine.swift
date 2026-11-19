@@ -885,7 +885,8 @@ actor E2EEngine {
         return encrypted
     }
 
-    /// The photo sent as `clientID` reached the server: forget its blob.
+    /// The photo sent as `clientID` reached the server, or the user
+    /// removed the failed send: forget its blob and key.
     func didSendPhoto(clientID: String) {
         outgoingMedia[clientID] = nil
     }
