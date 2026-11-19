@@ -43,6 +43,13 @@ The `.xcodeproj` and generated `Info.plist` are git-ignored. Change
 Every screen has SwiftUI previews (`#Preview`) that inject mock dependencies
 via `.previewEnvironment()`.
 
+Debug builds also open single screens on a fresh mock backend for
+screenshots: `xcrun simctl launch booted gay.stexx.app -StexxScreenshotRoute <name>`
+with `chatList`, `tabs` (the Chats badge counts new taps), `taps`, `tapsEmpty`,
+`chatListError` (load failed, nothing cached), `chatListStale` (refresh
+failed, cached chats with a banner) or `chatListOffline` (chats and taps both
+failed, as on a cold launch with the server down); see `App/ScreenshotRoute.swift`.
+
 ## Passkeys
 
 New accounts are created with a passkey (Face ID / Touch ID, kept in iCloud
@@ -360,6 +367,7 @@ ios/
 │   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up, sign-in (passkey or email link)
 │   │   ├── Nearby/             Grid, filters, profile detail
 │   │   ├── Chat/               Conversation list and thread (key-change banner, encrypted placeholders)
+│   │   ├── Taps/               Received taps inbox (opened from the Taps row in Chats)
 │   │   ├── Me/                 Own profile, edit profile, settings
 │   │   ├── Safety/             Block/report UI, blocked list
 │   │   └── Paywall/            Stexx+ placeholder
@@ -405,7 +413,7 @@ ios/
 - Email links open the app (universal links through `applinks:stexx.gay`,
   Debug and Release) only once `stexx.gay` serves the AASA file; until then
   they open in the browser
-- Push notifications
+- Push notifications (taps and messages reach an offline user only through the lists when they next open the app)
 - Discreet alternate app icons, localization
 - End-to-end encryption for chat photos (they're still sent as plain
   attachments), the safety-number comparison screen, and multi-device

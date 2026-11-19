@@ -11,6 +11,7 @@ import {
   sweepOrphanMedia,
 } from "./retention.ts";
 import { createScheduler } from "./scheduler.ts";
+import { purgeOldTaps, TAP_PURGE_INTERVAL_MS } from "./taps.ts";
 
 export * from "./retention.ts";
 export { createScheduler, HEARTBEAT_INTERVAL_MS, JOBS_STOP_TIMEOUT_MS } from "./scheduler.ts";
@@ -42,6 +43,7 @@ export function startJobs(): () => Promise<void> {
   if (alertChannels().length > 0) {
     every("moderatorAlerts", MODERATOR_ALERT_INTERVAL_MS, async () => void (await runModeratorAlerts()), 30_000);
   }
+  every("taps", TAP_PURGE_INTERVAL_MS, () => purgeOldTaps(), 90_000);
 
   // Removes `.tmp` files left by crashed or failed media writes; logs disk.low under 15 % free.
   every("mediaTmp", MEDIA_TMP_INTERVAL_MS, () => sweepStaleTempFiles(), 30_000);
