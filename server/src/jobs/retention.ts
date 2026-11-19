@@ -18,8 +18,17 @@ import { DAY, HOUR, MINUTE, SECOND } from "../lib/time.ts";
 export const BATCH = 1000;
 /** Unread messages that were sent with an expiry timer are deleted after this long, read or not. */
 export const UNREAD_EXPIRING_CAP_MS = 14 * DAY;
-/** How long a view-once photo stays fetchable after the recipient first opens it (lets the image finish loading). */
+/**
+ * How long a view-once photo stays fetchable after the recipient opens it (POST .../messages/:id/open), so an app
+ * that marks it opened before (or while) downloading can still finish loading it.
+ */
 export const VIEW_ONCE_GRACE_MS = 30 * SECOND;
+/**
+ * View-once photos the recipient never opened are deleted this long after sending. Shorter than the unread-expiring
+ * cap because, until it is opened, the photo's URL keeps working for anyone holding it (a plaintext one is also a file
+ * the server can read), and opening depends on the recipient's app calling the open endpoint.
+ */
+export const VIEW_ONCE_UNOPENED_CAP_MS = 3 * DAY;
 export const PROFILE_VIEW_RETENTION_MS = 7 * DAY;
 /** Files younger than this are never swept as orphans (an upload may not have its DB row yet). */
 export const ORPHAN_MIN_AGE_MS = 1 * HOUR;
@@ -63,8 +72,10 @@ export async function purgeUnreadExpiringMessages(now: Date = new Date()): Promi
 }
 
 /**
- * View-once photos: once the recipient has opened one (`attachment_opened_at`) and the grace window has passed, the
- * file is deleted. The message row stays with attachment_kind = 'photo' and no key, so the client shows a spent photo.
+ * View-once photos (plaintext `.jpg` and end-to-end encrypted `.bin` alike): once the recipient has opened one
+ * (`attachment_opened_at`, set only by the open endpoint; listing the thread doesn't count) and the grace window has
+ * passed, the file is deleted. The message row stays with attachment_kind = 'photo' and no key, so the client shows a
+ * spent photo.
  */
 export async function purgeViewedOnceAttachments(
   now: Date = new Date(),
@@ -85,13 +96,14 @@ export async function purgeViewedOnceAttachments(
 }
 
 /**
- * Hard cap for view-once photos the recipient never opened (never fetched GET .../messages: inactive, deleted the
- * app, hid the thread...). They carry no expiresAfterSeconds, so the unread-expiring cap above doesn't see them;
- * without this the file would stay on disk and in the DB forever. After UNREAD_EXPIRING_CAP_MS the file is deleted
- * (row kept as a spent photo, like an opened one).
+ * Hard cap for view-once photos the recipient never opened (never called the open endpoint: didn't tap it, inactive,
+ * deleted the app, hid the thread, or an app version from before the endpoint, which only lists the thread). They
+ * carry no expiresAfterSeconds, so the unread-expiring cap above doesn't see them; without this the file would stay on
+ * disk and in the DB forever. After VIEW_ONCE_UNOPENED_CAP_MS (3 days after sending) the file is deleted (row kept as a
+ * spent photo, like an opened one). Same for `.jpg` and `.bin` files.
  */
 export async function purgeUnopenedViewOnceAttachments(now: Date = new Date()): Promise<number> {
-  const cutoff = new Date(now.getTime() - UNREAD_EXPIRING_CAP_MS);
+  const cutoff = new Date(now.getTime() - VIEW_ONCE_UNOPENED_CAP_MS);
   const n = await inBatches(async () => {
     const r = await sql`
       UPDATE messages SET attachment_key = NULL WHERE id IN (
@@ -332,7 +344,7 @@ export async function runFastJobs(now: Date = new Date()) {
   return { expired, viewOnce, trashed };
 }
 
-/** Every 10 min: the 14-day caps (unread expiring messages, unopened view-once photos), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows, old report evidence. */
+/** Every 10 min: the caps (unread expiring messages after 14 days, unopened view-once photos after 3), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows, old report evidence. */
 export async function runSlowJobs(now: Date = new Date()) {
   const unreadCapped = await purgeUnreadExpiringMessages(now);
   const unopenedViewOnce = await purgeUnopenedViewOnceAttachments(now);

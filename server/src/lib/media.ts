@@ -1,4 +1,4 @@
-import { mkdir, unlink, copyFile, readdir, rename, stat, statfs } from "node:fs/promises";
+import { mkdir, unlink, copyFile, link, readdir, rename, stat, statfs } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import sharp from "sharp";
 import { config } from "../config.ts";
@@ -354,6 +354,18 @@ export async function storeImage(input: Uint8Array): Promise<string> {
 export async function copyMedia(key: string): Promise<string> {
   const src = mediaPath(key);
   return writeNewFile(isEncryptedKey(key) ? "bin" : "jpg", (tmp) => io.copy(src, tmp));
+}
+
+/**
+ * Give a stored file a second name under a NEW random key of the same kind (a hard link: same bytes, no copy). The
+ * caller unlinks the old name once nothing references it. Used to hand a view-once upload to its message under a
+ * name the sender has never seen (POST /me/attachments returned the old one).
+ */
+export async function relinkMedia(key: string): Promise<string> {
+  await ensureDir();
+  const dest = newStorageKey(isEncryptedKey(key) ? "bin" : "jpg");
+  await link(mediaPath(key), mediaPath(dest));
+  return dest;
 }
 
 /** Delete a file; missing files are fine. */

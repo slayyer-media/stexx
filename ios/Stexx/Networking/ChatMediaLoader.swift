@@ -1,7 +1,8 @@
 import UIKit
 
 /// Downloads, verifies and decrypts end-to-end encrypted chat photos
-/// (`E2EMediaCrypto`). Plaintext photos keep using `PrivateAsyncImage`.
+/// (`E2EMediaCrypto`). Plaintext photos keep using `PrivateAsyncImage`,
+/// except view-once ones (`plaintextPhoto`).
 ///
 /// - Downloads go through `PrivateMedia.session` (ephemeral, no disk cache):
 ///   the blob is opaque anyway, but nothing from a chat lands in
@@ -101,6 +102,29 @@ actor ChatMediaLoader {
         if caches, generation == self.generation, !evictedWhileLoading.contains(messageID), !Task.isCancelled {
             let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
             cache.setObject(Entry(image: image, verdict: verdict), forKey: messageID as NSString, cost: cost)
+        }
+        return .image(image, verdict)
+    }
+
+    /// A plaintext view-once photo (not end-to-end encrypted): downloaded
+    /// through the same private session, decoded and checked on device like
+    /// an encrypted one, and never cached.
+    func plaintextPhoto(url: URL, analyzer: (any ChatPhotoAnalyzer)? = nil) async -> Outcome {
+        let data: Data
+        do {
+            data = try await download(url)
+        } catch LoadError.gone {
+            return .gone
+        } catch is E2EMediaCrypto.Failure {
+            return .unreadable
+        } catch {
+            return .failed
+        }
+        guard let decoded = UIImage(data: data) else { return .unreadable }
+        let image = await decoded.byPreparingForDisplay() ?? decoded
+        var verdict = ChatPhotoVerdict.unknown
+        if let analyzer, let cgImage = decoded.cgImage {
+            verdict = await analyzer.assess(cgImage)
         }
         return .image(image, verdict)
     }

@@ -148,8 +148,9 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   when it marks the chat read. The history is pruned on load, on foreground and
   (at most once a minute) while messages are revealed, and the decrypted images
   of dropped keys leave memory too. A view-once photo's key is
-  dropped when the viewer closes (`forgetAttachmentKey`), and the bubble shows
-  "Opened". The viewer downloads and decrypts on tap, never earlier.
+  dropped as soon as the server confirms the open, and again when the viewer
+  closes (`forgetAttachmentKey`), and the bubble shows "Opened". The viewer
+  downloads and decrypts on tap, never earlier (see View-once photos below).
 - **Payload timer.** Sent photos with a timer put `expiresAfterSeconds` (integer
   seconds) in the encrypted payload, because the server doesn't tell the
   recipient the timer. The recipient uses it only when it is 1 to 2592000 and
@@ -160,10 +161,35 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   `attachment_limit` stops further uploads (those items keep `hasPhoto: true`
   without a `photoID`). If the report fails with not-found, the sheet forgets the
   IDs and the next attempt uploads afresh.
-- **Known limitations.** A decrypted photo on screen can show up in iOS's
-  app-switcher snapshot (plaintext photos already can); a privacy cover is a
-  follow-up. The app never sends view-once photos; see docs/security.md for the
-  open-on-list rule that affects ones from other clients.
+- **View-once photos** (encrypted and plaintext). Listing a thread never opens
+  one. Tapping the "View once · Tap to open" tile opens `ViewOnceViewer`,
+  which downloads (and decrypts) the photo into memory only. Once it is on
+  screen (unblurred; a blurred one counts when the user taps to see it), or
+  turned out unreadable, `ChatStore.openViewOnce` calls
+  `POST …/messages/{id}/open`; the server deletes the photo about 30 s later.
+  An encrypted photo's key goes as soon as the server answers
+  (`E2EAPIClient.openViewOnce`), and on close in any case. `ChatStore` records
+  the open before the call, in `UserDefaults` (message IDs and dates only,
+  wiped at sign-out and after 15 days), so a photo opened here is never shown
+  again on this phone, and a failed open (offline, an error, the app killed)
+  is retried on the next resync or list load, also after a relaunch. Both
+  sides then show "Opened": the recipient always, the sender when
+  `attachment.openedAt` arrives (only if the recipient sends read receipts;
+  live via `message.updated`). The attachment menu has a **View once** toggle
+  (exclusive with **Expiring photos**) to send one. Never-opened photos go
+  after the server's 3-day cap.
+- **App-switcher cover.** `PrivacyCover` puts a separate window with the logo
+  over the whole app when the scene deactivates or goes to the background, so
+  the app switcher (live card and saved snapshot) shows no grid, chats or
+  photos. On by default; **Settings › Privacy › Hide Stexx in the app
+  switcher** turns it off (`UserDefaults`, this phone only). iOS can't say why
+  the app went inactive, so Notification Center, Control Center and system
+  alerts get the cover too; prompts the app starts itself (location
+  permission, the purchase sheet) call `expectSystemPrompt()` first and don't
+  flash it, but the background always does. The exemption is single-use and
+  `endSystemPrompt()` drops it when the purchase call returns; while such a
+  prompt is up, the switcher's live card isn't covered (no new scene event),
+  only the saved snapshot. The photo picker doesn't deactivate the app.
 - **Moderation hook.** Incoming decrypted photos go through
   `ChatPhotoAnalyzer` (`ChatPhotoModeration`). The real analyzer is Apple's
   Sensitive Content Analysis, which needs the
@@ -206,6 +232,13 @@ xcrun simctl launch booted gay.stexx.app \
 ```
 
 `-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
+More debug-only screenshot switches: `-StexxScreenshotSendPhoto viewOnce`
+(liveChat: sends a generated test photo as view-once), `-StexxScreenshotViewOnce
+open|openAndClose` (liveChat: opens the newest incoming view-once photo, as a
+tap would), `-StexxShowPrivacyCover YES` (keeps the app-switcher cover up, since
+the real app switcher can't be captured with `simctl`), and
+`-StexxScreenshotRoute settings`. Pair with `e2e-peer.ts read --open` to open
+the app's view-once photo from the other side.
 
 ## Travel mode (Stexx+)
 

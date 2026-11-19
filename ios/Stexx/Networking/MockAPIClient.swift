@@ -296,7 +296,11 @@ actor MockAPIClient: APIClient {
         }
         // Like the server, an attachment is a copy of an uploaded photo.
         let attachment = draft.attachmentPhotoID.map { photoID in
-            Message.Attachment(kind: .photo, url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url)
+            Message.Attachment(
+                kind: .photo,
+                url: attachments.removeValue(forKey: photoID) ?? me.photos.first { $0.id == photoID }?.url,
+                isViewOnce: draft.isViewOnce ?? false
+            )
         }
         // The mock backend behaves like a server with `E2E_MODE=off`.
         if draft.envelope != nil {
@@ -325,6 +329,27 @@ actor MockAPIClient: APIClient {
 
     func markRead(conversationID: Conversation.ID) async throws {
         conversationStore[conversationID]?.unreadCount = 0
+    }
+
+    /// Like the server: only the recipient of a view-once photo, idempotent,
+    /// and a photo that's already gone isn't marked opened late.
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        try await pause()
+        guard let conversation = conversationStore[conversationID],
+              !blocked.contains(conversation.participant.id),
+              let index = messageStore[conversationID]?.firstIndex(where: { $0.id == messageID }),
+              var message = messageStore[conversationID]?[index],
+              message.senderID != MockData.myID,
+              message.attachment?.isViewOnce == true
+        else { throw APIError.notFound }
+        if message.attachment?.openedAt == nil, message.attachment?.url != nil {
+            message.attachment?.openedAt = .now
+            messageStore[conversationID]?[index] = message
+            if conversationStore[conversationID]?.lastMessage?.id == messageID {
+                conversationStore[conversationID]?.lastMessage = message
+            }
+        }
+        return message
     }
 
     func deleteConversation(_ conversationID: Conversation.ID) async throws {

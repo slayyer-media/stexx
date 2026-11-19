@@ -60,6 +60,12 @@ protocol APIClient: Sendable {
     /// it when the chat is end-to-end encrypted.
     func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message
     func markRead(conversationID: Conversation.ID) async throws
+    /// `POST /conversations/{id}/messages/{messageID}/open`: the recipient
+    /// is looking at a view-once photo. The server deletes it about 30 s
+    /// later. Idempotent; returns the message with `attachment.openedAt`
+    /// (and the URL while the file still exists). 404 for anyone but the
+    /// recipient.
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message
     func deleteConversation(_ conversationID: Conversation.ID) async throws
 
     // MARK: End-to-end encryption (`docs/api.md`)

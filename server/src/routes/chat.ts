@@ -6,7 +6,7 @@ import { currentUserId, requireAuth } from "../lib/auth.ts";
 import { conflict, badRequest, notFound } from "../lib/errors.ts";
 import { isId, newId } from "../lib/ids.ts";
 import { logError } from "../lib/logger.ts";
-import { copyMedia, drainMediaTrash, unlinkMedia } from "../lib/media.ts";
+import { copyMedia, drainMediaTrash, relinkMedia, unlinkMedia } from "../lib/media.ts";
 import { isConnected, publish, publishUnlessBlocked } from "../lib/realtime.ts";
 import { consume, rateLimit } from "../lib/ratelimit.ts";
 import { attest, deviceOf } from "../lib/abuse/attestation.ts";
@@ -32,7 +32,8 @@ import type { AppEnv } from "../types.ts";
 
 /**
  * chat routes, mounted at /v1. Paths are written in full relative to /v1 (e.g. "/me", not "/").
- * Owns: /conversations, /conversations/:id/messages, /conversations/:id/read, DELETE /conversations/:id
+ * Owns: /conversations, /conversations/:id/messages, /conversations/:id/messages/:messageID/open,
+ * /conversations/:id/read, DELETE /conversations/:id
  * See server/AGENTS-NOTES.md for helpers and conventions.
  *
  * Rules implemented here (each has a test in test/chat.test.ts):
@@ -46,9 +47,12 @@ import type { AppEnv } from "../types.ts";
  *  - expiresAfterSeconds starts counting when the recipient reads (expires_at = read_at + seconds).
  *  - Read receipts: messages.read_receipt records the reader's sendReadReceipts at read time. The sender
  *    only sees `read` (and the resulting expiresAt) if it is true.
- *  - View-once photos: the URL is only handed to the recipient by GET .../messages (which stamps
- *    attachment_opened_at so the expiry job can delete the file after a grace window). Realtime events and the
- *    conversation list never carry a view-once URL to the recipient.
+ *  - View-once photos: the URL is only handed to the recipient by GET .../messages and by the open route, never by
+ *    realtime events or the conversation list, and never to the sender. Listing does NOT open the photo: the
+ *    recipient's app calls POST .../messages/:messageID/open when the photo is actually shown, which stamps
+ *    attachment_opened_at (the retention job deletes the file a grace window later) and, if the opener sends read
+ *    receipts, tells the sender (`message.updated`). Never-opened ones are deleted 3 days after sending
+ *    (VIEW_ONCE_UNOPENED_CAP_MS); until then the URL works for anyone holding it, like any chat photo's.
  *  - DELETE /conversations/:id hides the thread for the caller only (cleared_before = now); a new message
  *    un-hides it. Once both people have cleared it, the rows (and files) are physically deleted.
  *  - Shadow limit (lib/abuse/spam.ts): a message from a spam-limited sender to someone who hasn't written to them is
@@ -64,7 +68,8 @@ const MAX_PAGE = 100;
 /** Message select list (alias `m`). Matches MessageRow. */
 const MSG_COLS = sql`m.id, m.conversation_id, m.sender_id, m.client_id, m.text, m.envelope_type, m.envelope_body,
   m.attachment_kind, m.attachment_key,
-  m.attachment_view_once, m.attachment_encrypted, m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
+  m.attachment_view_once, m.attachment_encrypted, m.attachment_opened_at, m.attachment_open_receipt,
+  m.sent_at, m.delivered_at, m.read_at, m.read_receipt, m.expires_at`;
 
 /** SQL: message `m` is visible to the member row `cm` (not cleared, not expired, not held from them). */
 const visibleTo = (cmAlias: string): Fragment =>
@@ -380,23 +385,72 @@ chatRoutes.get("/conversations/:id/messages", requireAuth, async (c) => {
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit).reverse();
 
-  // Fetching incoming messages = delivery; fetching a view-once photo = opening it.
-  const incoming = page.filter((m) => m.sender_id !== me);
-  if (incoming.length > 0) {
+  // Fetching incoming messages = delivery. It does NOT open a view-once photo (that is POST .../open, when the app
+  // actually shows it): an app that lists the thread without the user tapping the photo must not start its deletion.
+  const undelivered = page.filter((m) => m.sender_id !== me && m.delivered_at === null);
+  if (undelivered.length > 0) {
     await sql`
-      UPDATE messages
-         SET delivered_at = COALESCE(delivered_at, now()),
-             attachment_opened_at = CASE WHEN attachment_view_once AND attachment_key IS NOT NULL
-                                         THEN COALESCE(attachment_opened_at, now()) ELSE attachment_opened_at END
-       WHERE id = ANY(${incoming.map((m) => m.id)}) AND sender_id <> ${me}
-         AND (delivered_at IS NULL
-              OR (attachment_view_once AND attachment_key IS NOT NULL AND attachment_opened_at IS NULL))`;
+      UPDATE messages SET delivered_at = COALESCE(delivered_at, now())
+       WHERE id = ANY(${undelivered.map((m) => m.id)}) AND sender_id <> ${me} AND delivered_at IS NULL`;
   }
 
   return c.json({
     items: page.map((m) => viewMessage(m, me)),
     nextCursor: hasMore ? page[0]!.id : null,
   });
+});
+
+// ---- POST /conversations/:id/messages/:messageID/open ----------------------------------------------
+
+/**
+ * The recipient opened a view-once photo: stamp `attachment_opened_at` (the retention job deletes the file
+ * VIEW_ONCE_GRACE_MS later) and return the message as the recipient sees it (with the URL while the file exists).
+ * Idempotent: a second call changes nothing and returns the same message. A photo that is already gone (opened
+ * earlier, or hit the 3-day cap unopened) is returned with `url: null` and never stamped late.
+ * 404 for anything else: not a participant, blocked either way, a banned partner, the sender, a message that isn't a
+ * view-once photo, or one the caller can no longer see (cleared, expired).
+ * The sender gets `message.updated` (and `conversation.updated`) only if the opener sends read receipts.
+ */
+chatRoutes.post("/conversations/:id/messages/:messageID/open", requireAuth, rateLimit("viewOnceOpens"), async (c) => {
+  const me = currentUserId(c);
+  const conversationId = idParam(c, "id", "conversation");
+  const messageId = idParam(c, "messageID", "message");
+  const { otherId } = await requireConversation(me, conversationId);
+
+  const result = await sql.begin(async (tx) => {
+    const [row] = await tx<MessageRow[]>`
+      SELECT ${MSG_COLS}
+        FROM messages m
+        JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ${me}
+       WHERE m.id = ${messageId} AND m.conversation_id = ${conversationId} AND m.sender_id <> ${me}
+         AND m.attachment_kind = 'photo' AND m.attachment_view_once AND ${visibleTo("cm")}
+         FOR UPDATE OF m`;
+    if (!row) return null;
+    if (row.attachment_opened_at !== null || row.attachment_key === null) return { row, opened: false };
+    const [reader] = await tx<{ send_read_receipts: boolean }[]>`SELECT send_read_receipts FROM users WHERE id = ${me}`;
+    const [updated] = await tx<MessageRow[]>`
+      UPDATE messages AS m
+         SET attachment_opened_at = now(),
+             attachment_open_receipt = ${reader?.send_read_receipts ?? false},
+             delivered_at = COALESCE(m.delivered_at, now())
+       WHERE m.id = ${row.id}
+      RETURNING ${MSG_COLS}`;
+    return { row: updated!, opened: true };
+  });
+  if (!result) throw notFound();
+
+  const { row, opened } = result;
+  if (opened && row.attachment_open_receipt) {
+    void (async () => {
+      try {
+        publish(otherId, { type: "message.updated", data: viewMessage(row, otherId) });
+        await pushConversationUpdated(otherId, conversationId);
+      } catch (err) {
+        logError("chat.fanout", err);
+      }
+    })();
+  }
+  return c.json(viewMessage(row, me));
 });
 
 // ---- POST /conversations/:id/messages ----------------------------------------------------------
@@ -460,8 +514,12 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
   // to the message, or one of their profile photos, which is COPIED so message and profile lifetimes are
   // independent. Every attachment is a file on disk, so both paths count against the `attachments` limit.
   let attachmentKey: string | null = null;
-  /** Set when the key belongs to a pending upload: consumed in the insert transaction, never unlinked here. */
+  /** Set when the attachment comes from a pending upload: consumed in the insert transaction. */
   let uploadId: string | null = null;
+  /** The upload's own file name, when the message gets a fresh one (view-once): unlinked once the send commits. */
+  let uploadKey: string | null = null;
+  /** A file this request created for the message (copy or fresh name): unlinked if the send doesn't commit. */
+  let ownedKey: string | null = null;
   let viewOnce = false;
   /** The attachment is an end-to-end encrypted blob (its key is inside the envelope). */
   let encryptedPhoto = false;
@@ -500,6 +558,7 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
         if ((err as NodeJS.ErrnoException).code === "ENOENT") throw notFound();
         throw err;
       }
+      ownedKey = attachmentKey;
     }
     if (draft.isViewOnce != null) {
       viewOnce = draft.isViewOnce;
@@ -507,6 +566,20 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
       const [u] = await sql<{ expiring_photos_by_default: boolean }[]>`
         SELECT expiring_photos_by_default FROM users WHERE id = ${me}`;
       viewOnce = u?.expiring_photos_by_default ?? false;
+    }
+    if (uploadId && viewOnce) {
+      // POST /me/attachments gave the sender this upload's URL, and media is served without auth. If the message
+      // kept that file name, the sender could poll it and see it vanish when the recipient opens the photo, read
+      // receipts or not. So a view-once message gets its own name (hard link) and the upload's name is unlinked
+      // after the send commits. A crash in between leaves an unreferenced file for the orphan sweep.
+      uploadKey = attachmentKey!;
+      try {
+        attachmentKey = await relinkMedia(uploadKey);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") throw notFound();
+        throw err;
+      }
+      ownedKey = attachmentKey;
     }
   }
 
@@ -532,7 +605,8 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
         const [consumed] = await tx`
           DELETE FROM attachment_uploads WHERE id = ${uploadId} AND owner_id = ${me} RETURNING storage_key`;
         if (!consumed) throw notFound(); // sent concurrently in another message: roll this one back
-        await tx`DELETE FROM media_trash WHERE storage_key = ${attachmentKey}`;
+        // Same file name: take it back off the queue. Fresh name (view-once): leave the old name queued.
+        if (!uploadKey) await tx`DELETE FROM media_trash WHERE storage_key = ${attachmentKey}`;
       }
       // Spam heuristics (lib/abuse/spam.ts): may hold the message (shadow limit). Same transaction, so a held message
       // is never visible to the recipient, not even for a moment.
@@ -547,19 +621,25 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
       return inserted;
     });
   } catch (err) {
-    if (attachmentKey && !uploadId) await unlinkMedia(attachmentKey).catch(() => {});
+    if (ownedKey) await unlinkMedia(ownedKey).catch(() => {});
     throw err;
   }
 
   if (!row) {
-    // Lost a race with a concurrent identical request: return the winner, drop our copy (a pending upload is
-    // left alone: it still belongs to its row).
-    if (attachmentKey && !uploadId) await unlinkMedia(attachmentKey).catch(() => {});
+    // Lost a race with a concurrent identical request: return the winner, drop our copy or fresh name (a pending
+    // upload is left alone: it still belongs to its row).
+    if (ownedKey) await unlinkMedia(ownedKey).catch(() => {});
     const winner = await findByClientId(me, draft.clientID);
     if (!winner || winner.conversation_id !== conversationId) {
       throw conflict("That clientID was already used for a different message.", "client_id_reused");
     }
     return c.json(viewMessage(winner, me));
+  }
+
+  if (uploadKey) {
+    // The upload's old name, queued by the delete trigger: unlink it now rather than at the next job tick.
+    await unlinkMedia(uploadKey).catch((err) => logError("media.unlink", err));
+    await sql`DELETE FROM media_trash WHERE storage_key = ${uploadKey}`.catch(() => {});
   }
 
   fanOutNewMessage(row, me, otherId, { held });

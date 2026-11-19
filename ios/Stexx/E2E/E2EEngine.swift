@@ -1035,6 +1035,8 @@ actor E2EEngine {
         switch event {
         case .messageCreated(let message):
             return .messageCreated(await reveal(message))
+        case .messageUpdated(let message):
+            return .messageUpdated(await reveal(message))
         case .conversationUpdated(var conversation):
             if let last = conversation.lastMessage { conversation.lastMessage = await reveal(last) }
             return .conversationUpdated(conversation)

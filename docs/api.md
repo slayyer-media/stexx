@@ -141,7 +141,7 @@ Non-2xx responses carry:
   "senderID": "p_7f3a",
   "text": "Museum this weekend?",
   "envelope": null,
-  "attachment": { "kind": "photo", "url": "https://media.stexx.gay/…", "isViewOnce": false, "isEncrypted": false },
+  "attachment": { "kind": "photo", "url": "https://media.stexx.gay/…", "isViewOnce": false, "isEncrypted": false, "openedAt": null },
   "sentAt": "2026-11-17T20:30:00Z",
   "status": "delivered",
   "expiresAt": null,
@@ -159,8 +159,13 @@ Non-2xx responses carry:
 - `attachment.isEncrypted` is `true` for an end-to-end encrypted photo: `url`
   points at an opaque blob, and the key to it is inside `envelope`
   ([Encrypted photos](#encrypted-photos)). `url` is `null` once the photo is
-  gone (expired, or a view-once photo already opened), and for the recipient
-  of a view-once photo everywhere except `GET …/messages`.
+  gone (expired, or a view-once photo already opened), for the recipient
+  of a view-once photo everywhere except `GET …/messages` and the open call,
+  and always for the sender of a view-once photo.
+- `attachment.openedAt` is when the recipient opened a view-once photo
+  ([View-once photos](#view-once-photos)), `null` until then and for every
+  other photo. The recipient always sees it; the sender only if the
+  recipient's `sendReadReceipts` was on when they opened it.
 
 ### Session
 
@@ -194,7 +199,7 @@ Non-2xx responses carry:
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
-| POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
+| POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send; a view-once send moves the file to a new name, so the upload's `url` stops working), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
 | PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito` (incognito → 402 without Stexx+) |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
@@ -218,14 +223,17 @@ Non-2xx responses carry:
 | POST | `/conversations` | `{ participantID }` → `Conversation` | Returns the existing conversation if there is one. |
 | GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100). Oldest-first within the page; `nextCursor` is the ID to pass as `before`. |
 | POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied; 400 `photo_hidden` if a moderator hid it). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
+| POST | `/conversations/{id}/messages/{messageID}/open` | → `Message` | The recipient opened a view-once photo ([View-once photos](#view-once-photos)). Idempotent. 404 for anyone else. 60/min (429). |
 | POST | `/conversations/{id}/read` | → 204 | Ignored for read receipts if the reader disabled them. |
 | DELETE | `/conversations/{id}` | → 204 | Deletes for the caller only. |
 
 Realtime: `wss://api.stexx.gay/v1/ws` with the bearer token (header, or a
 first frame `{ "type": "auth", "token": "…" }` within 5 s; never the query string),
-pushing `message.created`, `message.read`, `conversation.updated`, `tap.received`
+pushing `message.created`, `message.updated`, `message.read`, `conversation.updated`, `tap.received`
 events using the same JSON models. Each frame is `{ "type": "…", "data": … }`:
-`message.created` → `Message`, `conversation.updated` → `Conversation`,
+`message.created` → `Message`, `message.updated` → `Message` (a message you
+already have changed; today only the sender of a view-once photo gets it, when
+it was opened and the recipient sends read receipts), `conversation.updated` → `Conversation`,
 `message.read` → `{ conversationID, readerID, messageIDs, readAt }`,
 `tap.received` → `{ from: Profile, sentAt }`, and for end-to-end encryption
 `identity.changed` → `{ userID, identityKeyChangedAt }` and
@@ -239,6 +247,50 @@ When the server restarts (deploy, reboot) it closes every socket with **1012 `re
 before it stops: reconnect with the usual backoff and refetch what may have been missed,
 exactly as after a dropped connection. Expect the first attempts to fail for a few seconds
 while the new process starts.
+
+### View-once photos
+
+A view-once photo (`isViewOnce: true`) can be looked at once by the
+recipient, then the server deletes it.
+
+- **Receiving.** Realtime events and the conversation list never carry its
+  `url` to the recipient; `GET …/messages` does. Listing the thread does
+  **not** open the photo (it used to: an app that only listed the thread
+  started the deletion timer before the user ever tapped the photo).
+- **Opening.** When the photo is actually shown, the recipient's app calls
+  `POST /conversations/{id}/messages/{messageID}/open` (no body) → the
+  `Message` as the recipient sees it, with `attachment.openedAt` set and the
+  `url` while the file still exists. The server deletes the file about 30 s
+  after the first open (`VIEW_ONCE_GRACE_MS`, so a download started at the
+  open can finish; the job runs every 15 s), for plaintext and end-to-end
+  encrypted photos alike. The message stays, with `url: null`.
+  - Idempotent: calling it again returns the same message and changes
+    nothing. A photo already gone unopened (3-day cap) comes back with
+    `url: null` and `openedAt: null` and is not marked opened.
+  - **404 `not_found`** for anyone but the recipient: the sender, other
+    users, a block either way, a banned sender, a thread the recipient
+    deleted, an expired message, or a message that isn't a view-once photo.
+  - 60 per minute per account (**429** with `Retry-After`).
+- **Never opened.** 3 days after sending, the file is deleted anyway
+  (shorter than the 14 days for unread expiring messages). Until it is
+  opened or capped, the `url` works for anyone who has it, like any chat
+  photo's: media is served without auth and protected only by its
+  unguessable name.
+- **The sender** never gets the `url` of their own view-once photo (seeing
+  the file disappear would tell them it was opened). The upload's `url` from
+  `POST /me/attachments` stops working when the photo is sent view-once: the
+  message gets its own, new file name and the upload's name is deleted, so
+  the sender has no URL to watch. They learn that it was
+  opened only through `attachment.openedAt`, and only if the recipient's
+  `sendReadReceipts` was on at the moment they opened it (recorded then, like
+  read receipts; turning receipts on later doesn't reveal an earlier open).
+  In that case the sender also gets `message.updated` (the `Message`) and
+  `conversation.updated`.
+- **Older apps** that predate the open call still see the `url` in
+  `GET …/messages` and can show the photo, but never mark it opened: their
+  view-once photos stay on the server until the 3-day cap, and the sender
+  never sees "Opened". That's the safe direction (nothing is deleted before
+  the recipient saw it, nothing is revealed).
 
 ### End-to-end encryption
 
@@ -513,23 +565,18 @@ server stores bytes it can't read.
 
 View-once and expiring photos work as for plaintext ones: the server deletes
 the blob on the same schedule (an expiring photo at `expiresAt`; a view-once
-photo 30 s after the recipient's first `GET …/messages`, or 14 days after
-sending if never opened; an unsent upload after 1 h; with the conversation or
-the account), and the app drops the key when the photo expires or once a
-view-once photo has been viewed. Spent photos have `attachment.url: null`.
-
-Known limitation: the server marks a view-once photo opened when the
-recipient's app first lists the thread, not when they tap it (same rule as
-plaintext), and deletes the blob about 30 s later. An encrypted view-once photo
-that isn't tapped right away becomes "no longer available". The iOS app never
-sends view-once photos; other clients can. A fix needs a dedicated open
-endpoint (follow-up).
+photo about 30 s after the recipient opens it with
+`POST …/messages/{messageID}/open` ([View-once photos](#view-once-photos)), or
+3 days after sending if never opened; an unsent upload after 1 h; with the
+conversation or the account), and the app drops the key when the photo
+expires, as soon as a view-once photo has been opened, or when the server says
+it's gone. Spent photos have `attachment.url: null`.
 Blobs are served as `application/octet-stream` from `<32 hex>.bin`.
 
 **What the server can still see** about an encrypted photo: that a photo was
 sent, who sent it to whom and when, the blob's size bucket (not the exact
-size), the `isViewOnce` flag and the expiry timer, when the recipient first
-loaded it, and when it was deleted. It can't see the image, the caption, the
+size), the `isViewOnce` flag and the expiry timer, when the recipient
+opened a view-once photo (the open call), and when the blob was deleted. It can't see the image, the caption, the
 dimensions or the key, and it doesn't run any image check on it. Explicit
 photos are blurred by the receiving app, not filtered by the server.
 
