@@ -37,6 +37,8 @@ actor MockAPIClient: APIClient {
     /// Every fake sign-in email carries this code (Debug builds: type it on
     /// the "check your email" screen).
     static let emailCode = "12345678"
+    /// See `verifyEmailLink`.
+    static let someoneElsesLinkPrefix = "someone-else"
 
     init(latency: Duration = .milliseconds(250), plusActive: Bool = false) {
         let profilesByID = Dictionary(uniqueKeysWithValues: MockData.profiles.map { ($0.id, $0) })
@@ -189,8 +191,16 @@ actor MockAPIClient: APIClient {
 
     /// Links from `requestEmailLink` work once; anything else is expired.
     /// A link asked for with another nonce asks first, like the server.
+    /// A link token starting with `someone-else` stands for a link another
+    /// install asked for (Debug: `-StexxOpenURL` shows "sign in as …?").
     func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session {
         try await pause()
+        if token.hasPrefix(Self.someoneElsesLinkPrefix) {
+            guard confirmed else {
+                throw EmailSignInError.confirmationRequired(EmailLinkAccount(isNew: false, displayName: "NightOwl"))
+            }
+            return MockData.session
+        }
         guard let address = emailLinks[token] else { throw EmailSignInError.invalidLink }
         if !confirmed, emailLinkNonces[token] != requestNonce {
             let pending = emailCodes[address] ?? nil
