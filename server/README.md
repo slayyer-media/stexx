@@ -57,7 +57,7 @@ src/moderation/         moderator CLI (entry point scripts/moderate.ts); rules i
 src/dev/                dev-only: seed, welcome conversations, bot replies, /v1/dev/*  (dynamically imported only when STEXX_DEV_AUTH=1)
 migrations/NNN_*.sql    plain SQL, applied in order, one transaction each, tracked in schema_migrations
 test/                   bun test, real Postgres
-deploy/                 VPS deployment: Caddy, systemd, Postgres hardening, backups, firewall, deploy script
+deploy/                 VPS deployment: Caddy, systemd, Postgres hardening, backups + restore drill, watchdog/alerts, firewall, deploy script
 ```
 
 - **Wire format.** camelCase JSON matching the Swift models; dates are ISO 8601 UTC with no fractional seconds (`isoDate`, asserted by every test helper); errors are `{code, message}`;
@@ -141,5 +141,5 @@ Test-only: `TEST_MEDIA_DIR` (default `./media/test`), `STEXX_TEST_LOGS=1` (show 
 ## Deploying
 
 See [`deploy/README.md`](deploy/README.md): one-time `deploy.sh --bootstrap`, then `DEPLOY_HOST=you@host ./deploy/deploy.sh`. It type-checks and tests locally, uploads an immutable release,
-installs dependencies with a frozen lockfile and no install scripts, validates the production config as the service user, takes an encrypted backup, migrates as the schema owner, flips a
+installs dependencies with a frozen lockfile and no install scripts, validates the production config as the service user, takes a full encrypted snapshot (kept on the box for 24 h), migrates as the schema owner, flips a
 symlink, health-checks, and rolls back by itself on failure.
