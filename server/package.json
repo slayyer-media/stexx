@@ -11,6 +11,7 @@
     "db:migrate:test": "bun src/db/migrate.ts --test",
     "db:seed": "bun src/dev/seed.ts",
     "moderate": "bun scripts/moderate.ts",
+    "bench:nearby": "bun scripts/bench-nearby.ts",
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "test": "bun test --timeout 30000",

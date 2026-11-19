@@ -75,6 +75,12 @@ protocol APIClient: PasskeyAPI {
     /// it when the chat is end-to-end encrypted.
     func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message
     func markRead(conversationID: Conversation.ID) async throws
+    /// `POST /conversations/{id}/messages/{messageID}/open`: the recipient
+    /// is looking at a view-once photo. The server deletes it about 30 s
+    /// later. Idempotent; returns the message with `attachment.openedAt`
+    /// (and the URL while the file still exists). 404 for anyone but the
+    /// recipient.
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message
     func deleteConversation(_ conversationID: Conversation.ID) async throws
 
     // MARK: End-to-end encryption (`docs/api.md`)
@@ -115,6 +121,13 @@ protocol APIClient: PasskeyAPI {
     /// `POST /v1/dev/plus`). Debug builds only.
     func debugGrantPlus() async throws
     #endif
+
+    // MARK: Taps
+    /// `GET /me/taps`: taps you received in the retention window, newest
+    /// first, one per sender. `before` is the previous page's `nextCursor`.
+    func taps(before cursor: String?) async throws -> TapsPage
+    /// `POST /me/taps/seen`: everything received so far is no longer new.
+    func markTapsSeen() async throws
 }
 
 extension APIClient {

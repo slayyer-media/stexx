@@ -22,7 +22,11 @@ struct StexxApp: App {
         let sessionStore = ScreenshotRoute.current == .liveChat
             ? CachedSessionStore(backing: InMemorySessionStore(session: ScreenshotRoute.devSession))
             : CachedSessionStore(backing: KeychainSessionStore())
-        let appState = ScreenshotRoute.current?.usesMockData == true ? AppState.preview() : AppState(sessionStore: sessionStore)
+        let appState = ScreenshotRoute.current?.usesMockData == true
+            ? AppState.preview(plus: ScreenshotRoute.startsWithPlus)
+            : AppState(sessionStore: sessionStore)
+        // `me` screenshots start before the profile has loaded.
+        if ScreenshotRoute.current == .me { appState.me = nil }
         #else
         let sessionStore = CachedSessionStore(backing: KeychainSessionStore())
         let appState = AppState(sessionStore: sessionStore)
@@ -69,6 +73,9 @@ struct StexxApp: App {
             // refresh token and retries network failures.
             Task { await SessionRevocation.revoke(session, using: api) }
         }
+
+        // Covers the app in the app switcher (Settings › Privacy).
+        PrivacyCover.shared.install()
 
         let chatStore = ChatStore(api: api)
         self.api = api

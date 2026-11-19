@@ -9,7 +9,7 @@
  *   bun scripts/e2e-peer.ts --state /tmp/peer.json send --to <profileID> --text "Museum this weekend?"
  *   bun scripts/e2e-peer.ts --state /tmp/peer.json send --to <profileID> --photo cat.jpg [--text "caption"] \
  *       [--expires <seconds>] [--view-once]          # encrypted photo (format v1, docs/api.md), needs E2E_MODE != off
- *   bun scripts/e2e-peer.ts --state /tmp/peer.json read --with <profileID> [--save-dir /tmp/photos]
+ *   bun scripts/e2e-peer.ts --state /tmp/peer.json read --with <profileID> [--save-dir /tmp/photos] [--open]
  *   bun scripts/e2e-peer.ts --state /tmp/peer.json reinstall        # new identity key → identity.changed
  *   bun scripts/e2e-peer.ts --state /tmp/peer.json session          # prints the session JSON
  *
@@ -17,7 +17,9 @@
  * `PORT=8791`); it's saved in the --state file and used by every later command. Use one state file per peer.
  * `read` prints `photo: ok <n> bytes` / `photo: tampered` / `photo: gone` for photo messages; `--save-dir` also writes
  * `<messageID>.jpg`. Photo keys are kept in the state file (a Signal message can only be decrypted once) so a later
- * `read` can retry a photo that wasn't downloadable yet.
+ * `read` can retry a photo that wasn't downloadable yet. Listing never opens a view-once photo: `read --open` also
+ * calls POST .../messages/{id}/open for each incoming view-once photo it could download (encrypted or plaintext),
+ * like the app does when the photo is shown; it prints `  opened <openedAt>`.
  *
  * `init --no-keys` creates an account without keys (a "not upgraded yet" chat partner). State (session, private
  * keys, sessions) lives in the --state file, readable only by you; delete it when done.
@@ -69,6 +71,7 @@ const { values: opts, positionals } = parseArgs({
     expires: { type: "string" },
     "view-once": { type: "boolean", default: false },
     "save-dir": { type: "string" },
+    open: { type: "boolean", default: false },
     help: { type: "boolean", default: false },
     "no-keys": { type: "boolean", default: false },
   },
@@ -92,7 +95,7 @@ const USAGE = `DEV ONLY: scriptable end-to-end encryption chat partner (local de
   bun scripts/e2e-peer.ts --state <file> send --to <id> [--text <t>]
   bun scripts/e2e-peer.ts --state <file> send --to <id> --photo <file.jpg> [--text <caption>] [--expires <sec>] [--view-once]
   bun scripts/e2e-peer.ts --state <file> plain --to <id> --text <t>
-  bun scripts/e2e-peer.ts --state <file> read --with <id> [--save-dir <dir>]
+  bun scripts/e2e-peer.ts --state <file> read --with <id> [--save-dir <dir>] [--open]
   bun scripts/e2e-peer.ts --state <file> reinstall | session
 
 The server URL is set by \`init --server\` (e.g. http://127.0.0.1:8791) and stored in the state file
@@ -369,8 +372,15 @@ async function main() {
       const page = await api(state, "GET", `conversations/${conv}/messages?limit=100`);
       for (const m of page.items) {
         const who = m.senderID === state.session.userID ? "me" : "them";
+        // `--open`: the app opens a view-once photo once it is on screen; listing alone doesn't.
+        const openViewOnce = async () => {
+          if (!opts.open || who !== "them" || !m.attachment?.isViewOnce || m.attachment.openedAt) return;
+          const opened = await api(state, "POST", `conversations/${conv}/messages/${m.id}/open`);
+          console.log(`  opened ${opened.attachment?.openedAt ?? "(already gone)"}`);
+        };
         if (!m.envelope) {
-          console.log(`${who} [plaintext] ${m.text ?? "(photo)"}`);
+          console.log(`${who} [plaintext] ${m.text ?? "(photo)"}${m.attachment?.isViewOnce ? " (view once)" : ""}`);
+          if (m.attachment?.url) await openViewOnce();
           continue;
         }
         if (who === "me") continue;
@@ -400,6 +410,7 @@ async function main() {
               mkdirSync(opts["save-dir"], { recursive: true });
               writeFileSync(join(opts["save-dir"], `${m.id}.jpg`), photo);
             }
+            await openViewOnce();
           }
         }
       }

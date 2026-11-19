@@ -64,6 +64,15 @@ export async function sendSignInLink(to: string, token: string, code: string): P
   if (!config.isTest) console.log(`[dev-mail] sign-in link: ${url}  code: ${code}`);
 }
 
+/**
+ * Plain-text mail through the same SMTP transport (moderator alerts). Throws when SMTP isn't configured; the caller
+ * decides what that means. Never pass user content in `text`.
+ */
+export async function sendPlainMail(to: string[], subject: string, text: string): Promise<void> {
+  if (!config.smtpUrl) throw serviceUnavailable("email_unavailable", "SMTP is not configured.");
+  await smtp().sendMail({ from: config.mailFrom, to, subject, text });
+}
+
 /** Latest dev link sent to `email` (tests). */
 export function lastDevLinkFor(email: string): DevMail | undefined {
   const norm = email.trim().toLowerCase();

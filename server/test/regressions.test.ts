@@ -13,7 +13,7 @@ import {
   purgeStaleAttachmentUploads,
   purgeUnopenedViewOnceAttachments,
   runSlowJobs,
-  UNREAD_EXPIRING_CAP_MS,
+  VIEW_ONCE_UNOPENED_CAP_MS,
 } from "../src/jobs/index.ts";
 import { snapToCell } from "../src/lib/distance.ts";
 import { newId } from "../src/lib/ids.ts";
@@ -140,13 +140,15 @@ describe("GET /me/export respects the other person's privacy and expiry", () => 
 
     const dump = await expectJson(await as(b).get("/v1/me/export"));
     const [m] = dump.conversations.find((c: { id: string }) => c.id === conv).messages;
-    expect(m.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
+    expect(m.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false, openedAt: null });
     const [row] = await sql`SELECT attachment_opened_at, attachment_key FROM messages WHERE id = ${sent.id}`;
     expect(row!.attachment_opened_at).toBeNull();
     expect(JSON.stringify(dump)).not.toContain(row!.attachment_key);
-    // the sender keeps their own copy's URL, as in the chat views
+    // nor the sender's: as in the chat views, a view-once URL never goes to its sender (its deletion would reveal
+    // when it was opened)
     const mine = await expectJson(await as(a).get("/v1/me/export"));
-    expect(mine.conversations.find((c: { id: string }) => c.id === conv).messages[0].attachment.url).toContain(row!.attachment_key);
+    expect(mine.conversations.find((c: { id: string }) => c.id === conv).messages[0].attachment.url).toBeNull();
+    expect(JSON.stringify(mine)).not.toContain(row!.attachment_key);
   });
 
   test("expired-but-not-yet-purged messages are left out", async () => {
@@ -167,7 +169,7 @@ describe("GET /me/export respects the other person's privacy and expiry", () => 
 
 // ---- Retention: unopened view-once photos -------------------------------------------------------
 
-describe("view-once photos that are never opened are deleted after 14 days", () => {
+describe("view-once photos that are never opened are deleted after 3 days", () => {
   const T0 = new Date("2001-05-06T07:08:09Z");
   test("file and key are removed by the slow jobs; younger ones are kept", async () => {
     const a = await createUser();
@@ -185,7 +187,7 @@ describe("view-once photos that are never opened are deleted after 14 days", () 
       VALUES (${oldId}, ${conv}, ${a.id}, ${uniq()}, 'photo', ${oldKey}, true, ${T0}),
              (${youngId}, ${conv}, ${a.id}, ${uniq()}, 'photo', ${youngKey}, true, ${new Date(T0.getTime() + 2 * 86_400_000)})`;
 
-    const now = new Date(T0.getTime() + UNREAD_EXPIRING_CAP_MS + 1000);
+    const now = new Date(T0.getTime() + VIEW_ONCE_UNOPENED_CAP_MS + 1000);
     expect(await purgeUnopenedViewOnceAttachments(now)).toBeGreaterThanOrEqual(1);
     const rows = await sql<{ id: string; attachment_key: string | null }[]>`
       SELECT id, attachment_key FROM messages WHERE id IN (${oldId}, ${youngId})`;
@@ -195,7 +197,7 @@ describe("view-once photos that are never opened are deleted after 14 days", () 
     expect(exists(oldKey)).toBe(false);
     expect(exists(youngKey)).toBe(true);
 
-    const slow = await runSlowJobs(new Date(T0.getTime() + 2 * 86_400_000 + UNREAD_EXPIRING_CAP_MS + 1000));
+    const slow = await runSlowJobs(new Date(T0.getTime() + 2 * 86_400_000 + VIEW_ONCE_UNOPENED_CAP_MS + 1000));
     expect(slow.unopenedViewOnce).toBeGreaterThanOrEqual(1);
     expect(exists(youngKey)).toBe(false);
   });

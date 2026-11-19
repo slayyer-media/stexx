@@ -79,30 +79,47 @@ struct Message: Identifiable, Hashable, Codable, Sendable {
         }
 
         var kind: Kind
-        /// `nil` once the photo is gone (expired or a spent view-once), and
-        /// for the recipient of a view-once photo outside `GET …/messages`.
+        /// `nil` once the photo is gone (expired or a spent view-once), for
+        /// the recipient of a view-once photo outside `GET …/messages` and
+        /// the open call, and always for the sender of a view-once photo.
         var url: URL?
         /// View-once media disappears after the recipient opens it.
         var isViewOnce: Bool = false
         /// The file is an end-to-end encrypted blob; the key is in the
         /// envelope (`Message.e2eAttachment`), never on the server.
         var isEncrypted: Bool = false
+        /// View-once only: when the recipient opened it
+        /// (`APIClient.openViewOnce`). The sender only gets it if the
+        /// recipient sends read receipts.
+        var openedAt: Date? = nil
     }
 }
 
 extension Message.Attachment {
     private enum CodingKeys: String, CodingKey {
-        case kind, url, isViewOnce, isEncrypted
+        case kind, url, isViewOnce, isEncrypted, openedAt
     }
 
     /// The mock and servers from before encrypted photos omit `isEncrypted`
-    /// (and older ones `isViewOnce`).
+    /// (and older ones `isViewOnce`); servers from before the view-once open
+    /// call omit `openedAt`.
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         kind = try container.decode(Kind.self, forKey: .kind)
         url = try container.decodeIfPresent(URL.self, forKey: .url)
         isViewOnce = try container.decodeIfPresent(Bool.self, forKey: .isViewOnce) ?? false
         isEncrypted = try container.decodeIfPresent(Bool.self, forKey: .isEncrypted) ?? false
+        openedAt = try container.decodeIfPresent(Date.self, forKey: .openedAt)
+    }
+}
+
+extension Message {
+    /// A view-once photo the recipient opened, as far as this message says
+    /// (the server's `openedAt`, or this phone's own record of opening an
+    /// encrypted one).
+    var isViewOnceOpened: Bool {
+        guard attachment?.isViewOnce == true else { return false }
+        return attachment?.openedAt != nil || e2eAttachmentRemoval == .opened
     }
 }
 

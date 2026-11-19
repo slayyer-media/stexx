@@ -211,6 +211,10 @@ struct HTTPAPIClient: APIClient {
         try await callVoid("POST", "conversations/\(conversationID)/read")
     }
 
+    func openViewOnce(messageID: Message.ID, in conversationID: Conversation.ID) async throws -> Message {
+        try await call("POST", "conversations/\(conversationID)/messages/\(messageID)/open")
+    }
+
     func deleteConversation(_ conversationID: Conversation.ID) async throws {
         try await callVoid("DELETE", "conversations/\(conversationID)")
     }
@@ -298,6 +302,18 @@ struct HTTPAPIClient: APIClient {
         try await callVoid("POST", "dev/plus", body: [String: String]())
     }
     #endif
+
+    // MARK: Taps
+
+    func taps(before cursor: String?) async throws -> TapsPage {
+        var items = [URLQueryItem(name: "limit", value: "30")]
+        if let cursor { items.append(URLQueryItem(name: "before", value: cursor)) }
+        return try await call("GET", "me/taps", query: items)
+    }
+
+    func markTapsSeen() async throws {
+        try await callVoid("POST", "me/taps/seen")
+    }
 
     // MARK: - Plumbing
 
