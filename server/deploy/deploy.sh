@@ -232,11 +232,27 @@ if [ '$ADMIN' = 1 ]; then
   install -m 0644 admin.env.example /etc/stexx/admin.env.example
   install -m 0644 caddy-admin.env.example /etc/stexx/caddy-admin.env.example
   systemctl daemon-reload
-  systemctl enable $ADMIN_SERVICE >/dev/null 2>&1   # starts at boot; (re)started by deploy.sh once /etc/stexx/admin.env is filled in
-  echo '  $ADMIN_SERVICE.service installed and enabled (not started: set ADMIN_ORIGIN in /etc/stexx/admin.env, then deploy or: sudo systemctl restart $ADMIN_SERVICE)'
+  # Not enabled here: until admin.env is filled in, a reboot (unattended upgrades reboot at 04:30) would start it into a
+  # crash loop and an alert. The first deploy enables it once its settings pass the boot check (admin_restart enable).
+  echo '  $ADMIN_SERVICE.service installed (not enabled or started yet: fill in /etc/stexx/admin.env, then deploy; the deploy enables it)'
   # Caddy needs the console's tailnet hostname from /etc/stexx/caddy-admin.env (no secrets). Without it the site file
   # would fail validation and block every Caddy reload, so the private site waits until that file exists.
+  # The site listens on every interface (no bind, see Caddyfile.admin), so it also waits for the firewall that keeps its
+  # port off the public interface: ufw active, filtering IPv6 too, with the tailscale0 rule for this very port
+  # (ufw-cloudflare.sh --apply --tailscale-admin). Without that, Caddy's abort and the app's checks would be all that is
+  # left, after a TLS handshake with anyone on the internet.
+  ADMIN_FIREWALL=''
   if [ -s /etc/stexx/caddy-admin.env ]; then
+    ADMIN_SITE_PORT="\$(. /etc/stexx/caddy-admin.env; printf '%s' "\${STEXX_ADMIN_PORT:-8443}")"
+    if ! ufw status 2>/dev/null | head -1 | grep -q 'Status: active'; then
+      ADMIN_FIREWALL='ufw is not active'
+    elif ! grep -q '^IPV6=yes' /etc/default/ufw 2>/dev/null; then
+      ADMIN_FIREWALL='IPV6=yes is not set in /etc/default/ufw, so ufw leaves IPv6 unfiltered'
+    elif ! ufw status 2>/dev/null | grep -E "^\$ADMIN_SITE_PORT/tcp +on tailscale0 " | grep -q 'stexx-admin-tailscale'; then
+      ADMIN_FIREWALL="ufw has no stexx-admin-tailscale rule for port \$ADMIN_SITE_PORT on tailscale0"
+    fi
+  fi
+  if [ -s /etc/stexx/caddy-admin.env ] && [ -z "\$ADMIN_FIREWALL" ]; then
     SITE=1
     # A drop-in, so the stock caddy.service stays untouched.
     install -D -m 0644 caddy-admin-dropin.conf /etc/systemd/system/caddy.service.d/stexx-admin.conf
@@ -246,13 +262,18 @@ if [ '$ADMIN' = 1 ]; then
     # The shell validating the config must see the same values Caddy gets, or {\$STEXX_ADMIN_HOST} is empty.
     set -a; . /etc/stexx/caddy-admin.env; set +a
   else
-    echo '  /etc/stexx/caddy-admin.env is missing, so the private Caddy site is NOT installed yet. Copy /etc/stexx/caddy-admin.env.example there, set STEXX_ADMIN_HOST, and run --sync-config again.' >&2
-    # Installed earlier and the settings file removed since (turned off, or a restore without it): take the site and
-    # the drop-in out too, so nothing about the console is left for Caddy to trip over at its next restart.
+    if [ -n "\$ADMIN_FIREWALL" ]; then
+      echo "  \$ADMIN_FIREWALL, so the private Caddy site is NOT installed (it would listen on the public interface too). On the server: sudo ./ufw-cloudflare.sh --apply --tailscale-admin (with IPV6=yes in /etc/default/ufw), then run --sync-config again." >&2
+    else
+      echo '  /etc/stexx/caddy-admin.env is missing, so the private Caddy site is NOT installed yet. Copy /etc/stexx/caddy-admin.env.example there, set STEXX_ADMIN_HOST, and run --sync-config again.' >&2
+    fi
+    # Installed earlier and the settings file removed since (turned off, or a restore without it), or the firewall
+    # turned off since: take the site and the drop-in out too, so nothing about the console is left listening or for
+    # Caddy to trip over at its next restart.
     if [ -e /etc/caddy/sites/stexx-admin.caddy ] || [ -e /etc/systemd/system/caddy.service.d/stexx-admin.conf ]; then
       rm -f /etc/caddy/sites/stexx-admin.caddy /etc/caddy/sites/stexx-admin.caddy.prev /etc/systemd/system/caddy.service.d/stexx-admin.conf
       systemctl daemon-reload
-      echo '  removed the console'"'"'s Caddy site and drop-in (no /etc/stexx/caddy-admin.env)'
+      echo '  removed the console'"'"'s Caddy site and drop-in (see above)'
     fi
   fi
 fi
@@ -407,6 +428,7 @@ fi
 cd '$NEW'
 HOME=/nonexistent setpriv --reuid=stexx --regid=stexx --clear-groups $BUN -e '
 const { config } = await import("./src/config.ts");
+if (config.admin.error) { console.error("  console config refused: " + config.admin.error); process.exit(1); }
 if (!config.admin.configured) { console.error("  console config incomplete: set ADMIN_ORIGIN in /etc/stexx/admin.env"); process.exit(1); }
 const origin = new URL(config.admin.origin);
 const host = process.env.STEXX_CHECK_CADDY_HOST;

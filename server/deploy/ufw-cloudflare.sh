@@ -9,7 +9,8 @@
 # Env: SSH_ALLOW_FROM="203.0.113.7 198.51.100.0/24"  restrict ssh to these sources (default: anywhere, rate-limited)
 #      SSH_PORT=22
 #      STEXX_ADMIN_TAILSCALE=1                       same as --tailscale-admin
-#      STEXX_ADMIN_PORT=8443                         the console's port (must match /etc/stexx/caddy-admin.env)
+#      STEXX_ADMIN_PORT=8443                         the console's port. Read from /etc/stexx/caddy-admin.env when that
+#                                                    exists (what Caddy listens on); setting a different one here is refused
 #
 # Why Cloudflare-only: api.stexx.gay and media.stexx.gay sit behind Cloudflare. If the origin answered anyone,
 # a scanner could bypass Cloudflare (WAF, rate limiting, hidden origin IP). With 80/443 open only to
@@ -18,9 +19,12 @@
 #
 # --tailscale-admin (opt-in): the private staff console (deploy/Caddyfile.admin) answers on its own port (default 8443,
 # not 443: Caddy can't share 443 with the public sites and stay off the public interface). This adds ONE rule, that
-# port in on the tailscale0 interface, and nothing for the public interface. It is never added without the flag, and a
-# later run without the flag leaves an existing rule alone (remove it with `ufw status numbered` and `ufw delete N`,
-# rule comment "stexx-admin-tailscale"). Tailscale ACLs decide which devices may reach it.
+# port in on the tailscale0 interface, and nothing for the public interface. It is never added without the flag; a run
+# with the flag replaces the earlier one (so a changed port leaves no stale rule), and a later run without the flag
+# leaves an existing rule alone (remove it with `ufw status numbered` and `ufw delete N`, rule comment
+# "stexx-admin-tailscale"). Tailscale ACLs decide which devices may reach it. Caddy listens on that port on every
+# interface, so with the flag this refuses to run unless /etc/default/ufw has IPV6=yes: otherwise ufw installs no IPv6
+# rules at all and the port would answer on the server's public IPv6 address.
 #
 # ACME (Let's Encrypt HTTP-01) still works: validation requests arrive via Cloudflare's proxy.
 # Re-run this monthly (or from a timer) to follow Cloudflare's published ranges; it replaces its own rules only.
@@ -34,12 +38,22 @@ for arg in "$@"; do
   case "$arg" in
     --apply)            APPLY=1 ;;
     --tailscale-admin)  TS_ADMIN=1 ;;
-    -h|--help)          sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help)          sed -n '2,30p' "$0"; exit 0 ;;
     *)                  echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
 SSH_PORT="${SSH_PORT:-22}"
 ADMIN_PORT="${STEXX_ADMIN_PORT:-8443}"
+CADDY_ADMIN_ENV="${STEXX_CADDY_ADMIN_ENV:-/etc/stexx/caddy-admin.env}"
+if [ "$TS_ADMIN" = 1 ] && [ -f "$CADDY_ADMIN_ENV" ]; then
+  # The port Caddy actually listens on (same default as Caddyfile.admin), whatever this shell has exported.
+  # shellcheck source=/dev/null
+  CADDY_PORT="$(unset STEXX_ADMIN_PORT; . "$CADDY_ADMIN_ENV"; printf '%s' "${STEXX_ADMIN_PORT:-8443}")"
+  if [ -n "${STEXX_ADMIN_PORT:-}" ] && [ "$STEXX_ADMIN_PORT" != "$CADDY_PORT" ]; then
+    echo "STEXX_ADMIN_PORT=$STEXX_ADMIN_PORT here, but $CADDY_ADMIN_ENV has the console on $CADDY_PORT: fix one of them" >&2; exit 2
+  fi
+  ADMIN_PORT="$CADDY_PORT"
+fi
 TAG="stexx-cloudflare"
 TS_TAG="stexx-admin-tailscale"
 if [[ ! "$ADMIN_PORT" =~ ^[0-9]{4,5}$ ]] || [ "$ADMIN_PORT" -lt 1024 ] || [ "$ADMIN_PORT" -gt 65535 ] || [ "$ADMIN_PORT" = 8787 ] || [ "$ADMIN_PORT" = 8788 ]; then
@@ -48,6 +62,11 @@ fi
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 command -v ufw >/dev/null || { echo "ufw not installed (apt install ufw)" >&2; exit 1; }
+if [ "$TS_ADMIN" = 1 ] && ! grep -q '^IPV6=yes' /etc/default/ufw 2>/dev/null; then
+  echo "--tailscale-admin: set IPV6=yes in /etc/default/ufw first. Without it ufw filters no IPv6 at all, and the console's" >&2
+  echo "port (Caddy listens on every interface) would answer on the server's public IPv6 address. Nothing was changed." >&2
+  exit 1
+fi
 
 fetch() {
   curl -fsS --max-time 20 --retry 2 "https://www.cloudflare.com/ips-$1"
@@ -67,12 +86,15 @@ done <<< "$V4"$'\n'"$V6"
 
 say() { echo "+ $*"; if [ "$APPLY" = 1 ]; then "$@"; fi; }
 
-# Remove our previous Cloudflare rules (tagged by comment) so removed ranges do not linger.
+# Remove our previous Cloudflare rules (tagged by comment) so removed ranges do not linger, and with --tailscale-admin
+# the previous console rule too (it is added again below, for the current port).
 # Delete from the highest number down so numbering stays valid.
+OURS="$TAG"
+[ "$TS_ADMIN" = 1 ] && OURS="$TAG|$TS_TAG"
 if [ "$APPLY" = 1 ]; then
   while read -r n; do
     [ -n "$n" ] && ufw --force delete "$n" >/dev/null
-  done < <(ufw status numbered | grep "$TAG" | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn)
+  done < <(ufw status numbered | grep -E "# ($OURS)\b" | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn)
 fi
 
 say ufw default deny incoming

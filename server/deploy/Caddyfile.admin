@@ -5,9 +5,9 @@
 # reload; see deploy/README.md "Staff console"). Caddyfile.main already imports /etc/caddy/sites/*.caddy.
 #
 # Values come from Caddy's environment, never from this file (so nothing real is committed):
-#   STEXX_ADMIN_HOST   the console's tailnet name, e.g. stexx-admin.<your-tailnet>.ts.net. Must equal ADMIN_ORIGIN's
+#   STEXX_ADMIN_HOST   the console's tailnet name, <neutral machine name>.<your-tailnet>.ts.net. Must equal ADMIN_ORIGIN's
 #                      host and ADMIN_RP_ID in /etc/stexx/admin.env (passkeys are bound to it).
-#   STEXX_ADMIN_PORT   optional, default 8443. Must equal the port in ADMIN_ORIGIN, and the port ufw opens on tailscale0.
+#   STEXX_ADMIN_PORT   optional, default 8443. Must equal the port in ADMIN_ORIGIN; ufw-cloudflare.sh reads it from here.
 # Put them in /etc/stexx/caddy-admin.env (root:root 0644, no secrets) and load it with a drop-in:
 #   /etc/systemd/system/caddy.service.d/stexx-admin.conf   [Service] EnvironmentFile=/etc/stexx/caddy-admin.env
 #
@@ -15,14 +15,18 @@
 # the public sites: a bound site and an unbound site (api, media) both want :443 and :80 (the automatic HTTP redirect),
 # and the second listener fails with "bind: address already in use". That is not a validation error: `caddy validate`
 # passes, a reload fails, and on the next boot Caddy does not start at all, which takes the public API down. So this
-# site listens on its own port, on every interface, and is kept private three ways instead:
-#   1. ufw: the port is open on the tailscale0 interface only (ufw-cloudflare.sh --tailscale-admin);
+# site listens on its own port, ON EVERY INTERFACE (the public one too), and is kept private three ways instead:
+#   1. ufw: the port is open on the tailscale0 interface only (ufw-cloudflare.sh --tailscale-admin, which requires
+#      IPV6=yes so the public IPv6 address is filtered too). deploy.sh installs this site only while ufw is active with
+#      that rule for this port;
 #   2. Caddy: a connection whose peer is not a Tailscale address is closed without an answer (below);
 #   3. the app: it answers only loopback peers carrying a forwarded address inside ADMIN_ALLOWED_CIDRS.
 # Do not add `bind` here, and do not move this site to 443. deploy/selftest.sh checks for both.
 #
 # Certificate: issued by tailscaled for the .ts.net name (HTTPS must be enabled for the tailnet, and the caddy user
-# allowed to ask for it: TS_PERMIT_CERT_UID=caddy in /etc/default/tailscaled). No ACME, no public DNS, no Cloudflare.
+# allowed to ask for it: TS_PERMIT_CERT_UID=caddy in /etc/default/tailscaled). No ACME here, no Cloudflare. The name is
+# NOT secret: Let's Encrypt (through tailscaled) logs it in public Certificate Transparency logs, and *.ts.net names can
+# resolve in public DNS. Only the tailnet can reach the address; keep the machine name neutral.
 #
 # PRIVACY: no `log` directive, so Caddy writes no access log for this site (no addresses, no paths). Caddyfile.main
 # keeps request details out of Caddy's runtime error logs too. The console itself logs route patterns only.

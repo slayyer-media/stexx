@@ -44,8 +44,9 @@
 #                                                                   sessions, WebAuthn challenges and the single-use
 #                                                                   invite tokens. A restore must not bring back a live
 #                                                                   staff session or a spent invite.
-#   (staff_audit, staff_accounts and staff_passkeys ARE backed up: the audit log is the accountability record, and the
-#   accounts and public passkey keys are what lets staff sign in again after a restore.)
+#   (staff_audit, staff_accounts, staff_passkeys and staff_removed_passkeys ARE backed up: the audit log is the
+#   accountability record, the accounts and public passkey keys are what lets staff sign in again after a restore, and
+#   removed credential ids keep attempts with a copied passkey attributed to its account.)
 #   A name here that is not a table (yet) is fine: pg_dump ignores exclude patterns that match nothing (no
 #   --strict-names). The fixed list is not in EXCLUDE_DATA so an old backup.env that sets EXCLUDE_DATA can't put
 #   these back.

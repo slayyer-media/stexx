@@ -416,6 +416,8 @@ case "$cmd" in
   *"src/admin/index.ts"*) [ -z "${STUB_OLD_RELEASE:-}" ]; exit $? ;;
   *"systemctl restart stexx-admin"*) echo "    [stub ssh $host] $cmd" >&2; [ -z "${STUB_ADMIN_START_FAIL:-}" ]; exit $? ;;
   *"bash -s"*|*"bash -se"*) f="$(mktemp)"; cat > "$f"
+               # STUB_SCRIPTS: keep a copy of every remote root script, so checks can read what would run on the box.
+               if [ -n "${STUB_SCRIPTS:-}" ]; then cat "$f" >> "$STUB_SCRIPTS"; fi
                if bash -n "$f"; then echo "    [stub ssh $host] remote root script: $(wc -l < "$f" | tr -d ' ') lines, bash -n ok"; else echo "    [stub ssh] SYNTAX ERROR in remote script" ; exit 1; fi
                rm -f "$f" ;;
   *) echo "    [stub ssh $host] $cmd" >&2 ;;
@@ -447,8 +449,13 @@ check "deploy without the console never mentions it" bash -c "! grep -qi 'stexx-
 check "deploy --with-admin refuses when the unit is not installed" bash -c "! grep -qx 0 '$T/deploy-withadmin.rc' && grep -q 'sync-config --with-admin' '$T/deploy-withadmin'"
 (cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid STUB_NO_ADMIN=1 bash deploy/deploy.sh --sync-config) > "$T/sync-noadmin" 2>&1; echo $? > "$T/sync-noadmin.rc"
 check "--sync-config on a box without the console installs nothing of it" bash -c "grep -qx 0 '$T/sync-noadmin.rc' && grep -q 'bash -n ok' '$T/sync-noadmin' && ! grep -qi 'stexx-admin' '$T/sync-noadmin'"
-(cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid STUB_NO_ADMIN=1 bash deploy/deploy.sh --sync-config --with-admin) > "$T/sync-withadmin" 2>&1; echo $? > "$T/sync-withadmin.rc"
+(cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid STUB_NO_ADMIN=1 STUB_SCRIPTS="$T/sync-withadmin.sh" bash deploy/deploy.sh --sync-config --with-admin) > "$T/sync-withadmin" 2>&1; echo $? > "$T/sync-withadmin.rc"
 check "--sync-config --with-admin installs the unit, and its remote script parses" bash -c "grep -qx 0 '$T/sync-withadmin.rc' && grep -q 'bash -n ok' '$T/sync-withadmin' && grep -q 'stexx-admin.service' '$T/sync-withadmin'"
+# Enabled only by the first deploy whose boot check passed: enabled before admin.env exists, an unattended reboot would
+# start it into a crash loop and an alert.
+check "--sync-config --with-admin installs the unit but does not enable it" bash -c "grep -q 'install -m 0644 stexx-admin.service' '$T/sync-withadmin.sh' && ! grep -Eq 'systemctl enable( --now)? stexx-admin' '$T/sync-withadmin.sh'"
+# The site listens on every interface: ufw must be on, filter IPv6, and open its port on tailscale0 before it goes in.
+check "--sync-config installs the private site only behind ufw (active, IPv6 on, the tailscale0 rule for its port)" bash -c "grep -q \"grep -q 'Status: active'\" '$T/sync-withadmin.sh' && grep -q \"grep -q '^IPV6=yes' /etc/default/ufw\" '$T/sync-withadmin.sh' && grep -q 'on tailscale0 \" | grep -q .stexx-admin-tailscale.' '$T/sync-withadmin.sh' && grep -q 'if \[ -s /etc/stexx/caddy-admin.env \] && \[ -z \"\$ADMIN_FIREWALL\" \]; then' '$T/sync-withadmin.sh'"
 (cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid bash deploy/deploy.sh --rollback 20260101-000000 --dry-run) > "$T/rollback" 2>&1; echo $? > "$T/rollback.rc"
 check "--rollback (console installed) restarts it too" has "$T/rollback" "systemctl restart stexx-admin"
 # Real (not dry-run) rollbacks against the stub, with `sleep` stubbed out so the retry loops run instantly.
@@ -493,6 +500,7 @@ check "Caddyfile.admin takes its host from the environment and uses its own port
 check "Caddyfile.admin has no bind directive (it would clash with the public sites' listeners)" bash -c "! grep -v '^ *#' '$HERE/Caddyfile.admin' | grep -Eq '^[[:space:]]*bind\\b'"
 check "Caddyfile.admin closes connections from outside the tailnet" bash -c "grep -Eq '^[[:space:]]*@outside not remote_ip 100\\.64\\.0\\.0/10' '$HERE/Caddyfile.admin' && grep -Eq '^[[:space:]]*abort @outside' '$HERE/Caddyfile.admin'"
 check "ufw-cloudflare.sh opens the console's port on tailscale0 only, and only with the flag" bash -c "grep -q 'ufw allow in on tailscale0 to any port \"\$ADMIN_PORT\"' '$HERE/ufw-cloudflare.sh' && grep -q 'TS_ADMIN=1' '$HERE/ufw-cloudflare.sh' && grep -q -- '--tailscale-admin)' '$HERE/ufw-cloudflare.sh'"
+check "ufw-cloudflare.sh takes the console's port from caddy-admin.env, replaces its old rule, and refuses without IPv6 filtering" bash -c "grep -q 'CADDY_ADMIN_ENV=\"\${STEXX_CADDY_ADMIN_ENV:-/etc/stexx/caddy-admin.env}\"' '$HERE/ufw-cloudflare.sh' && grep -q 'OURS=\"\$TAG|\$TS_TAG\"' '$HERE/ufw-cloudflare.sh' && grep -q -- \"--tailscale-admin: set IPV6=yes\" '$HERE/ufw-cloudflare.sh'"
 check "Caddyfile.admin's Referrer-Policy is same-origin (no-referrer makes browsers send Origin: null on form posts)" bash -c "grep -Eq '^[[:space:]]*Referrer-Policy \"same-origin\"' '$HERE/Caddyfile.admin' && ! grep -Ev '^[[:space:]]*#' '$HERE/Caddyfile.admin' | grep -q 'no-referrer'"
 check "Caddyfile.admin has no log directive and proxies to loopback 8788" bash -c "! grep -v '^ *#' '$HERE/Caddyfile.admin' | grep -Eq '^[[:space:]]*log\b' && grep -q 'reverse_proxy 127.0.0.1:8788' '$HERE/Caddyfile.admin'"
 check "stexx-admin.service runs the console as the stexx user, no jobs, loopback only" bash -c "grep -q '^User=stexx' '$HERE/stexx-admin.service' && grep -q 'ExecStart=/usr/local/bin/bun src/admin/index.ts' '$HERE/stexx-admin.service' && grep -q '^Environment=ADMIN_HOST=127.0.0.1' '$HERE/stexx-admin.service'"
