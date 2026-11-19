@@ -173,6 +173,15 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   message keeps `delivered_at` (don't null it: the sender's status must look normal).
   `handles.ts` loads the shared pattern table `content-rules.json` (copy it to `ios/Stexx/E2E/` after editing).
   Tests: `overrideSpamForTests`.
+### moderator-alerts.ts (docs/security.md §5 "Alerts"; migration 114)
+- Off unless `MODERATOR_ALERT_EMAIL` (+ `SMTP_URL`) or `MODERATOR_ALERT_WEBHOOK_URL`. `runModeratorAlerts({now?, profileIds?})`
+  (jobs, every minute): per channel, a lease in `moderator_alert_channels`, debounce `MODERATOR_ALERT_INTERVAL_MINUTES`,
+  items = open reports with an alerted reason, still-hidden `auto_hide`s, open `blocklist` photo flags, created after the
+  channel was switched on and within 48 h, not yet in `moderator_alert_sent`. Retry backoff 1..60 min, failures logged
+  as a code only. `buildAlert(items, queue, now)` is pure: ids, reason codes, counts, commands. Never add names or content.
+- Tests: `setModeratorAlertsForTests({settings, senders, namespace})` (namespace keeps test channel rows apart).
+- Not wired into the write paths: the job reads `reports`, `moderation_actions`, `photo_flags` directly.
+
 ### photocheck/ (profile photo checks, see docs/security.md §6; migration 106)
 - `checkPhoto(jpeg) → {phash, nsfw}` never throws (null parts = unchecked). `checkColumns(check)` → INSERT values.
   `flagPhotoMatches(tx, {id, ownerId, phash})` → rows in `photo_flags` (duplicates on other accounts, blocklist).
@@ -182,6 +191,14 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Classifier: NudeNet 320n via onnxruntime-node, loaded lazily (`photoClassifier()` → null if off/missing).
   Tests: `setPhotoClassifierForTests(fake|null)`, `setPhotoPolicyForTests({...})`, `setHashBlocklistForTests`.
   Tests run with `PHOTO_CLASSIFIER=off`; `photo-checks.test.ts` also runs the real model if `models/` has it.
+- `review.ts` (migration 114): `listPhotoFlags`, `photoFlagReview` (prints file paths: CLI only, never an API), and the
+  audited decisions `clearPhotoFlag`, `hidePhotoForFlag`, `blocklistPhotoForFlag` (DB blocklist `photo_hash_blocklist`,
+  also matched by `flagPhotoMatches`; take `lockPhotoFlagging(tx)` first), `escalatePhotoFlag` (hide/ban account). CLI:
+  `src/moderation/photos-cli.ts` (`photos …`, `alerts …`), dispatched from `cli.ts`.
+- `photos.hidden_at` = hidden by a moderator: `visibleToOthers` excludes it; `photoJson` returns it to the owner with
+  `isExplicit: true`; chat refuses it as an attachment (400 `photo_hidden`). Hiding (`hide`/`blocklist`) copies the
+  file to a new key and trashes the old one so an already-shared URL dies. Select photos with `photoColumns` (it
+  includes `is_hidden`). `purgeModeratorAlertSent` also runs in `runSlowJobs`.
 
 ### e2e/ (end-to-end encryption keys and envelopes; docs/security.md section 7, contract in docs/api.md)
 - `keys.ts`: `e2eMode()` (`E2E_MODE` off|optional|required; tests `setE2eModeForTests`), `assertE2eEnabled()` (404
@@ -264,7 +281,9 @@ expires_at; UNIQUE(sender_id, client_id)), reports (SET NULL FKs, priority norma
 (PK original_transaction_id), dev_bots (dev seed markers). Migration 107: users.hidden_at/hidden_reason/banned_at/reviewed_at, reports.closed_at/
 reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL). Migration 109:
 e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), messages.envelope_type/envelope_body. Migration 111:
-attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers).
+attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers). Migration 114:
+photos.hidden_at, photo_hash_blocklist, moderator_alert_channels/moderator_alert_sent; moderation_actions.action is a
+format CHECK (`^[a-z][a-z_]{0,31}$`) instead of a fixed list (photo_clear, photo_hide, photo_blocklist, photo_escalate).
 
 ## Tests
 

@@ -486,9 +486,11 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
       uploadId = draft.attachmentPhotoID;
       attachmentKey = upload.storage_key;
     } else {
-      const [photo] = await sql<{ storage_key: string }[]>`
-        SELECT storage_key FROM photos WHERE id = ${draft.attachmentPhotoID} AND owner_id = ${me}`;
+      const [photo] = await sql<{ storage_key: string; hidden: boolean }[]>`
+        SELECT storage_key, hidden_at IS NOT NULL AS hidden FROM photos WHERE id = ${draft.attachmentPhotoID} AND owner_id = ${me}`;
       if (!photo) throw notFound();
+      // A photo a moderator hid (photo flag review) is never shown to anyone else, so it can't be sent either.
+      if (photo.hidden) throw badRequest("This photo was hidden by a moderator and can't be sent.", "photo_hidden");
       // Profile photos are public plaintext files: a copy is a plaintext attachment.
       assertPlaintextPhotoAllowed();
       consume("attachments", me);

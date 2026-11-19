@@ -468,8 +468,8 @@ meRoutes.get("/me/export", async (c) => {
   const checks = new Map(
     (
       await sql<
-        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null }[]
-      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels FROM photos WHERE owner_id = ${me}`
+        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null; hidden_at: Date | null }[]
+      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels, hidden_at FROM photos WHERE owner_id = ${me}`
     ).map((r) => [r.id, r]),
   );
 
@@ -569,6 +569,7 @@ meRoutes.get("/me/export", async (c) => {
           model: ck?.nsfw_model ?? null,
           explicitScore: ck?.nsfw_score ?? null,
           labels: ck?.nsfw_labels ?? null,
+          hiddenByModeratorAt: isoDate(ck?.hidden_at ?? null),
         },
       };
     }),

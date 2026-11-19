@@ -111,6 +111,13 @@ Non-2xx responses carry:
   out. The owner can still send it in a chat. Photos the classifier hasn't seen
   yet (model not installed or busy) come back with `isExplicit: false` and are
   re-checked in the background, so `isExplicit` can turn `true` later.
+- A moderator can also hide a profile photo (after a duplicate or stock-photo
+  flag). It is treated like an explicit one: left out of everyone else's view
+  and returned to its owner with `isExplicit: true`, so the app badges it
+  "Hidden". So `isExplicit: true` on your own photo means "not shown to others".
+  A moderator-hidden photo can't be sent as a chat attachment (400
+  `photo_hidden`), and hiding moves it to a new `url` (the old one stops
+  working).
 
 ### Conversation
 
@@ -191,7 +198,7 @@ Non-2xx responses carry:
 | PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito` (incognito → 402 without Stexx+) |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
-| GET | `/me/export` | → JSON archive | Data export (GDPR). Each photo includes `checks`: `perceptualHash`, `checkedAt`, `model`, `explicitScore`, `labels`. |
+| GET | `/me/export` | → JSON archive | Data export (GDPR). Each photo includes `checks`: `perceptualHash`, `checkedAt`, `model`, `explicitScore`, `labels`, `hiddenByModeratorAt` (null unless a moderator hid the photo). |
 
 ### Discovery
 
@@ -210,7 +217,7 @@ Non-2xx responses carry:
 | GET | `/conversations` | → `[Conversation]` | Most recent first. |
 | POST | `/conversations` | `{ participantID }` → `Conversation` | Returns the existing conversation if there is one. |
 | GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100). Oldest-first within the page; `nextCursor` is the ID to pass as `before`. |
-| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
+| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied; 400 `photo_hidden` if a moderator hid it). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
 | POST | `/conversations/{id}/read` | → 204 | Ignored for read receipts if the reader disabled them. |
 | DELETE | `/conversations/{id}` | → 204 | Deletes for the caller only. |
 

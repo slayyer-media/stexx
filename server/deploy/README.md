@@ -45,6 +45,8 @@ watchdog every 5 minutes (`stexx-watch.timer`).
    If the Postgres cluster hosts other databases, bootstrap refuses to install the cluster-wide `90-stexx.conf` unless you pass `INSTALL_PG_CONF=1` (read the file first).
 4. **Firewall.** On the server: `sudo ./ufw-cloudflare.sh` (dry run), then `--apply`. Re-run monthly to follow Cloudflare's published ranges.
 5. **Mail** (optional): set `SMTP_URL` in `/etc/stexx/stexx.env`. Without it, email sign-in returns 503 `email_unavailable` (passkeys still work).
+   **Moderator alerts** (optional): set `MODERATOR_ALERT_EMAIL` (needs `SMTP_URL`) and/or `MODERATOR_ALERT_WEBHOOK_URL` there too, then
+   `systemctl restart stexx-api` and check with `stexx-mod alerts test` (docs/security.md section 5, "Alerts").
 6. **Backups** (below), then `systemctl enable --now stexx-backup.timer`.
 7. **First deploy:** `DEPLOY_HOST=you@host ./deploy/deploy.sh --no-backup` (no data yet), then `--status`.
    **Alerts** ([Monitoring and alerts](#monitoring-and-alerts)): fill `/etc/stexx/watch.env`, then `sudo stexx-watch --test-alert`.

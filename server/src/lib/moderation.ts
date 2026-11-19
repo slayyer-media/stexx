@@ -44,7 +44,19 @@ export type ReportReason =
   | "illegalContent"
   | "other";
 export type HideReason = "reports" | "underage" | "moderator";
-export type ModerationActionKind = "auto_hide" | "hide" | "unhide" | "dismiss" | "action" | "ban" | "unban";
+export type ModerationActionKind =
+  | "auto_hide"
+  | "hide"
+  | "unhide"
+  | "dismiss"
+  | "action"
+  | "ban"
+  | "unban"
+  // Photo-flag decisions (lib/photocheck/review.ts, migration 114).
+  | "photo_clear"
+  | "photo_hide"
+  | "photo_blocklist"
+  | "photo_escalate";
 export const SYSTEM_ACTOR = "system";
 
 // ---- Settings ------------------------------------------------------------------------------------
@@ -219,7 +231,8 @@ export async function reporterFacts(userId: string, db: Sql = sql, now = new Dat
 
 // ---- Audit ---------------------------------------------------------------------------------------------
 
-async function audit(
+/** Write one moderation_actions row (call inside the action's transaction). */
+export async function audit(
   db: Sql,
   entry: {
     actor: string;
@@ -343,12 +356,12 @@ export interface ActionResult {
 export type AccountState = "visible" | "hidden" | "banned";
 
 const ACTOR_RE = /^[A-Za-z0-9._-]{1,64}$/;
-function checkActor(actor: string): void {
+export function checkActor(actor: string): void {
   if (!ACTOR_RE.test(actor) || actor === SYSTEM_ACTOR) {
     throw new ModerationError("Moderator handle must be 1-64 letters, digits, dot, dash or underscore (not 'system').");
   }
 }
-function checkNote(note: string | null | undefined): void {
+export function checkNote(note: string | null | undefined): void {
   if (note && note.length > 2000) throw new ModerationError("Note is limited to 2000 characters.");
 }
 

@@ -1,4 +1,5 @@
 import { MEDIA_TMP_INTERVAL_MS, sweepStaleTempFiles } from "../lib/media.ts";
+import { alertChannels, runModeratorAlerts } from "../lib/moderator-alerts.ts";
 import { runPhotoChecks } from "../lib/photocheck/index.ts";
 import { MINUTE } from "../lib/time.ts";
 import {
@@ -15,6 +16,7 @@ export * from "./retention.ts";
 export { createScheduler, HEARTBEAT_INTERVAL_MS, JOBS_STOP_TIMEOUT_MS } from "./scheduler.ts";
 
 export const PHOTO_CHECK_INTERVAL_MS = 1 * MINUTE;
+export const MODERATOR_ALERT_INTERVAL_MS = 1 * MINUTE;
 
 /**
  * Starts the in-process retention jobs and returns an async stop function. Not started by tests (they call the job
@@ -35,6 +37,11 @@ export function startJobs(): () => Promise<void> {
   every("orphans", ORPHAN_INTERVAL_MS, () => sweepOrphanMedia(), 60_000);
   // Retries unchecked photos (model missing/busy at upload) and backfills hashes of older photos.
   every("photoChecks", PHOTO_CHECK_INTERVAL_MS, () => runPhotoChecks(), 20_000);
+  // Moderator alert digests (off unless MODERATOR_ALERT_EMAIL or MODERATOR_ALERT_WEBHOOK_URL is set). The task logs
+  // its own sent/failed events; the result counts are not logged.
+  if (alertChannels().length > 0) {
+    every("moderatorAlerts", MODERATOR_ALERT_INTERVAL_MS, async () => void (await runModeratorAlerts()), 30_000);
+  }
 
   // Removes `.tmp` files left by crashed or failed media writes; logs disk.low under 15 % free.
   every("mediaTmp", MEDIA_TMP_INTERVAL_MS, () => sweepStaleTempFiles(), 30_000);

@@ -4,6 +4,7 @@ import { config } from "../config.ts";
 import { sql } from "../db/sql.ts";
 import { drainMediaTrash, isStorageKey } from "../lib/media.ts";
 import { runSpamJobs } from "../lib/abuse/spam.ts";
+import { purgeModeratorAlertSent } from "../lib/moderator-alerts.ts";
 import { DAY, HOUR, MINUTE, SECOND } from "../lib/time.ts";
 
 /**
@@ -344,5 +345,19 @@ export async function runSlowJobs(now: Date = new Date()) {
   const reports = await purgeReportEvidence(now);
   // Spam heuristics: cooldown lifts, expired content hashes, unreviewed held messages, old episodes.
   const spam = await runSpamJobs(now);
-  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts, devices, abuseCounters, reports, spam };
+  // Debounce state of moderator alerts (ids only); also purged here in case alerts were switched off.
+  const moderatorAlertsSent = await purgeModeratorAlertSent(now);
+  return {
+    unreadCapped,
+    unopenedViewOnce,
+    staleUploads,
+    profileViews,
+    auth,
+    boosts,
+    devices,
+    abuseCounters,
+    reports,
+    spam,
+    moderatorAlertsSent,
+  };
 }

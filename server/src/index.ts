@@ -33,6 +33,11 @@ logInfo("listening", {
   deviceCheck: config.antiSpam.deviceCheck !== null,
   photoClassifier: config.photoChecks.classifier,
   photoBlocklist: config.photoChecks.blocklist.length,
+  // Channel names only: never the addresses or the webhook URL.
+  moderatorAlerts: [
+    config.moderatorAlerts.emails.length > 0 ? "email" : null,
+    config.moderatorAlerts.webhookUrl ? "webhook" : null,
+  ].filter(Boolean).join(",") || "off",
   e2e: config.e2e.mode,
   // libsignal, or the built-in fallback if the native module can't load on this host (docs/security.md).
   e2eVerifier: config.e2e.mode === "off" ? "unused" : await verifierName(),
