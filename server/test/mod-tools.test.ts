@@ -6,13 +6,16 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { randomInt } from "node:crypto";
 import sharp from "sharp";
 import { ConfigError, DEFAULT_ALERT_REASONS, loadConfig, REPORT_REASONS } from "../src/config.ts";
+import { runSlowJobs } from "../src/jobs/retention.ts";
 import { setLogSilent } from "../src/lib/logger.ts";
+import { mediaPath } from "../src/lib/media.ts";
 import { overrideAutoHideForTests } from "../src/lib/moderation.ts";
 import {
   buildAlert,
   collectAlertItems,
   ITEMS_LISTED,
   runModeratorAlerts,
+  SENT_RETENTION_MS,
   setModeratorAlertsForTests,
   type AlertItem,
   type AlertMessage,
@@ -835,5 +838,107 @@ describe("photo flags: decisions", () => {
     expect(again.code).toBe(1);
     expect(again.out).toContain("already banned");
     expect((await auditRows(b.flagId)).map((r) => r.action)).toEqual(["photo_escalate"]);
+  });
+});
+
+// ---- Review follow-ups: a hidden photo is cut off everywhere --------------------------------------------------
+
+describe("photo flags: a hidden photo is cut off", () => {
+  const keyOf = async (photoId: string) =>
+    (await sql<{ storage_key: string }[]>`SELECT storage_key FROM photos WHERE id = ${photoId}`)[0]!.storage_key;
+  const onDisk = (key: string) => Bun.file(mediaPath(key)).exists();
+  const ownUrl = async (owner: TestUser, photoId: string) =>
+    ((await expectJson(await as(owner).get("/v1/me"))).photos as { id: string; url: string }[]).find((p) => p.id === photoId)!.url;
+
+  test("hide moves the file to a new name, so a URL someone already has stops working; clear keeps the new one", async () => {
+    const dup = await duplicatePair();
+    const before = await keyOf(dup.copy);
+    const urlBefore = await ownUrl(dup.copier, dup.copy);
+    expect(urlBefore).toContain(before);
+
+    const res = JSON.parse((await cli("photos", "hide", dup.flagId, "--as", MOD, "--json")).out);
+    expect(res.details).toEqual({ fileMoved: true });
+    const after = await keyOf(dup.copy);
+    expect(after).not.toBe(before);
+    expect(await onDisk(before)).toBe(false); // the old public URL is dead
+    expect(await onDisk(after)).toBe(true);
+    const [queued] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM media_trash WHERE storage_key = ${before}`;
+    expect(queued!.n).toBe(0); // drained right after the decision
+    // The owner still has the photo, under its new URL.
+    const urlAfter = await ownUrl(dup.copier, dup.copy);
+    expect(urlAfter).toContain(after);
+    expect(urlAfter).not.toBe(urlBefore);
+    expect((await auditRows(dup.flagId))[0]!.details).toMatchObject({ fileMoved: true, photoHidden: true });
+
+    // Clearing unhides the photo under the new name; nothing moves again.
+    await cli("photos", "clear", dup.flagId, "--as", MOD);
+    expect(await keyOf(dup.copy)).toBe(after);
+    expect(await photoIdsSeenBy(await user(), dup.copier)).toContain(dup.copy);
+  });
+
+  test("blocklist moves the file too; a photo that was already hidden is not moved again", async () => {
+    const dup = await duplicatePair();
+    const before = await keyOf(dup.copy);
+    const res = JSON.parse((await cli("photos", "blocklist", dup.flagId, "--as", MOD, "--json")).out);
+    expect(res.details).toMatchObject({ fileMoved: true });
+    const moved = await keyOf(dup.copy);
+    expect(moved).not.toBe(before);
+    expect(await onDisk(before)).toBe(false);
+    expect(await onDisk(moved)).toBe(true);
+
+    // A second flag on the already hidden photo: hiding again via that flag keeps the file where it is.
+    const [second] = await sql<{ id: string }[]>`
+      INSERT INTO photo_flags (photo_id, owner_id, kind, distance, blocklist_hash, blocklist_label)
+      VALUES (${dup.copy}, ${dup.copier.id}, 'blocklist', 2, 54321, 'other') RETURNING id::text AS id`;
+    const again = JSON.parse((await cli("photos", "hide", second!.id, "--as", MOD, "--json")).out);
+    expect(again.details).toEqual({ fileMoved: false });
+    expect(await keyOf(dup.copy)).toBe(moved);
+  });
+
+  test("a photo whose file is missing is still hidden (nothing to move)", async () => {
+    const dup = await duplicatePair();
+    const key = await keyOf(dup.copy);
+    await sql`UPDATE photos SET storage_key = ${"0".repeat(32) + ".jpg"} WHERE id = ${dup.copy}`;
+    try {
+      const res = JSON.parse((await cli("photos", "hide", dup.flagId, "--as", MOD, "--json")).out);
+      expect(res).toMatchObject({ photoHidden: true, details: { fileMoved: false } });
+    } finally {
+      await sql`UPDATE photos SET storage_key = ${key} WHERE id = ${dup.copy}`;
+    }
+  });
+
+  test("the owner can't send a hidden photo as a chat attachment; after clear they can", async () => {
+    const dup = await duplicatePair();
+    const friend = await user();
+    const conv = (await expectJson(await as(dup.copier).post("/v1/conversations", { json: { participantID: friend.id } }))).id;
+    const sendPhoto = () =>
+      as(dup.copier).post(`/v1/conversations/${conv}/messages`, {
+        json: { clientID: `c-${uniq()}`, attachmentPhotoID: dup.copy, isViewOnce: false },
+      });
+
+    await cli("photos", "hide", dup.flagId, "--as", MOD);
+    const err = await expectError(await sendPhoto(), 400, "photo_hidden");
+    expect(err.message).toContain("hidden by a moderator");
+    const [n] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM messages WHERE conversation_id = ${conv}`;
+    expect(n!.n).toBe(0);
+
+    await cli("photos", "clear", dup.flagId, "--as", MOD);
+    const msg = await expectJson(await sendPhoto());
+    expect(msg.attachment).toBeTruthy();
+  });
+
+  test("alert debounce rows are purged by the slow retention job, even with alerts switched off", async () => {
+    const ns = `t${RUN}${uniq()}`;
+    namespaces.push(ns);
+    const channel = `${ns}:email`;
+    await sql`INSERT INTO moderator_alert_channels (channel) VALUES (${channel})`;
+    const old = new Date(Date.now() - SENT_RETENTION_MS - 60_000);
+    await sql`
+      INSERT INTO moderator_alert_sent (channel, kind, ref, sent_at)
+      VALUES (${channel}, 'report', 'old', ${old}), (${channel}, 'report', 'recent', now())`;
+    const slow = await runSlowJobs();
+    expect(slow.moderatorAlertsSent).toBeGreaterThanOrEqual(1);
+    const left = await sql<{ ref: string }[]>`SELECT ref FROM moderator_alert_sent WHERE channel = ${channel}`;
+    expect(left.map((r) => r.ref)).toEqual(["recent"]);
   });
 });

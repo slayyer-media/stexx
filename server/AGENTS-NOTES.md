@@ -174,7 +174,9 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   also matched by `flagPhotoMatches`; take `lockPhotoFlagging(tx)` first), `escalatePhotoFlag` (hide/ban account). CLI:
   `src/moderation/photos-cli.ts` (`photos …`, `alerts …`), dispatched from `cli.ts`.
 - `photos.hidden_at` = hidden by a moderator: `visibleToOthers` excludes it; `photoJson` returns it to the owner with
-  `isExplicit: true`. Select photos with `photoColumns` (it includes `is_hidden`).
+  `isExplicit: true`; chat refuses it as an attachment (400 `photo_hidden`). Hiding (`hide`/`blocklist`) copies the
+  file to a new key and trashes the old one so an already-shared URL dies. Select photos with `photoColumns` (it
+  includes `is_hidden`). `purgeModeratorAlertSent` also runs in `runSlowJobs`.
 
 ### e2e/ (end-to-end encryption keys and envelopes; docs/security.md section 7, contract in docs/api.md)
 - `keys.ts`: `e2eMode()` (`E2E_MODE` off|optional|required; tests `setE2eModeForTests`), `assertE2eEnabled()` (404

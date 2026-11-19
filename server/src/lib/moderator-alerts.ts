@@ -426,8 +426,17 @@ export async function runModeratorAlerts(opts: { now?: Date; profileIds?: string
       if (!released) await release();
     }
   }
-  await sql`DELETE FROM moderator_alert_sent WHERE sent_at < ${new Date(now.getTime() - SENT_RETENTION_MS)}`;
+  await purgeModeratorAlertSent(now);
   return results;
+}
+
+/**
+ * Drop moderator_alert_sent rows older than SENT_RETENTION_MS. Run after every alert run and by the slow retention
+ * job, so rows left behind after alerts are switched off are purged too. Returns the number of rows deleted.
+ */
+export async function purgeModeratorAlertSent(now: Date = new Date(), db: Sql = sql): Promise<number> {
+  const rows = await db`DELETE FROM moderator_alert_sent WHERE sent_at < ${new Date(now.getTime() - SENT_RETENTION_MS)}`;
+  return rows.count;
 }
 
 // ---- Operator tools (CLI `alerts status` / `alerts test`) --------------------------------------------------------

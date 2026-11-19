@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { config } from "../config.ts";
 import { sql } from "../db/sql.ts";
 import { drainMediaTrash, isStorageKey } from "../lib/media.ts";
+import { purgeModeratorAlertSent } from "../lib/moderator-alerts.ts";
 import { DAY, HOUR, MINUTE, SECOND } from "../lib/time.ts";
 
 /**
@@ -341,5 +342,18 @@ export async function runSlowJobs(now: Date = new Date()) {
   const devices = await purgeIdleDevices(now);
   const abuseCounters = await purgeAbuseCounters(now);
   const reports = await purgeReportEvidence(now);
-  return { unreadCapped, unopenedViewOnce, staleUploads, profileViews, auth, boosts, devices, abuseCounters, reports };
+  // Debounce state of moderator alerts (ids only); also purged here in case alerts were switched off.
+  const moderatorAlertsSent = await purgeModeratorAlertSent(now);
+  return {
+    unreadCapped,
+    unopenedViewOnce,
+    staleUploads,
+    profileViews,
+    auth,
+    boosts,
+    devices,
+    abuseCounters,
+    reports,
+    moderatorAlertsSent,
+  };
 }

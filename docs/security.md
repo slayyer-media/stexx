@@ -195,7 +195,7 @@ Options that don't belong to a command are refused rather than ignored. Write co
 So nobody has to keep running `list`, the server can tell moderators when something urgent arrives. It is off unless a channel is configured:
 
 - **Email:** `MODERATOR_ALERT_EMAIL` (one address, or up to five comma-separated) through the same SMTP relay as sign-in links. It needs `SMTP_URL`; the boot refuses one without the other.
-- **Webhook:** `MODERATOR_ALERT_WEBHOOK_URL` receives a JSON `POST` (10 s timeout, redirects count as failures). It suits a self-hosted [ntfy](https://ntfy.sh) topic or a Matrix webhook bridge. In production it must be `https`, unless it points at a loopback address on the same box. The URL is never logged, so a token in its path or query stays private.
+- **Webhook:** `MODERATOR_ALERT_WEBHOOK_URL` receives a JSON `POST` (10 s timeout, redirects count as failures). It suits a self-hosted [ntfy](https://ntfy.sh) topic or a Matrix webhook bridge. In production it must be `https`, unless it points at a loopback address on the same box. The URL is never logged, so a token in its path or query stays private. Treat the URL as a secret: alerts map profile ids to reason codes (including `underage`), so anyone who can read the topic learns which accounts were reported for what. On ntfy, use a long random topic name with access control on (`auth-default-access: deny-all` and a token for the moderators), never a guessable topic on a public server.
 
 **What is high priority.** An item is alerted once, per channel:
 
@@ -235,6 +235,7 @@ The email has the same content as plain text. Up to 20 items are listed one by o
 - The report row itself (reason, priority, status, dates) stays for history; account deletion anonymizes it (`SET NULL`) as before. `moderation_actions` is kept and anonymized the same way.
 - Evidence a reporter shared is part of their data export while it exists.
 - If the reporter deletes their account, the report is anonymized but its evidence keeps the same clock, so a harassed person leaving the app doesn't erase the evidence against the harasser. If the reported account is deleted, the evidence goes 30 days after the report was filed.
+- Moderator alert state: `moderator_alert_sent` (kind and id of each alerted item, no content) is deleted 4 days after sending, by the alert job and by the slow retention job, so rows are purged even after alerts are switched off. `moderator_alert_channels` keeps one row per channel (timestamps and a short error code).
 
 ## 6. Photo checks (profile photos)
 
@@ -271,9 +272,11 @@ Moderators review flags with the same CLI as reports (section 5), over SSH. Ever
 
 All take `--json`; the write commands need `--as` and take `--note`. The path printed is the file the server already serves for that profile photo; nothing is copied, uploaded or sent anywhere, and `--json` output is the only other place it appears.
 
-**A photo hidden by a moderator** (`photos.hidden_at`, migration 114) behaves like an explicit one: other people never see it, on any surface, and its owner still sees it, badged "Hidden" (the API returns it to the owner with `isExplicit: true`), and can still send it in a chat. The classifier's own label is left alone, so `clear` restores exactly what was there. The data export shows it as `checks.hiddenByModeratorAt`.
+**A photo hidden by a moderator** (`photos.hidden_at`, migration 114) behaves like an explicit one: other people never see it, on any surface, and its owner still sees it, badged "Hidden" (the API returns it to the owner with `isExplicit: true`). Unlike an explicit photo, the owner can't send it as a chat attachment (400 `photo_hidden`). Profile photos are public files, so hiding also moves the file to a new random name and deletes the old one: a URL someone already copied stops working (a copy already downloaded or cached on a phone can't be recalled). The owner's app gets the new URL from the API as usual, and `clear` keeps the new name. The classifier's own label is left alone, so `clear` restores exactly what was there. The data export shows it as `checks.hiddenByModeratorAt`.
 
-**Moderator blocklist.** `photo_hash_blocklist` holds only 64-bit hashes, the label, the moderator handle and the flag it came from; it is matched at upload and by the background job together with the `PHOTO_HASH_BLOCKLIST` file. Entries stay until a moderator clears the flag they came from (or you delete the row).
+**Hide or blocklist?** `hide` acts on that one photo row. If the owner deletes it and uploads the same picture again, the new photo starts visible; it gets a new `duplicate` flag if another account still has a copy, and stays visible until that flag is reviewed. For stolen or catfish photos, prefer `photos blocklist`: the hash then flags (and the moderator can hide) every later upload of it, from any account.
+
+**Moderator blocklist.** `photo_hash_blocklist` holds only 64-bit hashes, the label, the moderator handle and the flag it came from; it is matched at upload and by the background job together with the `PHOTO_HASH_BLOCKLIST` file. Entries stay until a moderator clears the flag they came from (or you delete the row). That is on purpose: an entry outlives the account whose photo it came from (its `source_flag_id` becomes NULL when the flag goes with the account), so a deleted catfish account's photos stay blocked. An entry is a hash, not an image, and doesn't name the account.
 
 **When the model is missing.** On dev machines, in CI and tests, or if the download failed, uploads work exactly as before. Photos are stored unchecked (`nsfw_checked_at` NULL) and stay visible. Every minute a background job retries unchecked photos (up to 5 attempts each) and backfills hashes for older photos. So dropping the model in place later fixes everything without a restart: the API retries loading a missing model every 5 minutes, and the job then works through the backlog. Set `PHOTO_HIDE_UNCHECKED=1` to fail closed instead: unchecked photos are then hidden from others until the classifier has seen them. Busy or slow inference (more than 8 queued, or 15 s) also leaves a photo unchecked for the job.
 
@@ -445,7 +448,7 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - End-to-end encryption adds public keys only (section 7), deleted with the account or on a ban, and ciphertext the server can't read. One-time prekeys are deleted the moment they are handed out.
 - Reports add two things: the messages and photos a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Evidence photos are files in `MEDIA_DIR` with random names that no API response contains; only the moderation CLI prints their path. Nothing in moderation stores or shows a location.
 - Encrypted chat photos add nothing readable: a blob, its size bucket and the usual message metadata.
-- Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read.
+- Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read. Moderator blocklist entries (`photo_hash_blocklist`: hash, label, moderator handle) are kept after the source account is deleted, which is what a blocklist is for (section 6).
 - Moderator alerts leave the server (by email or webhook) but carry only ids, reason codes, counts and commands: no names, profile text, report content, photos, reporter ids or locations. The alert tables store which items were alerted (kind and id) for a few days, and each channel's retry state.
 
 ## Not done yet

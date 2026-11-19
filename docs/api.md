@@ -107,6 +107,9 @@ Non-2xx responses carry:
   flag). It is treated like an explicit one: left out of everyone else's view
   and returned to its owner with `isExplicit: true`, so the app badges it
   "Hidden". So `isExplicit: true` on your own photo means "not shown to others".
+  A moderator-hidden photo can't be sent as a chat attachment (400
+  `photo_hidden`), and hiding moves it to a new `url` (the old one stops
+  working).
 
 ### Conversation
 
@@ -206,7 +209,7 @@ Non-2xx responses carry:
 | GET | `/conversations` | → `[Conversation]` | Most recent first. |
 | POST | `/conversations` | `{ participantID }` → `Conversation` | Returns the existing conversation if there is one. |
 | GET | `/conversations/{id}/messages` | → `Page<Message>` | Query: `before` (message ID), `limit` (≤ 100). Oldest-first within the page; `nextCursor` is the ID to pass as `before`. |
-| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
+| POST | `/conversations/{id}/messages` | `MessageDraft` → `Message` | `{ clientID, text?, envelope?, attachmentPhotoID?, expiresAfterSeconds?, isViewOnce? }`. `text` and `envelope` are exclusive (see [End-to-end encryption](#end-to-end-encryption)). `clientID` is visible ASCII (a UUID). `attachmentPhotoID` is an id from `POST /me/attachments` (preferred) or one of your profile photos (copied; 400 `photo_hidden` if a moderator hid it). For a photo, `isViewOnce` overrides the sender's "expiring photos by default" setting; when both it and `expiresAfterSeconds` are omitted, that setting decides whether the photo is view-once. The iOS app sends `isViewOnce: false` for a non-expiring photo. |
 | POST | `/conversations/{id}/read` | → 204 | Ignored for read receipts if the reader disabled them. |
 | DELETE | `/conversations/{id}` | → 204 | Deletes for the caller only. |
 

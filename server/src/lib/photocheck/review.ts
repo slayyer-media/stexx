@@ -4,11 +4,13 @@
  * decision runs in one transaction and writes a moderation_actions row (actor handle, the photo's owner, details with
  * the flag id), like the account actions in lib/moderation.ts.
  *
- * Nothing here copies, uploads or re-encodes a photo. The CLI prints the file's path under MEDIA_DIR (the server
- * already has it: profile photos are public files) so a moderator on the server can open it.
+ * Nothing here uploads or re-encodes a photo. The CLI prints the file's path under MEDIA_DIR (the server already has
+ * it: profile photos are public files) so a moderator on the server can open it. Hiding a photo moves its file to a
+ * new random name on the same disk, so a URL someone already copied stops working (see hidePhotoRow).
  */
 import { sql, type Sql } from "../../db/sql.ts";
-import { isStorageKey, mediaPath } from "../media.ts";
+import { logError } from "../logger.ts";
+import { copyMedia, drainMediaTrash, isStorageKey, mediaPath, unlinkMedia } from "../media.ts";
 import {
   audit,
   banAccount,
@@ -341,26 +343,58 @@ interface LockedFlag {
   owner_id: string;
   photo_hidden: boolean;
   phash: string | null;
+  storage_key: string;
 }
+
+/** Files a decision created; removed again if its transaction rolls back. */
+interface DecisionFiles {
+  created: string[];
+}
+
+type DecisionBody = (
+  tx: Sql,
+  flag: LockedFlag,
+  files: DecisionFiles,
+) => Promise<{ status: PhotoFlagStatus; details?: Record<string, unknown> }>;
 
 /** One photo-flag decision: lock the flag and its photo, apply `body`, set the status, write the audit row. */
 async function decide(
   input: PhotoActionInput,
   action: ModerationActionKind,
-  body: (tx: Sql, flag: LockedFlag) => Promise<{ status: PhotoFlagStatus; details?: Record<string, unknown> }>,
+  body: DecisionBody,
 ): Promise<PhotoActionResult> {
   checkActor(input.actor);
   checkNote(input.note);
   if (!isFlagId(input.flagId)) throw new ModerationError(`Not a photo flag id: ${input.flagId}`);
+  const files: DecisionFiles = { created: [] };
+  let result: PhotoActionResult;
+  try {
+    result = await decideTx(input, action, body, files);
+  } catch (err) {
+    // Rolled back: the photo still points at its old file, so a copy made for it is unreferenced.
+    for (const key of files.created) await unlinkMedia(key).catch((e) => logError("photo_review.unlink", e));
+    throw err;
+  }
+  // The old file of a photo hidden just now (queued in media_trash in the same transaction).
+  if (files.created.length > 0) await drainMediaTrash().catch((e) => logError("photo_review.drain", e));
+  return result;
+}
+
+function decideTx(
+  input: PhotoActionInput,
+  action: ModerationActionKind,
+  body: DecisionBody,
+  files: DecisionFiles,
+): Promise<PhotoActionResult> {
   return sql.begin(async (tx) => {
     const [flag] = await tx<LockedFlag[]>`
       SELECT f.id::text AS id, f.kind, f.status, f.distance, f.photo_id, f.owner_id,
-             p.hidden_at IS NOT NULL AS photo_hidden, p.phash::text AS phash
+             p.hidden_at IS NOT NULL AS photo_hidden, p.phash::text AS phash, p.storage_key
         FROM photo_flags f JOIN photos p ON p.id = f.photo_id
        WHERE f.id = ${input.flagId}
          FOR UPDATE OF f, p`;
     if (!flag) throw new ModerationError(`No photo flag ${input.flagId}.`);
-    const out = await body(tx, flag);
+    const out = await body(tx, flag, files);
     await tx`UPDATE photo_flags SET status = ${out.status} WHERE id = ${flag.id}`;
     const [after] = await tx<{ hidden: boolean }[]>`SELECT hidden_at IS NOT NULL AS hidden FROM photos WHERE id = ${flag.photo_id}`;
     const details = {
@@ -408,12 +442,38 @@ export function clearPhotoFlag(input: PhotoActionInput): Promise<PhotoActionResu
   });
 }
 
+/**
+ * Hide the flag's photo (photos.hidden_at) unless it already is. Profile photos are public files, so a URL someone
+ * already has would keep working after the API stops returning it: the file is copied to a new random key, the row
+ * points at the copy, and the old key is queued in media_trash (unlinked after commit). The owner's app gets the new
+ * URL from the API as usual. Returns whether the file moved (false if already hidden, or if the file is missing).
+ */
+async function hidePhotoRow(tx: Sql, flag: LockedFlag, files: DecisionFiles): Promise<boolean> {
+  if (flag.photo_hidden) return false;
+  let moved: string | null = null;
+  if (isStorageKey(flag.storage_key)) {
+    try {
+      moved = await copyMedia(flag.storage_key);
+      files.created.push(moved);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+  if (moved) {
+    await tx`UPDATE photos SET hidden_at = now(), storage_key = ${moved} WHERE id = ${flag.photo_id}`;
+    await tx`INSERT INTO media_trash (storage_key) VALUES (${flag.storage_key}) ON CONFLICT DO NOTHING`;
+  } else {
+    await tx`UPDATE photos SET hidden_at = now() WHERE id = ${flag.photo_id}`;
+  }
+  return moved !== null;
+}
+
 /** Hide the photo from everyone but its owner and mark the flag actioned. */
 export function hidePhotoForFlag(input: PhotoActionInput): Promise<PhotoActionResult> {
-  return decide(input, "photo_hide", async (tx, flag) => {
+  return decide(input, "photo_hide", async (tx, flag, files) => {
     if (flag.status === "actioned" && flag.photo_hidden) throw new ModerationError("Photo is already hidden.");
-    await tx`UPDATE photos SET hidden_at = COALESCE(hidden_at, now()) WHERE id = ${flag.photo_id}`;
-    return { status: "actioned" };
+    const fileMoved = await hidePhotoRow(tx, flag, files);
+    return { status: "actioned", details: { fileMoved } };
   });
 }
 
@@ -428,7 +488,7 @@ function cleanLabel(label: string): string | null {
  * Future uploads of the same photo are flagged at upload.
  */
 export function blocklistPhotoForFlag(input: PhotoActionInput & { label?: string | null }): Promise<PhotoActionResult> {
-  return decide(input, "photo_blocklist", async (tx, flag) => {
+  return decide(input, "photo_blocklist", async (tx, flag, files) => {
     if (flag.phash === null) throw new ModerationError("The photo has no hash yet; hide it instead.");
     const label = cleanLabel(input.label ?? "") ?? `moderator ${input.actor}, flag ${flag.id}`;
     await lockPhotoFlagging(tx);
@@ -436,7 +496,7 @@ export function blocklistPhotoForFlag(input: PhotoActionInput & { label?: string
       INSERT INTO photo_hash_blocklist (hash, label, added_by, source_flag_id)
       VALUES (${flag.phash}::bigint, ${label}, ${input.actor}, ${flag.id})
       ON CONFLICT (hash) DO NOTHING RETURNING hash`;
-    await tx`UPDATE photos SET hidden_at = COALESCE(hidden_at, now()) WHERE id = ${flag.photo_id}`;
+    const fileMoved = await hidePhotoRow(tx, flag, files);
     const max = photoPolicy().duplicateMaxDistance;
     const raised =
       max < 0
@@ -455,6 +515,7 @@ export function blocklistPhotoForFlag(input: PhotoActionInput & { label?: string
         blocklistHash: phashToHex(phashFromDb(flag.phash)),
         alreadyListed: added.length === 0,
         newFlags: raised.length,
+        fileMoved,
       },
     };
   });
