@@ -406,6 +406,13 @@ host="$1"; shift; cmd="$*"
 case "$cmd" in
   # The optional staff console: "installed" unless STUB_NO_ADMIN is set (deploy.sh asks `systemctl cat stexx-admin`).
   *"systemctl cat stexx-admin"*) [ -z "${STUB_NO_ADMIN:-}" ]; exit $? ;;
+  # Non-dry-run rollbacks: the API answers 204; the console answers 200, or (STUB_ADMIN_DOWN) is down the way curl
+  # reports it, "000" AND exit 7; STUB_OLD_RELEASE: the target release predates the console; STUB_ADMIN_START_FAIL:
+  # `systemctl restart stexx-admin` fails.
+  *"127.0.0.1:8787/healthz"*) printf 204 ;;
+  *"127.0.0.1:8788"*) if [ -n "${STUB_ADMIN_DOWN:-}" ]; then printf 000; exit 7; fi; printf 200 ;;
+  *"src/admin/index.ts"*) [ -z "${STUB_OLD_RELEASE:-}" ]; exit $? ;;
+  *"systemctl restart stexx-admin"*) echo "    [stub ssh $host] $cmd" >&2; [ -z "${STUB_ADMIN_START_FAIL:-}" ]; exit $? ;;
   *"bash -s"*|*"bash -se"*) f="$(mktemp)"; cat > "$f"
                if bash -n "$f"; then echo "    [stub ssh $host] remote root script: $(wc -l < "$f" | tr -d ' ') lines, bash -n ok"; else echo "    [stub ssh] SYNTAX ERROR in remote script" ; exit 1; fi
                rm -f "$f" ;;
@@ -442,6 +449,21 @@ check "--sync-config on a box without the console installs nothing of it" bash -
 check "--sync-config --with-admin installs the unit, and its remote script parses" bash -c "grep -qx 0 '$T/sync-withadmin.rc' && grep -q 'bash -n ok' '$T/sync-withadmin' && grep -q 'stexx-admin.service' '$T/sync-withadmin'"
 (cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid bash deploy/deploy.sh --rollback 20260101-000000 --dry-run) > "$T/rollback" 2>&1; echo $? > "$T/rollback.rc"
 check "--rollback (console installed) restarts it too" has "$T/rollback" "systemctl restart stexx-admin"
+# Real (not dry-run) rollbacks against the stub, with `sleep` stubbed out so the retry loops run instantly.
+mkdir -p "$T/fastsleep"; printf '#!/usr/bin/env bash\nexit 0\n' > "$T/fastsleep/sleep"; chmod +x "$T/fastsleep/sleep"
+rb() { # rb <outfile> [VAR=value ...]: a real --rollback against the stub ssh
+  local out="$1"; shift
+  (cd "$HERE/.." && env PATH="$T/fastsleep:$PATH" DEPLOY_HOST=ops@stexx.invalid "$@" bash deploy/deploy.sh --rollback 20260101-000000) > "$out" 2>&1
+  echo $? > "$out.rc"
+}
+rb "$T/rb-ok"
+check "--rollback with the console answering exits 0" has "$T/rb-ok.rc" 0
+rb "$T/rb-down" STUB_ADMIN_DOWN=1
+check "--rollback with the console down (curl: 000 and exit 7) fails, not 'HTTP 000000'" bash -c "! grep -qx 0 '$T/rb-down.rc' && grep -q 'stexx-admin is not answering' '$T/rb-down' && ! grep -q 'HTTP 000000' '$T/rb-down'"
+rb "$T/rb-startfail" STUB_ADMIN_START_FAIL=1
+check "--rollback whose console restart fails still runs the API health check, then fails" bash -c "! grep -qx 0 '$T/rb-startfail.rc' && grep -q 'attempt 1: HTTP 204' '$T/rb-startfail' && grep -q 'stexx-admin is not answering' '$T/rb-startfail'"
+rb "$T/rb-old" STUB_OLD_RELEASE=1
+check "--rollback to a release without the console stops it instead of restarting it" bash -c "grep -qx 0 '$T/rb-old.rc' && grep -q 'systemctl stop stexx-admin' '$T/rb-old' && ! grep -q 'systemctl restart stexx-admin' '$T/rb-old'"
 
 # The public site file never names the console's host or address, and refuses /admin; the private one takes both
 # from the environment and has no access log.
@@ -452,6 +474,7 @@ check "Caddyfile.admin takes its host from the environment and uses its own port
 check "Caddyfile.admin has no bind directive (it would clash with the public sites' listeners)" bash -c "! grep -v '^ *#' '$HERE/Caddyfile.admin' | grep -Eq '^[[:space:]]*bind\\b'"
 check "Caddyfile.admin closes connections from outside the tailnet" bash -c "grep -Eq '^[[:space:]]*@outside not remote_ip 100\\.64\\.0\\.0/10' '$HERE/Caddyfile.admin' && grep -Eq '^[[:space:]]*abort @outside' '$HERE/Caddyfile.admin'"
 check "ufw-cloudflare.sh opens the console's port on tailscale0 only, and only with the flag" bash -c "grep -q 'ufw allow in on tailscale0 to any port \"\$ADMIN_PORT\"' '$HERE/ufw-cloudflare.sh' && grep -q 'TS_ADMIN=1' '$HERE/ufw-cloudflare.sh' && grep -q -- '--tailscale-admin)' '$HERE/ufw-cloudflare.sh'"
+check "Caddyfile.admin's Referrer-Policy is same-origin (no-referrer makes browsers send Origin: null on form posts)" bash -c "grep -Eq '^[[:space:]]*Referrer-Policy \"same-origin\"' '$HERE/Caddyfile.admin' && ! grep -Ev '^[[:space:]]*#' '$HERE/Caddyfile.admin' | grep -q 'no-referrer'"
 check "Caddyfile.admin has no log directive and proxies to loopback 8788" bash -c "! grep -v '^ *#' '$HERE/Caddyfile.admin' | grep -Eq '^[[:space:]]*log\b' && grep -q 'reverse_proxy 127.0.0.1:8788' '$HERE/Caddyfile.admin'"
 check "stexx-admin.service runs the console as the stexx user, no jobs, loopback only" bash -c "grep -q '^User=stexx' '$HERE/stexx-admin.service' && grep -q 'ExecStart=/usr/local/bin/bun src/admin/index.ts' '$HERE/stexx-admin.service' && grep -q '^Environment=ADMIN_HOST=127.0.0.1' '$HERE/stexx-admin.service'"
 check "stexx-admin.service has the API unit's sandboxing" bash -c "for k in NoNewPrivileges=true ProtectSystem=strict PrivateDevices=true SystemCallFilter=@system-service RestrictAddressFamilies; do grep -q \"^\$k\" '$HERE/stexx-admin.service' || exit 1; done"

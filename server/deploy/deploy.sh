@@ -107,17 +107,34 @@ flip_to() { # flip_to <absolute release dir>: atomic symlink swap
 admin_installed() { rsh "systemctl cat $ADMIN_SERVICE >/dev/null 2>&1"; }
 
 # The console answers on loopback only. Any HTTP status means the process is up and listening (production answers 403
-# to a request without a tailnet forwarded address, 200 with one); 000 means nothing is listening.
+# to a request without a tailnet forwarded address, 200 with one); 000 means nothing is listening. curl prints 000 AND
+# exits non-zero when the connection is refused, so its exit status is ignored and only a real 3-digit status counts
+# (a `|| echo 000` fallback would append to curl's own 000 and read as "up").
 admin_up() { # admin_up <tries>
   local tries="${1:-15}" code i
   for i in $(seq 1 "$tries"); do
-    code="$(rsh "curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H 'X-Forwarded-For: 100.64.0.1' 'http://127.0.0.1:8788/static/console.css'" 2>/dev/null || echo 000)"
-    echo "  attempt $i: HTTP $code"
-    [ "$code" != "000" ] && return 0
+    code="$(rsh "curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H 'X-Forwarded-For: 100.64.0.1' 'http://127.0.0.1:8788/static/console.css' || true" 2>/dev/null || true)"
+    echo "  attempt $i: HTTP ${code:-none}"
+    [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && return 0
     sleep 2
   done
   return 1
 }
+
+# Restart the console without stopping the script (set -e): a console that fails to start (a bad admin.env, a start
+# limit) must never skip the API's health check and rollback. Sets ADMIN_FAILED=1 on failure; the run fails at the end.
+ADMIN_FAILED=0
+admin_restart() { # admin_restart [enable]
+  local enable=""
+  [ "${1:-}" = enable ] && enable="sudo systemctl enable $ADMIN_SERVICE >/dev/null 2>&1; "
+  if ! rrun "${enable}sudo systemctl restart $ADMIN_SERVICE"; then
+    ADMIN_FAILED=1
+    echo "  $ADMIN_SERVICE failed to start (see its journal below)" >&2
+  fi
+}
+
+# The console's entry point exists in a release (one from before the console has none). Read-only.
+admin_in_release() { rsh "sudo test -f '$1/src/admin/index.ts'"; } # admin_in_release <absolute release dir>
 
 preflight() {
   log "Preflight"
@@ -266,10 +283,22 @@ if [ "$ROLLBACK" = 1 ]; then
   echo "  target: $TARGET"
   flip_to "$RELEASES_DIR/$TARGET"
   rrun "sudo systemctl restart $SERVICE"
-  if admin_installed; then rrun "sudo systemctl restart $ADMIN_SERVICE"; fi
+  # The console follows only when the target release has it; an older release predates it, so it is stopped (instead of
+  # crash-looping on a missing file). Its tables stay, like every migration.
+  ADMIN_ROLLBACK=none
+  if admin_installed; then
+    if admin_in_release "$RELEASES_DIR/$TARGET"; then
+      ADMIN_ROLLBACK=restart
+      admin_restart
+    else
+      ADMIN_ROLLBACK=stop
+      echo "  $TARGET has no staff console (src/admin): stopping $ADMIN_SERVICE"
+      rrun "sudo systemctl stop $ADMIN_SERVICE" || true
+    fi
+  fi
   [ "$DRY" = 1 ] && exit 0
   health_ok || { rsh "sudo journalctl -u $SERVICE -n 40 --no-pager" >&2 || true; die "STILL UNHEALTHY after rollback to $TARGET"; }
-  if admin_installed && ! admin_up 10; then
+  if [ "$ADMIN_ROLLBACK" = restart ] && { [ "$ADMIN_FAILED" = 1 ] || ! admin_up 10; }; then
     rsh "sudo journalctl -u $ADMIN_SERVICE -n 40 --no-pager" >&2 || true
     die "rolled back to $TARGET and the API is healthy, but $ADMIN_SERVICE is not answering (journal above)"
   fi
@@ -391,7 +420,7 @@ log "Switching to $STAMP"
 flip_to "$NEW"
 rrun "sudo systemctl enable $SERVICE >/dev/null 2>&1; sudo systemctl restart $SERVICE"
 
-if [ "$ADMIN" = 1 ]; then rrun "sudo systemctl enable $ADMIN_SERVICE >/dev/null 2>&1; sudo systemctl restart $ADMIN_SERVICE"; fi
+if [ "$ADMIN" = 1 ]; then admin_restart enable; fi
 
 if [ "$DRY" = 1 ]; then
   echo "  [dry-run] health check$([ "$ADMIN" = 1 ] && echo " (API, then $ADMIN_SERVICE)"), prune to $KEEP_RELEASES releases"
@@ -414,11 +443,10 @@ if ! health_ok 20; then
 fi
 
 # The console is a separate process: a failure here never rolls the API back (the release is already live and healthy),
-# but it fails the run at the end so it is not missed.
-ADMIN_FAILED=0
+# but it fails the run at the end so it is not missed (ADMIN_FAILED may already be set by a failed restart above).
 if [ "$ADMIN" = 1 ]; then
   log "Staff console check ($ADMIN_SERVICE on 127.0.0.1:8788)"
-  if ! admin_up 15; then
+  if [ "$ADMIN_FAILED" = 1 ] || ! admin_up 15; then
     ADMIN_FAILED=1
     echo "  $ADMIN_SERVICE is not answering" >&2
     rsh "sudo journalctl -u $ADMIN_SERVICE -n 40 --no-pager" >&2 || true
