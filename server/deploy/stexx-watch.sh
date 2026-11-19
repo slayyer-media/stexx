@@ -123,7 +123,7 @@ send_email() { # send_email <subject> <body>
     [ -z "$user" ] || echo "user = $(cq "$user:$pass")"
     # TLS is required, except for a relay on this machine.
     case "$host" in localhost|127.0.0.1|::1|'[::1]') ;; *) echo "ssl-reqd" ;; esac
-  } | curl -sS --max-time 30 -K - >/dev/null || rc=$?
+  } | curl --disable -sS --max-time 30 -K - >/dev/null || rc=$?
   rm -f "$msg"
   [ "$rc" = 0 ] || echo "stexx-watch: email alert failed (curl exit $rc)" >&2
   return "$rc"
@@ -143,7 +143,7 @@ send_webhook() { # send_webhook <title> <body>
     echo "header = $(cq "Tags: warning")"
     [ -z "$ALERT_WEBHOOK_TOKEN" ] || echo "header = $(cq "Authorization: Bearer $ALERT_WEBHOOK_TOKEN")"
     echo "data-binary = $(cq "@$msg")"
-  } | curl -sS -f --max-time 15 -o /dev/null -K - || rc=$?
+  } | curl --disable -sS -f --max-time 15 -o /dev/null -K - || rc=$?
   rm -f "$msg"
   [ "$rc" = 0 ] || echo "stexx-watch: webhook alert failed (curl exit $rc)" >&2
   return "$rc"
@@ -204,7 +204,7 @@ check_backup_age() {
 check_health() { # check_health <name> <url>
   [ -n "$2" ] || return 0
   local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$2" 2>/dev/null || true)"
+  code="$(curl --disable -sS -o /dev/null -w '%{http_code}' --max-time 10 "$2" 2>/dev/null || true)"
   code="${code:-000}"
   if [ "$code" = 204 ]; then result OK "$1" "HTTP 204"; else result FAIL "$1" "HTTP $code (expected 204)"; fi
 }
