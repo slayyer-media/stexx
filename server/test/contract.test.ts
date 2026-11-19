@@ -61,17 +61,15 @@ const Profile = z.strictObject({
   isFavorite: z.boolean(),
 });
 
-// struct Profile, own copy (GET/PATCH /me): `var travel: TravelStatus?` (struct TravelStatus { var isActive: Bool }).
-// Other people's profiles never carry `travel` (Profile is strict above).
-const OwnProfile = Profile.extend({ travel: swiftOptional(z.strictObject({ isActive: z.boolean() })) });
-
-// struct Message.Attachment { var kind: Kind; var url: URL?; var isViewOnce: Bool = false; var isEncrypted: Bool = false }
+// struct Message.Attachment { var kind: Kind; var url: URL?; var isViewOnce: Bool = false; var isEncrypted: Bool = false;
+// var openedAt: Date? }
 // (isEncrypted is decoded with decodeIfPresent, so older servers and the mock may omit it; this server always sends it.)
 const Attachment = z.strictObject({
   kind: z.enum(["photo"]),
   url: swiftOptional(SwiftURL),
   isViewOnce: z.boolean(),
   isEncrypted: z.boolean(),
+  openedAt: swiftOptional(SwiftDate),
 });
 
 // E2E envelope (docs/api.md "End-to-end encryption"). The Swift model doesn't decode it yet (iOS phase pending);
@@ -123,8 +121,20 @@ const PrivacySettings = z.strictObject({
   incognito: z.boolean(),
 });
 
-// struct SubscriptionStatus { var isActive: Bool; var expiresAt: Date? }
-const SubscriptionStatus = z.strictObject({ isActive: z.boolean(), expiresAt: swiftOptional(SwiftDate) });
+// struct Profile, own copy (GET/PATCH /me): `var travel: TravelStatus?` (struct TravelStatus { var isActive: Bool })
+// and `var privacy: PrivacySettings?`. Other people's profiles never carry either (Profile is strict above).
+const OwnProfile = Profile.extend({
+  travel: swiftOptional(z.strictObject({ isActive: z.boolean() })),
+  privacy: swiftOptional(PrivacySettings),
+});
+
+// struct SubscriptionStatus { var isActive: Bool; var expiresAt: Date?; var willRenew: Bool?; var boostEndsAt: Date? }
+const SubscriptionStatus = z.strictObject({
+  isActive: z.boolean(),
+  expiresAt: swiftOptional(SwiftDate),
+  willRenew: swiftOptional(z.boolean()),
+  boostEndsAt: swiftOptional(SwiftDate),
+});
 // struct Boost { var endsAt: Date }
 const Boost = z.strictObject({ endsAt: SwiftDate });
 // HTTPAPIClient.ErrorBody { code: String?; message: String? } (docs/api.md: both always present)
@@ -142,6 +152,7 @@ const ReadReceipt = z.strictObject({
 const TapPayload = z.strictObject({ from: Profile, sentAt: swiftOptional(SwiftDate) });
 const Event = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("message.created"), data: Message }),
+  z.strictObject({ type: z.literal("message.updated"), data: Message }),
   z.strictObject({ type: z.literal("message.read"), data: ReadReceipt }),
   z.strictObject({ type: z.literal("conversation.updated"), data: Conversation }),
   z.strictObject({ type: z.literal("tap.received"), data: TapPayload }),
@@ -265,6 +276,7 @@ describe("contract: REST responses match the Swift models", () => {
       expiringPhotosByDefault: false, blurExplicitPhotos: true, incognito: false,
     };
     expect(await body(await api.put("/v1/me/privacy", { json: privacy }), PrivacySettings, "PrivacySettings")).toEqual(privacy);
+    expect((await body(await api.get("/v1/me"), OwnProfile, "Profile(GET /me)")).privacy).toEqual(privacy);
     conforms(ErrorBody, await (await api.get("/v1/me/viewers")).json(), "Error(402)");
 
     const plus = await createUser({ location: home, plusDays: 5 });
@@ -316,7 +328,12 @@ describe("contract: REST responses match the Swift models", () => {
     sent.push(await body(await as(a).post(url, { json: { clientID: crypto.randomUUID().toUpperCase(), attachmentPhotoID: photo.id } }), Message, "Message(photo)"));
     sent.push(await body(await as(a).post(url, { json: { clientID: crypto.randomUUID().toUpperCase(), text: "poof", expiresAfterSeconds: 600 } }), Message, "Message(expiring)"));
     expect(sent[1]!.attachment).toMatchObject({ kind: "photo" });
+    // A view-once photo, opened by the recipient (POST .../open → Message).
+    sent.push(await body(await as(a).post(url, { json: { clientID: crypto.randomUUID().toUpperCase(), attachmentPhotoID: photo.id, isViewOnce: true } }), Message, "Message(view-once)"));
     expect(sent.every((m) => m.status === "sent" && m.clientID)).toBe(true);
+    const opened = await body(await as(b).post(`${url}/${sent[3]!.id}/open`), Message, "Message(opened)");
+    expect(opened.attachment?.isViewOnce).toBe(true);
+    expect(opened.attachment?.openedAt).toMatch(ISO_DATE);
     // POST /me/attachments: a Photo plus isEncrypted (Swift's Photo decoding ignores the extra key).
     await body(
       await as(a).post("/v1/me/attachments", { body: await makeJpeg(), contentType: "image/jpeg" }),
@@ -332,8 +349,9 @@ describe("contract: REST responses match the Swift models", () => {
 
     const convsB = await body(await as(b).get("/v1/conversations"), z.array(Conversation), "[Conversation]");
     const mine = convsB.find((c) => c.id === conv.id)!;
-    expect(mine.unreadCount).toBe(3);
-    expect(mine.lastMessage?.id).toBe(sent[2]!.id);
+    expect(mine.unreadCount).toBe(4);
+    expect(mine.lastMessage?.id).toBe(sent[3]!.id);
+    expect(mine.lastMessage?.attachment?.url).toBeNull(); // a view-once URL is never in the conversation list
 
     const res = await as(b).post(`/v1/conversations/${conv.id}/read`);
     expect(res.status).toBe(204);
@@ -348,13 +366,17 @@ describe("contract: REST responses match the Swift models", () => {
     expect(await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus")).toEqual({
       isActive: false,
       expiresAt: null,
+      willRenew: null,
+      boostEndsAt: null,
     });
     conforms(ErrorBody, await (await as(u).post("/v1/boosts")).json(), "Error(402)");
     // debugGrantPlus() posts an empty JSON object
     expect((await as(u).post("/v1/dev/plus", { json: {} })).ok).toBe(true);
     const st = await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus(active)");
     expect(st.isActive).toBe(true);
-    await body(await as(u).post("/v1/boosts"), Boost, "Boost");
+    const boost = await body(await as(u).post("/v1/boosts"), Boost, "Boost");
+    const boosted = await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus(boosted)");
+    expect(boosted.boostEndsAt).toBe(boost.endsAt);
   });
 
   test("safety: [Profile] blocks list", async () => {
@@ -367,7 +389,7 @@ describe("contract: REST responses match the Swift models", () => {
 });
 
 describe("contract: realtime frames match RealtimeEvent", () => {
-  test("message.created, conversation.updated, message.read and tap.received decode", async () => {
+  test("message.created, message.updated, conversation.updated, message.read and tap.received decode", async () => {
     const home = randomCell();
     const a = await createUser({ location: home });
     const b = await createUser({ location: near(home, 900) });
@@ -386,13 +408,30 @@ describe("contract: realtime frames match RealtimeEvent", () => {
       expect((await as(b).post(`/v1/conversations/${conv.id}/read`)).status).toBe(204);
       const read = await waitFor(la.frames, (f) => f.type === "message.read");
       expect(read.data).toMatchObject({ conversationID: conv.id, readerID: b.id, messageIDs: [msg.id] });
+      // A view-once photo opened by b: a (who gets b's receipts) is told with message.updated.
+      const photo = await body(await as(a).post("/v1/me/photos", { body: await makeJpeg(), contentType: "image/jpeg" }), Photo, "Photo", 201);
+      const once = await body(
+        await as(a).post(`/v1/conversations/${conv.id}/messages`, {
+          json: { clientID: crypto.randomUUID(), attachmentPhotoID: photo.id, isViewOnce: true },
+        }),
+        Message,
+        "Message(view-once)",
+      );
+      expect((await as(b).post(`/v1/conversations/${conv.id}/messages/${once.id}/open`)).status).toBe(200);
+      const updated = await waitFor(la.frames, (f) => f.type === "message.updated");
+      // (Plain checks: toMatchObject with asymmetric matchers would write the matchers into the frame.)
+      expect(updated.data.id).toBe(once.id);
+      expect(updated.data.attachment.url).toBeNull();
+      expect(updated.data.attachment.openedAt).toMatch(ISO_DATE);
       expect((await as(a).post(`/v1/profiles/${b.id}/tap`)).status).toBe(204);
       await waitFor(lb.frames, (f) => f.type === "tap.received");
       await Bun.sleep(50);
 
       const all = [...la.frames, ...lb.frames];
       const types = new Set(all.map((f: any) => f.type));
-      for (const t of ["message.created", "message.read", "conversation.updated", "tap.received"]) expect(types).toContain(t);
+      for (const t of ["message.created", "message.updated", "message.read", "conversation.updated", "tap.received"]) {
+        expect(types).toContain(t);
+      }
       for (const f of all) conforms(Event, f, `event(${(f as any).type})`);
       expect(JSON.stringify(all)).not.toMatch(/\d{2}:\d{2}:\d{2}\.\d+/);
     } finally {

@@ -9,11 +9,24 @@ final class AppState {
     private(set) var isAgeConfirmed: Bool
     private(set) var session: Session?
     /// Your own profile. Setting it also adopts the server's travel mode
-    /// state (`Profile.travel`): the server wins.
+    /// state (`Profile.travel`) and privacy settings (`Profile.privacy`):
+    /// the server wins.
     var me: Profile? = nil {
-        didSet { if let me { syncTravel(with: me.travel) } }
+        didSet {
+            guard let me else { return }
+            syncTravel(with: me.travel)
+            if let privacy = me.privacy { adoptServerPrivacy(privacy) }
+        }
     }
-    var privacy: PrivacySettings
+    /// Your privacy settings as the server applies them (`GET /me`), plus any
+    /// change being saved. Change them with `setPrivacy(_:to:)`. Until they
+    /// have loaded these are the defaults and the toggles are disabled, so
+    /// the screen never shows (or saves) values the server isn't using.
+    private(set) var privacy = PrivacySettings()
+    private(set) var privacyStatus: PrivacyStatus = .loading
+    /// Why the last change didn't save (it was rolled back). Cleared by the
+    /// next change.
+    private(set) var privacyError: String?
     /// Stexx+ entitlement. Set from the server (`GET /subscriptions/status`,
     /// 402 responses); StoreKit purchases only trigger a server re-check.
     /// Also dropped when `plusExpiresAt` passes while the app is open, or
@@ -22,6 +35,11 @@ final class AppState {
     /// already stopped applying.
     var hasPlus = false
     private(set) var plusExpiresAt: Date?
+    /// Auto-renew status of the current Stexx+ period (`nil`: unknown or
+    /// not active), for "renews on" / "ends on".
+    private(set) var plusWillRenew: Bool?
+    /// End of the running boost, so it survives a relaunch.
+    private(set) var boostEndsAt: Date?
     /// Profiles blocked during this session; hidden everywhere immediately,
     /// even before the server round-trip finishes.
     private(set) var blockedIDs: Set<Profile.ID> = []
@@ -35,6 +53,21 @@ final class AppState {
     /// reloads.
     private(set) var travelRevision = 0
 
+    /// Saves privacy settings on the server (`PUT /me/privacy`) and returns
+    /// what it stored. Set by the app.
+    @ObservationIgnored var savePrivacy: (@Sendable (PrivacySettings) async throws -> PrivacySettings)?
+    /// The user signed out on purpose: erase this account's end-to-end
+    /// encryption keys and decrypted chat history from the phone
+    /// (`E2EStatus.erase`). Not called when a session merely expires. Set by
+    /// the app.
+    @ObservationIgnored var eraseAccountData: ((Profile.ID) -> Void)?
+    /// What the server last confirmed (`GET /me` or a save); a failed save
+    /// rolls back to it.
+    @ObservationIgnored private var savedPrivacy = PrivacySettings()
+    @ObservationIgnored private var privacySave: Task<Void, Never>?
+    /// Bumped whenever the session ends: answers for the previous account
+    /// are dropped.
+    @ObservationIgnored private var accountGeneration = 0
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let sessionStore: any SessionStore
     @ObservationIgnored private let travelStore: any TravelPlaceStore
@@ -48,7 +81,9 @@ final class AppState {
 
     private enum Keys {
         static let ageConfirmed = "stexx.ageConfirmed"
-        static let privacy = "stexx.privacy"
+        /// Older versions kept the privacy toggles here (and treated them as
+        /// the truth). Removed on launch.
+        static let legacyPrivacy = "stexx.privacy"
     }
 
     init(
@@ -61,8 +96,7 @@ final class AppState {
         self.travelStore = travelStore
         self.isAgeConfirmed = defaults.bool(forKey: Keys.ageConfirmed)
         self.session = sessionStore.load()
-        self.privacy = defaults.data(forKey: Keys.privacy)
-            .flatMap { try? JSONDecoder().decode(PrivacySettings.self, from: $0) } ?? PrivacySettings()
+        defaults.removeObject(forKey: Keys.legacyPrivacy)
         self.travel = session == nil ? nil : travelStore.load()
     }
 
@@ -82,17 +116,21 @@ final class AppState {
         self.session = session
     }
 
-    /// Clears the session. `wipeLocalData` also forgets onboarding and
-    /// settings, used after account deletion. A plain sign-out also revokes
-    /// the session on the server.
+    /// The user signed out (or deleted the account, `wipeLocalData`). Clears
+    /// the session and erases the account's encryption keys and decrypted
+    /// chat history from this phone (`eraseAccountData`); signing back in
+    /// starts with new keys, and earlier encrypted messages show as not
+    /// available on this phone. `wipeLocalData` also forgets the 18+
+    /// confirmation. A plain sign-out also revokes the session on the server.
     func signOut(wipeLocalData: Bool = false) {
-        if !wipeLocalData, let session { revokeSession?(session) }
+        if let session {
+            if !wipeLocalData { revokeSession?(session) }
+            eraseAccountData?(session.userID)
+        }
         clearSession()
         if wipeLocalData {
             defaults.removeObject(forKey: Keys.ageConfirmed)
-            defaults.removeObject(forKey: Keys.privacy)
             isAgeConfirmed = false
-            privacy = PrivacySettings()
         }
     }
 
@@ -103,7 +141,8 @@ final class AppState {
     }
 
     /// The server rejected the refresh token: back to onboarding, keeping
-    /// the 18+ flag and settings.
+    /// the 18+ flag, and the encryption keys and history for when the same
+    /// account signs in again.
     func sessionDidExpire() {
         guard session != nil else { return }
         clearSession()
@@ -115,9 +154,19 @@ final class AppState {
         me = nil
         hasPlus = false
         setPlusExpiry(nil)
+        plusWillRenew = nil
+        boostEndsAt = nil
         blockedIDs = []
         // The place belongs to this account; the next one starts clean.
         setTravel(nil)
+        // So do the privacy settings: the next account loads its own.
+        accountGeneration += 1
+        privacySave?.cancel()
+        privacySave = nil
+        privacy = PrivacySettings()
+        savedPrivacy = PrivacySettings()
+        privacyStatus = .loading
+        privacyError = nil
     }
 
     // MARK: Stexx+
@@ -126,6 +175,8 @@ final class AppState {
     func applySubscription(_ status: SubscriptionStatus) {
         hasPlus = status.isActive
         setPlusExpiry(status.isActive ? status.expiresAt : nil)
+        plusWillRenew = status.isActive ? status.willRenew : nil
+        boostEndsAt = status.boostEndsAt
         // The server's travel `isActive` is the same entitlement check.
         if me?.travel != nil, me?.travel?.isActive != status.isActive {
             me?.travel?.isActive = status.isActive
@@ -133,11 +184,17 @@ final class AppState {
         if !status.isActive { dropPlusOnlySettings() }
     }
 
+    /// "Renews on" / "ends on" for the paywall; `nil` without Stexx+.
+    var plusRenewal: SubscriptionStatus.Renewal? {
+        SubscriptionStatus(isActive: hasPlus, expiresAt: plusExpiresAt, willRenew: plusWillRenew).renewal
+    }
+
     /// The server answered 402 `requires_plus`: the entitlement is gone (or
     /// never existed), so turn off Plus-only settings and show the paywall.
     func handleRequiresPlus() {
         hasPlus = false
         setPlusExpiry(nil)
+        plusWillRenew = nil
         dropPlusOnlySettings()
         isPaywallPresented = true
     }
@@ -177,8 +234,15 @@ final class AppState {
     }
 
     private func dropPlusOnlySettings() {
-        // Re-sending incognito without Plus would just 402 again.
-        if privacy.incognito { privacy.incognito = false }
+        // Re-sending incognito without Plus would just 402 again; the server
+        // accepts turning it off.
+        if privacy.incognito {
+            if privacyStatus == .loaded {
+                setPrivacy(\.incognito, to: false)
+            } else {
+                privacy.incognito = false
+            }
+        }
         // Travel mode is NOT dropped: the server keeps the cell and ignores
         // it while Stexx+ is off (`isTravelPaused`), and resumes it when
         // Stexx+ is back. The user can still turn it off for free.
@@ -224,12 +288,110 @@ final class AppState {
         }
     }
 
-    // MARK: Privacy
+    // MARK: Profile & privacy
 
-    func persistPrivacy() {
-        if let data = try? JSONEncoder().encode(privacy) {
-            defaults.set(data, forKey: Keys.privacy)
+    enum PrivacyStatus: Equatable, Sendable {
+        /// Not loaded from the server yet: toggles disabled.
+        case loading
+        case loaded
+        /// `GET /me` failed: toggles disabled, with a retry.
+        case unavailable
+    }
+
+    /// The privacy toggles can be changed (the server's values are known).
+    var isPrivacyEditable: Bool { privacyStatus == .loaded }
+
+    /// `GET /me`: your profile, travel mode and privacy settings. Run on
+    /// launch and sign-in (the main tabs), and to retry from Settings.
+    func loadMe(from api: any APIClient) async {
+        let generation = accountGeneration
+        if privacyStatus == .unavailable { privacyStatus = .loading }
+        do {
+            let profile = try await api.fetchMe()
+            guard generation == accountGeneration else { return }
+            me = profile
+            // A server without `privacy` on /me: nothing to show truthfully.
+            if profile.privacy == nil, privacyStatus == .loading { privacyStatus = .unavailable }
+        } catch {
+            guard generation == accountGeneration else { return }
+            if privacyStatus == .loading { privacyStatus = .unavailable }
         }
+    }
+
+    /// Adopts the server's settings, unless a change is being saved (its
+    /// answer is newer).
+    func adoptServerPrivacy(_ settings: PrivacySettings) {
+        guard privacySave == nil else { return }
+        savedPrivacy = settings
+        privacy = settings
+        privacyStatus = .loaded
+    }
+
+    /// Changes one privacy setting: shown at once, saved on the server, and
+    /// rolled back (with `privacyError`) if the save fails. Ignored until the
+    /// settings have loaded. Changes made while a save is running are sent
+    /// together right after it, so the server ends up with the last choice.
+    func setPrivacy(_ setting: WritableKeyPath<PrivacySettings, Bool>, to value: Bool) {
+        guard privacyStatus == .loaded, privacy[keyPath: setting] != value else { return }
+        privacy[keyPath: setting] = value
+        privacyError = nil
+        savePrivacyIfNeeded()
+    }
+
+    private func savePrivacyIfNeeded() {
+        guard privacySave == nil, privacy != savedPrivacy, let savePrivacy else { return }
+        let wanted = privacy
+        let generation = accountGeneration
+        privacySave = Task { [weak self] in
+            let result: Result<PrivacySettings, any Error>
+            do {
+                result = .success(try await savePrivacy(wanted))
+            } catch {
+                result = .failure(error)
+            }
+            self?.privacySaveFinished(result, wanted: wanted, generation: generation)
+        }
+    }
+
+    private func privacySaveFinished(_ result: Result<PrivacySettings, any Error>, wanted: PrivacySettings, generation: Int) {
+        // Signed out meanwhile: the next account's settings aren't touched.
+        guard generation == accountGeneration else { return }
+        privacySave = nil
+        switch result {
+        case .success(let saved):
+            savedPrivacy = saved
+            if privacy == wanted {
+                // The server may have adjusted it (incognito after Stexx+ lapsed).
+                privacy = saved
+            } else {
+                savePrivacyIfNeeded()
+            }
+        case .failure(let error):
+            privacy = savedPrivacy
+            if case APIError.requiresPlus = error {
+                // The paywall explains it; nothing else to say.
+                handleRequiresPlus()
+            } else {
+                privacyError = Self.privacySaveMessage(for: error)
+            }
+        }
+    }
+
+    /// Waits until no privacy save is running (tests).
+    func privacySavesFinished() async {
+        while let save = privacySave { await save.value }
+    }
+
+    /// The user saw the message.
+    func clearPrivacyError() {
+        privacyError = nil
+    }
+
+    static func privacySaveMessage(for error: any Error) -> String {
+        if let apiError = error as? APIError, case .rateLimited = apiError {
+            return apiError.localizedDescription
+        }
+        return String(localized: "Couldn't save that change, so it was switched back. Check your connection and try again.")
     }
 
     // MARK: Safety
@@ -258,6 +420,7 @@ extension AppState {
         let defaults = UserDefaults(suiteName: "stexx.preview") ?? .standard
         defaults.removePersistentDomain(forName: "stexx.preview")
         let state = AppState(defaults: defaults, sessionStore: InMemorySessionStore(), travelStore: InMemoryTravelPlaceStore())
+        state.savePrivacy = { try await MockAPIClient.shared.updatePrivacy($0) }
         if signedIn {
             state.confirmAge()
             state.signIn(MockData.session)

@@ -28,6 +28,7 @@ import { sql, type Sql } from "../db/sql.ts";
 import { banDevicesOfUser } from "./abuse/attestation.ts";
 import { deleteKeysOf } from "./e2e/keys.ts";
 import { trustState } from "./abuse/trust.ts";
+import { clearSpamLimit, confirmSpam, decisionDetails, includesSpamReport } from "./abuse/spam.ts";
 import { revokeAllSessions } from "./auth.ts";
 import { accountUnderReview, ApiError, notFound } from "./errors.ts";
 import { logInfo } from "./logger.ts";
@@ -43,7 +44,19 @@ export type ReportReason =
   | "illegalContent"
   | "other";
 export type HideReason = "reports" | "underage" | "moderator";
-export type ModerationActionKind = "auto_hide" | "hide" | "unhide" | "dismiss" | "action" | "ban" | "unban";
+export type ModerationActionKind =
+  | "auto_hide"
+  | "hide"
+  | "unhide"
+  | "dismiss"
+  | "action"
+  | "ban"
+  | "unban"
+  // Photo-flag decisions (lib/photocheck/review.ts, migration 114).
+  | "photo_clear"
+  | "photo_hide"
+  | "photo_blocklist"
+  | "photo_escalate";
 export const SYSTEM_ACTOR = "system";
 
 // ---- Settings ------------------------------------------------------------------------------------
@@ -218,7 +231,8 @@ export async function reporterFacts(userId: string, db: Sql = sql, now = new Dat
 
 // ---- Audit ---------------------------------------------------------------------------------------------
 
-async function audit(
+/** Write one moderation_actions row (call inside the action's transaction). */
+export async function audit(
   db: Sql,
   entry: {
     actor: string;
@@ -294,7 +308,7 @@ export async function assertMayStartContact(userId: string, otherId: string, db:
   const [row] = await db<{ ok: boolean }[]>`
     SELECT EXISTS (
       SELECT 1 FROM conversations c JOIN messages m ON m.conversation_id = c.id
-       WHERE m.sender_id = ${otherId}
+       WHERE m.sender_id = ${otherId} AND m.held_at IS NULL
          AND ((c.user_a = ${userId} AND c.user_b = ${otherId}) OR (c.user_b = ${userId} AND c.user_a = ${otherId}))
     ) AS ok`;
   if (!row?.ok) throw accountUnderReview();
@@ -309,7 +323,8 @@ export async function assertMayMessage(
 ): Promise<void> {
   if (!(await isUnderReview(userId, db))) return;
   const [row] = await db<{ ok: boolean }[]>`
-    SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ${conversationId} AND sender_id = ${otherId}) AS ok`;
+    SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ${conversationId} AND sender_id = ${otherId}
+                                           AND held_at IS NULL) AS ok`;
   if (!row?.ok) throw accountUnderReview();
 }
 
@@ -341,12 +356,12 @@ export interface ActionResult {
 export type AccountState = "visible" | "hidden" | "banned";
 
 const ACTOR_RE = /^[A-Za-z0-9._-]{1,64}$/;
-function checkActor(actor: string): void {
+export function checkActor(actor: string): void {
   if (!ACTOR_RE.test(actor) || actor === SYSTEM_ACTOR) {
     throw new ModerationError("Moderator handle must be 1-64 letters, digits, dot, dash or underscore (not 'system').");
   }
 }
-function checkNote(note: string | null | undefined): void {
+export function checkNote(note: string | null | undefined): void {
   if (note && note.length > 2000) throw new ModerationError("Note is limited to 2000 characters.");
 }
 
@@ -422,16 +437,20 @@ export function unhideAccount(input: ActionInput): Promise<ActionResult> {
 /**
  * The reports were unfounded. Without `reportId`: close every open report as dismissed and unhide the account.
  * With `reportId`: dismiss just that report and leave the account as it is.
+ * Either way, dismissing the system spam report (or everything) clears a spam shadow limit: the limit lifts and the
+ * held messages are delivered (lib/abuse/spam.ts).
  */
 export function dismissReports(input: ActionInput & { reportId?: string }): Promise<ActionResult> {
   return moderate(input, "dismiss", async (tx, state) => {
     const closedReports = await closeOpenReports(tx, input.userId, "dismissed", input.reportId);
     if (input.reportId) {
       if (closedReports.length === 0) throw new ModerationError(`No open report ${input.reportId} about this account.`);
-      return { closedReports };
+      const spam = (await includesSpamReport(tx, closedReports)) ? await clearSpamLimit(tx, input.userId, input.actor) : null;
+      return { closedReports, ...(spam ? { details: decisionDetails(spam) } : {}) };
     }
     if (state !== "banned") await clearHide(tx, input.userId);
-    return { closedReports };
+    const spam = state !== "banned" ? await clearSpamLimit(tx, input.userId, input.actor) : null;
+    return { closedReports, ...(spam ? { details: decisionDetails(spam) } : {}) };
   });
 }
 
@@ -444,7 +463,9 @@ export function actionReports(input: ActionInput & { unhide?: boolean }): Promis
     const closedReports = await closeOpenReports(tx, input.userId, "actioned");
     if (input.unhide && state !== "banned") await clearHide(tx, input.userId);
     else await tx`UPDATE users SET reviewed_at = now() WHERE id = ${input.userId}`;
-    return { closedReports, details: { unhide: Boolean(input.unhide) } };
+    // Spam confirmed: held messages are dropped; the shadow limit stays (until its cooldown) unless --unhide.
+    const spam = await confirmSpam(tx, input.userId, input.actor, "actioned", { lift: Boolean(input.unhide) });
+    return { closedReports, details: { unhide: Boolean(input.unhide), ...decisionDetails(spam) } };
   });
 }
 
@@ -464,7 +485,9 @@ export function banAccount(input: ActionInput): Promise<ActionResult> {
     // E2E keys (identity, signed and one-time prekeys) go too: nobody can start an encrypted session with a banned
     // account, and an unban means registering fresh keys.
     const e2eDevices = await deleteKeysOf(input.userId, tx);
-    return { closedReports, details: { devicesBanned: devices, e2eKeysDeleted: e2eDevices } };
+    // Held messages (spam shadow limit) are dropped, never delivered.
+    const spam = await confirmSpam(tx, input.userId, input.actor, "banned", { lift: true });
+    return { closedReports, details: { devicesBanned: devices, e2eKeysDeleted: e2eDevices, ...decisionDetails(spam) } };
   });
 }
 

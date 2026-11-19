@@ -30,6 +30,9 @@ struct E2EConfig: Codable, Hashable, Sendable {
         var noLinks: Bool
         var duplicateRecipients: Int
         var duplicateMinLength: Int
+        /// Refuse payment and crypto handles and off-platform redirects
+        /// (`content-rules.json`). Absent from older servers: then false.
+        var noHandles: Bool = false
 
         static let unrestricted = ContentRules(restricted: false, noLinks: false, duplicateRecipients: 3, duplicateMinLength: 16)
     }
@@ -158,4 +161,20 @@ enum E2EErrorCode {
         disabled, keysUnavailable, encryptionRequired, keysNotRegistered,
         prekeyLimit, invalidKey, invalidSignature, invalidEnvelope,
     ]
+}
+
+extension E2EConfig.ContentRules {
+    private enum CodingKeys: String, CodingKey {
+        case restricted, noLinks, duplicateRecipients, duplicateMinLength, noHandles
+    }
+
+    /// Tolerates servers that predate `noHandles`.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        restricted = try c.decode(Bool.self, forKey: .restricted)
+        noLinks = try c.decode(Bool.self, forKey: .noLinks)
+        duplicateRecipients = try c.decode(Int.self, forKey: .duplicateRecipients)
+        duplicateMinLength = try c.decode(Int.self, forKey: .duplicateMinLength)
+        noHandles = try c.decodeIfPresent(Bool.self, forKey: .noHandles) ?? false
+    }
 }

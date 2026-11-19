@@ -43,6 +43,120 @@ The `.xcodeproj` and generated `Info.plist` are git-ignored. Change
 Every screen has SwiftUI previews (`#Preview`) that inject mock dependencies
 via `.previewEnvironment()`.
 
+Debug builds also open single screens on a fresh mock backend for
+screenshots: `xcrun simctl launch booted gay.stexx.app -StexxScreenshotRoute <name>`
+with `chatList`, `tabs` (the Chats badge counts new taps), `taps`, `tapsEmpty`,
+`chatListError` (load failed, nothing cached), `chatListStale` (refresh
+failed, cached chats with a banner) or `chatListOffline` (chats and taps both
+failed, as on a cold launch with the server down); see `App/ScreenshotRoute.swift`.
+
+## Passkeys
+
+New accounts are created with a passkey (Face ID / Touch ID, kept in iCloud
+Keychain) or an email sign-in link; nothing else identifies the user. Returning
+users tap **I already have an account** on the welcome screen (after the 18+
+gate, which is per device) and sign in with their passkey or request a new
+email link.
+
+How it works (`Services/Passkeys.swift`, `Services/SystemPasskeyAuthenticator.swift`):
+
+1. `POST /v1/auth/passkey/register/options` (or `login/options`) returns
+   WebAuthn options from the server (SimpleWebAuthn JSON, binary fields in
+   base64url). `PasskeyWire` decodes them and refuses options for another
+   relying party than the build's (`STEXX_PASSKEY_RP_ID`).
+2. `SystemPasskeyAuthenticator` shows the system sheet with
+   `ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier:)`,
+   user verification required, no attestation.
+3. The attestation (or assertion) goes to `…/finish` as
+   `RegistrationResponseJSON` / `AuthenticationResponseJSON`, with the
+   device attestation headers like every sign-up and sign-in. The session is
+   stored like the email path's (Keychain, this device only).
+
+The system sheet sits behind the `PasskeyAuthenticating` protocol, so unit
+tests (`StexxTests/PasskeyTests.swift`) cover decoding, request building,
+payloads, error mapping and the flow with a fake. Closing the sheet is silent
+on sign-up; on sign-in it shows a hint (iOS reports "no passkey on this
+iPhone" the same way). An unknown passkey (server 401) says so instead of
+"session expired".
+
+**Where passkeys work.** iOS only creates or uses a passkey for a domain that
+lists the app in `https://<domain>/.well-known/apple-app-site-association`
+(`webcredentials`), and only if the app has the matching
+`com.apple.developer.associated-domains` entitlement. So:
+
+| Configuration | Entitlement | Passkeys |
+| --- | --- | --- |
+| `Debug` (mock API) | `webcredentials:stexx.gay`, `applinks:stexx.gay` | Simulated: no system sheet, `MockAPIClient` checks the payloads and signs in. |
+| `Local` (`http://127.0.0.1:8787`) | none (`Stexx/Entitlements/StexxLocal.entitlements`) | Unavailable: the buttons are disabled with an explanation. A dev server on 127.0.0.1 has no domain or AASA file, so sign in with email: the code the dev server prints, or its no-email shortcut (see [Email sign-in](#email-sign-in)). |
+| `Release` | `webcredentials:stexx.gay`, `applinks:stexx.gay` | Simulated while `STEXX_USE_MOCK_API` is still `YES` there. With the live API: real passkeys, once `stexx.gay` serves the AASA file (see [`../server/deploy/README.md`](../server/deploy/README.md), step 8) and the App ID has the Associated Domains capability (automatic signing adds it). |
+
+`PasskeyAvailability.resolve` decides at launch: available only when the API
+base URL is `https` on the relying party or a subdomain of it (so
+`-StexxAPIBaseURL` pointing at a local server also degrades). To try real
+passkeys from a development build on a device, point it at a server whose
+`WEBAUTHN_RP_ID` serves an AASA listing your team's App ID; Apple's CDN can
+take a while to pick up changes (`?mode=developer` on the entitlement skips
+it, with Developer Mode on).
+
+## Email sign-in
+
+For people who'd rather not use a passkey (`Services/EmailSignIn.swift`,
+`Features/Onboarding/CheckEmailView.swift`). The address is used for sign-in
+only, stored on the server as a keyed hash, and never shown.
+
+1. Sign-up (nickname + email) or sign-in (email) calls
+   `POST /v1/auth/email/link`. A sign-up also sends the nickname and the 18+
+   confirmation; the account only exists once the link or code comes back,
+   so an address nobody reads never gets one.
+2. The **check your email** screen explains what was sent. One email carries
+   both a link and an 8-digit code for the same sign-in (15 minutes, once):
+   - **The link** opens the app as a universal link
+     (`https://stexx.gay/auth/email?token=…`, `applinks:` associated domain,
+     `.onOpenURL` in `RootView`). `EmailLinkRedeemer` shows the 18+ gate first
+     on a new iPhone, never uses a link while someone is signed in (it says
+     so and leaves the link unused), and explains an expired link or an
+     address without an account in a sheet with a way forward. When a link
+     fails without being used up (offline, 429, email or server trouble) the
+     sheet offers **Try again**, and tapping the same link in Mail again works
+     too. Only `https` links on `STEXX_APP_LINK_HOST` count.
+   - **Bound to this install.** Every email is asked for with a random
+     request nonce (`EmailRequestNonceStore`, in the Keychain, this device
+     only, reused for an hour after its last email and cleared on sign-in).
+     The code only works with it. A link this install didn't ask for (someone
+     can send you a link to their own account) gets `409 confirm_link`, and
+     the app asks **sign in as *nickname*?** (or **create the account
+     *nickname*?**) before using it; nothing is signed in, and location and
+     realtime stay off, until you say yes.
+   - **The code** is typed (or AutoFilled from Mail) on that screen and sent
+     to `POST /v1/auth/email/code` with the nonce, on its own once all 8
+     digits are in (if a resend is in flight then, as soon as it finishes).
+     It covers the link being read on a
+     computer or another phone, and mail apps that open links in their own
+     browser. Opened without the app, the link shows a static page from the
+     server saying exactly that.
+3. "Send another email" waits 60 s between emails, and follows the server's
+   `Retry-After` on a 429 with a live countdown ("Send another email in
+   4:05"). The server allows 3 emails per address per device in 15 minutes.
+
+Errors become plain sentences (`EmailSignInProblem`): wrong code, expired
+link, no account yet, mail down, offline, rate limited (emails), too many
+code tries.
+
+| Configuration | What happens |
+| --- | --- |
+| `Debug` (mock API) | Faked: every email "contains" code **12345678**; the mock's links work once and anything else is expired; a link asked for with another nonce asks "sign in as …?" first; 3 emails per address per 15 min, then a countdown. |
+| `Local` | The real flow against your dev server, which prints each link and code (`[dev-mail] sign-in link: … code: …`) instead of mailing it. Links can't open the app here (no associated domain), so type the code. A small **Dev server: sign up without the email** button uses the dev server's `POST /auth/register` shortcut (Debug builds against a dev server only; production refuses it). |
+| `Release` | Real email, once the server has `SMTP_URL`. Links open the app once `stexx.gay` serves the AASA file (`server/deploy/README.md`, step 8); until then they open the server's explanation page and the code still works. |
+
+Debug builds take `-StexxOpenURL <url>` to open a link at launch, as a tap in
+Mail would (for screenshots and checks in the simulator, which can't verify
+the real domain): e.g.
+`-StexxOpenURL "https://stexx.gay/auth/email?token=expired-example-token"`.
+
+Tests: `StexxTests/EmailSignInTests.swift` (wire format, error mapping, the
+send/resend/code state machine with a test clock, link handling, the mock)
+and `EmailSignInLinkTests.swift` (URL parsing).
+
 ## End-to-end encryption
 
 Chat text and photos are end-to-end encrypted with the Signal Protocol (PQXDH, then the
@@ -82,7 +196,10 @@ Stexx/E2E/
   E2ESecretStorage.swift   Keychain items (this device only, not synced) / in-memory for tests
   E2EProtocolStore.swift   libsignal's identity, prekey, signed, Kyber and session stores over it
   E2EHistoryStore.swift    Decrypted text, kept in an AES-GCM sealed file (key in the Keychain)
-  E2EContentRules.swift    Port of the server's link and duplicate-text rules
+  E2EContentRules.swift    Port of the server's link and duplicate-text rules; payment/crypto/redirect handle rules
+                           read from content-rules.json
+  content-rules.json       Byte-identical copy of server/src/lib/abuse/content-rules.json (patterns + test vectors).
+                           Edit the server file and copy it here; server/test/spam-content.test.ts fails if they differ
   E2EEngine.swift          Keys (register, top up, rotate), PQXDH, encrypt/decrypt, identity holds
   E2EAPIClient.swift       APIClient wrapper: encrypts sends, decrypts conversations and messages
   E2EStatus.swift          Main-actor state for the UI; realtime identity.changed / keys.low
@@ -145,8 +262,9 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   when it marks the chat read. The history is pruned on load, on foreground and
   (at most once a minute) while messages are revealed, and the decrypted images
   of dropped keys leave memory too. A view-once photo's key is
-  dropped when the viewer closes (`forgetAttachmentKey`), and the bubble shows
-  "Opened". The viewer downloads and decrypts on tap, never earlier.
+  dropped as soon as the server confirms the open, and again when the viewer
+  closes (`forgetAttachmentKey`), and the bubble shows "Opened". The viewer
+  downloads and decrypts on tap, never earlier (see View-once photos below).
 - **Payload timer.** Sent photos with a timer put `expiresAfterSeconds` (integer
   seconds) in the encrypted payload, because the server doesn't tell the
   recipient the timer. The recipient uses it only when it is 1 to 2592000 and
@@ -157,10 +275,35 @@ Format and server contract: [`../docs/api.md`](../docs/api.md#encrypted-photos).
   `attachment_limit` stops further uploads (those items keep `hasPhoto: true`
   without a `photoID`). If the report fails with not-found, the sheet forgets the
   IDs and the next attempt uploads afresh.
-- **Known limitations.** A decrypted photo on screen can show up in iOS's
-  app-switcher snapshot (plaintext photos already can); a privacy cover is a
-  follow-up. The app never sends view-once photos; see docs/security.md for the
-  open-on-list rule that affects ones from other clients.
+- **View-once photos** (encrypted and plaintext). Listing a thread never opens
+  one. Tapping the "View once · Tap to open" tile opens `ViewOnceViewer`,
+  which downloads (and decrypts) the photo into memory only. Once it is on
+  screen (unblurred; a blurred one counts when the user taps to see it), or
+  turned out unreadable, `ChatStore.openViewOnce` calls
+  `POST …/messages/{id}/open`; the server deletes the photo about 30 s later.
+  An encrypted photo's key goes as soon as the server answers
+  (`E2EAPIClient.openViewOnce`), and on close in any case. `ChatStore` records
+  the open before the call, in `UserDefaults` (message IDs and dates only,
+  wiped at sign-out and after 15 days), so a photo opened here is never shown
+  again on this phone, and a failed open (offline, an error, the app killed)
+  is retried on the next resync or list load, also after a relaunch. Both
+  sides then show "Opened": the recipient always, the sender when
+  `attachment.openedAt` arrives (only if the recipient sends read receipts;
+  live via `message.updated`). The attachment menu has a **View once** toggle
+  (exclusive with **Expiring photos**) to send one. Never-opened photos go
+  after the server's 3-day cap.
+- **App-switcher cover.** `PrivacyCover` puts a separate window with the logo
+  over the whole app when the scene deactivates or goes to the background, so
+  the app switcher (live card and saved snapshot) shows no grid, chats or
+  photos. On by default; **Settings › Privacy › Hide Stexx in the app
+  switcher** turns it off (`UserDefaults`, this phone only). iOS can't say why
+  the app went inactive, so Notification Center, Control Center and system
+  alerts get the cover too; prompts the app starts itself (location
+  permission, the purchase sheet) call `expectSystemPrompt()` first and don't
+  flash it, but the background always does. The exemption is single-use and
+  `endSystemPrompt()` drops it when the purchase call returns; while such a
+  prompt is up, the switcher's live card isn't covered (no new scene event),
+  only the saved snapshot. The photo picker doesn't deactivate the app.
 - **Moderation hook.** Incoming decrypted photos go through
   `ChatPhotoAnalyzer` (`ChatPhotoModeration`). The real analyzer is Apple's
   Sensitive Content Analysis, which needs the
@@ -203,6 +346,20 @@ xcrun simctl launch booted gay.stexx.app \
 ```
 
 `-StexxAPIBaseURL` overrides the base URL in Debug and Local builds only.
+More debug-only screenshot switches: `-StexxScreenshotSendPhoto viewOnce`
+(liveChat: sends a generated test photo as view-once), `-StexxScreenshotViewOnce
+open|openAndClose` (liveChat: opens the newest incoming view-once photo, as a
+tap would), `-StexxShowPrivacyCover YES` (keeps the app-switcher cover up, since
+the real app switcher can't be captured with `simctl`), and
+`-StexxScreenshotRoute settings`. Pair with `e2e-peer.ts read --open` to open
+the app's view-once photo from the other side.
+
+Settings has two screenshot routes: `-StexxScreenshotRoute settings` (mock
+backend) and `liveSettings` (a dev server, with `-StexxDevSession` like
+`liveChat`). `-StexxScreenshotAction hideDistance|export|signOut|delete`
+does that once the settings have loaded; with the mock,
+`-StexxMockMeDelay <seconds>` holds `GET /me` (the loading state) and
+`-StexxMockFailPrivacy YES` fails `PUT /me/privacy` (the rollback).
 
 ## Travel mode (Stexx+)
 
@@ -236,6 +393,71 @@ own position, and won't pick while zoomed out past ~60 km.
 
 Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
 signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.
+
+## Error handling
+
+A failed request never looks like it worked, and the app never fills a gap
+with sample data.
+
+- **Wording.** `UserFacingError.message(for:failedAction:)`
+  (`DesignSystem/ErrorToast.swift`) turns an error into one sentence: 429 says
+  how long to wait from `Retry-After` ("Try again in 10 min."), 402 /
+  `requires_plus` points at Stexx+, a 403 (`account_under_review`, anti-spam
+  limits) shows the server's own message, offline or unreachable asks to check
+  the connection, a 404 gets a neutral "That no longer exists." (profile
+  screens say "This profile is no longer available." themselves), and
+  anything else gets a generic "Try again". Pass
+  `failedAction` ("Couldn't send the tap.") to lead the offline and generic
+  cases. It returns `nil` for cancellations, which should stay silent.
+- **Toast.** `.errorToast($message)` shows a small black-glass banner at the
+  top of a screen for errors that don't need a decision (a tap, a favorite, a
+  failed save). VoiceOver announces it; it has a Dismiss button and the escape
+  gesture, and goes away after 6 s unless VoiceOver is running. Set the binding
+  to `nil` to hide it.
+- **Alerts** are for failures that need a decision or are about safety. A
+  failed block shows "Couldn't block …" with Retry, and the profile stays on
+  screen: it's only hidden once the server confirms the block.
+- **Optimistic UI is undone on failure.** A failed favorite puts the star
+  back; a failed tap re-enables the button. `Features/Nearby/ProfileActions.swift`
+  holds these paths so they're unit tested.
+- **Loading your own profile.** The You tab shows a skeleton until `fetchMe`
+  answers and an error with Retry if it fails. Edit stays disabled until the
+  real profile has loaded, so sample data can never be saved over an account.
+  Once the profile loads (including after Retry) the Stexx+ entitlement is
+  re-checked too, so a subscriber who launched offline isn't left showing as
+  free. `MockData` is for previews, tests and the Debug (mock) scheme only.
+- **Unsaved edits.** Edit profile is a sheet. With unsaved changes, or a photo
+  still uploading, swipe-down is disabled (SwiftUI doesn't report the refused
+  swipe, so it can't prompt) and Cancel asks "Discard changes?"; Save waits for
+  uploads. A failed save keeps the sheet open with the error in a toast. Photos
+  go to the server as soon as they're picked, so discarding deletes this edit's
+  uploads, including one that lands after the sheet closed. If the details save
+  but the photo changes don't, the details count as saved from then on (the You
+  tab shows them) and the toast says "Your details were saved, but your photo
+  changes weren't." The filter sheet is the exception: a filter
+  draft is cheap, so Cancel and swipe-down both discard it without asking.
+- **Trying failures in the mock.** `MockAPIClient.inject(_:for:)` makes one
+  endpoint fail or hang in tests. In Debug builds the same works from a launch
+  argument, e.g. `-StexxMockFail "fetchMe=offline,sendTap=429,block=offline"`
+  (values: `offline`, `429`, `402`, `403`, `500`, `hang`). Combine it with the
+  screenshot routes `-StexxScreenshotRoute me` (the You tab before your profile
+  has loaded), `profile` or `filters`.
+
+The mock routes `paywall` and `paywallPlus` (Debug build) open the app with the
+Stexx+ paywall up, for a free user and for a subscriber whose mock
+subscription renews:
+`xcrun simctl launch booted gay.stexx.app -StexxScreenshotRoute paywallPlus`.
+
+## Stexx+ paywall
+
+The paywall shows the plan, the price and links to the Terms of Use and
+Privacy Policy (`Models/LegalLinks.swift`, which also has the community
+guidelines URL). Subscribers instead see "Stexx+ renews on <date>" or "Stexx+
+ends on <date>" (from `willRenew` in `GET /subscriptions/status`; "is active
+until" while the server doesn't know yet) and a **Manage subscription** button
+that opens StoreKit's manage-subscriptions sheet; the status is fetched again
+when the sheet closes. `GET /subscriptions/status` also returns `boostEndsAt`,
+kept in `AppState.boostEndsAt` so a running boost survives a relaunch.
 
 ## Nearby states
 
@@ -286,6 +508,8 @@ Build settings in `project.yml` are exposed through `Info.plist`:
 | --- | --- | --- |
 | `STEXX_API_BASE_URL` | `https://api.stexx.gay` | Backend base URL (`/v1` is appended) |
 | `STEXX_USE_MOCK_API` | `YES` | `YES` uses `MockAPIClient`; `NO` uses `HTTPAPIClient` |
+| `STEXX_PASSKEY_RP_ID` | `stexx.gay` (`Local`: empty) | Passkey relying party: the `webcredentials:` associated domain and `StexxPasskeyRelyingParty` (see [Passkeys](#passkeys)) |
+| `STEXX_APP_LINK_HOST` | `stexx.gay` | Host of the server's `APP_LINK_BASE`: the `applinks:` associated domain that opens email sign-in links in the app (`Local` has no associated domains), and `StexxAppLinkHost` in `Info.plist`: the only host whose `https` links the app treats as sign-in links |
 
 Build configurations:
 
@@ -295,7 +519,7 @@ Build configurations:
 | `Local` (scheme **Stexx Local**) | `http://127.0.0.1:8787` | Run `../server` in dev mode. ATS allows plain HTTP to local hosts only in this configuration. Purchases use `StoreKit/Stexx.storekit`; see [`STOREKIT-LOCAL.md`](STOREKIT-LOCAL.md). Sends the `dev-bypass` attestation header, which only a dev server accepts. |
 | `Release` | As configured | ATS is not relaxed. App Attest uses the production environment. |
 
-Device attestation (App Attest with a DeviceCheck fallback) is described in [`../docs/security.md`](../docs/security.md). `xcodegen` writes the App Attest entitlement to `Stexx/Stexx.entitlements` (generated, git-ignored).
+Device attestation (App Attest with a DeviceCheck fallback) is described in [`../docs/security.md`](../docs/security.md). Entitlements are committed in `Stexx/Entitlements/`: `Stexx.entitlements` (App Attest + the `webcredentials` and `applinks` associated domains) for Debug and Release, `StexxLocal.entitlements` (App Attest only) for Local. Keep the two in sync.
 
 The API contract lives in [`../docs/api.md`](../docs/api.md).
 
@@ -312,12 +536,13 @@ ios/
 │   ├── Networking/             APIClient protocol, HTTP client, mock client & data, Keychain session store
 │   ├── E2E/                    Signal Protocol client (see "End-to-end encryption")
 │   ├── Features/
-│   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up
+│   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up, sign-in (passkey or email link)
 │   │   ├── Nearby/             Grid and its states (first run, location off, errors), filters, profile detail
 │   │   ├── Chat/               Conversation list and thread (key-change banner, encrypted placeholders)
+│   │   ├── Taps/               Received taps inbox (opened from the Taps row in Chats)
 │   │   ├── Me/                 Own profile, edit profile, settings
 │   │   ├── Safety/             Block/report UI, blocked list
-│   │   └── Paywall/            Stexx+ placeholder
+│   │   └── Paywall/            Stexx+ paywall (StoreKit 2, renewal date, Manage subscription, legal links)
 │   └── Resources/              Asset catalog (AppIcon, StexxMark SVG, colors)
 ├── Packages/LibSignalFfi/      Binary target for Signal's prebuilt libsignal XCFramework
 └── StexxTests/                 Unit tests (Swift Testing)
@@ -350,16 +575,40 @@ ios/
 - The session token is kept in the Keychain (`ThisDeviceOnly`, never synced).
 - End-to-end encryption keys and sessions live in the Keychain the same way
   (`gay.stexx.app.e2e`); decrypted chat text is kept only in an encrypted,
-  backup-excluded file on the phone. Deleting the account removes both.
+  backup-excluded file on the phone. Signing out and deleting the account
+  both remove them (`E2EEngine.erase`); signing back in on the same phone
+  starts a new identity, so chat partners see the key-change warning and
+  earlier messages, and any sent while signed out (the server keeps the old
+  public keys; deleting them would make peers fall back to plaintext), show
+  "not available on this phone". A session that just
+  expires keeps them for the same account. The sign-out dialog says this.
+- Privacy settings come from the server: `GET /me` carries `privacy`, and
+  `AppState` keeps the toggles disabled (with a "Loading" label, or a retry
+  if it failed) until it has them. Each change is shown at once, sent with
+  `PUT /me/privacy`, and switched back with a "Couldn't save" alert if that
+  fails (a 402 for incognito opens the paywall instead). Nothing is cached in
+  UserDefaults any more; older versions' copy (`stexx.privacy`) is deleted on
+  launch.
+- Settings › Privacy › **Download my data** fetches `GET /me/export` and
+  hands it to the share sheet as `stexx-data-<date>.json`, written to its
+  own folder under the temporary directory with complete file protection and
+  deleted when the sheet closes (leftovers go on the next launch).
+- The delete-account dialog says what deletion means: data is gone from the
+  servers at once and from the encrypted backups within 28 days, reports and
+  moderation records stay without a link to you, and Stexx+ has to be
+  cancelled in the App Store (the dialog offers "Manage Stexx+ subscription").
 
 ## Not done yet
 
-- Real passkey auth (`AuthenticationServices`, associated domain
-  `webcredentials:stexx.gay`); email links are handled in the API layer and
-  via `onOpenURL`, but there's no "sign in" screen yet
-- Push notifications
+- Passkeys against the live server haven't run on a device yet: that needs
+  `stexx.gay` serving the apple-app-site-association file and a signed build
+  (the simulator has no real domain to associate with)
+- Email links open the app (universal links through `applinks:stexx.gay`,
+  Debug and Release) only once `stexx.gay` serves the AASA file; until then
+  they open the server's explanation page and the 8-digit code does the job.
+  A real open from Mail hasn't been tried on a device yet
+- Push notifications (taps and messages reach an offline user only through the lists when they next open the app)
 - Discreet alternate app icons, localization
-- Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)
 - End-to-end encryption for chat photos (they're still sent as plain
   attachments), the safety-number comparison screen, and multi-device
 - A run of the E2E client on a physical iPhone (Keychain classes, App Attest

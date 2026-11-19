@@ -55,12 +55,23 @@ final class E2EStatus {
         Task { await engine.pruneHistory() }
     }
 
+    /// The session ended. Keys and history stay for the same account unless
+    /// the user signed out on purpose (`erase(userID:)`).
     func signedOut() {
         apply(E2ESnapshot())
         // Decrypted photos are memory only; none survive the account.
         Task { await ChatMediaLoader.shared.clear() }
         guard let engine else { return }
         Task { await engine.signedOut() }
+    }
+
+    /// The user signed out: erase the account's encryption keys and decrypted
+    /// history from this phone (see `E2EEngine.erase`).
+    func erase(userID: Profile.ID) {
+        apply(E2ESnapshot())
+        Task { await ChatMediaLoader.shared.clear() }
+        guard let engine else { return }
+        Task { await engine.erase(userID: userID) }
     }
 
     /// A view-once photo was closed (or found spent): drop its key.

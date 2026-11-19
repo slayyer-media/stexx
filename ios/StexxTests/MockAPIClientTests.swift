@@ -92,13 +92,13 @@ struct AppStateTests {
         let state = makeState()
         state.confirmAge()
         state.signIn(MockData.session)
-        state.privacy.hideDistance = true
-        state.persistPrivacy()
+        state.adoptServerPrivacy(PrivacySettings(hideDistance: true))
 
         state.signOut(wipeLocalData: true)
         #expect(!state.isSignedIn)
         #expect(!state.isAgeConfirmed)
         #expect(state.privacy == PrivacySettings())
+        #expect(state.privacyStatus == .loading)
     }
 
     @Test("Plus-gated actions open the paywall without Plus")

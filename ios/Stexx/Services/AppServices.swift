@@ -84,8 +84,8 @@ final class AppServices {
         }
         var location: LocationService? = LocationService(api: api)
         #if DEBUG
-        // Screenshot route on a live server: no location prompt over the chat.
-        if ScreenshotRoute.current == .liveChat { location = nil }
+        // Screenshot routes on a live server: no location prompt over the screen.
+        if ScreenshotRoute.current?.isLive == true { location = nil }
         // Forced Nearby states say what the location is themselves.
         if NearbyDebugScenario.current != nil { location = nil }
         #endif

@@ -9,13 +9,23 @@ import { config } from "../config.ts";
  */
 
 let silent = config.isTest && process.env.STEXX_TEST_LOGS !== "1";
+let sink: ((line: string) => void) | null = null;
 
 /** Tests silence logs by default; set STEXX_TEST_LOGS=1 to see them. */
 export function setLogSilent(value: boolean) {
   silent = value;
 }
 
+/** Tests: receive every log line (JSON text) instead of stdout, even while silent. `null` restores stdout. */
+export function setLogSinkForTests(fn: ((line: string) => void) | null) {
+  sink = fn;
+}
+
 function write(line: Record<string, unknown>) {
+  if (sink) {
+    sink(JSON.stringify({ t: new Date().toISOString(), ...line }));
+    return;
+  }
   if (silent) return;
   console.log(JSON.stringify({ t: new Date().toISOString(), ...line }));
 }
@@ -25,17 +35,90 @@ export function logInfo(event: string, fields: Record<string, string | number | 
   write({ level: "info", event, ...fields });
 }
 
-/** Errors: name/message/code/stack only, never request data or SQL parameters/detail. */
+/** Longest error message kept in a log line (after redaction). */
+export const MAX_LOGGED_MESSAGE = 200;
+
+const QUOTES = ['"', "'", "`", "\u201c", "\u2018"] as const;
+const CLOSING: Record<string, string> = { "\u201c": "\u201d", "\u2018": "\u2019" };
+const EMAIL_RE = /[^\s"'`<>()[\]{},;:]*@[^\s"'`<>()[\]{},;]+/g;
+/** Base64/base64url/hex-ish runs: tokens, keys, storage names, hashes. */
+const TOKEN_RE = /[A-Za-z0-9+/=_-]{20,}/g;
+/** Decimals with 3+ fractional digits (coordinates), then any run of 7+ digits (phone numbers, ids, amounts). */
+const DECIMAL_RE = /\d+[.,]\d{3,}/g;
+const LONG_NUMBER_RE = /\d{7,}/g;
+/**
+ * Digit groups joined by one or two separators (space, dot, dash, slash, parentheses), optionally led by "+": phone
+ * numbers like "+1 555 123 4567" or "(555) 123-4567", and dates like "1990-01-31". Redacted when the groups hold
+ * 7+ digits in all, so short pairs ("port 5432", "v1.2") stay.
+ */
+const DIGIT_GROUPS_RE = /\+?\(?\d+\)?(?:[ .\/-]{1,2}\(?\d+\)?)+/g;
+
+/**
+ * Strip quoted spans. A quoted span runs from the first opening quote to the LAST matching closing quote, so a
+ * value that itself contains the quote character can't leak its tail; an unmatched opening quote redacts to the
+ * end. An apostrophe between two letters ("couldn't") is not an opening quote.
+ */
+function stripQuoted(text: string): string {
+  let s = text;
+  for (const open of QUOTES) {
+    const close = CLOSING[open] ?? open;
+    let start = -1;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] !== open) continue;
+      if (open === "'" && /\p{L}/u.test(s[i - 1] ?? "") && /\p{L}/u.test(s[i + 1] ?? "")) continue;
+      start = i;
+      break;
+    }
+    if (start < 0) continue;
+    const end = s.lastIndexOf(close);
+    s = end > start ? `${s.slice(0, start)}${open}?${close}${s.slice(end + 1)}` : `${s.slice(0, start)}${open}?`;
+  }
+  return s;
+}
+
+/**
+ * An error message that is safe to log: Postgres and system errors can echo user input
+ * (`invalid input syntax for type uuid: "<value>"`, a file path, an address). Removes quoted literals, emails,
+ * long tokens, coordinates, numbers longer than 6 digits and digit groups of 7+ digits in all (phone numbers,
+ * dates), collapses whitespace and truncates to
+ * MAX_LOGGED_MESSAGE characters. The error class and the Postgres `code`/`routine` are logged as separate fields by
+ * logError (they never contain input).
+ */
+export function redactMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
+  let s = stripQuoted(raw);
+  s = s.replace(EMAIL_RE, "<email>");
+  s = s.replace(TOKEN_RE, (m) => (/\d/.test(m) || m.length >= 32 ? "<token>" : m));
+  s = s.replace(DIGIT_GROUPS_RE, (m) => ((m.match(/\d/g)?.length ?? 0) >= 7 ? "#" : m));
+  s = s.replace(DECIMAL_RE, "#").replace(LONG_NUMBER_RE, "#");
+  s = s.replace(/\s+/g, " ").trim();
+  return s.length > MAX_LOGGED_MESSAGE ? `${s.slice(0, MAX_LOGGED_MESSAGE - 1)}\u2026` : s;
+}
+
+/** The stack without its first line(s) (which repeat the raw message): only the `at ...` frames. */
+function framesOnly(stack: string | undefined): string | undefined {
+  if (!stack) return undefined;
+  const frames = stack.split("\n").filter((l) => /^\s+at /.test(l));
+  return frames.length ? frames.join("\n") : undefined;
+}
+
+/**
+ * Errors: class, redacted message (redactMessage), Postgres `code`/`routine`, and outside production the stack
+ * frames. Never request data, SQL parameters or the Postgres `detail`/`where` fields.
+ */
 export function logError(event: string, err: unknown) {
   const e = err instanceof Error ? err : new Error(String(err));
   const code = (e as { code?: unknown }).code;
+  const routine = (e as { routine?: unknown }).routine;
+  const stack = config.isProduction ? undefined : framesOnly(e.stack);
   write({
     level: "error",
     event,
     error: e.name,
-    message: e.message,
+    message: redactMessage(e),
     ...(typeof code === "string" ? { code } : {}),
-    ...(config.isProduction ? {} : { stack: e.stack }),
+    ...(typeof routine === "string" ? { routine } : {}),
+    ...(stack ? { stack } : {}),
   });
 }
 
