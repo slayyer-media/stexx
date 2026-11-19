@@ -175,6 +175,9 @@ struct ChatThreadView: View {
                 draft = text
                 send()
             }
+            if ScreenshotRoute.current == .liveChat, conversation != nil {
+                await runViewOnceScreenshotHooks()
+            }
             #endif
         }
         .task(id: conversation?.id) {
@@ -435,6 +438,31 @@ struct ChatThreadView: View {
         if target.attachment?.isEncrypted == true, target.e2eAttachment == nil { return }
         viewOnceMessage = target
     }
+
+    #if DEBUG
+    /// Screenshot-only (`ScreenshotRoute`): send a generated view-once photo,
+    /// or open the newest incoming one the way a tap would.
+    private func runViewOnceScreenshotHooks() async {
+        if ScreenshotRoute.sendsViewOncePhoto, let conversation, let jpeg = ScreenshotRoute.samplePhotoJPEG() {
+            sendsViewOnce = true
+            expiresPhotos = false
+            var pending = Message.pending(from: MessageDraft(clientID: UUID().uuidString), conversationID: conversation.id, senderID: appState.myID)
+            pending.attachment = Message.Attachment(kind: .photo, url: nil, isViewOnce: true)
+            messages.append(pending)
+            deliverPhoto(jpeg, clientID: pending.clientID ?? pending.id, pendingID: pending.id, in: conversation)
+        }
+        guard let action = ScreenshotRoute.viewOnceAction,
+              let target = messages.last(where: { $0.senderID != appState.myID && $0.attachment?.isViewOnce == true })
+        else { return }
+        await openViewOnce(target)
+        guard action == .openAndClose else { return }
+        for _ in 0..<50 where !chatStore.hasOpenedViewOnce(target.id) {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        try? await Task.sleep(for: .seconds(1))
+        viewOnceMessage = nil
+    }
+    #endif
 
     /// The viewer shows the photo: it's opened. The server is told (and
     /// deletes it shortly); for an encrypted photo the key goes as soon as

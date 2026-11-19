@@ -1,5 +1,6 @@
 #if DEBUG
 import SwiftUI
+import UIKit
 
 /// Debug/screenshot-only (the whole file is compiled out of Release).
 /// `-StexxScreenshotRoute <name>` skips onboarding (mock session) and opens a
@@ -11,9 +12,14 @@ import SwiftUI
 /// arguments are parsed as property lists; kept in memory only, never
 /// written to the Keychain), `-StexxScreenshotPeer <profileID>` and
 /// `-stexx.ageConfirmed YES`; `-StexxScreenshotDraft <text>` sends that text
-/// once the thread has loaded. See `ios/README.md`.
+/// once the thread has loaded. `-StexxScreenshotSendPhoto viewOnce` sends a
+/// generated test photo as view-once (through the normal photo path, so
+/// encrypted when the chat is). `-StexxScreenshotViewOnce open` opens the
+/// newest incoming view-once photo in the viewer (`openAndClose` closes it
+/// again once it counts as opened). `-StexxShowPrivacyCover YES` keeps the
+/// app-switcher cover up (`PrivacyCover`). See `ios/README.md`.
 enum ScreenshotRoute: String {
-    case profile, chat, reportFromChat, reportPicker, reportSent, liveChat
+    case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, settings
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -24,6 +30,32 @@ enum ScreenshotRoute: String {
 
     static var peerID: Profile.ID? { UserDefaults.standard.string(forKey: "StexxScreenshotPeer") }
     static var draft: String? { UserDefaults.standard.string(forKey: "StexxScreenshotDraft") }
+    /// `viewOnce`: send a generated photo as view-once once the thread loads.
+    static var sendsViewOncePhoto: Bool { UserDefaults.standard.string(forKey: "StexxScreenshotSendPhoto") == "viewOnce" }
+
+    enum ViewOnceAction: String {
+        case open, openAndClose
+    }
+
+    static var viewOnceAction: ViewOnceAction? {
+        UserDefaults.standard.string(forKey: "StexxScreenshotViewOnce").flatMap(ViewOnceAction.init)
+    }
+
+    /// A harmless generated test photo (no real image).
+    static func samplePhotoJPEG() -> Data? {
+        let size = CGSize(width: 900, height: 1200)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: size, format: format).image { context in
+            let colors = [UIColor(red: 0.29, green: 0.18, blue: 0.62, alpha: 1).cgColor,
+                          UIColor(red: 0.07, green: 0.55, blue: 0.68, alpha: 1).cgColor] as CFArray
+            let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0, 1])!
+            context.cgContext.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: size.width, y: size.height), options: [])
+            UIColor.white.withAlphaComponent(0.85).setFill()
+            context.cgContext.fillEllipse(in: CGRect(x: 250, y: 360, width: 400, height: 400))
+        }
+        return image.jpegData(compressionQuality: 0.85)
+    }
 
     /// A dev-server session for `liveChat`.
     static var devSession: Session? {
@@ -46,6 +78,8 @@ struct ScreenshotRouteView: View {
                 ProfileDetailView(profile: profile)
             case .liveChat:
                 LiveChatRoute()
+            case .settings:
+                SettingsView()
             default:
                 ChatThreadView(route: ChatRoute(participant: profile))
             }
