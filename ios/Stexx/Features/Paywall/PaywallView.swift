@@ -298,15 +298,14 @@ extension PaywallView {
     /// Terms of Use and Privacy Policy, opened in the browser.
     fileprivate var legalLinks: some View {
         HStack(spacing: Theme.Spacing.s) {
-            Link("Terms of Use", destination: LegalLinks.terms)
+            Link(destination: LegalLinks.terms) { Text("Terms of Use").underline() }
             Text(verbatim: "·")
                 .foregroundStyle(Theme.slate)
                 .accessibilityHidden(true)
-            Link("Privacy Policy", destination: LegalLinks.privacy)
+            Link(destination: LegalLinks.privacy) { Text("Privacy Policy").underline() }
         }
         .font(.caption.weight(.medium))
         .tint(Theme.steel)
-        .underline()
     }
 }
 
