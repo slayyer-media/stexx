@@ -328,6 +328,55 @@ own position, and won't pick while zoomed out past ~60 km.
 Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
 signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.
 
+## Error handling
+
+A failed request never looks like it worked, and the app never fills a gap
+with sample data.
+
+- **Wording.** `UserFacingError.message(for:failedAction:)`
+  (`DesignSystem/ErrorToast.swift`) turns an error into one sentence: 429 says
+  how long to wait from `Retry-After` ("Try again in 10 min."), 402 /
+  `requires_plus` points at Stexx+, a 403 (`account_under_review`, anti-spam
+  limits) shows the server's own message, offline or unreachable asks to check
+  the connection, a 404 gets a neutral "That no longer exists." (profile
+  screens say "This profile is no longer available." themselves), and
+  anything else gets a generic "Try again". Pass
+  `failedAction` ("Couldn't send the tap.") to lead the offline and generic
+  cases. It returns `nil` for cancellations, which should stay silent.
+- **Toast.** `.errorToast($message)` shows a small black-glass banner at the
+  top of a screen for errors that don't need a decision (a tap, a favorite, a
+  failed save). VoiceOver announces it; it has a Dismiss button and the escape
+  gesture, and goes away after 6 s unless VoiceOver is running. Set the binding
+  to `nil` to hide it.
+- **Alerts** are for failures that need a decision or are about safety. A
+  failed block shows "Couldn't block …" with Retry, and the profile stays on
+  screen: it's only hidden once the server confirms the block.
+- **Optimistic UI is undone on failure.** A failed favorite puts the star
+  back; a failed tap re-enables the button. `Features/Nearby/ProfileActions.swift`
+  holds these paths so they're unit tested.
+- **Loading your own profile.** The You tab shows a skeleton until `fetchMe`
+  answers and an error with Retry if it fails. Edit stays disabled until the
+  real profile has loaded, so sample data can never be saved over an account.
+  Once the profile loads (including after Retry) the Stexx+ entitlement is
+  re-checked too, so a subscriber who launched offline isn't left showing as
+  free. `MockData` is for previews, tests and the Debug (mock) scheme only.
+- **Unsaved edits.** Edit profile is a sheet. With unsaved changes, or a photo
+  still uploading, swipe-down is disabled (SwiftUI doesn't report the refused
+  swipe, so it can't prompt) and Cancel asks "Discard changes?"; Save waits for
+  uploads. A failed save keeps the sheet open with the error in a toast. Photos
+  go to the server as soon as they're picked, so discarding deletes this edit's
+  uploads, including one that lands after the sheet closed. If the details save
+  but the photo changes don't, the details count as saved from then on (the You
+  tab shows them) and the toast says "Your details were saved, but your photo
+  changes weren't." The filter sheet is the exception: a filter
+  draft is cheap, so Cancel and swipe-down both discard it without asking.
+- **Trying failures in the mock.** `MockAPIClient.inject(_:for:)` makes one
+  endpoint fail or hang in tests. In Debug builds the same works from a launch
+  argument, e.g. `-StexxMockFail "fetchMe=offline,sendTap=429,block=offline"`
+  (values: `offline`, `429`, `402`, `403`, `500`, `hang`). Combine it with the
+  screenshot routes `-StexxScreenshotRoute me` (the You tab before your profile
+  has loaded), `profile` or `filters`.
+
 ## Configuration
 
 Build settings in `project.yml` are exposed through `Info.plist`:
