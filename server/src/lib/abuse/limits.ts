@@ -370,7 +370,8 @@ export interface AccountCounter {
 
 /**
  * The abuse-limit counters stored about an account (GET /me/export): the ones keyed by the account itself
- * (`userId`, or `targetId` for fetches of its prekeys). Left out on purpose:
+ * (`userId`, or `targetId` for fetches of its prekeys), looked up by the same keyed hash tryAbuseLimits stores. Left out
+ * on purpose:
  * - counters keyed by an attested device: they count every account that uses that app install, so on a shared
  *   phone they would tell one account how active another is (docs/security.md "Data export");
  * - counters keyed by an IP or network hash, which are not linked to any account (only the keyed hash is stored);
@@ -380,7 +381,7 @@ export async function accountCounters(userId: string): Promise<AccountCounter[]>
   const wanted = new Map<string, AbuseLimitName>();
   for (const steps of Object.values(PLAN)) {
     for (const [name, field] of steps) {
-      if (field === "userId" || field === "targetId") wanted.set(`${name}:${userId}`, name);
+      if (field === "userId" || field === "targetId") wanted.set(`${name}:${abuseKeyHash(userId)}`, name);
     }
   }
   const rows = await store.snapshot([...wanted.keys()]);
