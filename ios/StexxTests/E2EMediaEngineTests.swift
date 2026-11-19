@@ -864,6 +864,9 @@ extension ChatMediaLoaderTests {
         let loader = ChatMediaLoader(session: EndlessURLProtocol.session())
         let outcome = await loader.photo(messageID: "endless", url: URL(string: "https://\(host)/blob.bin")!, pointer: pointer)
         #expect(outcome == .tampered)
+        // URLSession calls stopLoading on its own queue after the cancel, which
+        // can land just after the loader returns, so give it a moment.
+        for _ in 0..<100 where !EndlessURLProtocol.wasStopped(host) { try await Task.sleep(for: .milliseconds(20)) }
         #expect(EndlessURLProtocol.wasStopped(host))
         #expect(EndlessURLProtocol.sentBytes(host) < EndlessURLProtocol.cap)
     }
