@@ -172,7 +172,7 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `MAX_ACCOUNTS_PER_DEVICE` | `1` | |
 | `TRUST_RAMP_*`, `RATE_LIMIT_*` | see security.md | New-account limits and sliding-window rate limits. |
 | `REPORT_*` | see security.md | Auto-hide thresholds (`REPORT_AUTOHIDE_THRESHOLD` 3, window 14 days, underage 1 trusted / 2 any) and evidence retention (30 days after closing, 180 max). |
-| `BANNED_RETENTION_DAYS` | `30` | 1..3650. Review/appeal window after a ban; then the slow job purges the account like `DELETE /me`, keeping only its email HMAC and device bans ([security.md section 5](../docs/security.md#banned-accounts-review-window-and-purge)). Bans that predate migration 123 count the window from its deploy, so the first run purges nothing. Owner decision. |
+| `BANNED_RETENTION_DAYS` | `30` | 1..3650. Review/appeal window after a ban; then the slow job purges the account like `DELETE /me`, keeping only its email HMAC and device bans ([security.md section 5](../docs/security.md#banned-accounts-review-window-and-purge)). Bans that predate migration 123 count the window from its deploy, so the first run purges nothing. |
 | `SPAM_HEURISTICS_ENABLED` | `1` | Spam heuristics on messages and shadow limits ([security.md section 8](../docs/security.md#8-spam-heuristics-on-messages-shadow-limits)). `0` stops new limits and content features; existing limits run their course. |
 | `SPAM_WINDOW_HOURS` | `24` | Window for fan-out, first-contact rate, duplicate text, links and handles. |
 | `SPAM_FANOUT_MIN`, `SPAM_FANOUT_MAX_REPLY_RATE` | `20`, `0.1` | `fan_out_no_replies` (weight 3): conversations started in the window, and the reply rate at or under which it fires. |

@@ -74,7 +74,7 @@ We don't sell or rent your data, and we don't share it with advertisers or data 
 
 [Owner: international transfers, e.g. "Our server is in [country]. When data goes outside the EU/UK we rely on [adequacy decisions / standard contractual clauses]."]
 
-Moderators are people on the Stexx team. They review reports with a tool on our server; they see the reported profile, the reports, and any messages and photos a reporter shared, never the rest of a chat and never anyone's location. We will disclose data to authorities only when the law requires it [owner: describe the process].
+Moderators are people on the Stexx team. They review reports with a tool on our server; they see the reported profile, the reports, and any messages and photos a reporter shared, never the rest of a chat and never anyone's location. We disclose data to authorities only when the law requires it, in answer to a valid legal request that names a specific account. We hand over only what the request covers and what we still hold (we can't read encrypted messages and keep no location history), and we tell the person affected unless the law forbids it.
 
 ## How long we keep it
 

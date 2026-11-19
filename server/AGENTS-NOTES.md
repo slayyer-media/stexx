@@ -210,6 +210,7 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   message keeps `delivered_at` (don't null it: the sender's status must look normal).
   `handles.ts` loads the shared pattern table `content-rules.json` (copy it to `ios/Stexx/E2E/` after editing).
   Tests: `overrideSpamForTests`.
+
 ### moderator-alerts.ts (docs/security.md §5 "Alerts"; migration 114)
 - Off unless `MODERATOR_ALERT_EMAIL` (+ `SMTP_URL`) or `MODERATOR_ALERT_WEBHOOK_URL`. `runModeratorAlerts({now?, profileIds?})`
   (jobs, every minute): per channel, a lease in `moderator_alert_channels`, debounce `MODERATOR_ALERT_INTERVAL_MINUTES`,

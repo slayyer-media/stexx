@@ -39,7 +39,7 @@ Stexx helps you find people nearby; it doesn't check who they are. We don't run 
 - **Cancelling.** Manage or cancel your subscription in your iPhone's Settings → [your name] → Subscriptions, or in the App Store. Cancelling stops the next renewal; you keep Stexx+ until the end of the period you paid for. Deleting your Stexx account does **not** cancel the subscription.
 - **Refunds.** Refunds are handled by Apple under its policies (reportaproblem.apple.com). We can't issue refunds ourselves. If Apple refunds a purchase, Stexx+ ends.
 - **Price changes.** If the price goes up, Apple will tell you and, where required, ask for your consent before the next renewal.
-- **Banned accounts** lose access to Stexx+. [Owner: say whether any refund applies.]
+- **Banned accounts** lose access to Stexx+. We don't refund the rest of a subscription period after a ban. Stexx+ is bought through the App Store, so any refund request goes to Apple under its own policy.
 
 ## 7. The software is open source
 

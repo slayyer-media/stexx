@@ -94,7 +94,7 @@ const envSchema = z.object({
   REPORT_REPORTER_MIN_AGE_HOURS: z.coerce.number().min(0).max(24 * 365).optional(),
   REPORT_EVIDENCE_RETENTION_DAYS: z.coerce.number().min(1).max(365).default(30),
   REPORT_EVIDENCE_MAX_DAYS: z.coerce.number().min(1).max(3650).default(180),
-  /** Days a banned account is kept intact (appeal/review window) before the retention job purges it. Owner decision. */
+  /** Days a banned account is kept intact (appeal/review window) before the retention job purges it. */
   BANNED_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
 
   // Spam heuristics on messages, shadow limits pending review (src/lib/abuse/spam.ts, docs/security.md section 8).

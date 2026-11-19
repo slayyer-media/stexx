@@ -230,7 +230,7 @@ All in `ios/project.yml` (owned by the passkeys task right now) and the server e
 ## Follow-ups found while writing this
 
 - `docs/security.md`: "Privacy" says "No hardware identifiers", which is true, but should say plainly that the App Attest key id is a per-install identifier kept after account deletion (90 idle days, indefinitely if banned); "Not done yet" should list the sandbox-purchase gap.
-- The in-app delete dialog (`SettingsView.swift`, the "Delete your account?" message) says "location history", which doesn't exist (one current cell only), and doesn't mention that encrypted backups keep data up to 28 days.
+- The in-app delete dialog (`SettingsView.swift`, the "Delete your account?" message) now matches this: it mentions the approximate location (there is no location history), says encrypted backups keep data up to 28 days, and says deleting doesn't cancel Stexx+.
 - The data export (`GET /v1/me/export`) has no button in the app yet; the privacy policy draft tells people to ask support until it does.
 - Banned accounts are kept with no time limit (to stop re-registration); decide on a retention period and say it in the privacy policy.
 - Taps are kept until account deletion; consider a retention limit like profile views.
