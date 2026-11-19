@@ -1,9 +1,10 @@
 /**
  * Email sign-in end to end: the one-time code that travels with every link (POST /auth/email/code), its
- * brute-force limits, and the production sign-up path (no dev shortcut).
+ * brute-force limits, the binding of each email to the app install that asked for it (request nonce: codes only
+ * work there, and a link opened anywhere else asks first), and the production sign-up path (no dev shortcut).
  */
 import { describe, expect, test } from "bun:test";
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { config } from "../src/config.ts";
 import { emailCodeHash, emailHmac, hashToken } from "../src/lib/auth.ts";
 import { lastDevLinkFor, signInMailText } from "../src/lib/mailer.ts";
@@ -15,15 +16,27 @@ const email = () => `code-${uniq()}@example.com`;
 const name = () => `C${uniq()}`.slice(0, 30);
 const signUp = () => ({ displayName: name(), confirmedAdult: true });
 
-async function requestLink(address: string, extra: Record<string, unknown> = {}) {
-  await expectNoContent(await post("/v1/auth/email/link", { json: { email: address, ...extra } }));
+/** A fresh app install's request nonce (the app sends 32 random bytes, base64url). */
+const newNonce = () => randomBytes(32).toString("base64url");
+/** The install most tests play: it asks for the emails and types the codes. */
+const APP = newNonce();
+
+async function requestLink(address: string, extra: Record<string, unknown> = {}, nonce: string | null = APP) {
+  const json = { email: address, ...extra, ...(nonce ? { requestNonce: nonce } : {}) };
+  await expectNoContent(await post("/v1/auth/email/link", { json }));
   const mail = lastDevLinkFor(address);
   expect(mail).toBeDefined();
   return mail!;
 }
 
-const withCode = (address: string, code: string, ip?: string) =>
-  post("/v1/auth/email/code", { json: { email: address, code }, ...(ip ? { ip } : {}) });
+const withCode = (address: string, code: string, opts: { ip?: string; nonce?: string } = {}) =>
+  post("/v1/auth/email/code", {
+    json: { email: address, code, requestNonce: opts.nonce ?? APP },
+    ...(opts.ip ? { ip: opts.ip } : {}),
+  });
+
+const verify = (token: string, extra: Record<string, unknown> = {}) =>
+  post("/v1/auth/email/verify", { json: { token, ...extra } });
 
 /** A code that is certainly not `code` (same length). */
 const otherCode = (code: string) => ((Number(code) + 1) % 10 ** EMAIL_CODE_DIGITS).toString().padStart(EMAIL_CODE_DIGITS, "0");
@@ -120,13 +133,12 @@ describe("one-time code with every sign-in link", () => {
     await expectError(await withCode(addr, mail.code), 400, "invalid_code");
   });
 
-  test(`brute force: ${EMAIL_CODE_MAX_ATTEMPTS} wrong codes kill every live code of the address, but not the links`, async () => {
+  test(`brute force: ${EMAIL_CODE_MAX_ATTEMPTS} wrong codes kill every live code this install asked for, but not the links`, async () => {
     const addr = email();
     const a = await requestLink(addr, signUp());
     const b = await requestLink(addr, signUp());
     let guess = a.code;
     for (let i = 0; i < EMAIL_CODE_MAX_ATTEMPTS; i++) {
-      // each from a fresh client: the per-client limit doesn't protect the address, the strikes do
       do guess = otherCode(guess);
       while (guess === a.code || guess === b.code);
       await expectError(await withCode(addr, guess), 400, "invalid_code");
@@ -152,17 +164,63 @@ describe("one-time code with every sign-in link", () => {
     expect(row!.code_attempts).toBe(0);
   });
 
-  test("per-address cap across all clients: the 11th attempt within the hour is 429 with Retry-After", async () => {
+  test("lockout regression: a stranger's wrong codes never use up or lock the owner's code", async () => {
+    const addr = email();
+    const owner = await requestLink(addr, signUp());
+    // A stranger who knows the address hammers it from many clients and installs: far past the strike limit and
+    // past any one client's cap.
+    for (let i = 0; i < 3 * EMAIL_CODE_MAX_ATTEMPTS; i++) {
+      await expectError(
+        await withCode(addr, otherCode(owner.code), { ip: `198.18.7.${i + 1}`, nonce: newNonce() }),
+        400,
+        "invalid_code",
+      );
+    }
+    // The stranger also asks for an email of their own and burns its code: only that row takes the strikes.
+    const stranger = newNonce();
+    const theirs = await requestLink(addr, signUp(), stranger);
+    for (let i = 0; i < EMAIL_CODE_MAX_ATTEMPTS; i++) {
+      await expectError(await withCode(addr, otherCode(owner.code), { ip: "198.18.8.1", nonce: stranger }), 400, "invalid_code");
+    }
+    const [mine] = await sql`SELECT code_attempts, code_hash FROM email_link_tokens WHERE token_hash = ${hashToken(owner.token)}`;
+    expect(mine!.code_attempts).toBe(0);
+    expect(mine!.code_hash).not.toBeNull();
+    const [their] = await sql`SELECT code_attempts, code_hash FROM email_link_tokens WHERE token_hash = ${hashToken(theirs.token)}`;
+    expect(their!.code_attempts).toBe(EMAIL_CODE_MAX_ATTEMPTS);
+    expect(their!.code_hash).toBeNull();
+    // The owner, in the app that asked, still gets in with the code.
+    await expectJson(await withCode(addr, owner.code, { ip: "198.18.9.1" }), 200);
+  });
+
+  test("a code only works in the app install that asked for its email (request nonce)", async () => {
+    const addr = email();
+    const mail = await requestLink(addr, signUp());
+    // The right code from any other install is just a wrong code, and it costs the asking install nothing.
+    await expectError(await withCode(addr, mail.code, { nonce: newNonce() }), 400, "invalid_code");
+    const [row] = await sql`SELECT code_attempts, used_at FROM email_link_tokens WHERE token_hash = ${hashToken(mail.token)}`;
+    expect(row!.code_attempts).toBe(0);
+    expect(row!.used_at).toBeNull();
+    await expectJson(await withCode(addr, mail.code), 200);
+
+    // An email asked for without a nonce has a code nobody can use (its link still works).
+    const bare = await requestLink(email(), signUp(), null);
+    const [stored] = await sql`SELECT request_nonce_hash FROM email_link_tokens WHERE token_hash = ${hashToken(bare.token)}`;
+    expect(stored!.request_nonce_hash).toBeNull();
+  });
+
+  test("per (address, client) cap: the 11th attempt from one client within the hour is 429; other clients aren't held up", async () => {
     const addr = email();
     const mail = await requestLink(addr, signUp());
     // Burn the strikes on a code that no longer exists, so the cap (not the strikes) is what refuses.
     await sql`UPDATE email_link_tokens SET code_hash = NULL WHERE token_hash = ${hashToken(mail.token)}`;
-    for (let i = 0; i < 10; i++) {
-      await expectError(await withCode(addr, otherCode(mail.code), `198.18.${i}.${(Math.random() * 250) | 0}`), 400, "invalid_code");
-    }
-    const res = await withCode(addr, mail.code, "198.18.200.1");
+    const ip = `198.18.${(Math.random() * 250) | 0}.${(Math.random() * 250) | 0}`;
+    for (let i = 0; i < 10; i++) await expectError(await withCode(addr, otherCode(mail.code), { ip }), 400, "invalid_code");
+    const res = await withCode(addr, mail.code, { ip });
     await expectError(res, 429);
     expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
+    // The owner on another connection isn't locked out by that client's guesses.
+    const fresh = await requestLink(addr, signUp());
+    await expectJson(await withCode(addr, fresh.code, { ip: "198.18.250.250" }), 200);
   });
 
   test("concurrent use of one code: exactly one wins", async () => {
@@ -189,8 +247,104 @@ describe("one-time code with every sign-in link", () => {
     await expectError(await withCode(addr, "123456789"), 400, "validation_error");
     await expectError(await withCode(addr, "1234 5678"), 400, "validation_error");
     await expectError(await withCode("nope", "12345678"), 400, "validation_error");
-    await expectError(await post("/v1/auth/email/code", { json: { email: addr, code: "12345678", extra: 1 } }), 400);
+    await expectError(await post("/v1/auth/email/code", { json: { email: addr, code: "12345678", requestNonce: APP, extra: 1 } }), 400);
     await expectError(await post("/v1/auth/email/code", { json: {} }), 400);
+    // the request nonce is required, and well formed
+    await expectError(await post("/v1/auth/email/code", { json: { email: addr, code: "12345678" } }), 400, "validation_error");
+    await expectError(await withCode(addr, "12345678", { nonce: "short" }), 400, "validation_error");
+    await expectError(await withCode(addr, "12345678", { nonce: "not base64url!!!!!!!!!!!" }), 400, "validation_error");
+  });
+});
+
+describe("links are bound to the app install that asked for them (login CSRF)", () => {
+  test("the asking install's nonce: the link signs in at once, and the nonce is stored only as a hash", async () => {
+    const addr = email();
+    const mail = await requestLink(addr, signUp());
+    const [row] = await sql`SELECT request_nonce_hash FROM email_link_tokens WHERE token_hash = ${hashToken(mail.token)}`;
+    expect(Buffer.from(row!.request_nonce_hash).equals(hashToken(APP))).toBe(true);
+    const session = await expectJson(await verify(mail.token, { requestNonce: APP }), 200);
+    expect(session.userID).toMatch(/^p_/);
+  });
+
+  test("someone else's sign-in link: 409 confirm_link names the account, uses nothing, and works once confirmed", async () => {
+    const addr = email();
+    const reg = signUp();
+    const owner = await expectJson(await withCode(addr, (await requestLink(addr, reg)).code), 200);
+    // The attacker's own link, sent to a signed-out phone whose app has a different nonce (or none pending).
+    const mail = await requestLink(addr, {}, newNonce());
+    const res = await verify(mail.token, { requestNonce: APP });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toEqual({
+      code: "confirm_link",
+      message: expect.stringContaining(reg.displayName),
+      account: "existing",
+      displayName: reg.displayName,
+    });
+    const [row] = await sql`SELECT used_at, code_hash FROM email_link_tokens WHERE token_hash = ${hashToken(mail.token)}`;
+    expect(row!.used_at).toBeNull();
+    expect(row!.code_hash).not.toBeNull();
+    // Asking again without confirming still asks.
+    await expectError(await verify(mail.token, { requestNonce: APP }), 409, "confirm_link");
+    // The person said yes.
+    const session = await expectJson(await verify(mail.token, { requestNonce: APP, confirmed: true }), 200);
+    expect(session.userID).toBe(owner.userID);
+    await expectError(await verify(mail.token, { requestNonce: APP, confirmed: true }), 400, "invalid_link");
+  });
+
+  test("someone else's sign-up link: 409 says a new account would be created, and nothing is created until confirmed", async () => {
+    const addr = email();
+    const reg = signUp();
+    const mail = await requestLink(addr, reg, newNonce());
+    await expectError(await verify(mail.token, { requestNonce: APP }), 409, "confirm_link");
+    const body = (await expectError(await verify(mail.token, { requestNonce: APP }), 409, "confirm_link")) as unknown as {
+      account: string;
+      displayName: string;
+    };
+    expect(body.account).toBe("new");
+    expect(body.displayName).toBe(reg.displayName);
+    expect((await sql`SELECT 1 FROM users WHERE email_hmac = ${emailHmac(addr)}`).length).toBe(0);
+    const session = await expectJson(await verify(mail.token, { requestNonce: APP, confirmed: true }), 200);
+    const [user] = await sql`SELECT display_name FROM users WHERE id = ${session.userID}`;
+    expect(user!.display_name).toBe(reg.displayName);
+  });
+
+  test("a link asked for without a nonce asks too", async () => {
+    const addr = email();
+    const mail = await requestLink(addr, signUp(), null);
+    await expectError(await verify(mail.token, { requestNonce: APP }), 409, "confirm_link");
+    await expectJson(await verify(mail.token, { requestNonce: APP, confirmed: true }), 200);
+  });
+
+  test("used, expired or unknown links say invalid_link (never whose account), and no account says so", async () => {
+    const addr = email();
+    const mail = await requestLink(addr, signUp(), newNonce());
+    await sql`UPDATE email_link_tokens SET expires_at = now() - interval '1 second' WHERE token_hash = ${hashToken(mail.token)}`;
+    await expectError(await verify(mail.token, { requestNonce: APP }), 400, "invalid_link");
+    await expectError(await verify(randomBytes(32).toString("base64url"), { requestNonce: APP }), 400, "invalid_link");
+    const noAccount = await requestLink(email(), {}, newNonce());
+    await expectError(await verify(noAccount.token, { requestNonce: APP }), 400, "registration_required");
+  });
+
+  test("concurrent use of one link by the asking install: exactly one wins", async () => {
+    const addr = email();
+    const mail = await requestLink(addr, signUp());
+    const results = await Promise.all(Array.from({ length: 5 }, () => verify(mail.token, { requestNonce: APP })));
+    expect(results.filter((r) => r.status === 200).length).toBe(1);
+    for (const r of results) if (r.status !== 200) expect(r.status).toBe(400);
+  });
+
+  test("validation: confirmed is true or absent, and the nonce is well formed", async () => {
+    const mail = await requestLink(email(), signUp());
+    await expectError(await verify(mail.token, { requestNonce: APP, confirmed: false }), 400, "validation_error");
+    await expectError(await verify(mail.token, { requestNonce: "short" }), 400, "validation_error");
+    await expectError(
+      await post("/v1/auth/email/link", { json: { email: email(), requestNonce: "has spaces in it, not base64url" } }),
+      400,
+      "validation_error",
+    );
+    // still unused after all that
+    await expectJson(await verify(mail.token, { requestNonce: APP }), 200);
   });
 });
 

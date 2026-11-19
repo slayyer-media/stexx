@@ -33,9 +33,9 @@ export const LIMITS = {
    */
   emailLinkAddress: { capacity: 8, windowMs: 15 * MINUTE },
   /**
-   * One-time code attempts per address across ALL clients (POST /auth/email/code). With 8-digit codes, at most 5
-   * wrong guesses per live code (the code then stops working) and this cap, guessing stays hopeless. A stranger
-   * can use it up to block code entry for an address for a while; the emailed link still works.
+   * One-time code attempts per (address, client) (POST /auth/email/code). Keyed on the client too, so a stranger
+   * guessing at an address can't use up the owner's attempts. A code only works in the app install that asked for
+   * its email and takes at most 5 wrong guesses (routes/auth.ts), so guessing stays hopeless across clients.
    */
   emailCode: { capacity: 10, windowMs: HOUR },
   messages: { capacity: 60, windowMs: MINUTE },
