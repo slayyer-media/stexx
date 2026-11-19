@@ -43,6 +43,44 @@ The `.xcodeproj` and generated `Info.plist` are git-ignored. Change
 Every screen has SwiftUI previews (`#Preview`) that inject mock dependencies
 via `.previewEnvironment()`.
 
+## Chat
+
+- **History.** A thread opens on its newest 50 messages
+  (`GET …/messages`). Scrolling near the top loads the page before
+  (`before` = the oldest message shown), and the message you were reading
+  stays where it was (`ThreadHistory`). Only a scroll you make starts that,
+  never the first layout; the "Earlier messages" button at the top does the
+  same for VoiceOver and Switch Control, and turns into Retry if a page
+  fails. Loaded pages survive a resync (the socket reconnecting refetches
+  only the newest page). Encrypted messages need nothing extra: every page
+  goes through `E2EAPIClient`, so messages decrypted or sent on this phone
+  come from its local history and older ones (before a reinstall) show the
+  usual "not available on this phone" placeholder. If the thread can't load
+  at all, it says so with Retry.
+- **Mute.** Mute / Unmute in the thread's ••• menu and the chat list's swipe
+  actions (`PUT`/`DELETE /conversations/{id}/mute`). It's yours alone: the
+  other person never knows. A muted chat keeps its unread count in the
+  list (an outlined badge, a bell-slash after the name) but stays out of the
+  tab badge and the list's "new" total.
+- **Photo timer.** The + menu picks what happens to photos you send: Keep,
+  View once, or gone 10 seconds / 1 minute / 1 hour / 1 day after they're
+  read (`PhotoTimer`). It starts at 1 minute if "expiring photos by default"
+  is on, otherwise Keep, and works the same for plaintext and encrypted
+  photos. A retry reuses the timer the photo was first sent with.
+- **Failed sends.** A message or photo that doesn't go out stays in the
+  thread as a failed bubble with the reason underneath and Retry / Delete
+  (`SendFailure`): too many messages (429, with the wait from `Retry-After`),
+  `new_account_limit`, `links_not_allowed`, `duplicate_message`,
+  `account_under_review`, a pending key change, or no connection. Retry
+  re-sends with the same client ID, so a send that did arrive isn't
+  duplicated. Delete only removes it from this phone (and forgets the photo).
+- **Accessibility.** Each bubble is one VoiceOver element that reads the
+  sender, the text or the photo's kind, state and timer, the time and, for
+  your own messages, Sending / Sent / Delivered / Read / Not sent
+  (`MessageAccessibility`); a failed bubble has Retry and Delete actions.
+  The composer's buttons are labelled (the + button also reads the photo
+  timer), and text and icons follow Dynamic Type.
+
 ## End-to-end encryption
 
 Chat text and photos are end-to-end encrypted with the Signal Protocol (PQXDH, then the
@@ -231,7 +269,15 @@ More debug-only screenshot switches: `-StexxScreenshotSendPhoto viewOnce`
 open|openAndClose` (liveChat: opens the newest incoming view-once photo, as a
 tap would), `-StexxShowPrivacyCover YES` (keeps the app-switcher cover up, since
 the real app switcher can't be captured with `simctl`), and
-`-StexxScreenshotRoute settings`. Pair with `e2e-peer.ts read --open` to open
+`-StexxScreenshotRoute settings`. For chat screenshots on the mock (Debug
+build): `-StexxScreenshotRoute chats` opens the chat list,
+`-StexxScreenshotRoute chat -StexxScreenshotPeer p04` a thread with more than
+one page of history, `-StexxScreenshotScrollToTop YES` jumps to its top so
+the older page loads, `-StexxMockOlderPageDelay <seconds>` holds that page
+back, `-StexxScreenshotPhotoTimer <keep|viewOnce|tenSeconds|oneMinute|oneHour|oneDay>`
+sets the photo timer, and `-StexxMockSendFailure <rateLimited|newAccountLimit|linksNotAllowed|underReview|offline>`
+makes the mock refuse sends the way the server would (with
+`-StexxScreenshotDraft` to send something). Pair with `e2e-peer.ts read --open` to open
 the app's view-once photo from the other side.
 
 ## Configuration

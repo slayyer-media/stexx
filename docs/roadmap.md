@@ -30,6 +30,14 @@ Done; see [`security.md`](security.md) for how each works and how to turn it on 
 - Stexx+ adds a small natural deterrent, since spammers rarely pay, but it is not a control on its own.
 - Every measure must respect the privacy rules in the README: no real names, no phone numbers, no exact location, and minimal retained data.
 
+## Chat
+
+- [x] **Older history.** Threads load earlier messages as you scroll up, keeping your place; encrypted history before a reinstall shows a placeholder. Load errors have an inline Retry.
+- [x] **Mute.** Mute a chat for yourself (`PUT`/`DELETE /conversations/{id}/mute`); muted chats stay out of the badge. Push notifications don't exist yet, so muting them comes with push.
+- [x] **Photo timers.** Keep, view once, or gone 10 s / 1 min / 1 h / 1 day after reading, for plaintext and encrypted photos.
+- [x] **Send errors.** Failed messages and photos stay as failed bubbles with the reason (rate limits, new-account limits, links, review, key changes) and Retry / Delete.
+- [x] **Chat accessibility.** VoiceOver reads each bubble's sender, content or photo kind and timer, time and status; the composer is labelled; Dynamic Type works up to the accessibility sizes.
+
 ## End-to-end encrypted chat
 
 Chat text and chat photos are end-to-end encrypted with the Signal Protocol, using Signal's official [`libsignal`](https://github.com/signalapp/libsignal) (AGPL-3.0, the same license as Stexx). The server relays ciphertext it can't read.

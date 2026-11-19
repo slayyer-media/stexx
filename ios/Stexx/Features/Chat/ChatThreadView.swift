@@ -27,6 +27,10 @@ struct ChatThreadView: View {
     @State private var olderState: OlderPageState = .idle
     /// The bubble to keep in place after older messages were prepended.
     @State private var scrollAnchorKey: String?
+    /// The user has scrolled the thread themselves. Older pages only load on
+    /// their own after that: the first layout (and lazy rows measuring
+    /// themselves) can pass near the top without anyone scrolling.
+    @State private var hasUserScrolled = false
     /// One quiet line above the composer (key change and mute problems).
     @State private var sendNotice: String?
     /// What happens to photos sent now (`PhotoTimer`).
@@ -51,6 +55,8 @@ struct ChatThreadView: View {
     /// Plaintext view-once photos `GET …/messages` listed without a URL: spent.
     @State private var spentViewOnceIDs: Set<Message.ID> = []
     @FocusState private var isComposerFocused: Bool
+
+    private static let olderRowID = "older-messages"
 
     enum OlderPageState: Hashable {
         case idle, loading, failed
@@ -90,6 +96,7 @@ struct ChatThreadView: View {
                         OlderMessagesRow(state: olderState) {
                             Task { await loadOlder(userInitiated: true) }
                         }
+                        .id(Self.olderRowID)
                     }
                     if let loadError, messages.isEmpty, !isLoading {
                         ThreadLoadErrorView(message: loadError) {
@@ -141,7 +148,10 @@ struct ChatThreadView: View {
             .onScrollGeometryChange(for: Bool.self) { geometry in
                 ThreadHistory.isNearTop(contentOffsetY: geometry.contentOffset.y, topInset: geometry.contentInsets.top)
             } action: { _, isNearTop in
-                if isNearTop { Task { await loadOlder(userInitiated: false) } }
+                if isNearTop && hasUserScrolled { Task { await loadOlder(userInitiated: false) } }
+            }
+            .onScrollPhaseChange { _, phase in
+                if phase == .interacting { hasUserScrolled = true }
             }
             .onChange(of: messages.last?.bubbleKey) { _, lastKey in
                 guard let lastKey else { return }
@@ -149,20 +159,34 @@ struct ChatThreadView: View {
                     proxy.scrollTo(lastKey, anchor: .bottom)
                 }
             }
+            .onChange(of: failures) { _, failures in
+                // The newest message just failed: its reason and buttons appear under it, keep them in view.
+                guard let last = messages.last, failures[last.bubbleKey] != nil else { return }
+                withAnimation(Motion.animation(Motion.standard, reduceMotion: reduceMotion)) {
+                    proxy.scrollTo(last.bubbleKey, anchor: .bottom)
+                }
+            }
             .onChange(of: scrollAnchorKey) { _, key in
                 // Older messages went in above: keep the one that was on top where it was.
                 guard let key else { return }
+                scrollAnchorKey = nil
                 var transaction = Transaction()
                 transaction.disablesAnimations = true
                 withTransaction(transaction) { proxy.scrollTo(key, anchor: .top) }
-                scrollAnchorKey = nil
+                // Once more after the lazy stack has measured the new rows
+                // (the first jump lands on estimated heights).
+                Task { @MainActor in
+                    await Task.yield()
+                    withTransaction(transaction) { proxy.scrollTo(key, anchor: .top) }
+                }
             }
             #if DEBUG
             .task(id: messages.first?.bubbleKey) {
-                // Screenshot-only: jump to the oldest loaded message, to show older pages loading.
-                guard ScreenshotRoute.scrollsToTop, !isLoading, let first = messages.first?.bubbleKey else { return }
+                // Screenshot-only: jump to the top, to show older pages loading.
+                guard ScreenshotRoute.scrollsToTop, !isLoading, messages.first != nil, history.hasOlder else { return }
                 try? await Task.sleep(for: .milliseconds(600))
-                proxy.scrollTo(first, anchor: .top)
+                proxy.scrollTo(Self.olderRowID, anchor: .top)
+                await loadOlder(userInitiated: false)
             }
             #endif
         }

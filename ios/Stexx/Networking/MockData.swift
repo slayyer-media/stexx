@@ -124,10 +124,10 @@ enum MockData {
             (false, "Yes. Somewhere with good wifi, obviously."),
             (true, "Obviously"),
         ]
-        // Oldest first: 72 messages, two days ago up to a few hours ago.
+        // Oldest first: 72 messages, 12 hours ago up to about 6 hours ago.
         return (0..<72).map { index in
             let line = lines[index % lines.count]
-            return (line.0, line.1, 60 * 48 - Double(index) * 35)
+            return (line.0, line.1, 60 * 12 - Double(index) * 5)
         }
     }()
 
