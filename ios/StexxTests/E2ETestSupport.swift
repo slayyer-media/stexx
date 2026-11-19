@@ -321,8 +321,13 @@ struct FakeE2EClient: APIClient {
     func deleteAccount() async throws {}
 
     func register(_ request: RegistrationRequest) async throws -> Session { throw Self.unused }
-    func requestEmailLink(email: String) async throws { throw Self.unused }
-    func verifyEmailLink(token: String) async throws -> Session { throw Self.unused }
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions { throw Self.unused }
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session { throw Self.unused }
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions { throw Self.unused }
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session { throw Self.unused }
+    func requestEmailLink(_ request: EmailLinkRequest) async throws { throw Self.unused }
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session { throw Self.unused }
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session { throw Self.unused }
     func refreshSession(refreshToken: String) async throws -> Session { throw Self.unused }
     func logout(_ session: Session) async throws { throw Self.unused }
     func fetchMe() async throws -> Profile { throw Self.unused }
@@ -351,6 +356,8 @@ struct FakeE2EClient: APIClient {
     #if DEBUG
     func debugGrantPlus() async throws { throw Self.unused }
     #endif
+    func taps(before cursor: String?) async throws -> TapsPage { throw Self.unused }
+    func markTapsSeen() async throws { throw Self.unused }
 }
 
 /// One person's app: engine + E2E-wrapped client, with in-memory secrets

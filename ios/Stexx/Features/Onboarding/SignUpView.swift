@@ -1,15 +1,21 @@
 import SwiftUI
 
 /// Anonymous sign-up: a nickname plus either a passkey or an email used only
-/// for sign-in links. No real name, no phone number.
+/// for sign-in links. No real name, no phone number. The email path sends a
+/// link and a code (`EmailSignInModel`); the account exists once one of
+/// them comes back.
 struct SignUpView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
+    @Environment(\.passkeys) private var passkeys
+    @Environment(\.allowsDevSignUpShortcut) private var allowsDevSignUpShortcut
 
     @State private var displayName = ""
     @State private var email = ""
     @State private var isWorking = false
     @State private var errorMessage: String?
+    @State private var emailFlow: EmailSignInModel?
+    @State private var showsCheckEmail = false
     @FocusState private var focusedField: Field?
 
     private enum Field { case name, email }
@@ -20,11 +26,7 @@ struct SignUpView: View {
 
     private var isNameValid: Bool { (2...30).contains(trimmedName.count) }
 
-    private var isEmailValid: Bool {
-        let value = email.trimmingCharacters(in: .whitespaces)
-        guard let at = value.firstIndex(of: "@") else { return false }
-        return value[value.index(after: at)...].contains(".") && at != value.startIndex
-    }
+    private var isEmailValid: Bool { EmailSignInModel.looksLikeEmail(email) }
 
     var body: some View {
         ScrollView {
@@ -57,12 +59,14 @@ struct SignUpView: View {
                         WideLabel("Continue with a passkey", systemImage: "person.badge.key.fill")
                     }
                     .stexxPrimaryButton()
-                    .disabled(!isNameValid || isWorking)
+                    .disabled(!isNameValid || isWorking || !passkeys.availability.isAvailable)
 
-                    Text("Recommended. Uses Face ID or Touch ID. Nothing to remember, nothing to leak.")
+                    Text(passkeys.availability.explanation
+                        ?? String(localized: "Recommended. Uses Face ID or Touch ID. Nothing to remember, nothing to leak."))
                         .font(.footnote)
                         .foregroundStyle(Theme.slate)
                         .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 HStack(spacing: Theme.Spacing.m) {
@@ -95,6 +99,17 @@ struct SignUpView: View {
                 .stexxSecondaryButton()
                 .disabled(!isNameValid || !isEmailValid || isWorking)
 
+                #if DEBUG
+                if allowsDevSignUpShortcut {
+                    // Local builds only: the dev server's no-email shortcut.
+                    Button("Dev server: sign up without the email", action: signUpWithDevShortcut)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.slate)
+                        .frame(maxWidth: .infinity)
+                        .disabled(!isNameValid || !isEmailValid || isWorking)
+                }
+                #endif
+
                 if let errorMessage {
                     Text(errorMessage)
                         .font(.stexxSub)
@@ -113,6 +128,14 @@ struct SignUpView: View {
         .scrollDismissesKeyboard(.interactively)
         .stexxBackground()
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(isPresented: $showsCheckEmail) {
+            if let emailFlow {
+                CheckEmailView(model: emailFlow, onSignedIn: finishSignIn, onChangeAddress: {
+                    showsCheckEmail = false
+                    focusedField = .email
+                })
+            }
+        }
         .overlay {
             if isWorking {
                 ProgressView()
@@ -124,35 +147,64 @@ struct SignUpView: View {
         }
     }
 
+    /// Options → system passkey sheet → finish (`PasskeyFlow`). Closing the
+    /// sheet just returns here, without an error.
     private func signUpWithPasskey() {
-        // TODO: Real passkey flow with AuthenticationServices:
-        // fetch options from POST /v1/auth/passkey/register/options, create
-        // an ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: "stexx.gay")
-        // registration request, then send the attestation to .../finish.
-        // Requires the `webcredentials:stexx.gay` associated domain.
-        register(RegistrationRequest(displayName: trimmedName, method: .passkey, email: nil, confirmedAdult: true))
+        guard isNameValid, passkeys.availability.isAvailable else { return }
+        let flow = PasskeyFlow(api: api, authenticator: passkeys.authenticator, availability: passkeys.availability)
+        let name = trimmedName
+        start { try await flow.signUp(displayName: name) }
     }
 
+    /// Emails a link and a code; the nickname and the 18+ confirmation
+    /// travel with the request and become the account when one comes back.
     private func signUpWithEmail() {
+        guard isNameValid, isEmailValid, !isWorking else { return }
+        let flow = EmailSignInModel(purpose: .signUp(displayName: trimmedName), api: api)
+        emailFlow = flow
+        focusedField = nil
+        isWorking = true
+        errorMessage = nil
+        Task {
+            defer { isWorking = false }
+            if await flow.send(to: email) {
+                showsCheckEmail = true
+            } else {
+                errorMessage = flow.problem?.message()
+            }
+        }
+    }
+
+    #if DEBUG
+    /// `POST /auth/register` on a dev server (`config.devAuth`); production
+    /// refuses it with `use_email_link`.
+    private func signUpWithDevShortcut() {
         guard isNameValid, isEmailValid else { return }
-        register(RegistrationRequest(
+        let request = RegistrationRequest(
             displayName: trimmedName,
             method: .email,
-            email: email.trimmingCharacters(in: .whitespaces),
+            email: EmailSignInModel.normalize(email),
             confirmedAdult: true
-        ))
+        )
+        start { [api] in try await api.register(request) }
+    }
+    #endif
+
+    private func finishSignIn(_ session: Session) async {
+        appState.signIn(session)
+        appState.me = try? await api.fetchMe()
     }
 
-    private func register(_ request: RegistrationRequest) {
+    private func start(_ makeSession: @escaping @MainActor () async throws -> Session) {
         focusedField = nil
         isWorking = true
         errorMessage = nil
         Task {
             defer { isWorking = false }
             do {
-                let session = try await api.register(request)
-                appState.signIn(session)
-                appState.me = try? await api.fetchMe()
+                await finishSignIn(try await makeSession())
+            } catch PasskeyError.canceled {
+                // The user closed the passkey sheet: nothing to report.
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -183,4 +235,12 @@ private struct SignUpField<Content: View>: View {
         SignUpView()
     }
     .previewEnvironment(signedIn: false)
+}
+
+#Preview("Passkeys unavailable") {
+    NavigationStack {
+        SignUpView()
+    }
+    .previewEnvironment(signedIn: false)
+    .environment(\.passkeys, PasskeySupport(availability: .unavailable(.localServer), authenticator: SimulatedPasskeyAuthenticator()))
 }

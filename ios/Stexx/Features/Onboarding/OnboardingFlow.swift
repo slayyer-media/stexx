@@ -1,33 +1,58 @@
 import SwiftUI
 
-/// Welcome → 18+ gate → anonymous sign-up.
+/// Welcome → 18+ gate → anonymous sign-up, or → 18+ gate → sign-in for an
+/// existing account (the gate is per device: `AppState.isSignedIn` needs it).
 struct OnboardingFlow: View {
     enum Step: Hashable {
-        case ageGate, signUp
+        case ageGate(then: Destination)
+        case signUp
+        case signIn
+    }
+
+    enum Destination: Hashable {
+        case signUp, signIn
+
+        var step: Step { self == .signUp ? .signUp : .signIn }
     }
 
     @Environment(AppState.self) private var appState
+    @Environment(EmailLinkRedeemer.self) private var linkRedeemer
     @State private var path: [Step] = []
 
     var body: some View {
         NavigationStack(path: $path) {
-            WelcomeView {
-                path.append(appState.isAgeConfirmed ? .signUp : .ageGate)
-            }
+            WelcomeView(
+                onContinue: { go(to: .signUp) },
+                onSignIn: { go(to: .signIn) }
+            )
             .navigationDestination(for: Step.self) { step in
                 switch step {
-                case .ageGate:
-                    AgeGateView { path.append(.signUp) }
+                case .ageGate(let destination):
+                    AgeGateView { path.append(destination.step) }
                 case .signUp:
                     SignUpView()
+                case .signIn:
+                    SignInView()
                 }
             }
         }
+        // An expired link ("Get a new link") or one for an address without an account ("Sign up").
+        .onChange(of: linkRedeemer.followUp) { _, followUp in
+            guard let followUp else { return }
+            linkRedeemer.followUp = nil
+            path = []
+            go(to: followUp == .signIn ? .signIn : .signUp)
+        }
+    }
+
+    private func go(to destination: Destination) {
+        path.append(appState.isAgeConfirmed ? destination.step : .ageGate(then: destination))
     }
 }
 
 struct WelcomeView: View {
     var onContinue: () -> Void
+    var onSignIn: () -> Void = {}
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hasAppeared = false
@@ -75,6 +100,11 @@ struct WelcomeView: View {
                     WideLabel("Get started")
                 }
                 .stexxPrimaryButton()
+
+                Button(action: onSignIn) {
+                    WideLabel("I already have an account")
+                }
+                .stexxSecondaryButton()
 
                 Text("Stexx is for adults 18+ only.")
                     .stexxLabelStyle(.micro, color: Theme.slate)
@@ -127,7 +157,7 @@ private struct PromiseRow: View {
 
 #Preview("Welcome") {
     NavigationStack {
-        WelcomeView {}
+        WelcomeView(onContinue: {}, onSignIn: {})
     }
     .previewEnvironment(signedIn: false)
 }

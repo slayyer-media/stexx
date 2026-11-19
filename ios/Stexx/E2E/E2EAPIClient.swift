@@ -261,8 +261,23 @@ struct E2EAPIClient: APIClient {
     // MARK: Pass-through
 
     func register(_ request: RegistrationRequest) async throws -> Session { try await base.register(request) }
-    func requestEmailLink(email: String) async throws { try await base.requestEmailLink(email: email) }
-    func verifyEmailLink(token: String) async throws -> Session { try await base.verifyEmailLink(token: token) }
+    func passkeyRegistrationOptions(displayName: String) async throws -> PasskeyCreationOptions {
+        try await base.passkeyRegistrationOptions(displayName: displayName)
+    }
+    func finishPasskeyRegistration(_ credential: PasskeyRegistrationCredential) async throws -> Session {
+        try await base.finishPasskeyRegistration(credential)
+    }
+    func passkeyLoginOptions() async throws -> PasskeyRequestOptions { try await base.passkeyLoginOptions() }
+    func finishPasskeyLogin(_ credential: PasskeyAssertionCredential) async throws -> Session {
+        try await base.finishPasskeyLogin(credential)
+    }
+    func requestEmailLink(_ request: EmailLinkRequest) async throws { try await base.requestEmailLink(request) }
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session {
+        try await base.verifyEmailLink(token: token, requestNonce: requestNonce, confirmed: confirmed)
+    }
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session {
+        try await base.verifyEmailCode(email: email, code: code, requestNonce: requestNonce)
+    }
     func refreshSession(refreshToken: String) async throws -> Session { try await base.refreshSession(refreshToken: refreshToken) }
     func logout(_ session: Session) async throws { try await base.logout(session) }
     func fetchMe() async throws -> Profile { try await base.fetchMe() }
@@ -304,4 +319,7 @@ struct E2EAPIClient: APIClient {
     #if DEBUG
     func debugGrantPlus() async throws { try await base.debugGrantPlus() }
     #endif
+
+    func taps(before cursor: String?) async throws -> TapsPage { try await base.taps(before: cursor) }
+    func markTapsSeen() async throws { try await base.markTapsSeen() }
 }

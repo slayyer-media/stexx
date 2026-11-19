@@ -4,9 +4,10 @@
  *
  * These sit ON TOP of the per-route token buckets in lib/ratelimit.ts (which smooth bursts per minute): the
  * windows here cap volume over hours and days, so they live in Postgres (`abuse_counters`, migration 105) and
- * survive restarts and deploys without an extra service. Keys are opaque ids (devices, accounts) or keyed
- * hashes of the IP / network (`abuseKeyHash`, HMAC with a key derived from EMAIL_PEPPER); no raw IP is stored,
- * and rows are deleted by the retention job once both of their windows have passed.
+ * survive restarts and deploys without an extra service. Every key is `<limit name>:` plus a keyed hash
+ * (`abuseKeyHash`, HMAC with a key derived from EMAIL_PEPPER) of the IP, network, device id, account id or
+ * (fetcher, target) pair; no raw IP or id is stored, and rows are deleted by the retention job once both of their
+ * windows have passed.
  *
  * Defaults below; override any of them with RATE_LIMIT_<NAME>=<count>/<window>, e.g. RATE_LIMIT_SIGNUP_IP=5/1h
  * (window units s, m, h, d). docs/security.md lists them.
@@ -99,8 +100,17 @@ export interface LimiterStore {
    * nothing and return the longest wait in milliseconds.
    */
   hit(entries: LimiterEntry[], now: number): Promise<number>;
+  /** The stored counters for these keys (missing keys are left out), for the data export. */
+  snapshot(keys: string[]): Promise<StoredCounter[]>;
   /** Tests: forget every counter. */
   clear(): void;
+}
+
+export interface StoredCounter extends Counter {
+  key: string;
+  windowMs: number;
+  /** When the row stops mattering and is deleted (end of the window after the current one). */
+  expiresAt: Date;
 }
 
 export interface Counter {
@@ -162,6 +172,13 @@ export class MemorySlidingWindowStore implements LimiterStore {
     if (wait > 0) return wait;
     for (const [key, spec] of entries) this.record(key, spec, now);
     return 0;
+  }
+
+  async snapshot(keys: string[]): Promise<StoredCounter[]> {
+    return keys.flatMap((key) => {
+      const c = this.counters.get(key);
+      return c ? [{ key, ...c, expiresAt: new Date(c.windowStart + 2 * c.windowMs) }] : [];
+    });
   }
 
   clear(): void {
@@ -227,6 +244,21 @@ export class PostgresSlidingWindowStore implements LimiterStore {
     });
   }
 
+  async snapshot(keys: string[]): Promise<StoredCounter[]> {
+    if (keys.length === 0) return [];
+    const rows = await this.db<(CounterRow & { expires_at: Date })[]>`
+      SELECT key, window_ms, window_start, current_count, previous_count, expires_at
+        FROM abuse_counters WHERE key = ANY(${keys.map((k) => this.namespace + k)}::text[]) ORDER BY key`;
+    return rows.map((r) => ({
+      key: r.key.slice(this.namespace.length),
+      windowMs: r.window_ms,
+      windowStart: Number(r.window_start),
+      current: r.current_count,
+      previous: r.previous_count,
+      expiresAt: r.expires_at,
+    }));
+  }
+
   clear(): void {
     this.namespace = testNamespace();
   }
@@ -255,9 +287,12 @@ export function setLimiterStoreForTests(next: LimiterStore): () => void {
 const ABUSE_KEY = createHmac("sha256", config.emailPepper).update("stexx abuse-limit keys v1").digest();
 
 /**
- * Keyed hash for IP and network keys that go to the database. Stable across restarts (unlike the in-memory
- * salt in ratelimit.ts) so windows survive a deploy; without EMAIL_PEPPER (never in the database or backups) the
- * stored value can't be turned back into an address.
+ * Keyed hash for every value that becomes an `abuse_counters` key: IPs and networks, but also account ids, device
+ * ids and (fetcher, target) pairs, so the table (which backups include) holds no plaintext address or social-graph
+ * edge. Stable across restarts (unlike the in-memory salt in ratelimit.ts) so windows survive a deploy. Without
+ * EMAIL_PEPPER (never in the database or backups) a stored key can't be linked back to an address or account; with
+ * it, small spaces such as IPv4 can be enumerated, so this protects a leaked database or backup, not against the
+ * operator.
  */
 export function abuseKeyHash(value: string): string {
   return createHmac("sha256", ABUSE_KEY).update(value).digest("base64url").slice(0, 22);
@@ -319,17 +354,54 @@ export async function tryAbuseLimits(action: AbuseAction, subject: AbuseSubject,
   for (const [name, field] of PLAN[action]) {
     const value = subject[field];
     if (!value) continue;
-    keys.push([`${name}:${value}`, limits[name]]);
+    keys.push([`${name}:${abuseKeyHash(value)}`, limits[name]]);
   }
   return store.hit(keys, now);
 }
 
-/** The subject for a request: keyed hashes of the IP and network, the attested device (if any) and the signed-in user. */
+export interface AccountCounter {
+  limit: AbuseLimitName;
+  windowMs: number;
+  windowStart: number;
+  current: number;
+  previous: number;
+  expiresAt: Date;
+}
+
+/**
+ * The abuse-limit counters stored about an account (GET /me/export): the ones keyed by the account itself
+ * (`userId`, or `targetId` for fetches of its prekeys), looked up by the same keyed hash tryAbuseLimits stores. Left out
+ * on purpose:
+ * - counters keyed by an attested device: they count every account that uses that app install, so on a shared
+ *   phone they would tell one account how active another is (docs/security.md "Data export");
+ * - counters keyed by an IP or network hash, which are not linked to any account (only the keyed hash is stored);
+ * - the per-pair prekey counters, which name another account.
+ */
+export async function accountCounters(userId: string): Promise<AccountCounter[]> {
+  const wanted = new Map<string, AbuseLimitName>();
+  for (const steps of Object.values(PLAN)) {
+    for (const [name, field] of steps) {
+      if (field === "userId" || field === "targetId") wanted.set(`${name}:${abuseKeyHash(userId)}`, name);
+    }
+  }
+  const rows = await store.snapshot([...wanted.keys()]);
+  return rows.flatMap((r) => {
+    const limit = wanted.get(r.key);
+    return limit
+      ? [{ limit, windowMs: r.windowMs, windowStart: r.windowStart, current: r.current, previous: r.previous, expiresAt: r.expiresAt }]
+      : [];
+  });
+}
+
+/**
+ * The subject for a request: the IP and network, the attested device (if any) and the signed-in user. Plain values
+ * in memory; tryAbuseLimits hashes each one with abuseKeyHash before it becomes a database key.
+ */
 export function subjectOf(c: Context, extra: { deviceId?: string | null; userId?: string | null } = {}): AbuseSubject {
   const ip = clientIp(c);
   return {
-    ip: abuseKeyHash(ip),
-    network: abuseKeyHash(networkOf(ip)),
+    ip,
+    network: networkOf(ip),
     deviceId: extra.deviceId ?? null,
     userId: extra.userId ?? null,
   };

@@ -281,7 +281,7 @@ struct PlusGatingTests {
         let suite = "stexx.tests.\(UUID().uuidString)"
         let appState = AppState(defaults: UserDefaults(suiteName: suite)!, sessionStore: InMemorySessionStore())
         appState.applySubscription(SubscriptionStatus(isActive: true, expiresAt: .distantFuture))
-        appState.privacy.incognito = true
+        appState.adoptServerPrivacy(PrivacySettings(incognito: true))
 
         let hooks = APIClientHooks(requiresPlus: { await appState.handleRequiresPlus() })
         let client = HTTPAPIClient(

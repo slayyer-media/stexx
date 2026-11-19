@@ -11,8 +11,19 @@ final class ChatStore {
     private(set) var isLoading = false
     private(set) var hasLoaded = false
     var errorMessage: String?
-    /// The most recent tap someone sent you (from `tap.received`).
-    private(set) var latestTap: RealtimeEvent.Tap?
+
+    /// Taps you received (`GET /me/taps`), newest first, one per sender.
+    /// Live `tap.received` events land here too.
+    private(set) var taps: [ReceivedTap] = []
+    /// How many senders tapped you since you last opened your taps. Part
+    /// of `unreadTotal`, so the Chats tab badge counts them.
+    private(set) var tapsUnseen = 0
+    private(set) var tapsNextCursor: String?
+    private(set) var isLoadingTaps = false
+    private(set) var hasLoadedTaps = false
+    /// The last failed taps fetch; separate from `errorMessage` so a taps
+    /// failure never replaces the chat list.
+    private(set) var tapsErrorMessage: String?
     /// View-once photos opened on this phone, with when: shown as "Opened"
     /// right away, and never shown again, even if telling the server failed.
     /// Kept across launches in `defaults` (message IDs and dates only, never
@@ -46,6 +57,17 @@ final class ChatStore {
     @ObservationIgnored private var loadGeneration = 0
     /// Bumped by `reset()` (sign-out).
     @ObservationIgnored private var epoch = 0
+    /// Like `loadGeneration`, for the taps list: bumped by every first-page
+    /// load and by `reset()`. A newer first page (or a sign-out) drops any
+    /// older first-page or next-page result.
+    @ObservationIgnored private var tapsGeneration = 0
+    /// Bumped by `markTapsSeen()`. A first-page load that started before it
+    /// is dropped (its "new" flags and count are stale); a next-page load is
+    /// kept, with its "new" flags cleared, so infinite scroll never stalls.
+    @ObservationIgnored private var tapsSeenEpoch = 0
+    /// Live taps that arrived while a first-page load was in flight; the
+    /// load's snapshot may predate them.
+    @ObservationIgnored private var tapsDuringLoad: [ReceivedTap] = []
     @ObservationIgnored private let defaults: UserDefaults
     /// View-once opens the server hasn't confirmed yet (offline, an error,
     /// the app quit before the call finished), retried on the next resync or
@@ -74,13 +96,23 @@ final class ChatStore {
         }
     }
 
+    /// The Chats tab badge: unread messages in unmuted chats plus new taps.
     var unreadTotal: Int {
-        conversations.reduce(0) { $0 + ($1.isMuted ? 0 : $1.unreadCount) }
+        conversations.reduce(0) { $0 + ($1.isMuted ? 0 : $1.unreadCount) } + tapsUnseen
     }
 
+    /// Launch: the conversation list and the first page of taps.
     func loadIfNeeded() async {
-        guard !hasLoaded else { return }
-        await load()
+        async let conversations: Void = hasLoaded ? () : load()
+        async let taps: Void = hasLoadedTaps ? () : loadTaps()
+        _ = await (conversations, taps)
+    }
+
+    /// Pull to refresh: conversations and the first page of taps.
+    func refresh() async {
+        async let conversations: Void = load()
+        async let taps: Void = loadTaps()
+        _ = await (conversations, taps)
     }
 
     /// Fetches the conversation list. Concurrent loads are fine: only the
@@ -112,6 +144,7 @@ final class ChatStore {
             broadcast(.resync, to: conversationID)
         }
         Task { await load() }
+        Task { await loadTaps() }
     }
 
     /// Open threads show everything, so the server's unread counts for them
@@ -156,9 +189,13 @@ final class ChatStore {
         }
     }
 
-    /// Drops every conversation with a blocked member.
+    /// Drops every conversation with a blocked member, and their tap.
     func removeConversations(with profileID: Profile.ID) {
         conversations.removeAll { $0.participant.id == profileID }
+        if let index = taps.firstIndex(where: { $0.id == profileID }) {
+            if taps[index].isNew { tapsUnseen = max(0, tapsUnseen - 1) }
+            taps.remove(at: index)
+        }
     }
 
     func reset() {
@@ -168,7 +205,14 @@ final class ChatStore {
         hasLoaded = false
         isLoading = false
         errorMessage = nil
-        latestTap = nil
+        tapsGeneration += 1
+        taps = []
+        tapsDuringLoad = []
+        tapsUnseen = 0
+        tapsNextCursor = nil
+        isLoadingTaps = false
+        hasLoadedTaps = false
+        tapsErrorMessage = nil
         pendingPhotos = [:]
         openedViewOnce = [:]
         pendingViewOnceOpens = [:]
@@ -229,6 +273,109 @@ final class ChatStore {
         for (messageID, conversationID) in pendingViewOnceOpens {
             Task { await sendViewOnceOpen(messageID, in: conversationID) }
         }
+    }
+
+    // MARK: Taps
+
+    /// Fetches the first page of taps (launch, resync, pull to refresh).
+    /// Only the newest load applies its result. Live taps that arrived
+    /// while it was in flight and aren't in it yet are kept on top.
+    func loadTaps() async {
+        tapsGeneration += 1
+        let generation = tapsGeneration
+        let seenEpoch = tapsSeenEpoch
+        tapsDuringLoad = []
+        isLoadingTaps = true
+        defer { if generation == tapsGeneration { isLoadingTaps = false } }
+        do {
+            let page = try await api.taps(before: nil)
+            guard generation == tapsGeneration, seenEpoch == tapsSeenEpoch else { return }
+            apply(firstTapsPage: page)
+            hasLoadedTaps = true
+            tapsErrorMessage = nil
+        } catch {
+            guard generation == tapsGeneration else { return }
+            tapsErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// The next page, for infinite scroll. Senders already listed (they may
+    /// have tapped again and moved up meanwhile) are skipped. If the taps
+    /// were marked seen while it was in flight, the page still lands (only a
+    /// new first page or a sign-out drops it), with its "new" flags cleared.
+    func loadMoreTaps() async {
+        guard let cursor = tapsNextCursor, !isLoadingTaps else { return }
+        let generation = tapsGeneration
+        let seenEpoch = tapsSeenEpoch
+        isLoadingTaps = true
+        defer { if generation == tapsGeneration { isLoadingTaps = false } }
+        do {
+            let page = try await api.taps(before: cursor)
+            guard generation == tapsGeneration else { return }
+            let known = Set(taps.map(\.id))
+            var older = page.items.filter { !known.contains($0.id) }
+            if seenEpoch != tapsSeenEpoch {
+                for index in older.indices { older[index].isNew = false }
+            }
+            taps.append(contentsOf: older)
+            tapsNextCursor = page.nextCursor
+        } catch {
+            guard generation == tapsGeneration else { return }
+            tapsErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func apply(firstTapsPage page: TapsPage) {
+        var merged = page.items
+        var unseen = page.unseenCount
+        for tap in tapsDuringLoad {
+            if let index = merged.firstIndex(where: { $0.id == tap.id }) {
+                guard tap.sentAt > merged[index].sentAt else { continue }
+                if !merged[index].isNew { unseen += 1 }
+                merged.remove(at: index)
+            } else {
+                unseen += 1
+            }
+            merged.append(tap)
+        }
+        tapsDuringLoad = []
+        // Newest first, like the server (stable for equal times).
+        taps = merged.enumerated()
+            .sorted { $0.element.sentAt != $1.element.sentAt ? $0.element.sentAt > $1.element.sentAt : $0.offset < $1.offset }
+            .map(\.element)
+        tapsUnseen = unseen
+        tapsNextCursor = page.nextCursor
+    }
+
+    /// Opening the taps screen: the badge drops to zero now, then the
+    /// server's watermark moves (`POST /me/taps/seen`). A first-page load
+    /// still in flight is dropped, since it would bring back stale "new"
+    /// flags; a next-page load still lands (see `loadMoreTaps()`).
+    func markTapsSeen() async {
+        tapsSeenEpoch += 1
+        tapsDuringLoad = []
+        tapsUnseen = 0
+        for index in taps.indices where taps[index].isNew {
+            taps[index].isNew = false
+        }
+        try? await api.markTapsSeen()
+    }
+
+    /// A live `tap.received`: the sender moves to the top as new. Counts
+    /// once per sender until the taps are seen.
+    func receive(_ tap: ReceivedTap) {
+        var wasNew = false
+        if let index = taps.firstIndex(where: { $0.id == tap.id }) {
+            wasNew = taps[index].isNew
+            // A replay (same or older tap) changes nothing.
+            guard tap.sentAt > taps[index].sentAt else { return }
+            taps.remove(at: index)
+        }
+        var received = tap
+        received.isNew = true
+        taps.insert(received, at: 0)
+        if !wasNew { tapsUnseen += 1 }
+        if isLoadingTaps { tapsDuringLoad.append(received) }
     }
 
     // MARK: Photo messages
@@ -384,7 +531,7 @@ final class ChatStore {
             conversations.insert(updated, at: index)
 
         case .tapReceived(let tap):
-            latestTap = tap
+            receive(ReceivedTap(tap))
 
         case .identityChanged, .keysLow, .unknown:
             // Encryption events are handled by `E2EStatus`.

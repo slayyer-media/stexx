@@ -34,6 +34,11 @@ final class AppServices {
         self.location = location
         self.realtime = realtime
         self.e2e = e2e
+        // Stexx+ looked expired on this device (clock or `GET /me`): ask the
+        // server, which turns it back on after a renewal.
+        appState.recheckEntitlement = { [weak purchases] in
+            Task { await purchases?.refreshEntitlement() }
+        }
         if let realtime {
             // One consumer, so events are decrypted and applied in the order
             // they arrived (a ratchet message decrypts only once, and a
@@ -79,8 +84,10 @@ final class AppServices {
         }
         var location: LocationService? = LocationService(api: api)
         #if DEBUG
-        // Screenshot route on a live server: no location prompt over the chat.
-        if ScreenshotRoute.current == .liveChat { location = nil }
+        // Screenshot routes on a live server: no location prompt over the screen.
+        if ScreenshotRoute.current?.isLive == true { location = nil }
+        // Forced Nearby states say what the location is themselves.
+        if NearbyDebugScenario.current != nil { location = nil }
         #endif
         let services = AppServices(
             appState: appState,

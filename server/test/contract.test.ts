@@ -121,8 +121,20 @@ const PrivacySettings = z.strictObject({
   incognito: z.boolean(),
 });
 
-// struct SubscriptionStatus { var isActive: Bool; var expiresAt: Date? }
-const SubscriptionStatus = z.strictObject({ isActive: z.boolean(), expiresAt: swiftOptional(SwiftDate) });
+// struct Profile, own copy (GET/PATCH /me): `var travel: TravelStatus?` (struct TravelStatus { var isActive: Bool })
+// and `var privacy: PrivacySettings?`. Other people's profiles never carry either (Profile is strict above).
+const OwnProfile = Profile.extend({
+  travel: swiftOptional(z.strictObject({ isActive: z.boolean() })),
+  privacy: swiftOptional(PrivacySettings),
+});
+
+// struct SubscriptionStatus { var isActive: Bool; var expiresAt: Date?; var willRenew: Bool?; var boostEndsAt: Date? }
+const SubscriptionStatus = z.strictObject({
+  isActive: z.boolean(),
+  expiresAt: swiftOptional(SwiftDate),
+  willRenew: swiftOptional(z.boolean()),
+  boostEndsAt: swiftOptional(SwiftDate),
+});
 // struct Boost { var endsAt: Date }
 const Boost = z.strictObject({ endsAt: SwiftDate });
 // HTTPAPIClient.ErrorBody { code: String?; message: String? } (docs/api.md: both always present)
@@ -244,7 +256,7 @@ describe("contract: REST responses match the Swift models", () => {
       await api.patch("/v1/me", {
         json: { displayName: "Contract", age: 33, heightCm: 178, position: "versBottom", lookingFor: ["chat", "rightNow"], tags: ["Books"] },
       }),
-      Profile,
+      OwnProfile,
       "Profile(PATCH /me)",
     );
     expect(updated.pronouns).toBeNull();
@@ -254,7 +266,8 @@ describe("contract: REST responses match the Swift models", () => {
     const p2 = await body(await api.post("/v1/me/photos", { body: await makeJpeg(), contentType: "image/jpeg" }), Photo, "Photo", 201);
     const order = await body(await api.put("/v1/me/photos/order", { json: { photoIDs: [p2.id, p1.id] } }), z.array(Photo), "[Photo]");
     expect(order.map((p) => p.id)).toEqual([p2.id, p1.id]);
-    const full = await body(await api.get("/v1/me"), Profile, "Profile(GET /me)");
+    const full = await body(await api.get("/v1/me"), OwnProfile, "Profile(GET /me)");
+    expect(full.travel).toBeNull();
     expect(full.photos).toHaveLength(2);
     expect(full.lastActiveAt).toBeString();
 
@@ -263,6 +276,7 @@ describe("contract: REST responses match the Swift models", () => {
       expiringPhotosByDefault: false, blurExplicitPhotos: true, incognito: false,
     };
     expect(await body(await api.put("/v1/me/privacy", { json: privacy }), PrivacySettings, "PrivacySettings")).toEqual(privacy);
+    expect((await body(await api.get("/v1/me"), OwnProfile, "Profile(GET /me)")).privacy).toEqual(privacy);
     conforms(ErrorBody, await (await api.get("/v1/me/viewers")).json(), "Error(402)");
 
     const plus = await createUser({ location: home, plusDays: 5 });
@@ -352,13 +366,17 @@ describe("contract: REST responses match the Swift models", () => {
     expect(await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus")).toEqual({
       isActive: false,
       expiresAt: null,
+      willRenew: null,
+      boostEndsAt: null,
     });
     conforms(ErrorBody, await (await as(u).post("/v1/boosts")).json(), "Error(402)");
     // debugGrantPlus() posts an empty JSON object
     expect((await as(u).post("/v1/dev/plus", { json: {} })).ok).toBe(true);
     const st = await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus(active)");
     expect(st.isActive).toBe(true);
-    await body(await as(u).post("/v1/boosts"), Boost, "Boost");
+    const boost = await body(await as(u).post("/v1/boosts"), Boost, "Boost");
+    const boosted = await body(await as(u).get("/v1/subscriptions/status"), SubscriptionStatus, "SubscriptionStatus(boosted)");
+    expect(boosted.boostEndsAt).toBe(boost.endsAt);
   });
 
   test("safety: [Profile] blocks list", async () => {
@@ -427,6 +445,6 @@ describe("contract: realtime frames match RealtimeEvent", () => {
 test("contract: database timestamps are serialized without fractions even when stored with them", async () => {
   const u = await createUser({ lastActiveAt: new Date(Date.UTC(2026, 10, 17, 20, 30, 0, 987)) });
   await sql`UPDATE users SET show_online_status = true WHERE id = ${u.id}`;
-  const me = await body(await as(u).get("/v1/me"), Profile, "Profile");
+  const me = await body(await as(u).get("/v1/me"), OwnProfile, "Profile");
   expect(me.lastActiveAt).toMatch(ISO_DATE);
 });

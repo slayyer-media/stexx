@@ -35,6 +35,27 @@ export interface ProfileJson {
   isFavorite: boolean;
 }
 
+/**
+ * Travel mode as its owner sees it: only on the user's OWN profile (GET/PATCH /me), never on anyone else's.
+ * Deliberately carries no coordinates (/me never returns any): the app keeps the place it picked on the device.
+ * `isActive` is false while Stexx+ has lapsed: the travel cell is kept but ignored (effective_locations) until
+ * Plus is active again or the user clears it.
+ */
+export interface TravelJson {
+  isActive: boolean;
+}
+
+/**
+ * The own profile (GET/PATCH /me): a Profile plus `travel` (null = travel mode off) and `privacy`, the six stored
+ * privacy settings, so the app shows what the server applies instead of a local copy (after a reinstall, on a new
+ * phone, or after signing in to another account). `privacy.incognito` is the stored choice; it only applies while
+ * Stexx+ is active.
+ */
+export interface OwnProfileJson extends ProfileJson {
+  travel: TravelJson | null;
+  privacy: PrivacyJson;
+}
+
 export interface AttachmentJson {
   kind: "photo";
   url: string | null;
@@ -114,10 +135,13 @@ export interface PhotoRow {
   is_explicit: boolean;
   /** The NSFW classifier has labelled it (nsfw_checked_at IS NOT NULL). */
   is_checked: boolean;
+  /** A moderator hid it from others (photos.hidden_at, from a photo flag). Optional for hand-built rows. */
+  is_hidden?: boolean;
 }
 
 /** Select list producing a PhotoRow from `photos`. */
-export const photoColumns = sql`id, owner_id, storage_key, position, is_explicit, (nsfw_checked_at IS NOT NULL) AS is_checked`;
+export const photoColumns = sql`id, owner_id, storage_key, position, is_explicit, (nsfw_checked_at IS NOT NULL) AS is_checked,
+  (hidden_at IS NOT NULL) AS is_hidden`;
 
 export interface MessageRow {
   id: string;
@@ -161,8 +185,12 @@ export function profileColumns(viewerId: string) {
 
 // ---- Pure builders ------------------------------------------------------------
 
+/**
+ * `isExplicit` is true whenever the photo is kept from everyone but its owner: labelled explicit, or hidden by a
+ * moderator. Only the owner ever receives such a photo, and the app badges it "Hidden".
+ */
 export function photoJson(p: PhotoRow): PhotoJson {
-  return { id: p.id, url: mediaUrl(p.storage_key), isExplicit: p.is_explicit };
+  return { id: p.id, url: mediaUrl(p.storage_key), isExplicit: p.is_explicit || p.is_hidden === true };
 }
 
 export interface ViewerContext {
@@ -262,6 +290,11 @@ export function conversationJson(input: {
     updatedAt: isoDate(input.updatedAt),
     isMuted: input.isMuted,
   };
+}
+
+/** `travel` for the own profile: null without a travel row, else whether it applies right now. */
+export function travelJson(row: { is_active: boolean } | undefined): TravelJson | null {
+  return row ? { isActive: row.is_active } : null;
 }
 
 export function privacyJson(r: PrivacyRow): PrivacyJson {

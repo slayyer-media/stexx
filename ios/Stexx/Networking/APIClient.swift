@@ -3,14 +3,29 @@ import SwiftUI
 
 /// Everything the app needs from the Stexx backend. The UI only talks to
 /// this protocol, so the mock and the real HTTP client are interchangeable.
-/// See `docs/api.md` for the wire format.
-protocol APIClient: Sendable {
+/// See `docs/api.md` for the wire format. Passkey sign-up and sign-in
+/// (`PasskeyAPI`) are driven by `PasskeyFlow`.
+protocol APIClient: PasskeyAPI {
     // MARK: Auth & account
+    /// `POST /auth/register`: the dev server's shortcut (a session without
+    /// a credential). Production answers 400 `use_passkey_flow` /
+    /// `use_email_link`; email sign-up there is `requestEmailLink` with a
+    /// nickname (see `EmailSignIn.swift`).
     func register(_ request: RegistrationRequest) async throws -> Session
-    /// Sends a one-time sign-in link. Succeeds whether or not the address exists.
-    func requestEmailLink(email: String) async throws
-    /// Exchanges the token from a sign-in link for a session.
-    func verifyEmailLink(token: String) async throws -> Session
+    /// `POST /auth/email/link`: emails a one-time sign-in link and code.
+    /// Succeeds whether or not the address has an account. 429 carries
+    /// `Retry-After`.
+    func requestEmailLink(_ request: EmailLinkRequest) async throws
+    /// `POST /auth/email/verify`: the token from a sign-in link → session.
+    /// `requestNonce` is this install's (see `EmailRequestNonceStore`); a
+    /// link it didn't ask for throws `.confirmationRequired` unless
+    /// `confirmed`. Throws `EmailSignInError.invalidLink` /
+    /// `.registrationRequired` / `.confirmationRequired`.
+    func verifyEmailLink(token: String, requestNonce: String, confirmed: Bool) async throws -> Session
+    /// `POST /auth/email/code`: the 8-digit code from the same email →
+    /// session; only with the nonce the email was asked for with. Throws
+    /// `EmailSignInError.invalidCode` / `.registrationRequired`.
+    func verifyEmailCode(email: String, code: String, requestNonce: String) async throws -> Session
     /// Rotates the refresh token. `HTTPAPIClient` calls this itself on 401.
     func refreshSession(refreshToken: String) async throws -> Session
     /// Revokes `session` on the server. Never reads or writes the stored
@@ -113,6 +128,13 @@ protocol APIClient: Sendable {
     /// `POST /v1/dev/plus`). Debug builds only.
     func debugGrantPlus() async throws
     #endif
+
+    // MARK: Taps
+    /// `GET /me/taps`: taps you received in the retention window, newest
+    /// first, one per sender. `before` is the previous page's `nextCursor`.
+    func taps(before cursor: String?) async throws -> TapsPage
+    /// `POST /me/taps/seen`: everything received so far is no longer new.
+    func markTapsSeen() async throws
 }
 
 extension APIClient {
@@ -180,6 +202,15 @@ struct APIConfiguration: Sendable {
     var baseURL: URL
     var apiVersion = "v1"
     var useMock: Bool
+    /// The passkey relying party this build is associated with
+    /// (`StexxPasskeyRelyingParty` ← `STEXX_PASSKEY_RP_ID`); empty in the
+    /// Local configuration, which has no associated domain.
+    var passkeyRelyingPartyID: String? = nil
+
+    /// Whether the passkey buttons work (see `PasskeyAvailability`).
+    var passkeyAvailability: PasskeyAvailability {
+        PasskeyAvailability.resolve(baseURL: baseURL, relyingPartyID: passkeyRelyingPartyID, useMock: useMock)
+    }
 
     static func fromBundle(_ bundle: Bundle = .main) -> APIConfiguration {
         var urlString = bundle.object(forInfoDictionaryKey: "StexxAPIBaseURL") as? String
@@ -193,7 +224,8 @@ struct APIConfiguration: Sendable {
         #endif
         return APIConfiguration(
             baseURL: urlString.flatMap { URL(string: $0) } ?? defaultBaseURL,
-            useMock: mockFlag?.uppercased() != "NO"
+            useMock: mockFlag?.uppercased() != "NO",
+            passkeyRelyingPartyID: bundle.object(forInfoDictionaryKey: "StexxPasskeyRelyingParty") as? String
         )
     }
 

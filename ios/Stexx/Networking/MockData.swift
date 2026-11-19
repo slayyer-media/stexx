@@ -165,3 +165,23 @@ enum MockData {
         )
     }
 }
+
+// MARK: - Taps
+
+extension MockData {
+    /// Seed taps you received: (sender, minutes ago). Senders tapped within
+    /// `tapsSeenMinutesAgo` show as new.
+    static let seedTaps: [(Profile.ID, Double)] = [
+        ("p06", 4),
+        ("p02", 38),
+        ("p15", 60 * 3),
+        ("p09", 60 * 9),
+        ("p05", 60 * 26),
+        ("p17", 60 * 24 * 3),
+        ("p12", 60 * 24 * 6),
+        ("p20", 60 * 24 * 12),
+    ]
+
+    /// When the mock user last opened their taps.
+    static let tapsSeenMinutesAgo: Double = 60 * 4
+}

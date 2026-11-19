@@ -1,12 +1,13 @@
 import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
-import { randomBytes } from "node:crypto";
-import { Hono } from "hono";
+import { randomBytes, randomInt } from "node:crypto";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { config } from "../config.ts";
 import { sql, type Sql } from "../db/sql.ts";
 import {
   createSession,
+  emailCodeHash,
   emailHmac,
   generateToken,
   hashToken,
@@ -14,6 +15,7 @@ import {
   requireAuth,
   revokeSessionFamily,
   rotateSession,
+  type SessionJson,
 } from "../lib/auth.ts";
 import { snapToCell } from "../lib/distance.ts";
 import { badRequest, conflict, serviceUnavailable, unauthorized } from "../lib/errors.ts";
@@ -40,7 +42,7 @@ import type { AppEnv } from "../types.ts";
 /**
  * auth routes, mounted at /v1. Paths are written in full relative to /v1.
  * POST /auth/register, /auth/passkey/register/{options,finish}, /auth/passkey/login/{options,finish},
- * /auth/email/link, /auth/email/verify, /auth/refresh, /auth/logout.
+ * /auth/email/link, /auth/email/verify, /auth/email/code, /auth/refresh, /auth/logout.
  *
  * Every credential-bearing step is rate limited per client ("auth": 10/min). Challenges and link tokens are
  * single use (consumed atomically with DELETE/UPDATE ... RETURNING) and short lived.
@@ -49,7 +51,18 @@ export const authRoutes = new Hono<AppEnv>();
 
 const CHALLENGE_TTL_MS = 5 * MINUTE;
 const LINK_TTL_MS = 15 * MINUTE;
+/** Digits in the one-time code that travels with every sign-in link. */
+export const EMAIL_CODE_DIGITS = 8;
+/** Wrong codes, from the app install that asked for the email, before that email's code stops working. */
+export const EMAIL_CODE_MAX_ATTEMPTS = 5;
 const UNIQUE_VIOLATION = "23505";
+/**
+ * The account label a new passkey is saved under (WebAuthn `user.name` / `user.displayName`). Deliberately not
+ * the nickname: passkeys sync through the platform's password manager (iCloud Keychain) to every device on the
+ * account and show up in its password list and shared password groups next to the relying party. The domain
+ * can't be hidden; the nickname can. One account per device means there's no list of accounts to tell apart.
+ */
+export const PASSKEY_ACCOUNT_LABEL = "Stexx account";
 
 // ---- Schemas ---------------------------------------------------------------
 
@@ -75,18 +88,37 @@ const passkeyRegisterOptionsSchema = z.strictObject({
 
 const tokenString = z.string().min(20).max(200).regex(/^[A-Za-z0-9_-]+$/, "malformed token");
 
+/**
+ * A random value the app keeps while it waits for the email (base64url, 20-200 chars; the app sends 32 random
+ * bytes). Only its SHA-256 is stored, on the email's row. It binds the email to the app install that asked for it.
+ */
+const requestNonceSchema = tokenString;
+
 const emailLinkSchema = z
   .strictObject({
     email: emailSchema,
     // Only needed when the address has no account yet: they travel with the link and create the account on verify.
     displayName: displayNameSchema.nullish(),
     confirmedAdult: confirmedAdultSchema.nullish(),
+    requestNonce: requestNonceSchema.nullish(),
   })
   .refine((v) => (v.displayName == null) === (v.confirmedAdult == null), {
     message: "displayName and confirmedAdult must be sent together",
   });
 
-const emailVerifySchema = z.strictObject({ token: tokenString });
+const emailVerifySchema = z.strictObject({
+  token: tokenString,
+  // The app's current request nonce. When sent, a link this install didn't ask for is not used until the person
+  // confirms whose account it is (409 confirm_link, then again with confirmed: true).
+  requestNonce: requestNonceSchema.nullish(),
+  confirmed: z.literal(true).nullish(),
+});
+const emailCodeSchema = z.strictObject({
+  email: emailSchema,
+  code: z.string().regex(new RegExp(`^[0-9]{${EMAIL_CODE_DIGITS}}$`), `must be ${EMAIL_CODE_DIGITS} digits`),
+  // Required: a code only works in the app install that asked for its email.
+  requestNonce: requestNonceSchema,
+});
 const refreshSchema = z.strictObject({ refreshToken: tokenString });
 
 const b64u = (max: number) => z.string().min(1).max(max).regex(/^[A-Za-z0-9_-]+$/, "must be base64url");
@@ -176,6 +208,11 @@ function challengeOf(clientDataJSON: string): string {
   throw badRequest("Invalid credential response.", "invalid_credential");
 }
 
+/** A uniformly random code of EMAIL_CODE_DIGITS digits (leading zeros kept). */
+function newEmailCode(): string {
+  return randomInt(0, 10 ** EMAIL_CODE_DIGITS).toString().padStart(EMAIL_CODE_DIGITS, "0");
+}
+
 interface ChallengeRow {
   id: string;
   display_name: string | null;
@@ -240,7 +277,8 @@ authRoutes.post("/auth/passkey/register/options", rateLimit("auth"), async (c) =
   const options = await generateRegistrationOptions({
     rpName: config.webauthn.rpName,
     rpID: config.webauthn.rpId,
-    userName: body.displayName,
+    userName: PASSKEY_ACCOUNT_LABEL,
+    userDisplayName: PASSKEY_ACCOUNT_LABEL,
     userID: webauthnUserId,
     attestationType: "none",
     authenticatorSelection: { residentKey: "required", userVerification: "required" },
@@ -375,13 +413,16 @@ authRoutes.post("/auth/email/link", rateLimit("auth"), attest("login"), async (c
   await sweepExpired();
 
   const token = generateToken();
+  const code = newEmailCode();
   await sql`
-    INSERT INTO email_link_tokens (token_hash, email_hmac, display_name, confirmed_adult, expires_at)
-    VALUES (${hashToken(token)}, ${hmac}, ${body.displayName ?? null}, ${body.confirmedAdult ?? null}, ${inMs(LINK_TTL_MS)})`;
+    INSERT INTO email_link_tokens (token_hash, email_hmac, display_name, confirmed_adult, expires_at, code_hash,
+                                   request_nonce_hash)
+    VALUES (${hashToken(token)}, ${hmac}, ${body.displayName ?? null}, ${body.confirmedAdult ?? null}, ${inMs(LINK_TTL_MS)},
+            ${emailCodeHash(hmac, code)}, ${body.requestNonce ? hashToken(body.requestNonce) : null})`;
 
   // A link is sent for every address, known or not (no account enumeration).
   try {
-    await sendSignInLink(address, token);
+    await sendSignInLink(address, token, code);
   } catch (err) {
     await sql`DELETE FROM email_link_tokens WHERE token_hash = ${hashToken(token)}`;
     if (err && typeof err === "object" && "status" in err) throw err; // already an ApiError (503 email_unavailable)
@@ -393,22 +434,41 @@ authRoutes.post("/auth/email/link", rateLimit("auth"), attest("login"), async (c
 
 class NeedsRegistration extends Error {}
 
-authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async (c) => {
+/** A link this app install didn't ask for: say whose account it is and let the person decide (login CSRF). */
+class NeedsConfirmation extends Error {
+  constructor(
+    readonly account: "existing" | "new",
+    readonly displayName: string,
+  ) {
+    super("confirm_link");
+  }
+}
+
+interface LinkRow {
+  email_hmac: Buffer;
+  display_name: string | null;
+  confirmed_adult: boolean | null;
+}
+
+/**
+ * Turns a live sign-in (found and marked used by `claim`, inside the transaction) into a session: signs in the
+ * address's account, or creates it from the pending registration that travelled with the link. Shared by the link
+ * (`/auth/email/verify`) and the code (`/auth/email/code`). `claim` returns null when nothing matched; then
+ * `invalid` is thrown. Any throw rolls back, so a refused sign-up (or a missing registration) doesn't burn it.
+ */
+async function redeemEmailSignIn(
+  c: Context<AppEnv>,
+  claim: (tx: Sql) => Promise<LinkRow | null>,
+  invalid: () => Error,
+): Promise<SessionJson> {
   const device = deviceOf(c);
-  await hitAbuseLimits("login", subjectOf(c, { deviceId: device.deviceId }));
-  const { token } = await parseJson(c, emailVerifySchema);
   await assertLoginAllowed(device); // banned devices (DeviceCheck bit1) can neither sign in nor sign up
-  const invalid = () => badRequest("This sign-in link is invalid or has expired.", "invalid_link");
 
   let createdUserId: string | null = null;
   let signupCheck: SignupCheck | null = null;
   try {
     const session = await sql.begin(async (tx) => {
-      // Single use: only one concurrent verify can flip used_at.
-      const [link] = await tx<{ email_hmac: Buffer; display_name: string | null; confirmed_adult: boolean | null }[]>`
-        UPDATE email_link_tokens SET used_at = now()
-         WHERE token_hash = ${hashToken(token)} AND used_at IS NULL AND expires_at > now()
-        RETURNING email_hmac, display_name, confirmed_adult`;
+      const link = await claim(tx);
       if (!link) throw invalid();
 
       const [existing] = await tx<{ id: string }[]>`SELECT id FROM users WHERE email_hmac = ${link.email_hmac}`;
@@ -443,7 +503,7 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async 
       if (signupCheck) await afterSignup(device, signupCheck);
       await afterNewUser(createdUserId);
     }
-    return c.json(session, 200);
+    return session;
   } catch (err) {
     if (err instanceof NeedsRegistration) {
       // Transaction rolled back, so the link is not burnt.
@@ -451,6 +511,111 @@ authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async 
         "There is no account for this address yet. Start sign-up again and request a new link.",
         "registration_required",
       );
+    }
+    throw err;
+  }
+}
+
+/**
+ * Trades a link's token for a session. Login CSRF: anyone can mail someone a link to their own account, and a
+ * signed-out phone would otherwise open it straight into that account. So the app sends its request nonce: a link
+ * this install asked for is used at once; any other link (another install's, or one asked for without a nonce)
+ * gets 409 `confirm_link` with whose account it is (`account`: existing | new, `displayName`), is left unused, and
+ * is used only when the app sends it again with `confirmed: true` after the person said yes. Without
+ * `requestNonce` there is no check (older clients and scripts).
+ */
+authRoutes.post("/auth/email/verify", rateLimit("auth"), attest("login"), async (c) => {
+  await hitAbuseLimits("login", subjectOf(c, { deviceId: deviceOf(c).deviceId }));
+  const { token, requestNonce, confirmed } = await parseJson(c, emailVerifySchema);
+  const mustMatch = requestNonce != null && confirmed !== true;
+  try {
+    const session = await redeemEmailSignIn(
+      c,
+      // Single use: only one concurrent verify can flip used_at (the row lock makes the others see it used). The
+      // code dies with the link.
+      async (tx) => {
+        const [live] = await tx<(LinkRow & { requested_here: boolean })[]>`
+          SELECT email_hmac, display_name, confirmed_adult,
+                 coalesce(request_nonce_hash = ${requestNonce ? hashToken(requestNonce) : null}, false) AS requested_here
+            FROM email_link_tokens
+           WHERE token_hash = ${hashToken(token)} AND used_at IS NULL AND expires_at > now()
+           FOR UPDATE`;
+        if (!live) return null;
+        if (mustMatch && !live.requested_here) {
+          const [existing] = await tx<{ display_name: string }[]>`
+            SELECT display_name FROM users WHERE email_hmac = ${live.email_hmac}`;
+          if (existing) throw new NeedsConfirmation("existing", existing.display_name);
+          if (!live.display_name || live.confirmed_adult !== true) throw new NeedsRegistration();
+          throw new NeedsConfirmation("new", live.display_name);
+        }
+        await tx`UPDATE email_link_tokens SET used_at = now(), code_hash = NULL WHERE token_hash = ${hashToken(token)}`;
+        return { email_hmac: live.email_hmac, display_name: live.display_name, confirmed_adult: live.confirmed_adult };
+      },
+      () => badRequest("This sign-in link is invalid or has expired.", "invalid_link"),
+    );
+    return c.json(session, 200);
+  } catch (err) {
+    if (!(err instanceof NeedsConfirmation)) throw err;
+    // Nothing changed (the transaction rolled back): the link still works once confirmed.
+    return c.json(
+      {
+        code: "confirm_link",
+        message:
+          err.account === "existing"
+            ? `This link signs in to the Stexx account ${err.displayName}. It wasn't requested in this app.`
+            : `This link creates a new Stexx account named ${err.displayName}. It wasn't requested in this app.`,
+        account: err.account,
+        displayName: err.displayName,
+      },
+      409,
+    );
+  }
+});
+
+/**
+ * The one-time code from the same email, typed into the app: for a link read on another device, or one a mail app
+ * won't hand to the app. 8 digits, single use, dies with its link (15 min), and only works in the app install that
+ * asked for the email (its request nonce). That binding is what keeps strangers out of other people's codes: a
+ * guess only ever tests, and only ever counts against, the emails the guesser's own install asked for. So nobody
+ * can use up or lock someone else's code. Brute force: 5 wrong codes and an email's code stops working (its link
+ * still works); per (address, client) cap (emailCode, 10/h), the per-client auth limit and the login abuse limits.
+ * To get codes to guess at, an attacker has to ask for the emails, all of which land in the owner's inbox.
+ */
+authRoutes.post("/auth/email/code", rateLimit("auth"), attest("login"), async (c) => {
+  await hitAbuseLimits("login", subjectOf(c, { deviceId: deviceOf(c).deviceId }));
+  const body = await parseJson(c, emailCodeSchema);
+  const hmac = emailHmac(normalizeEmail(body.email));
+  consume("emailCode", `${hmac.toString("base64url")}:${clientKey(c)}`);
+  const codeHash = emailCodeHash(hmac, body.code);
+  const nonceHash = hashToken(body.requestNonce);
+  const invalid = () => badRequest("That code is wrong or has expired. Check the latest email.", "invalid_code");
+
+  let wrongCode = false;
+  try {
+    const session = await redeemEmailSignIn(
+      c,
+      async (tx) => {
+        // Single use, like the link: using the code burns the link, and the other way round.
+        const [link] = await tx<LinkRow[]>`
+          UPDATE email_link_tokens SET used_at = now(), code_hash = NULL
+           WHERE email_hmac = ${hmac} AND request_nonce_hash = ${nonceHash} AND code_hash = ${codeHash}
+             AND used_at IS NULL AND expires_at > now() AND code_attempts < ${EMAIL_CODE_MAX_ATTEMPTS}
+          RETURNING email_hmac, display_name, confirmed_adult`;
+        wrongCode = !link;
+        return link ?? null;
+      },
+      invalid,
+    );
+    return c.json(session, 200);
+  } catch (err) {
+    if (wrongCode) {
+      // A wrong guess (outside the rolled-back transaction, so it sticks): one strike on each live code this
+      // install asked for. Other installs' codes (the owner's, when a stranger guesses) are never touched.
+      await sql`
+        UPDATE email_link_tokens SET code_attempts = code_attempts + 1,
+               code_hash = CASE WHEN code_attempts + 1 >= ${EMAIL_CODE_MAX_ATTEMPTS} THEN NULL ELSE code_hash END
+         WHERE email_hmac = ${hmac} AND request_nonce_hash = ${nonceHash}
+           AND used_at IS NULL AND expires_at > now() AND code_hash IS NOT NULL`;
     }
     throw err;
   }

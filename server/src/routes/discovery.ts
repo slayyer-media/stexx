@@ -2,14 +2,16 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { sql, type Sql } from "../db/sql.ts";
 import { requireAuth, currentUserId } from "../lib/auth.ts";
-import { decodeCursor, encodeCursor } from "../lib/cursor.ts";
+import { decodeCursor } from "../lib/cursor.ts";
 import { badRequest, notFound } from "../lib/errors.ts";
 import { logError } from "../lib/logger.ts";
 import { isConnected, publishUnlessBlocked } from "../lib/realtime.ts";
 import { assertMayTap } from "../lib/moderation.ts";
+import { isSpamLimited } from "../lib/abuse/spam.ts";
 import { requirePlus } from "../lib/plus.ts";
 import { rateLimit } from "../lib/ratelimit.ts";
-import { ONLINE_WINDOW_MS, profileColumns, profilesFor, viewerCell, type ProfileRow } from "../lib/serialize.ts";
+import { nearbyPage } from "../lib/nearby.ts";
+import { profilesFor } from "../lib/serialize.ts";
 import {
   cleanText,
   idParam,
@@ -21,7 +23,7 @@ import {
   qMany,
   qOne,
 } from "../lib/validation.ts";
-import { assertVisibleUser, col, isIncognito, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
+import { assertVisibleUser, isIncognito } from "../lib/visibility.ts";
 import { DAY, isoDate } from "../lib/time.ts";
 import type { AppEnv } from "../types.ts";
 
@@ -43,6 +45,9 @@ import type { AppEnv } from "../types.ts";
  *    trilaterating them. With a fixed grid the visible/invisible boundary is a grid line that does not depend
  *    on where the target is inside their region, so the most anyone can learn is which ~111 km region.
  *  - onlineOnly only matches users who show their online status.
+ *  - The search itself (lib/nearby.ts) only reads users near the viewer, growing the area until the page is
+ *    provably complete. It returns exactly what one query over every user would, so none of the above depends on
+ *    it; test/nearby-search.test.ts checks that against the original query.
  */
 export const discoveryRoutes = new Hono<AppEnv>();
 
@@ -64,22 +69,6 @@ const nearbyQuery = z
     tag: qMany,
   })
   .strict();
-
-/** Sort keys for hideDistance users are drawn from [0, HIDDEN_SORT_SPAN) metres-equivalents. */
-const HIDDEN_SORT_SPAN = 10_000;
-/**
- * hideDistance users are only listed when the viewer's region on a fixed HIDDEN_REGION_DEG grid (lat and lon
- * indices) is the same as, or adjacent to, theirs. Must stay a fixed grid: see the privacy notes above.
- */
-export const HIDDEN_REGION_DEG = 1;
-
-/** Region index of a cell on the fixed grid used to gate hideDistance users. */
-export function hiddenRegion(cell: { latitude: number; longitude: number }): { lat: number; lon: number } {
-  const lat = Math.floor((cell.latitude + 90) / HIDDEN_REGION_DEG);
-  const lons = Math.round(360 / HIDDEN_REGION_DEG);
-  const lon = ((Math.floor((cell.longitude + 180) / HIDDEN_REGION_DEG) % lons) + lons) % lons;
-  return { lat, lon };
-}
 
 const cursorSchema = z.strictObject({
   d: z.number().int().min(0).max(1e9),
@@ -111,54 +100,20 @@ discoveryRoutes.get("/nearby", requireAuth, async (c) => {
   const cursor = decodeCursor(q.cursor, cursorSchema);
   const limit = q.limit ?? DEFAULT_LIMIT;
 
-  const cell = await viewerCell(me);
-  // Without a known location of our own we can neither sort nor measure: nothing to show.
-  if (!cell) return c.json({ items: [], nextCursor: null });
-
-  const onlineCutoff = new Date(Date.now() - ONLINE_WINDOW_MS);
-  const region = hiddenRegion(cell);
-  const lonRegions = Math.round(360 / HIDDEN_REGION_DEG);
-  const maxD = q.maxDistanceMeters;
-
-  const rows = await sql<(ProfileRow & { sort_h: boolean; sort_d: number })[]>`
-    SELECT * FROM (
-      SELECT ${profileColumns(me)},
-             u.hide_distance AS sort_h,
-             CASE WHEN u.hide_distance THEN abs(hashtextextended(${me + ":" + "x"} || u.id, 0) % ${HIDDEN_SORT_SPAN})::int
-                  ELSE stexx_distance_bucket(stexx_haversine_m(${cell.latitude}::float8, ${cell.longitude}::float8, el.cell_lat, el.cell_lon))
-             END AS sort_d
-        FROM users u
-        JOIN effective_locations el ON el.user_id = u.id
-       WHERE u.id <> ${me}
-         AND (NOT u.hide_distance OR (
-               abs(floor((el.cell_lat + 90) / ${HIDDEN_REGION_DEG}::float8)::int - ${region.lat}::int) <= 1
-               AND (((floor((el.cell_lon + 180) / ${HIDDEN_REGION_DEG}::float8)::int - ${region.lon}::int)
-                     % ${lonRegions}::int + ${lonRegions}::int) % ${lonRegions}::int) IN (0, 1, ${lonRegions - 1}::int)))
-         AND ${notBlocked(val(me), col("u.id"))}
-         AND ${visibleToViewer(val(me), "u")}
-         AND ${notModerated("u")}
-         AND (NOT ${q.onlineOnly} OR (u.show_online_status AND u.last_active_at > ${onlineCutoff}))
-         AND (NOT ${q.favoritesOnly} OR EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = ${me} AND f.target_id = u.id))
-         AND (${lookingFor.length === 0} OR u.looking_for && ${lookingFor}::text[])
-         AND (${q.minAge ?? null}::int IS NULL OR u.age >= ${q.minAge ?? null}::int)
-         AND (${q.maxAge ?? null}::int IS NULL OR u.age <= ${q.maxAge ?? null}::int)
-         AND (${positions.length === 0} OR u.position = ANY(${positions}::text[]))
-         AND (${tags.length === 0} OR u.tags && ${tags}::text[])
-    ) s
-    WHERE (${maxD ?? null}::int IS NULL OR (NOT s.sort_h AND s.sort_d <= ${maxD ?? null}::int))
-      AND (${cursor === null} OR (s.sort_d, s.id) > (${cursor?.d ?? 0}::int, ${cursor?.id ?? ""}::text))
-    ORDER BY s.sort_d, s.id
-    LIMIT ${limit + 1}`;
-
-  const page = rows.slice(0, limit);
-  const last = page[page.length - 1];
-  const nextCursor = rows.length > limit && last ? encodeCursor({ d: last.sort_d, id: last.id }) : null;
-  const items = await profilesFor(
-    me,
-    page.map((r) => r.id),
-    { rows: page, cell },
+  return c.json(
+    await nearbyPage(me, {
+      limit,
+      cursor,
+      onlineOnly: q.onlineOnly,
+      favoritesOnly: q.favoritesOnly,
+      lookingFor,
+      minAge: q.minAge,
+      maxAge: q.maxAge,
+      maxDistanceMeters: q.maxDistanceMeters,
+      positions,
+      tags,
+    }),
   );
-  return c.json({ items, nextCursor });
 });
 
 discoveryRoutes.get("/profiles/:id", requireAuth, async (c) => {
@@ -201,6 +156,8 @@ discoveryRoutes.post("/profiles/:id/tap", requireAuth, rateLimit("taps"), async 
   const id = idParam(c, "id", "user");
   await assertVisibleUser(me, id);
   await assertMayTap(me);
+  // Shadow limit (lib/abuse/spam.ts): a spam-limited account's taps are accepted and silently dropped.
+  if (await isSpamLimited(me)) return c.body(null, 204);
 
   // One tap per (from,to) per 24 h; a repeat inside the window is an idempotent no-op.
   const created = await sql.begin(async (tx) => {

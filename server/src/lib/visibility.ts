@@ -24,6 +24,18 @@ export function notBlocked(a: Fragment, b: Fragment): Fragment {
         OR (bl.blocker_id = ${b} AND bl.blocked_id = ${a}))`;
 }
 
+/**
+ * Same rule as `notBlocked(val(viewerId), target)`, shaped for scans over MANY targets (nearby): the subquery doesn't
+ * depend on the row, so Postgres reads the viewer's blocks (both directions) once into a hashed set instead of
+ * probing `blocks` for every candidate. `target` must be non-null (an id column).
+ */
+export function notBlockedByViewer(viewerId: string, target: Fragment): Fragment {
+  return sql`${target} NOT IN (
+    SELECT bl.blocked_id FROM blocks bl WHERE bl.blocker_id = ${viewerId}
+    UNION ALL
+    SELECT bl.blocker_id FROM blocks bl WHERE bl.blocked_id = ${viewerId})`;
+}
+
 /** TRUE when the user `u` is effectively incognito (flag on AND Stexx+ active). `u` = users-row alias. */
 export function isIncognito(u: string): Fragment {
   return sql`(${sql(u + ".incognito")} AND ${sql(u + ".plus_expires_at")} > now())`;
@@ -44,12 +56,30 @@ export function visibleToViewer(viewer: Fragment, t: string): Fragment {
 }
 
 /**
+ * Same rule as `visibleToViewer(val(viewerId), t)`, shaped for scans over MANY rows (nearby). The people who have
+ * written to the viewer are read once, and only when the first incognito row needs them (an uncorrelated subquery
+ * is an init plan, run lazily), instead of a conversations/messages probe per incognito row. The probe form also
+ * makes the planner charge a subquery for EVERY row (it can't know the OR usually short-circuits), which on a full
+ * scan talks it out of hash joins; this one is charged once.
+ */
+export function visibleToViewerInScan(viewerId: string, t: string): Fragment {
+  return sql`(NOT ${isIncognito(t)} OR ${sql(t + ".id")} = ANY (ARRAY(
+    SELECT CASE WHEN cv.user_a = ${viewerId} THEN cv.user_b ELSE cv.user_a END
+      FROM conversations cv
+     WHERE (cv.user_a = ${viewerId} OR cv.user_b = ${viewerId})
+       AND EXISTS (SELECT 1 FROM messages ms
+                    WHERE ms.conversation_id = cv.id
+                      AND ms.sender_id = CASE WHEN cv.user_a = ${viewerId} THEN cv.user_b ELSE cv.user_a END))))`;
+}
+
+/**
  * Moderation gate for LISTS of other users (nearby grid, viewers): TRUE unless the target row `t` is hidden pending
- * review (auto-hidden after reports, or by a moderator) or banned. No exceptions: a hidden account disappears from
- * discovery for everyone.
+ * review (auto-hidden after reports, or by a moderator), banned, or shadow-limited by the spam heuristics
+ * (lib/abuse/spam.ts). No exceptions: such an account disappears from discovery for everyone.
  */
 export function notModerated(t: string): Fragment {
-  return sql`(${sql(t + ".hidden_at")} IS NULL AND ${sql(t + ".banned_at")} IS NULL)`;
+  return sql`(${sql(t + ".hidden_at")} IS NULL AND ${sql(t + ".banned_at")} IS NULL
+              AND ${sql(t + ".spam_limited_at")} IS NULL)`;
 }
 
 /**
