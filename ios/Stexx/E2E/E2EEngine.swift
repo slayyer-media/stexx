@@ -43,11 +43,50 @@ enum E2EOutgoing: Equatable, Sendable {
     case envelope(MessageEnvelope)
 }
 
-/// What's inside an envelope: small UTF-8 JSON, with room for media keys
-/// later (`docs/api.md`, "Sending encrypted messages"). Unknown fields are
-/// ignored.
+/// How a message to someone goes out, decided before anything is encrypted
+/// or uploaded (`E2EEngine.route`).
+enum E2ERoute: Equatable, Sendable {
+    /// `E2E_MODE=off`, or `optional` and the recipient has no keys.
+    case plaintext
+    /// A session is ready: seal the content with `E2EEngine.seal`.
+    case encrypt
+}
+
+/// What's inside an envelope: small UTF-8 JSON (`docs/api.md`, "Sending
+/// encrypted messages"): the text and/or an encrypted photo's pointer.
+/// Unknown fields are ignored.
 struct E2EPayload: Codable, Equatable, Sendable {
     var text: String?
+    var attachment: E2EAttachmentPointer? = nil
+    /// The message's timer (the send's `expiresAfterSeconds`), so the
+    /// recipient knows how long a photo can exist on the server (the server
+    /// only reports `expiresAt` once the message is read). Omitted when
+    /// `nil`; older versions ignore it.
+    var expiresAfterSeconds: Int? = nil
+
+    /// The server's longest timer.
+    static let maxExpiresAfterSeconds = 30 * 24 * 3600
+
+    /// `expiresAfterSeconds` if it's a timer the server could have accepted.
+    var timer: Int? {
+        guard let seconds = expiresAfterSeconds, (1...Self.maxExpiresAfterSeconds).contains(seconds) else { return nil }
+        return seconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case text, attachment, expiresAfterSeconds
+    }
+}
+
+extension E2EPayload {
+    /// Lenient about the timer: a malformed one is dropped, never the text
+    /// and photo with it.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        text = try container.decodeIfPresent(String.self, forKey: .text)
+        attachment = try container.decodeIfPresent(E2EAttachmentPointer.self, forKey: .attachment)
+        expiresAfterSeconds = (try? container.decodeIfPresent(Int.self, forKey: .expiresAfterSeconds)) ?? nil
+    }
 }
 
 /// The Signal Protocol client: keys, sessions, encrypt and decrypt, for the
@@ -58,12 +97,13 @@ struct E2EPayload: Codable, Equatable, Sendable {
 ///   last-resort key and batches of one-time EC and Kyber prekeys, private
 ///   parts in the Keychain (`E2EProtocolStore`). `syncKeys()` registers,
 ///   replenishes and rotates them against `GET /keys/status`.
-/// - Sending: `prepareOutgoing` decides plaintext or envelope from
-///   `E2E_MODE`, runs the text rules, sets up a session with PQXDH from a
-///   prekey bundle if needed and encrypts with the Double Ratchet.
-/// - Receiving: `reveal` decrypts envelopes once and keeps the plaintext in
-///   the encrypted local history; later copies of the same message (REST,
-///   websocket, conversation list) are read from there.
+/// - Sending: `route` decides plaintext or envelope from `E2E_MODE`, runs
+///   the text rules and sets up a session with PQXDH from a prekey bundle if
+///   needed; `seal` encrypts the payload (text and/or a photo pointer) with
+///   the Double Ratchet. `prepareOutgoing` does both for text.
+/// - Receiving: `reveal` decrypts envelopes once and keeps the plaintext (and
+///   photo keys) in the encrypted local history; later copies of the same
+///   message (REST, websocket, conversation list) are read from there.
 /// - Identity changes are held until the user accepts them; until then
 ///   nothing is sent to that person and their new-key messages stay hidden.
 ///
@@ -105,8 +145,18 @@ actor E2EEngine {
     private var lastSnapshot = E2ESnapshot()
     private var syncTask: Task<Void, Never>?
     private var syncGeneration = 0
+    /// Encrypted photos being sent, by client ID: a retry re-uploads the same
+    /// blob, so whichever copy the server keeps matches the local pointer.
+    /// Memory only; dropped on success and sign-out.
+    private var outgoingMedia: [String: (blob: Data, pointer: E2EAttachmentPointer)] = [:]
+    /// Drops the decrypted copies of photos whose keys went (`ChatMediaLoader`).
+    private let evictMedia: @Sendable ([Message.ID]) async -> Void
+    /// When the history was last pruned (at most every `historyPruneInterval` while revealing).
+    private var historyPrunedAt: Date?
 
     static let deviceID: UInt32 = 1
+    /// How often `reveal` prunes the history while the app runs.
+    static let historyPruneInterval: TimeInterval = 60
     /// How long a fetched `E2EConfig` is used before it's re-read.
     static let configLifetime: TimeInterval = 10 * 60
     /// At most one identity re-check per person in this window (thread opens).
@@ -115,18 +165,23 @@ actor E2EEngine {
     /// - Parameters:
     ///   - api: The plain client (not `E2EAPIClient`).
     ///   - currentUserID: The signed-in account, if any.
+    ///   - evictMedia: Drops decrypted photos from memory once their keys are gone.
     init(
         api: any APIClient,
         secrets: any E2ESecretStorage,
         history: any E2EHistoryPersistence,
         currentUserID: @escaping @Sendable () async -> Profile.ID?,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        evictMedia: @escaping @Sendable ([Message.ID]) async -> Void = { ids in
+            for id in ids { await ChatMediaLoader.shared.evict(id) }
+        }
     ) {
         self.api = api
         self.secrets = secrets
         self.historyPersistence = history
         self.currentUserID = currentUserID
         self.now = now
+        self.evictMedia = evictMedia
     }
 
     func setSnapshotHandler(_ handler: @escaping @Sendable (E2ESnapshot) async -> Void) async {
@@ -158,11 +213,40 @@ actor E2EEngine {
             guard let existing = try E2EProtocolStore.load(storage: secrets, userID: userID) else { return nil }
             store = existing
         }
-        var history = loadHistory(userID: userID)
-        history.prune(now: now())
-        let loaded = Account(userID: userID, store: store, history: history)
+        let loaded = Account(userID: userID, store: store, history: loadHistory(userID: userID))
         account = loaded
+        // Expired text and photo keys leave the file now, not with the next change.
+        _ = pruneHistory(of: loaded)
+        flushHistory(loaded)
         return loaded
+    }
+
+    /// Drops expired entries and photo keys past their deadline. Returns the
+    /// IDs of messages whose entry or photo key went.
+    private func pruneHistory(of account: Account) -> [Message.ID] {
+        let date = now()
+        historyPrunedAt = date
+        let before = account.history
+        account.history.prune(now: date)
+        guard account.history != before else { return [] }
+        account.historyDirty = true
+        return before.messages.compactMap { id, entry in
+            guard let after = account.history.messages[id] else { return id }
+            return entry.attachment != nil && after.attachment == nil ? id : nil
+        }.sorted()
+    }
+
+    /// Prunes the history during a session (expired messages, photo keys past
+    /// their deadline), not only when it's loaded: on foreground, and from
+    /// `reveal` at most once a minute. Their decrypted photos leave memory
+    /// too. Returns the IDs of messages whose entry or photo key went.
+    @discardableResult
+    func pruneHistory() async -> [Message.ID] {
+        guard let account = try? await loadAccount(create: false) else { return [] }
+        let dropped = pruneHistory(of: account)
+        flushHistory(account)
+        if !dropped.isEmpty { await evictMedia(dropped) }
+        return dropped
     }
 
     /// The account's history. Never lets an unreadable history be silently
@@ -210,6 +294,7 @@ actor E2EEngine {
         encryptedPeers = []
         identityCheckedAt = [:]
         sessionSetups = [:]
+        outgoingMedia = [:]
         await publish()
     }
 
@@ -224,14 +309,17 @@ actor E2EEngine {
         try? E2EProtocolStore.wipe(storage: secrets, userID: userID)
         try? historyPersistence.delete(userID: userID)
         encryptedPeers = []
+        outgoingMedia = [:]
         await publish()
     }
 
     // MARK: Config
 
     /// `GET /e2e/config`, cached for `configLifetime`. Falls back to the
-    /// cached value when the request fails.
-    func currentConfig(refresh: Bool = false) async throws -> E2EConfig {
+    /// cached value when the request fails, unless `fallBackToCache` is
+    /// false: then a failed refresh throws (before a plaintext photo upload,
+    /// a stale mode must not decide).
+    func currentConfig(refresh: Bool = false, fallBackToCache: Bool = true) async throws -> E2EConfig {
         let userID = await currentUserID()
         let cached = configUserID == userID ? config : nil
         if !refresh, let cached, let at = configFetchedAt, now().timeIntervalSince(at) < Self.configLifetime {
@@ -240,11 +328,11 @@ actor E2EEngine {
         let fresh: E2EConfig
         do {
             fresh = try await api.e2eConfig()
-        } catch APIError.notFound where cached == nil {
+        } catch APIError.notFound where cached == nil || (!fallBackToCache && cached?.mode == .off) {
             // A server from before end-to-end encryption: plaintext.
             fresh = .off
         } catch {
-            if let cached { return cached }
+            if fallBackToCache, let cached { return cached }
             throw error
         }
         // Only keep it if the same account is still signed in.
@@ -647,26 +735,43 @@ actor E2EEngine {
         try ProtocolAddress(name: peer, deviceId: Self.deviceID)
     }
 
-    /// Decides how `text` goes to `peer` and, for an envelope, encrypts it.
+    /// Decides how `text` goes to `peer` and, for an envelope, encrypts it
+    /// (`route`, then `seal`). Text messages only; photos go through
+    /// `E2EAPIClient.sendPhoto`.
+    func prepareOutgoing(text: String, to peer: Profile.ID, conversationID: Conversation.ID, clientID: String) async throws -> E2EOutgoing {
+        switch try await route(text: text, to: peer, conversationID: conversationID) {
+        case .plaintext:
+            return .plaintext
+        case .encrypt:
+            return .envelope(try await seal(E2EPayload(text: text), to: peer, conversationID: conversationID, clientID: clientID))
+        }
+    }
+
+    /// Decides how a message to `peer` goes out, without encrypting anything:
     ///
     /// - `off`: plaintext.
-    /// - `optional`: an envelope if there is a session or the recipient has
-    ///   keys; plaintext if the server says `keys_unavailable` / `e2e_disabled`.
-    /// - `required`: an envelope or an error, never plaintext.
+    /// - `optional`: encrypt if there is a session or the recipient has keys
+    ///   (setting up the session from their bundle); plaintext if the server
+    ///   says `keys_unavailable` / `e2e_disabled`.
+    /// - `required`: encrypt or an error, never plaintext.
     ///
-    /// Never falls back to plaintext because of a key change or a broken
-    /// bundle: that would let a server quietly downgrade a chat.
-    func prepareOutgoing(text: String, to peer: Profile.ID, conversationID: Conversation.ID, clientID: String) async throws -> E2EOutgoing {
+    /// Runs the text rules on `text` (if any) and refuses while `peer`'s key
+    /// change is pending. Never falls back to plaintext because of a key
+    /// change or a broken bundle: that would let a server quietly downgrade a
+    /// chat.
+    func route(text: String?, to peer: Profile.ID, conversationID: Conversation.ID) async throws -> E2ERoute {
         let config = try await currentConfig()
         guard config.mode != .off else { return .plaintext }
         let account = try await requireAccount()
-        try E2EContentRules.check(
-            text,
-            conversationID: conversationID,
-            rules: config.contentRules,
-            recentSends: account.history.recentSends,
-            now: now()
-        )
+        if let text, !text.isEmpty {
+            try E2EContentRules.check(
+                text,
+                conversationID: conversationID,
+                rules: config.contentRules,
+                recentSends: account.history.recentSends,
+                now: now()
+            )
+        }
         let store = account.store
         if try store.pendingIdentity(of: peer) != nil {
             await publish()
@@ -689,12 +794,40 @@ actor E2EEngine {
             // A key change found while fetching the bundle.
             if try store.pendingIdentity(of: peer) != nil { throw E2EError.identityChanged(peer: peer) }
         }
+        return .encrypt
+    }
 
-        let payload = try JSONEncoder().encode(E2EPayload(text: text))
+    /// Encrypts `payload` for `peer` with the session `route` set up, and
+    /// keeps the sent text and photo pointer by `clientID` (the sender can't
+    /// decrypt its own envelope).
+    ///
+    /// - Parameters:
+    ///   - expiresAfterSeconds: The message's timer, if any: a photo key is
+    ///     then dropped once the server must have deleted the photo, even if
+    ///     this device never learns when it was read.
+    ///   - isViewOnce: A view-once photo (the key is dropped after the
+    ///     server's cap for unopened ones).
+    func seal(
+        _ payload: E2EPayload,
+        to peer: Profile.ID,
+        conversationID: Conversation.ID,
+        clientID: String,
+        expiresAfterSeconds: Int? = nil,
+        isViewOnce: Bool = false
+    ) async throws -> MessageEnvelope {
+        let config = try await currentConfig()
+        let account = try await requireAccount()
+        let store = account.store
+        if try store.pendingIdentity(of: peer) != nil {
+            await publish()
+            throw E2EError.identityChanged(peer: peer)
+        }
+        let address = try address(peer)
+        let plaintext = try JSONEncoder().encode(payload)
         let ciphertext: CiphertextMessage
         do {
             ciphertext = try signalEncrypt(
-                message: payload,
+                message: plaintext,
                 for: address,
                 localAddress: store.localAddress,
                 sessionStore: store,
@@ -719,27 +852,61 @@ actor E2EEngine {
 
         // Kept before the request goes out: the server's websocket echo can
         // arrive before the response.
-        account.history.sent[clientID] = E2EHistory.Entry(conversationID: conversationID, text: text, storedAt: now())
+        let date = now()
+        var keyUntil: Date?
+        if let seconds = expiresAfterSeconds {
+            // The server deletes an expiring message at most 14 days after
+            // it was sent plus its timer, read or not.
+            keyUntil = date.addingTimeInterval(E2EHistory.serverPhotoCap + TimeInterval(seconds))
+        } else if isViewOnce {
+            keyUntil = date.addingTimeInterval(E2EHistory.serverPhotoCap + E2EHistory.attachmentKeyMargin)
+        }
+        account.history.sent[clientID] = E2EHistory.Entry(
+            conversationID: conversationID,
+            text: payload.text,
+            storedAt: date,
+            attachment: payload.attachment,
+            attachmentKeyUntil: keyUntil
+        )
         account.historyDirty = true
         flushHistory(account)
         encryptedPeers.insert(peer)
         await publish()
-        return .envelope(MessageEnvelope(type: kind, body: body.base64EncodedString()))
+        return MessageEnvelope(type: kind, body: body.base64EncodedString())
+    }
+
+    /// The encrypted blob and pointer for the photo sent as `clientID`:
+    /// the same ones on every retry of that send, a fresh key otherwise.
+    func encryptedPhoto(_ jpeg: Data, clientID: String) throws -> (blob: Data, pointer: E2EAttachmentPointer) {
+        if let cached = outgoingMedia[clientID] { return cached }
+        let size = E2EMediaCrypto.pixelSize(of: jpeg)
+        let encrypted = try E2EMediaCrypto.encrypt(jpeg: jpeg, width: size?.width, height: size?.height)
+        outgoingMedia[clientID] = encrypted
+        return encrypted
+    }
+
+    /// The photo sent as `clientID` reached the server: forget its blob.
+    func didSendPhoto(clientID: String) {
+        outgoingMedia[clientID] = nil
     }
 
     /// The server accepted `message` (plaintext or envelope) whose text was
     /// `text`: remember it for the duplicate rule and, for an envelope, show
     /// the plaintext.
-    func didSend(_ message: Message, text: String) async -> Message {
+    func didSend(_ message: Message, text: String?) async -> Message {
         guard let account = try? await loadAccount(create: false), account.userID == message.senderID else { return message }
-        account.history.recentSends.append(E2EHistory.Send(
-            conversationID: message.conversationID,
-            normalized: E2EContentRules.normalizeForDuplicate(text),
-            sentAt: now()
-        ))
-        account.historyDirty = true
-        let revealed = reveal(message, in: account)
+        if let text, !text.isEmpty {
+            account.history.recentSends.append(E2EHistory.Send(
+                conversationID: message.conversationID,
+                normalized: E2EContentRules.normalizeForDuplicate(text),
+                sentAt: now()
+            ))
+            account.historyDirty = true
+        }
+        var dropped: [Message.ID] = []
+        let revealed = reveal(message, in: account, dropped: &dropped)
         flushHistory(account)
+        if !dropped.isEmpty { await evictMedia(dropped) }
         return revealed
     }
 
@@ -842,8 +1009,14 @@ actor E2EEngine {
                 return copy
             }
         }
-        let revealed = messages.map { reveal($0, in: account) }
+        // Keys that expired while the app was running go before anything is shown.
+        var dropped: [Message.ID] = []
+        if historyPrunedAt.map({ now().timeIntervalSince($0) >= Self.historyPruneInterval }) ?? true {
+            dropped = pruneHistory(of: account)
+        }
+        let revealed = messages.map { reveal($0, in: account, dropped: &dropped) }
         flushHistory(account)
+        if !dropped.isEmpty { await evictMedia(dropped) }
         await publish()
         // A message under an unknown key: check it against the published key
         // (in the background, at most once a minute per person).
@@ -884,17 +1057,28 @@ actor E2EEngine {
     /// Synchronous on purpose: the history lookup, the decrypt and storing
     /// the plaintext happen without a suspension point, so the same message
     /// arriving twice at once (REST and websocket) is decrypted only once.
-    private func reveal(_ message: Message, in account: Account) -> Message {
+    /// Appends to `dropped` the messages whose photo key went here.
+    private func reveal(_ message: Message, in account: Account, dropped: inout [Message.ID]) -> Message {
         guard let envelope = message.envelope else { return message }
         var revealed = message
         if var entry = account.history.messages[message.id] {
-            if entry.expiresAt != message.expiresAt {
-                entry.expiresAt = message.expiresAt
+            let before = entry
+            // The server's `expiresAt` wins over one stamped here (`didMarkRead`);
+            // a copy without one (fetched before the read) never clears it.
+            if let expiresAt = message.expiresAt { entry.expiresAt = expiresAt }
+            // Expired since the last prune: the server has deleted the photo.
+            let date = now()
+            if let expiresAt = entry.expiresAt, expiresAt <= date {
+                entry.dropAttachment()
+            } else {
+                entry.pruneAttachment(now: date)
+            }
+            if before.attachment != nil && entry.attachment == nil { dropped.append(message.id) }
+            if entry != before {
                 account.history.messages[message.id] = entry
                 account.historyDirty = true
             }
-            revealed.text = entry.text
-            revealed.encryption = entry.text == nil && message.attachment == nil ? .unsupported : .decrypted
+            Self.apply(entry, to: &revealed)
             return revealed
         }
 
@@ -905,8 +1089,7 @@ actor E2EEngine {
                 account.history.messages[message.id] = entry
                 account.history.sent[clientID] = nil
                 account.historyDirty = true
-                revealed.text = entry.text
-                revealed.encryption = .decrypted
+                Self.apply(entry, to: &revealed)
             } else {
                 revealed.encryption = .unavailable
             }
@@ -945,17 +1128,33 @@ actor E2EEngine {
                     context: NullContext()
                 )
             }
-            let text = (try? JSONDecoder().decode(E2EPayload.self, from: plaintext))?.text
-            account.history.messages[message.id] = E2EHistory.Entry(
+            let payload = try? JSONDecoder().decode(E2EPayload.self, from: plaintext)
+            let date = now()
+            let timer = payload?.timer
+            var keyUntil: Date?
+            if let timer {
+                // Like the sender's: the server deletes an expiring photo at
+                // most 14 days after it was sent plus its timer, read or not,
+                // even if this device never learns its `expiresAt`.
+                keyUntil = date.addingTimeInterval(E2EHistory.serverPhotoCap + TimeInterval(timer) + E2EHistory.attachmentKeyMargin)
+            } else if message.attachment?.isViewOnce == true {
+                // An unopened view-once photo is deleted by the server after
+                // its cap; this device may never load the thread again.
+                keyUntil = date.addingTimeInterval(E2EHistory.serverPhotoCap + E2EHistory.attachmentKeyMargin)
+            }
+            let entry = E2EHistory.Entry(
                 conversationID: message.conversationID,
-                text: text,
-                storedAt: now(),
-                expiresAt: message.expiresAt
+                text: payload?.text,
+                storedAt: date,
+                expiresAt: message.expiresAt,
+                attachment: payload?.attachment,
+                attachmentKeyUntil: keyUntil,
+                expiresAfterSeconds: timer
             )
+            account.history.messages[message.id] = entry
             account.historyDirty = true
             encryptedPeers.insert(message.senderID)
-            revealed.text = text
-            revealed.encryption = text == nil && message.attachment == nil ? .unsupported : .decrypted
+            Self.apply(entry, to: &revealed)
         } catch SignalError.untrustedIdentity {
             // Recorded as pending by the store; decrypted once the user accepts.
             revealed.encryption = .awaitingKeyConfirmation
@@ -966,12 +1165,91 @@ actor E2EEngine {
         return revealed
     }
 
-    /// The conversation was deleted (for this user): forget its plaintext.
+    /// Fills in what the history knows about a message: its text, and the
+    /// photo key if it still has one.
+    private static func apply(_ entry: E2EHistory.Entry, to message: inout Message) {
+        message.text = entry.text
+        message.e2eAttachment = nil
+        message.e2eAttachmentRemoval = nil
+        if let pointer = entry.attachment {
+            if pointer.isSupported {
+                message.e2eAttachment = pointer
+                message.encryption = .decrypted
+            } else {
+                // A photo from a newer version of the app.
+                message.encryption = .unsupported
+            }
+        } else if entry.hadAttachment == true {
+            message.e2eAttachmentRemoval = entry.viewOnceOpenedAt != nil ? .opened : .gone
+            message.encryption = .decrypted
+        } else {
+            // No pointer: an encrypted photo's tile then says it isn't
+            // available on this phone (never "needs a newer version").
+            message.encryption = entry.text == nil && message.attachment == nil ? .unsupported : .decrypted
+        }
+    }
+
+    /// The user closed a view-once photo: drop its key and remember it was
+    /// opened here, so the bubble shows "Opened".
+    func forgetAttachmentKey(messageID: Message.ID) async {
+        guard let account = try? await loadAccount(create: false),
+              var entry = account.history.messages[messageID]
+        else { return }
+        entry.dropAttachment(openedAt: now())
+        account.history.messages[messageID] = entry
+        account.historyDirty = true
+        flushHistory(account)
+        await evictMedia([messageID])
+    }
+
+    /// The server no longer has these photos (`url: null` in `GET …/messages`:
+    /// spent or expired): drop their keys.
+    func attachmentsGone(messageIDs: [Message.ID]) async {
+        guard !messageIDs.isEmpty, let account = try? await loadAccount(create: false) else { return }
+        for id in messageIDs {
+            guard var entry = account.history.messages[id], entry.attachment != nil else { continue }
+            entry.dropAttachment()
+            account.history.messages[id] = entry
+            account.historyDirty = true
+        }
+        flushHistory(account)
+        await evictMedia(messageIDs)
+    }
+
+    /// The conversation was deleted (for this user): forget its plaintext
+    /// and its decrypted photos.
     func forgetConversation(_ conversationID: Conversation.ID) async {
         guard let account = try? await loadAccount(create: false) else { return }
+        let forgotten = account.history.messages.filter { $0.value.conversationID == conversationID }.keys.sorted()
         account.history.messages = account.history.messages.filter { $0.value.conversationID != conversationID }
         account.history.sent = account.history.sent.filter { $0.value.conversationID != conversationID }
         account.historyDirty = true
+        flushHistory(account)
+        if !forgotten.isEmpty { await evictMedia(forgotten) }
+    }
+
+    /// The user read `conversationID` (`POST …/read`): the server starts the
+    /// timers of the messages they received now. Received entries whose
+    /// timer came in the envelope (`E2EPayload.expiresAfterSeconds`) get
+    /// their `expiresAt` here, so they're pruned on time even if this device
+    /// doesn't see the server's `expiresAt` again. Only entries stored before
+    /// `requestedAt` (from `markReadRequested()`, taken before the request):
+    /// a message that arrived while the request was in flight may be unread
+    /// on the server, and stamping it would delete its only decrypted copy
+    /// while the server still holds it.
+    /// The engine's clock, read just before `POST …/read` (see `didMarkRead`).
+    func markReadRequested() -> Date { now() }
+
+    func didMarkRead(conversationID: Conversation.ID, requestedAt: Date) async {
+        guard let account = try? await loadAccount(create: false) else { return }
+        let date = now()
+        for (id, entry) in account.history.messages
+        where entry.conversationID == conversationID && entry.expiresAt == nil && entry.storedAt <= requestedAt {
+            // Only received entries carry the timer.
+            guard let seconds = entry.expiresAfterSeconds else { continue }
+            account.history.messages[id]?.expiresAt = date.addingTimeInterval(TimeInterval(seconds))
+            account.historyDirty = true
+        }
         flushHistory(account)
     }
 

@@ -61,11 +61,13 @@ const Profile = z.strictObject({
   isFavorite: z.boolean(),
 });
 
-// struct Message.Attachment { var kind: Kind; var url: URL?; var isViewOnce: Bool = false }
+// struct Message.Attachment { var kind: Kind; var url: URL?; var isViewOnce: Bool = false; var isEncrypted: Bool = false }
+// (isEncrypted is decoded with decodeIfPresent, so older servers and the mock may omit it; this server always sends it.)
 const Attachment = z.strictObject({
   kind: z.enum(["photo"]),
   url: swiftOptional(SwiftURL),
   isViewOnce: z.boolean(),
+  isEncrypted: z.boolean(),
 });
 
 // E2E envelope (docs/api.md "End-to-end encryption"). The Swift model doesn't decode it yet (iOS phase pending);
@@ -310,6 +312,13 @@ describe("contract: REST responses match the Swift models", () => {
     sent.push(await body(await as(a).post(url, { json: { clientID: crypto.randomUUID().toUpperCase(), text: "poof", expiresAfterSeconds: 600 } }), Message, "Message(expiring)"));
     expect(sent[1]!.attachment).toMatchObject({ kind: "photo" });
     expect(sent.every((m) => m.status === "sent" && m.clientID)).toBe(true);
+    // POST /me/attachments: a Photo plus isEncrypted (Swift's Photo decoding ignores the extra key).
+    await body(
+      await as(a).post("/v1/me/attachments", { body: await makeJpeg(), contentType: "image/jpeg" }),
+      Photo.extend({ isEncrypted: z.literal(false) }),
+      "Photo(attachment upload)",
+      201,
+    );
 
     const page1 = await body(await as(b).get(`${url}?limit=2`), Page(Message), "Page<Message>");
     expect(page1.nextCursor).toBeString();

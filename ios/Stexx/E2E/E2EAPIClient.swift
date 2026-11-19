@@ -6,8 +6,14 @@ import Foundation
 /// - `send` encrypts text into an `envelope` when `E2EEngine` says so, and
 ///   retries once when the server's mode changed under it (`e2e_disabled`
 ///   after encrypting, `encryption_required` after plaintext).
+/// - `sendPhoto` decides the route first, then either uploads the JPEG as a
+///   plaintext attachment (no keys / E2E off) or encrypts it, uploads the
+///   opaque blob and seals its key (and the message's timer) into the
+///   envelope. A plaintext upload only follows a freshly read config. Once a
+///   chat is encrypted, a failure never falls back to a plaintext upload.
 /// - `conversations`, `openConversation` and `messages` decrypt envelopes
-///   (or read the local copy) before returning.
+///   (or read the local copy) before returning; `markRead` starts the local
+///   expiry of received expiring messages.
 /// - Deleting a conversation forgets its plaintext; deleting the account
 ///   wipes this device's keys and history.
 ///
@@ -60,16 +66,112 @@ struct E2EAPIClient: APIClient {
     func messages(in conversationID: Conversation.ID, before: Message.ID?) async throws -> Page<Message> {
         var page = try await base.messages(in: conversationID, before: before)
         page.items = await engine.reveal(page.items)
+        // Only this listing hands out every live photo's URL (realtime events
+        // withhold view-once ones from the recipient), so `null` here means
+        // the photo is gone for good: drop its key.
+        let gone = Set(page.items.filter { $0.attachment?.isEncrypted == true && $0.attachment?.url == nil }.map(\.id))
+        if !gone.isEmpty {
+            await engine.attachmentsGone(messageIDs: Array(gone))
+            for index in page.items.indices where gone.contains(page.items[index].id) && page.items[index].e2eAttachment != nil {
+                page.items[index].e2eAttachment = nil
+                page.items[index].e2eAttachmentRemoval = .gone
+            }
+        }
         return page
     }
 
     func send(_ draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message {
-        // Photo-only messages aren't end-to-end encrypted yet (phase 3).
+        if draft.attachmentPhotoID != nil, draft.envelope == nil {
+            // Photos go through `sendPhoto`, which encrypts the photo with
+            // its caption. A photo uploaded elsewhere is only sent as is
+            // (plaintext, with a plaintext caption) where the chat isn't
+            // encrypted: never a plaintext photo next to encrypted text.
+            let peer = try await participant(of: conversationID)
+            let caption = draft.text.flatMap { $0.isEmpty ? nil : $0 }
+            guard try await engine.route(text: caption, to: peer, conversationID: conversationID) == .plaintext else {
+                throw E2EError.encryptionFailed
+            }
+            return await engine.didSend(try await base.send(draft, in: conversationID), text: caption)
+        }
+        // A draft that already carries an envelope or has no text passes through.
         guard let text = draft.text, draft.envelope == nil else {
             return try await base.send(draft, in: conversationID)
         }
         let peer = try await participant(of: conversationID)
         return try await sendText(text, draft: draft, to: peer, in: conversationID, isRetry: false)
+    }
+
+    func sendPhoto(jpegData: Data, draft: MessageDraft, in conversationID: Conversation.ID) async throws -> Message {
+        let peer = try await participant(of: conversationID)
+        return try await sendPhoto(jpegData, draft: draft, to: peer, in: conversationID, isRetry: false)
+    }
+
+    /// Routes first (nothing is uploaded until it's clear how the photo goes
+    /// out), then sends the photo either way.
+    private func sendPhoto(_ jpeg: Data, draft: MessageDraft, to peer: Profile.ID, in conversationID: Conversation.ID, isRetry: Bool) async throws -> Message {
+        let caption = draft.text.flatMap { $0.isEmpty ? nil : $0 }
+        do {
+            var route = try await engine.route(text: caption, to: peer, conversationID: conversationID)
+            if route == .plaintext {
+                // The cached config may be stale (the server may require
+                // encryption by now): re-read it and route again before a
+                // plaintext photo leaves the phone. No fresh config, no upload.
+                _ = try await engine.currentConfig(refresh: true, fallBackToCache: false)
+                route = try await engine.route(text: caption, to: peer, conversationID: conversationID)
+            }
+            switch route {
+            case .plaintext:
+                // `off`, or `optional` and they can't receive encrypted messages yet.
+                let upload = try await base.uploadAttachment(jpegData: jpeg)
+                var wire = draft
+                wire.envelope = nil
+                wire.attachmentPhotoID = upload.id
+                let sent = try await base.send(wire, in: conversationID)
+                // Drops a blob kept from an earlier, encrypted attempt.
+                await engine.didSendPhoto(clientID: draft.clientID)
+                return await engine.didSend(sent, text: caption)
+            case .encrypt:
+                let encrypted = try await encryptedPhoto(jpeg, clientID: draft.clientID)
+                let upload = try await base.uploadEncryptedAttachment(encrypted.blob)
+                let envelope = try await engine.seal(
+                    E2EPayload(text: caption, attachment: encrypted.pointer, expiresAfterSeconds: draft.expiresAfterSeconds),
+                    to: peer,
+                    conversationID: conversationID,
+                    clientID: draft.clientID,
+                    expiresAfterSeconds: draft.expiresAfterSeconds,
+                    isViewOnce: draft.isViewOnce ?? false
+                )
+                var wire = draft
+                wire.text = nil
+                wire.envelope = envelope
+                wire.attachmentPhotoID = upload.id
+                let sent = try await base.send(wire, in: conversationID)
+                await engine.didSendPhoto(clientID: draft.clientID)
+                return await engine.didSend(sent, text: caption)
+            }
+        } catch APIError.e2e(let code, let message) where !isRetry
+            && (code == E2EErrorCode.encryptionRequired || code == E2EErrorCode.disabled) {
+            // The server's mode changed since the config was read. Retried
+            // only on a fresh config: a stale one could upload the plaintext
+            // photo again.
+            do {
+                _ = try await engine.currentConfig(refresh: true, fallBackToCache: false)
+            } catch {
+                throw APIError.e2e(code: code, message: message)
+            }
+            return try await sendPhoto(jpeg, draft: draft, to: peer, in: conversationID, isRetry: true)
+        } catch let error as APIError {
+            if case .server(403, _) = error { await engine.invalidateConfig() }
+            throw error
+        }
+    }
+
+    private func encryptedPhoto(_ jpeg: Data, clientID: String) async throws -> (blob: Data, pointer: E2EAttachmentPointer) {
+        do {
+            return try await engine.encryptedPhoto(jpeg, clientID: clientID)
+        } catch {
+            throw E2EError.encryptionFailed
+        }
     }
 
     private func sendText(_ text: String, draft: MessageDraft, to peer: Profile.ID, in conversationID: Conversation.ID, isRetry: Bool) async throws -> Message {
@@ -92,6 +194,14 @@ struct E2EAPIClient: APIClient {
             if case .server(403, _) = error { await engine.invalidateConfig() }
             throw error
         }
+    }
+
+    /// Reading starts the timers of received expiring messages: their local
+    /// copies (and photo keys) then expire on time.
+    func markRead(conversationID: Conversation.ID) async throws {
+        let requestedAt = await engine.markReadRequested()
+        try await base.markRead(conversationID: conversationID)
+        await engine.didMarkRead(conversationID: conversationID, requestedAt: requestedAt)
     }
 
     // MARK: Account
@@ -119,6 +229,7 @@ struct E2EAPIClient: APIClient {
     func uploadPhoto(jpegData: Data) async throws -> Photo { try await base.uploadPhoto(jpegData: jpegData) }
     func deletePhoto(id: Photo.ID) async throws { try await base.deletePhoto(id: id) }
     func uploadAttachment(jpegData: Data) async throws -> Photo { try await base.uploadAttachment(jpegData: jpegData) }
+    func uploadEncryptedAttachment(_ blob: Data) async throws -> Photo { try await base.uploadEncryptedAttachment(blob) }
     func reorderPhotos(_ photoIDs: [Photo.ID]) async throws -> [Photo] { try await base.reorderPhotos(photoIDs) }
     func updatePrivacy(_ settings: PrivacySettings) async throws -> PrivacySettings { try await base.updatePrivacy(settings) }
     func updateLocation(_ location: FuzzedLocation) async throws { try await base.updateLocation(location) }
@@ -128,7 +239,6 @@ struct E2EAPIClient: APIClient {
     func setFavorite(_ isFavorite: Bool, profileID: Profile.ID) async throws { try await base.setFavorite(isFavorite, profileID: profileID) }
     func sendTap(to profileID: Profile.ID) async throws { try await base.sendTap(to: profileID) }
     func viewers() async throws -> [Profile] { try await base.viewers() }
-    func markRead(conversationID: Conversation.ID) async throws { try await base.markRead(conversationID: conversationID) }
     func e2eConfig() async throws -> E2EConfig { try await base.e2eConfig() }
     func registerKeys(_ registration: KeyRegistration) async throws -> KeyStatus { try await base.registerKeys(registration) }
     func keyStatus() async throws -> KeyStatus { try await base.keyStatus() }

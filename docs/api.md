@@ -44,7 +44,8 @@ These aren't optional implementation details; they are product promises.
    not contain locations or message bodies.
 9. Media is served from `media.stexx.gay` with unguessable URLs; uploaded
    images are re-encoded server-side as well to strip any metadata the
-   client missed.
+   client missed. End-to-end encrypted chat photos are the exception: the
+   server can't read them, so the app strips metadata before encrypting.
 
 ## Errors
 
@@ -125,7 +126,7 @@ Non-2xx responses carry:
   "senderID": "p_7f3a",
   "text": "Museum this weekend?",
   "envelope": null,
-  "attachment": { "kind": "photo", "url": "https://media.stexx.gay/…", "isViewOnce": false },
+  "attachment": { "kind": "photo", "url": "https://media.stexx.gay/…", "isViewOnce": false, "isEncrypted": false },
   "sentAt": "2026-11-17T20:30:00Z",
   "status": "delivered",
   "expiresAt": null,
@@ -140,6 +141,11 @@ Non-2xx responses carry:
 - `envelope` is an end-to-end encrypted message (see
   [End-to-end encryption](#end-to-end-encryption)): `{ "type": "prekey" | "signal", "body": "<base64>" }`.
   When it is set, `text` is `null`. A message has `text` or `envelope`, never both.
+- `attachment.isEncrypted` is `true` for an end-to-end encrypted photo: `url`
+  points at an opaque blob, and the key to it is inside `envelope`
+  ([Encrypted photos](#encrypted-photos)). `url` is `null` once the photo is
+  gone (expired, or a view-once photo already opened), and for the recipient
+  of a view-once photo everywhere except `GET …/messages`.
 
 ### Session
 
@@ -173,7 +179,7 @@ Non-2xx responses carry:
 | POST | `/me/photos` | `image/jpeg` body → `Photo` | Client strips EXIF and downsizes to ≤ 2048 px. Max 6 photos. Never rejected for content: `isExplicit: true` means it was accepted but is hidden from everyone else (see Profile). |
 | DELETE | `/me/photos/{photoID}` | → 204 | |
 | PUT | `/me/photos/order` | `{ photoIDs: [...] }` → `[Photo]` | |
-| POST | `/me/attachments` | `image/jpeg` body → `Photo` (201) | Private upload for a **chat** photo: sanitized like a profile photo but never on the profile, not counted in the 6 photos, no clean-up delete needed. Pass its `id` as `attachmentPhotoID` (consumed by the send). Unsent uploads are deleted after 1 h; at most 10 pending (409 `attachment_limit`); 30 attachments/h (429). |
+| POST | `/me/attachments` | `image/jpeg` or `application/octet-stream` body → `Photo` (201) | Private upload for a **chat** photo, never on the profile, not counted in the 6 photos, no clean-up delete needed. `image/*`: sanitized like a profile photo. `application/octet-stream`: an end-to-end encrypted photo, stored as is ([Encrypted photos](#encrypted-photos)). The response adds `isEncrypted`. Pass its `id` as `attachmentPhotoID` (consumed by the send), or as an evidence `photoID` in a report. Unsent uploads are deleted after 1 h; at most 10 pending of either kind (409 `attachment_limit`); 30 attachments/h (429); 10 MB (413). |
 | PUT | `/me/privacy` | `PrivacySettings` → `PrivacySettings` | `hideDistance, showOnlineStatus, sendReadReceipts, expiringPhotosByDefault, blurExplicitPhotos, incognito` (incognito → 402 without Stexx+) |
 | PUT | `/me/location` | `{ latitude, longitude, precisionMeters }` → 204 | Already fuzzed on device. Overwrites; no history kept. |
 | GET | `/me/viewers` | → `[Profile]` | Stexx+ only (402 otherwise). Last 7 days. |
@@ -240,10 +246,11 @@ verifies them (with libsignal) and refuses anything else.
 
 **Mode.** `E2E_MODE` on the server is `off`, `optional` or `required`
 (`GET /e2e/config` → `mode`). With `off`, every `/keys` route answers
-**404 `e2e_disabled`** and a message with an `envelope` gets
-**400 `e2e_disabled`**. With `optional`, plaintext `text` and `envelope` both
-work. With `required`, plaintext `text` gets **400 `encryption_required`**
-(photo-only messages still work until encrypted media lands).
+**404 `e2e_disabled`**, and a message with an `envelope` or an encrypted
+photo upload gets **400 `e2e_disabled`**. With `optional`, plaintext and
+encrypted text and photos all work. With `required`, plaintext `text` and
+plaintext photos (a plaintext upload or a profile photo, with or without an
+envelope) get **400 `encryption_required`**.
 
 #### Endpoints
 
@@ -396,7 +403,8 @@ last-resort `pqPreKey`, so nobody can drain someone else's one-time prekeys.
   base64 and the size (≤ 32768 bytes decoded, **400 `invalid_envelope`**); it never
   parses or decrypts `body`.
 - What goes inside is up to the app: encrypt a small UTF-8 JSON
-  (`{"text": "…"}`, room for the media key later), not raw text.
+  (`{"text": "…"}`, plus `attachment` for a photo, see
+  [Encrypted photos](#encrypted-photos)), not raw text.
 - The envelope is addressed to the recipient's device only. The sender can't
   decrypt its own copy: keep your sent plaintext locally, keyed by `clientID`.
 - A ratchet message decrypts **once**. Store the decrypted plaintext locally,
@@ -408,8 +416,94 @@ last-resort `pqPreKey`, so nobody can drain someone else's one-time prekeys.
   receipts, idempotent `clientID`. The text rules (`links_not_allowed`,
   `duplicate_message`) aren't run on ciphertext: the app runs them
   (`contentRules`).
-- `attachmentPhotoID` still works next to an `envelope` (the photo isn't
-  end-to-end encrypted yet).
+- `attachmentPhotoID` next to an `envelope` should be an encrypted upload
+  ([Encrypted photos](#encrypted-photos)). A plaintext photo next to an
+  envelope is still accepted in `optional` (for builds that predate encrypted
+  photos), refused in `required`.
+
+#### Encrypted photos
+
+Chat photos are encrypted on the phone with a fresh random key per photo and
+uploaded as an opaque blob; the key travels inside the Signal envelope, so the
+server stores bytes it can't read.
+
+1. **Encrypt.** Take the sanitized JPEG (EXIF stripped, ≤ 2048 px: the
+   server can't re-encode it). Pad it with zero bytes to
+   `P(n) = max(541, floor(1.05 ^ ceil(log(n) / log(1.05))))` bytes (Signal's
+   size buckets, so the blob size doesn't give the exact photo size away).
+   Encrypt with **AES-256-GCM**, a random 32-byte key and a random 12-byte
+   nonce, no associated data. The blob is `nonce (12) ‖ ciphertext (P) ‖ tag (16)`
+   (CryptoKit's `AES.GCM.SealedBox.combined`). The digest is SHA-256 of the
+   whole blob.
+2. **Upload.** `POST /me/attachments` with `Content-Type: application/octet-stream`
+   and the blob as the body (29 bytes to 10 MB). The server never decodes,
+   re-encodes, hashes or classifies it; it stores the bytes as they are. 201
+   `{ "id": "ph_…", "url": "https://media.stexx.gay/<32 hex>.bin", "isExplicit": false, "isEncrypted": true }`.
+   **400 `e2e_disabled`** when `E2E_MODE` is `off`; **400 `invalid_attachment`**
+   for an empty or too-short body; **413 `payload_too_large`** above 10 MB.
+   Same limits as plaintext uploads (pending cap, 1 h expiry, 30/h,
+   attestation). Any other content type is **400 `invalid_image`**.
+3. **Send** `{ clientID, envelope, attachmentPhotoID, expiresAfterSeconds?, isViewOnce? }`
+   where the envelope's plaintext is:
+
+   ```json
+   {
+     "text": "optional caption",
+     "attachment": {
+       "v": 1, "kind": "photo", "contentType": "image/jpeg",
+       "key": "<base64, 32 bytes>", "digest": "<base64, 32 bytes>",
+       "size": 123456, "width": 1536, "height": 2048
+     },
+     "expiresAfterSeconds": 3600
+   }
+   ```
+
+   `expiresAfterSeconds` is optional: a JSON integer, set to the send's
+   `expiresAfterSeconds`, on encrypted photo sends only and left out without a
+   timer. It exists because the server doesn't reveal the timer to the
+   recipient before it starts, and the recipient's app needs it to know how
+   long to keep the photo key (the read time plus the timer, instead of the
+   14-day cap plus the timer). A receiver uses it only if it is between 1 and
+   2592000; anything else is ignored and the text and photo still decode. Older
+   builds ignore it as an unknown field.
+
+   `size` is the unpadded length; `width` and `height` are optional layout
+   hints. An encrypted upload without an `envelope` gets
+   **400 `envelope_required`** (the upload stays pending). The send rules per
+   `E2E_MODE` are in the Mode paragraph above: under `required`, a
+   plaintext photo gets **400 `encryption_required`** and nothing is consumed.
+4. **Receive.** Download `attachment.url`, check that SHA-256 of the blob
+   equals `digest` (before decrypting, constant-time compare), open it with
+   `key`, keep the first `size` bytes. Refuse a blob of 28 bytes or fewer, or
+   over 10 MB plus a little. A mismatch means the blob was swapped or damaged:
+   show an error, never the image. A pointer with `v` other than 1, or a `kind`
+   other than `photo`, is "needs a newer version". Why a digest on top of
+   AES-GCM: GCM isn't key-committing (one blob can be made to open under two
+   different keys), so the digest, which travels in the authenticated Signal
+   envelope, pins exactly one blob to the message and the server can't swap
+   blobs between messages.
+
+View-once and expiring photos work as for plaintext ones: the server deletes
+the blob on the same schedule (an expiring photo at `expiresAt`; a view-once
+photo 30 s after the recipient's first `GET …/messages`, or 14 days after
+sending if never opened; an unsent upload after 1 h; with the conversation or
+the account), and the app drops the key when the photo expires or once a
+view-once photo has been viewed. Spent photos have `attachment.url: null`.
+
+Known limitation: the server marks a view-once photo opened when the
+recipient's app first lists the thread, not when they tap it (same rule as
+plaintext), and deletes the blob about 30 s later. An encrypted view-once photo
+that isn't tapped right away becomes "no longer available". The iOS app never
+sends view-once photos; other clients can. A fix needs a dedicated open
+endpoint (follow-up).
+Blobs are served as `application/octet-stream` from `<32 hex>.bin`.
+
+**What the server can still see** about an encrypted photo: that a photo was
+sent, who sent it to whom and when, the blob's size bucket (not the exact
+size), the `isViewOnce` flag and the expiry timer, when the recipient first
+loaded it, and when it was deleted. It can't see the image, the caption, the
+dimensions or the key, and it doesn't run any image check on it. Explicit
+photos are blurred by the receiving app, not filtered by the server.
 
 #### Identity changes
 
@@ -437,14 +531,22 @@ messages the reporter ticked, sent by the app as plaintext so it keeps working
 once chats are end-to-end encrypted:
 
 ```json
-{ "messageID": "m_…", "sentAt": "2026-11-17T20:30:00Z", "fromReported": true, "text": "…", "hasPhoto": false }
+{ "messageID": "m_…", "sentAt": "2026-11-17T20:30:00Z", "fromReported": true, "text": "…", "hasPhoto": true, "photoID": "ph_…" }
 ```
 
 `fromReported` is true when the reported person sent it. Each item needs
-`text` (≤ 4000) or `hasPhoto: true`; photos themselves are not uploaded. The
-server records whether a message with that id, thread and sender exists, but
-can't check the text. Evidence is deleted 30 days after the report is closed
-(180 days at most), and survives the reporter deleting their account until then.
+`text` (≤ 4000) or `hasPhoto: true`. `photoID` (optional) attaches the photo
+itself: the app decrypts the photo the reporter ticked and uploads it again
+as a plain `image/jpeg` with `POST /me/attachments`, and passes that upload's
+`id`. The report consumes the upload, so moderators see only photos the
+reporter chose to share. It must be one of the reporter's own pending
+**plaintext** uploads (else **404 `not_found`**), each at most once per report
+(400), and needs `hasPhoto` to be `true` or omitted (400 otherwise). The
+pending-upload cap makes that at most 10 photos per report. The server
+records whether a message with that id, thread and sender exists, but can't
+check the text or that the photo is the one in the chat. Evidence, photos
+included, is deleted 30 days after the report is closed (180 days at most),
+and survives the reporter deleting their account until then.
 
 Several independent reports hide an account until a moderator reviews it
 (rules in [`security.md`](security.md#5-reports-auto-hide-and-moderation)).

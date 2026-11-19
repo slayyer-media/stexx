@@ -32,6 +32,12 @@ struct ChatThreadView: View {
     /// Bumped on every send, for haptics.
     @State private var sendCount = 0
     @State private var isAcceptingKeyChange = false
+    /// Blurred incoming photos the user tapped to see, while this thread is open.
+    @State private var revealedPhotoIDs: Set<Message.ID> = []
+    /// The encrypted view-once photo open in the full-screen viewer.
+    @State private var viewOnceMessage: Message?
+    /// Plaintext view-once photos `GET …/messages` listed without a URL: spent.
+    @State private var spentViewOnceIDs: Set<Message.ID> = []
     @FocusState private var isComposerFocused: Bool
 
     private var participant: Profile { route.participant }
@@ -68,7 +74,11 @@ struct ChatThreadView: View {
                             showsTimestamp: showsTimestamp(at: index),
                             isFirstInGroup: !continues,
                             isLastInGroup: isLastInGroup(at: index),
-                            showsReadReceipt: index == lastReadIndex
+                            showsReadReceipt: index == lastReadIndex,
+                            isViewOnceSpent: spentViewOnceIDs.contains(message.id),
+                            isPhotoRevealed: revealedPhotoIDs.contains(message.id),
+                            onRevealPhoto: { revealedPhotoIDs.insert(message.id) },
+                            onOpenViewOnce: { Task { await openViewOnce(message) } }
                         )
                         .id(key)
                         .padding(.top, continues ? 2 : Theme.Spacing.s)
@@ -180,6 +190,11 @@ struct ChatThreadView: View {
                     }
                     ChatStore.merge(update, into: &messages, myID: appState.myID)
                 }
+            }
+        }
+        .fullScreenCover(item: $viewOnceMessage) { message in
+            ViewOnceViewer(message: message) { outcome in
+                Task { await closeViewOnce(message, outcome: outcome) }
             }
         }
         .photosPicker(isPresented: $isPickingPhoto, selection: $photoItem, matching: .images)
@@ -386,7 +401,43 @@ struct ChatThreadView: View {
     /// live events that arrived while the request was in flight.
     private func refreshMessages(in conversationID: Conversation.ID) async throws {
         let snapshot = try await api.messages(in: conversationID, before: nil).items
-        messages = ChatStore.reconcile(snapshot: snapshot, with: messages, myID: appState.myID)
+        let myID = appState.myID
+        // Only this listing gives the recipient a view-once URL: none here means it's spent.
+        spentViewOnceIDs.formUnion(snapshot.filter {
+            $0.senderID != myID && $0.attachment?.isViewOnce == true && $0.attachment?.url == nil
+        }.map(\.id))
+        messages = ChatStore.reconcile(snapshot: snapshot, with: messages, myID: myID)
+    }
+
+    /// An encrypted view-once photo was tapped. Realtime events don't carry
+    /// its URL, so the thread is refetched first if needed; if the server no
+    /// longer has it, the bubble turns into "no longer available" instead.
+    private func openViewOnce(_ message: Message) async {
+        var target = message
+        if target.attachment?.url == nil, let id = conversation?.id {
+            try? await refreshMessages(in: id)
+            target = messages.first { $0.id == message.id } ?? target
+        }
+        guard target.e2eAttachment != nil, target.attachment?.url != nil else { return }
+        viewOnceMessage = target
+    }
+
+    /// The viewer closed: the photo is done on this phone. Its key is
+    /// forgotten (unless a network error kept it from showing at all) and
+    /// the bubble says "Opened" (or "no longer available").
+    private func closeViewOnce(_ message: Message, outcome: ChatMediaLoader.Outcome?) async {
+        let removal: Message.AttachmentRemoval
+        switch outcome {
+        case .image?, .tampered?, .unreadable?: removal = .opened
+        case .gone?: removal = .gone
+        case .failed?, nil: return
+        }
+        await ChatMediaLoader.shared.evict(message.id)
+        await e2e.forgetAttachmentKey(messageID: message.id, gone: removal == .gone)
+        if let index = messages.firstIndex(where: { $0.id == message.id }) {
+            messages[index].e2eAttachment = nil
+            messages[index].e2eAttachmentRemoval = removal
+        }
     }
 
     private func send() {
@@ -547,6 +598,12 @@ struct MessageBubble: View {
     var isLastInGroup = true
     /// Whether a `.read` status is spelled out under this bubble.
     var showsReadReceipt = true
+    /// A plaintext view-once photo the server no longer gives a URL for.
+    var isViewOnceSpent = false
+    /// A blurred incoming photo the user tapped to see.
+    var isPhotoRevealed = false
+    var onRevealPhoto: () -> Void = {}
+    var onOpenViewOnce: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 4) {
@@ -634,6 +691,10 @@ struct MessageBubble: View {
     /// What to show instead of text for an encrypted message this device
     /// can't read (never blank).
     private var encryptedPlaceholder: String? {
+        // An encrypted photo's tile already says why it can't be shown.
+        if message.attachment?.isEncrypted == true, message.encryption != .awaitingKeyConfirmation {
+            return nil
+        }
         switch message.encryption {
         case .unavailable?:
             // Typically a reinstall or a new phone: the plaintext was only ever on the old one.
@@ -670,14 +731,31 @@ struct MessageBubble: View {
         }
     }
 
+    @ViewBuilder
     private func attachmentView(_ attachment: Message.Attachment) -> some View {
+        if attachment.isEncrypted {
+            // End-to-end encrypted: fetched, verified and decrypted on device.
+            EncryptedPhotoTile(
+                message: message,
+                isMine: isMine,
+                isRevealed: isPhotoRevealed,
+                onReveal: onRevealPhoto,
+                onOpenViewOnce: onOpenViewOnce
+            )
+        } else {
+            plaintextAttachmentView(attachment)
+        }
+    }
+
+    private func plaintextAttachmentView(_ attachment: Message.Attachment) -> some View {
         let shape = RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
+        let isOpened = !isMine && attachment.isViewOnce && isViewOnceSpent
         return ZStack {
             Theme.ink1
             VStack(spacing: 6) {
-                Image(systemName: attachment.isViewOnce ? "eye.slash" : "photo")
+                Image(systemName: isOpened ? "checkmark.circle" : attachment.isViewOnce ? "eye.slash" : "photo")
                     .font(.title2.weight(.light))
-                Text(attachment.isViewOnce ? "View once" : "Photo")
+                Text(isOpened ? "Opened" : attachment.isViewOnce ? "View once" : "Photo")
                     .stexxLabelStyle(.micro, color: Theme.steel)
             }
             .foregroundStyle(Theme.steel)

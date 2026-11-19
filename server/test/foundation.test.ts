@@ -253,7 +253,7 @@ describe("serialize & visibility", () => {
     const m = {
       id: "m_1", conversation_id: "c_1", sender_id: "p_a", client_id: "cid", text: "hi",
       envelope_type: null, envelope_body: null,
-      attachment_kind: "photo", attachment_key: null, attachment_view_once: true,
+      attachment_kind: "photo", attachment_key: null, attachment_view_once: true, attachment_encrypted: false,
       sent_at: new Date("2026-11-17T20:30:00.250Z"), delivered_at: new Date(), read_at: new Date(), read_receipt: false,
       expires_at: null,
     };
@@ -263,7 +263,8 @@ describe("serialize & visibility", () => {
     expect(messageJson({ ...m, delivered_at: null, read_at: null }, "p_a").status).toBe("sent");
     const j = messageJson(m, "p_b");
     expect(j.sentAt).toBe("2026-11-17T20:30:00Z");
-    expect(j.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true });
+    expect(j.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
+    expect(messageJson({ ...m, attachment_encrypted: true }, "p_b").attachment?.isEncrypted).toBe(true);
     expect(j.clientID).toBeNull(); // the idempotency key is only echoed to its sender
     expect(messageJson(m, "p_a").clientID).toBe("cid");
   });

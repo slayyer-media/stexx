@@ -140,7 +140,7 @@ describe("GET /me/export respects the other person's privacy and expiry", () => 
 
     const dump = await expectJson(await as(b).get("/v1/me/export"));
     const [m] = dump.conversations.find((c: { id: string }) => c.id === conv).messages;
-    expect(m.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true });
+    expect(m.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
     const [row] = await sql`SELECT attachment_opened_at, attachment_key FROM messages WHERE id = ${sent.id}`;
     expect(row!.attachment_opened_at).toBeNull();
     expect(JSON.stringify(dump)).not.toContain(row!.attachment_key);

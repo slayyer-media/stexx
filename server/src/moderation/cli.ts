@@ -171,10 +171,11 @@ function printReview(r: AccountReview, out: (line: string) => void, now: Date): 
       for (const e of rep.evidence) {
         const who = e.fromReported ? "REPORTED" : "REPORTER";
         const check = e.verified ? "matches a message in the chat" : "not matched";
-        const body = [e.text ? `"${oneLine(e.text, 4000)}"` : null, e.hasPhoto ? "[photo, not shared]" : null]
-          .filter(Boolean)
-          .join(" ");
+        const photo = e.photoPath ? "[photo, shared below]" : e.hasPhoto ? "[photo, not shared]" : null;
+        const body = [e.text ? `"${oneLine(e.text, 4000)}"` : null, photo].filter(Boolean).join(" ");
         out(`      ${who} ${day(e.sentAt)} (${check}) ${body}`);
+        // The reporter's copy of the photo (they chose to share it). Only ever shown here, to the moderator.
+        if (e.photoPath) out(`        photo: ${e.photoPath}`);
       }
     }
   }

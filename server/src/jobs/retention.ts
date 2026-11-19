@@ -217,7 +217,8 @@ export interface ReportPurgeResult {
  * report's free-text details and the reporter's IP hash are deleted REPORT_EVIDENCE_RETENTION_DAYS (30) after the
  * report is closed, or after it was filed when the reported account no longer exists, and in any case
  * REPORT_EVIDENCE_MAX_DAYS (180) after it was filed. The report row itself (reason, status, dates) stays, anonymized
- * by the SET NULL foreign keys when either account is deleted.
+ * by the SET NULL foreign keys when either account is deleted. Shared photos go with their evidence rows (trigger
+ * queues the file, drainMediaTrash unlinks it).
  */
 export async function purgeReportEvidence(now: Date = new Date()): Promise<ReportPurgeResult> {
   const closedCutoff = new Date(now.getTime() - config.moderation.evidenceRetentionDays * DAY);
@@ -232,6 +233,7 @@ export async function purgeReportEvidence(now: Date = new Date()): Promise<Repor
          WHERE ${expired} LIMIT ${BATCH})`;
     return res.count;
   });
+  if (evidence > 0) await drainMediaTrash();
   const scrubbed = await inBatches(async () => {
     const res = await sql`
       UPDATE reports SET details = NULL, reporter_ip_hash = NULL WHERE id IN (
@@ -260,8 +262,9 @@ export interface OrphanSweepOptions {
 }
 
 /**
- * Delete files in the media directory that nothing references: not a profile photo, not a message attachment, not
- * queued in media_trash (that queue unlinks them itself). Catches files left behind by a crash between writing a
+ * Delete files in the media directory that nothing references: not a profile photo, not a pending upload, not a
+ * message attachment, not a photo shared in report evidence, not queued in media_trash (that queue unlinks them
+ * itself). Covers `.jpg` and encrypted `.bin` files alike. Catches files left behind by a crash between writing a
  * file and committing its row, or between deleting a row and unlinking. Only touches names that look like our
  * storage keys, and only files older than `minAgeMs` (by the later of mtime/ctime) so in-flight uploads are safe.
  */
@@ -295,6 +298,7 @@ export async function sweepOrphanMedia(now: Date = new Date(), opts: OrphanSweep
       SELECT storage_key AS k FROM photos WHERE storage_key IN ${sql(chunk)}
       UNION SELECT storage_key FROM attachment_uploads WHERE storage_key IN ${sql(chunk)}
       UNION SELECT attachment_key FROM messages WHERE attachment_key IN ${sql(chunk)}
+      UNION SELECT photo_key FROM report_evidence WHERE photo_key IN ${sql(chunk)}
       UNION SELECT storage_key FROM media_trash WHERE storage_key IN ${sql(chunk)}`;
     const keep = new Set(referenced.map((r) => r.k));
     for (const name of chunk) {

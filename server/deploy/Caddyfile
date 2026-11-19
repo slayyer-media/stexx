@@ -55,8 +55,8 @@ api.stexx.gay {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Media: static, read-only, unguessable names only (<32 hex>.jpg). No directory listing, no dotfiles,
-# no other extensions, GET/HEAD only.
+# Media: static, read-only, unguessable names only: <32 hex>.jpg (sanitized photos) and <32 hex>.bin (end-to-end
+# encrypted chat photos, opaque blobs). No directory listing, no dotfiles, no other extensions, GET/HEAD only.
 # ---------------------------------------------------------------------------------------------
 media.stexx.gay {
 	import security_headers
@@ -78,6 +78,27 @@ media.stexx.gay {
 			Content-Security-Policy "default-src 'none'; sandbox"
 			Cross-Origin-Resource-Policy "cross-origin"
 			# Do not leak upload times through validators.
+			-Last-Modified
+			-ETag
+		}
+		file_server {
+			hide .*
+		}
+	}
+
+	# Encrypted chat photos: the app downloads the blob, checks its digest and decrypts it. Served as opaque bytes
+	# (never sniffed as an image) with exactly the same caching and privacy headers as the JPEGs.
+	@bin {
+		method GET HEAD
+		path_regexp ^/[0-9a-f]{32}\.bin$
+	}
+
+	handle @bin {
+		header {
+			Content-Type "application/octet-stream"
+			Cache-Control "private, max-age=31536000, immutable"
+			Content-Security-Policy "default-src 'none'; sandbox"
+			Cross-Origin-Resource-Policy "cross-origin"
 			-Last-Modified
 			-ETag
 		}

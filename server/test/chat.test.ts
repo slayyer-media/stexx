@@ -411,7 +411,7 @@ describe("attachments", () => {
     // conversation list for the recipient never carries a view-once URL, and does not open it
     const list = await expectJson(await as(rcpt).get("/v1/conversations"));
     const mine = list.find((c: any) => c.id === c1);
-    expect(mine.lastMessage.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true });
+    expect(mine.lastMessage.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
     const [untouched] = await sql`SELECT attachment_opened_at FROM messages WHERE id = ${vo.id}`;
     expect(untouched!.attachment_opened_at).toBeNull();
 
@@ -435,7 +435,7 @@ describe("attachments", () => {
     await sql`UPDATE messages SET attachment_key = NULL WHERE id = ${msg.id}`;
     await drainMediaTrash();
     const again = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));
-    expect(again.items[0].attachment).toEqual({ kind: "photo", url: null, isViewOnce: true });
+    expect(again.items[0].attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
   });
 });
 
@@ -652,7 +652,7 @@ describe("realtime (/v1/ws)", () => {
     const created = await cb.waitFor((f) => f.type === "message.created");
     expect(created.data.id).toBe(msg.id);
     expect(created.data.text).toBe("live!");
-    expect(created.data.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true });
+    expect(created.data.attachment).toEqual({ kind: "photo", url: null, isViewOnce: true, isEncrypted: false });
     expect(created.data.status).toBe("delivered");
     const upd = await cb.waitFor((f) => f.type === "conversation.updated");
     expect(upd.data.id).toBe(conv);

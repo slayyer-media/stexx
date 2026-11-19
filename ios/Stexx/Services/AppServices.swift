@@ -128,11 +128,13 @@ final class AppServices {
     }
 
     /// Returning to the foreground: catch up on anything missed while the
-    /// socket was closed, and re-check the entitlement.
+    /// socket was closed, drop expired encrypted messages and photo keys, and
+    /// re-check the entitlement.
     func didEnterForeground() {
         guard appState.isSignedIn else { return }
         chatStore.resync()
         e2e.syncKeys()
+        e2e.pruneHistory()
         Task { await purchases.refreshEntitlement() }
     }
 }

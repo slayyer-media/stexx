@@ -34,6 +34,13 @@ struct Message: Identifiable, Hashable, Codable, Sendable {
     var clientID: String?
     /// Local only, never on the wire: what the app made of `envelope`.
     var encryption: Encryption? = nil
+    /// Local only: the key for an end-to-end encrypted photo
+    /// (`attachment.isEncrypted`), from the decrypted envelope or the local
+    /// history. `nil` when this phone doesn't have it (see `e2eAttachmentRemoval`).
+    var e2eAttachment: E2EAttachmentPointer? = nil
+    /// Local only: why this phone no longer has the key of an encrypted
+    /// photo it once had.
+    var e2eAttachmentRemoval: AttachmentRemoval? = nil
 
     enum Status: String, Codable, Sendable {
         case sending, sent, delivered, read, failed
@@ -54,6 +61,14 @@ struct Message: Identifiable, Hashable, Codable, Sendable {
         case unsupported
     }
 
+    /// Why an encrypted photo's key was dropped from this phone.
+    enum AttachmentRemoval: Hashable, Sendable {
+        /// A view-once photo the user opened here.
+        case opened
+        /// The photo can't exist any more (expired, or spent on the server).
+        case gone
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, conversationID, senderID, text, envelope, attachment, sentAt, status, expiresAt, clientID
     }
@@ -64,9 +79,30 @@ struct Message: Identifiable, Hashable, Codable, Sendable {
         }
 
         var kind: Kind
+        /// `nil` once the photo is gone (expired or a spent view-once), and
+        /// for the recipient of a view-once photo outside `GET …/messages`.
         var url: URL?
         /// View-once media disappears after the recipient opens it.
         var isViewOnce: Bool = false
+        /// The file is an end-to-end encrypted blob; the key is in the
+        /// envelope (`Message.e2eAttachment`), never on the server.
+        var isEncrypted: Bool = false
+    }
+}
+
+extension Message.Attachment {
+    private enum CodingKeys: String, CodingKey {
+        case kind, url, isViewOnce, isEncrypted
+    }
+
+    /// The mock and servers from before encrypted photos omit `isEncrypted`
+    /// (and older ones `isViewOnce`).
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(Kind.self, forKey: .kind)
+        url = try container.decodeIfPresent(URL.self, forKey: .url)
+        isViewOnce = try container.decodeIfPresent(Bool.self, forKey: .isViewOnce) ?? false
+        isEncrypted = try container.decodeIfPresent(Bool.self, forKey: .isEncrypted) ?? false
     }
 }
 

@@ -31,6 +31,7 @@ import { trustState } from "./abuse/trust.ts";
 import { revokeAllSessions } from "./auth.ts";
 import { accountUnderReview, ApiError, notFound } from "./errors.ts";
 import { logInfo } from "./logger.ts";
+import { isStorageKey, mediaPath } from "./media.ts";
 import { DAY, HOUR } from "./time.ts";
 
 export type ReportReason =
@@ -567,6 +568,11 @@ export interface EvidenceItem {
   sentAt: Date | null;
   text: string | null;
   hasPhoto: boolean;
+  /**
+   * Absolute path of the photo the reporter shared (a sanitized JPEG under MEDIA_DIR), or null. For the moderator
+   * on the server only: printed by the CLI, never put in an API response.
+   */
+  photoPath: string | null;
   verified: boolean;
 }
 
@@ -652,15 +658,16 @@ export async function accountReview(userId: string, db: Sql = sql, now = new Dat
        FROM reports WHERE reported_id = ${userId} AND status <> 'open'
       ORDER BY closed_at DESC NULLS LAST LIMIT 20)`;
   const evidence = reports.length
-    ? await db<(EvidenceItem & { report_id: string })[]>`
+    ? await db<(Omit<EvidenceItem, "photoPath"> & { report_id: string; photo_key: string | null })[]>`
         SELECT report_id, position, message_id AS "messageId", from_reported AS "fromReported", sent_at AS "sentAt",
-               text, has_photo AS "hasPhoto", verified
+               text, has_photo AS "hasPhoto", photo_key, verified
           FROM report_evidence WHERE report_id = ANY(${reports.map((r) => r.id)})
          ORDER BY report_id, position`
     : [];
   const evidenceBy = new Map<string, EvidenceItem[]>();
   for (const e of evidence) {
-    const { report_id, ...item } = e;
+    const { report_id, photo_key, ...rest } = e;
+    const item: EvidenceItem = { ...rest, photoPath: photo_key && isStorageKey(photo_key) ? mediaPath(photo_key) : null };
     const list = evidenceBy.get(report_id) ?? [];
     list.push(item);
     evidenceBy.set(report_id, list);

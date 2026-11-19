@@ -39,6 +39,8 @@ export interface AttachmentJson {
   kind: "photo";
   url: string | null;
   isViewOnce: boolean;
+  /** End-to-end encrypted photo: `url` is an opaque blob whose key and digest are inside the message's envelope. */
+  isEncrypted: boolean;
 }
 
 export interface MessageJson {
@@ -123,6 +125,7 @@ export interface MessageRow {
   attachment_kind: string | null;
   attachment_key: string | null;
   attachment_view_once: boolean;
+  attachment_encrypted: boolean;
   sent_at: Date;
   delivered_at: Date | null;
   read_at: Date | null;
@@ -214,7 +217,12 @@ export function messageJson(m: MessageRow, viewerId: string): MessageJson {
     envelope: envelopeJson(m.envelope_type, m.envelope_body),
     attachment:
       m.attachment_kind === "photo"
-        ? { kind: "photo", url: mediaUrl(m.attachment_key), isViewOnce: m.attachment_view_once }
+        ? {
+            kind: "photo",
+            url: mediaUrl(m.attachment_key),
+            isViewOnce: m.attachment_view_once,
+            isEncrypted: m.attachment_encrypted,
+          }
         : null,
     sentAt: isoDate(m.sent_at),
     status,

@@ -138,19 +138,20 @@ describe("envelope validation and E2E_MODE", () => {
     expect((await expectJson(await send(b, conv, { envelope: fakeEnvelope() }))).text).toBeNull();
   });
 
-  test("required: plaintext text is refused, envelopes and photo-only messages go through", async () => {
+  test("required: plaintext text and plaintext photos are refused, envelopes go through", async () => {
     const [a, b] = await Promise.all([createUser(), createUser()]);
     const conv = await conversation(a, b);
     const restore = setE2eModeForTests("required");
     try {
       await expectError(await send(a, conv, { text: "plain" }), 400, "encryption_required");
       await expectJson(await send(a, conv, { envelope: fakeEnvelope() }));
+      // Plaintext uploads are still accepted (report evidence needs them), but can't be sent in a chat.
       const upload = await expectJson(
         await as(a).post("/v1/me/attachments", { body: await makeJpeg(), contentType: "image/jpeg" }),
         201,
       );
-      const photo = await expectJson(await send(a, conv, { attachmentPhotoID: upload.id, isViewOnce: false }));
-      expect(photo.attachment?.kind).toBe("photo");
+      await expectError(await send(a, conv, { attachmentPhotoID: upload.id, isViewOnce: false }), 400, "encryption_required");
+      // (Encrypted photos under `required`: test/e2e-media.test.ts.)
     } finally {
       restore();
     }
