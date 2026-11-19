@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { sql, type Sql } from "../db/sql.ts";
-import { forgetTouch, requireAuth } from "../lib/auth.ts";
+import { requireAuth } from "../lib/auth.ts";
 import { snapToCell } from "../lib/distance.ts";
 import { ApiError, badRequest, conflict, notFound } from "../lib/errors.ts";
 import { newId } from "../lib/ids.ts";
@@ -17,7 +17,6 @@ import {
 } from "../lib/media.ts";
 import { requirePlus } from "../lib/plus.ts";
 import { rateLimit } from "../lib/ratelimit.ts";
-import { closeUserConnections } from "../lib/realtime.ts";
 import {
   photoColumns,
   photoJson,
@@ -32,6 +31,7 @@ import { DAY, isoDate } from "../lib/time.ts";
 import { cleanText, idParam, locationSchema, lookingForSchema, multilineText, parseJson, positionSchema, privacySchema, tagsSchema } from "../lib/validation.ts";
 import { col, notBlocked, notModerated, val, visibleToViewer } from "../lib/visibility.ts";
 import { afterAccountDeleted, attest, deviceOf } from "../lib/abuse/attestation.ts";
+import { deleteAccountRows, forgetDeletedAccount } from "../lib/account.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import { envelopeJson } from "../lib/e2e/envelope.ts";
 import { e2eMode, keyStatus } from "../lib/e2e/keys.ts";
@@ -140,19 +140,14 @@ meRoutes.patch("/me", async (c) => {
  * `reports`, whose reporter/reported FKs are SET NULL (reports filed are anonymized, not erased, so
  * moderation history survives). DB triggers queue every photo/attachment file into media_trash in the same
  * transaction; we then unlink them. Anything that fails to unlink stays queued for the purge job.
+ * The same code (lib/account.ts) purges banned accounts after their review window.
  */
 meRoutes.delete("/me", attest("optional"), async (c) => {
   const me = c.get("userId");
   await sql.begin(async (tx) => {
-    const [row] = await tx<{ email_hmac: Buffer | null }[]>`SELECT email_hmac FROM users WHERE id = ${me} FOR UPDATE`;
-    if (!row) throw notFound();
-    // Defense in depth: kill tokens first (also gone via cascade), and drop pending sign-in links for the address.
-    await tx`UPDATE sessions SET revoked_at = now() WHERE user_id = ${me} AND revoked_at IS NULL`;
-    if (row.email_hmac) await tx`DELETE FROM email_link_tokens WHERE email_hmac = ${row.email_hmac}`;
-    await tx`DELETE FROM users WHERE id = ${me}`;
+    if (!(await deleteAccountRows(tx, me))) throw notFound();
   });
-  forgetTouch(me);
-  closeUserConnections(me, 4401, "account_deleted");
+  forgetDeletedAccount(me);
   await drainMediaTrash();
   // Frees this phone's DeviceCheck "has an account" bit once no account is left on it (never a ban bit).
   await afterAccountDeleted(deviceOf(c));
