@@ -12,7 +12,7 @@ struct RootView: View {
     var body: some View {
         ZStack {
             #if DEBUG
-            if let route = ScreenshotRoute.current {
+            if let route = ScreenshotRoute.current, route.replacesRoot {
                 ScreenshotRouteView(route: route)
             } else if appState.isSignedIn {
                 MainTabView()
@@ -56,15 +56,10 @@ struct RootView: View {
         var isForeground: Bool
     }
 
-    /// Email sign-in links (`…/auth/email?token=…`, a universal link once the
-    /// associated domain is set up) exchange their token for a session.
+    /// Email sign-in links (`…/auth/email?token=…`, universal links through
+    /// the `applinks:` associated domain) exchange their token for a session.
     private func signIn(fromEmailLink url: URL) async {
-        guard !appState.isSignedIn,
-              url.path().contains("auth/email"),
-              let token = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-                  .queryItems?.first(where: { $0.name == "token" })?.value,
-              !token.isEmpty
-        else { return }
+        guard !appState.isSignedIn, let token = EmailSignInLink.token(from: url) else { return }
         guard let session = try? await api.verifyEmailLink(token: token) else { return }
         // The link proves the email, not age: the 18+ gate still applies.
         appState.signIn(session)

@@ -35,6 +35,10 @@ process.env.PHOTO_CLASSIFIER = "off";
 for (const k of ["PHOTO_NSFW_MODEL", "PHOTO_NSFW_THRESHOLD", "PHOTO_NSFW_LABELS", "PHOTO_HIDE_UNCHECKED", "PHOTO_DUPLICATE_MAX_DISTANCE", "PHOTO_HASH_BLOCKLIST"]) {
   delete process.env[k];
 }
+// Moderator alerts off unless a test injects senders (test/moderator-alerts.test.ts).
+for (const k of ["MODERATOR_ALERT_EMAIL", "MODERATOR_ALERT_WEBHOOK_URL", "MODERATOR_ALERT_INTERVAL_MINUTES", "MODERATOR_ALERT_REASONS"]) {
+  delete process.env[k];
+}
 process.env.EMAIL_PEPPER ??= "test-pepper-test-pepper-test-pepper-0000";
 
 await migrate(testUrl, { quiet: true });

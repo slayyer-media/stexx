@@ -1,0 +1,54 @@
+# iOS build check. Manual only (Actions tab > ios > Run workflow): macOS minutes are the slow, scarce kind, and the
+# owner decides when (or whether) this runs on pull requests. Generates the project with XcodeGen and builds the
+# "Stexx Local" scheme for a generic simulator, unsigned. No tests, no secrets.
+name: ios
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: xcodegen + build (Stexx Local, simulator)
+    runs-on: macos-26
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Release config guard (advisory)
+        continue-on-error: true
+        run: scripts/check-release-config.sh
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: ios/build/dd/SourcePackages
+          key: spm-${{ runner.os }}-${{ hashFiles('ios/project.yml', 'ios/Packages/**/Package.swift') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Build
+        run: |
+          xcodebuild build -quiet \
+            -project Stexx.xcodeproj \
+            -scheme "Stexx Local" \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO

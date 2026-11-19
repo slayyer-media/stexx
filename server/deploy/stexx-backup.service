@@ -2,6 +2,8 @@
 Description=Stexx encrypted database backup (pg_dump | age | rclone -> B2)
 After=postgresql.service network-online.target
 Wants=network-online.target
+# Alert (unit name only) on a failed nightly backup; see stexx-alert@.service and /etc/stexx/watch.env.
+OnFailure=stexx-alert@%n.service
 
 [Service]
 Type=oneshot

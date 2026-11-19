@@ -9,6 +9,9 @@ import Foundation
 /// can add events without breaking older apps.
 enum RealtimeEvent: Hashable, Sendable {
     case messageCreated(Message)
+    /// `message.updated`: a message the app already has changed (today: the
+    /// recipient opened my view-once photo and sends read receipts).
+    case messageUpdated(Message)
     case messageRead(ReadReceipt)
     case conversationUpdated(Conversation)
     case tapReceived(Tap)
@@ -90,6 +93,8 @@ enum RealtimeEvent: Hashable, Sendable {
         switch type {
         case "message.created":
             return .messageCreated(try decoder.decode(DataEnvelope<Message>.self, from: data).payload)
+        case "message.updated":
+            return .messageUpdated(try decoder.decode(DataEnvelope<Message>.self, from: data).payload)
         case "message.read":
             return .messageRead(try decoder.decode(DataEnvelope<ReadReceipt>.self, from: data).payload)
         case "conversation.updated":

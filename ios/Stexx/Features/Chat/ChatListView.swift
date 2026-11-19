@@ -17,6 +17,9 @@ struct ChatListView: View {
     /// on the first appearance only (not every time a lazy row is reused).
     @State private var hasRevealed = false
     @State private var openCount = 0
+    /// Height of the rows above the conversations (error banner, Taps row),
+    /// so the empty and error states sit below them instead of on top.
+    @State private var headerRowsHeight: CGFloat = 0
 
     private var conversations: [Conversation] {
         chatStore.conversations.filter { !appState.blockedIDs.contains($0.participant.id) }
@@ -28,6 +31,33 @@ struct ChatListView: View {
 
         NavigationStack(path: $path) {
             List {
+                VStack(spacing: 0) {
+                    if let error = chatStore.errorMessage, !visible.isEmpty {
+                        ChatListErrorBanner(message: error) {
+                            Task { await chatStore.refresh() }
+                        }
+                    }
+                    Button {
+                        openCount += 1
+                        path.append(TapsRoute())
+                    } label: {
+                        TapsRow(
+                            taps: tapsPreview,
+                            unseen: chatStore.tapsUnseen,
+                            hasLoaded: chatStore.hasLoadedTaps,
+                            failed: chatStore.tapsErrorMessage != nil
+                        )
+                    }
+                    .buttonStyle(ConversationRowButtonStyle())
+                    .overlay(alignment: .bottom) {
+                        HairlineDivider(leadingInset: Theme.Spacing.screen + ConversationRow.avatarSize + Theme.Spacing.m)
+                    }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { headerRowsHeight = $0 }
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+                .listRowInsets(EdgeInsets())
+
                 ForEach(Array(visible.enumerated()), id: \.element.id) { index, conversation in
                     Button {
                         openCount += 1
@@ -59,6 +89,19 @@ struct ChatListView: View {
                 if chatStore.isLoading && visible.isEmpty {
                     ProgressView()
                         .tint(Theme.steel)
+                        .padding(.top, headerRowsHeight)
+                } else if visible.isEmpty, let error = chatStore.errorMessage {
+                    ContentUnavailableView {
+                        Label("Couldn't load chats", systemImage: "wifi.exclamationmark")
+                    } description: {
+                        Text(error)
+                            .font(.stexxSub)
+                            .foregroundStyle(Theme.steel)
+                    } actions: {
+                        Button("Try again") { Task { await chatStore.refresh() } }
+                            .stexxSecondaryButton()
+                    }
+                    .padding(.top, headerRowsHeight)
                 } else if visible.isEmpty {
                     ContentUnavailableView {
                         VStack(spacing: Theme.Spacing.l) {
@@ -74,6 +117,7 @@ struct ChatListView: View {
                             .font(.stexxSub)
                             .foregroundStyle(Theme.steel)
                     }
+                    .padding(.top, headerRowsHeight)
                 }
             }
             .tabHeader {
@@ -82,7 +126,7 @@ struct ChatListView: View {
                 ChatListCount(unread: unread, count: visible.count)
             }
             .stexxBackground()
-            .refreshable { await chatStore.load() }
+            .refreshable { await chatStore.refresh() }
             .task { await chatStore.loadIfNeeded() }
             .onChange(of: visible.isEmpty, initial: true) { _, isEmpty in
                 guard !isEmpty, !hasRevealed else { return }
@@ -96,7 +140,140 @@ struct ChatListView: View {
             .navigationDestination(for: Profile.self) { profile in
                 ProfileDetailView(profile: profile)
             }
+            .navigationDestination(for: TapsRoute.self) { _ in
+                TapsView()
+            }
         }
+    }
+
+    /// The newest senders for the Taps row, without blocked people.
+    private var tapsPreview: [ReceivedTap] {
+        chatStore.taps.lazy.filter { !appState.blockedIDs.contains($0.id) }.prefix(3).map { $0 }
+    }
+}
+
+// MARK: - Taps row
+
+/// The entry to the taps inbox, above the conversations: the newest
+/// senders' avatars, a one-line summary and a count pill (solid while
+/// something is new).
+private struct TapsRow: View {
+    let taps: [ReceivedTap]
+    let unseen: Int
+    /// A taps load has succeeded at least once.
+    let hasLoaded: Bool
+    /// The last taps fetch failed.
+    let failed: Bool
+
+    private var summary: String {
+        TapsCopy.rowSummary(latest: taps.first, unseen: unseen, hasLoaded: hasLoaded, failed: failed)
+    }
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.m) {
+            avatars
+                .frame(width: ConversationRow.avatarSize, height: ConversationRow.avatarSize)
+
+            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                Text("Taps")
+                    .font(.stexxHeadline)
+                    .foregroundStyle(Theme.frost)
+                Text(summary)
+                    .font(.stexxSub)
+                    .foregroundStyle(unseen > 0 ? Theme.frost : Theme.steel)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: Theme.Spacing.s)
+
+            if unseen > 0 {
+                XXBadge(verbatim: unseen.formatted())
+                    .accessibilityHidden(true)
+            }
+            Image(systemName: "chevron.right")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(Theme.slate)
+                .accessibilityHidden(true)
+        }
+        .padding(.horizontal, Theme.Spacing.screen)
+        .padding(.vertical, Theme.Spacing.m + 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(.rect)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(unseen > 0 ? Text("\(unseen) new") : Text(verbatim: ""))
+        .accessibilityHint("Opens who tapped you")
+    }
+
+    /// Up to three overlapping avatars of the newest senders, or a hand in
+    /// a flat tile when nobody has tapped yet.
+    @ViewBuilder
+    private var avatars: some View {
+        if taps.isEmpty {
+            RoundedRectangle(cornerRadius: Theme.Radius.avatar, style: .continuous)
+                .fill(Theme.ink1)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.avatar, style: .continuous)
+                        .strokeBorder(Theme.line, lineWidth: 0.5)
+                )
+                .overlay {
+                    Image(systemName: "hand.wave")
+                        .font(.title3)
+                        .foregroundStyle(Theme.steel)
+                }
+        } else {
+            let size: CGFloat = taps.count == 1 ? ConversationRow.avatarSize : 36
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(taps.enumerated().reversed()), id: \.element.id) { index, tap in
+                    AvatarView(profile: tap.from, size: size, showsOnline: false)
+                        .offset(x: CGFloat(index) * 8, y: CGFloat(index) * 8)
+                }
+            }
+            .frame(width: ConversationRow.avatarSize, height: ConversationRow.avatarSize, alignment: .topLeading)
+        }
+    }
+}
+
+// MARK: - Error banner
+
+/// Shown above cached conversations when a refresh failed: the list stays,
+/// with a way to retry.
+private struct ChatListErrorBanner: View {
+    let message: String
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.s) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.footnote)
+                .foregroundStyle(Theme.warning)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Couldn't refresh chats")
+                    .font(.stexxSub.weight(.semibold))
+                    .foregroundStyle(Theme.frost)
+                Text(message)
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: Theme.Spacing.s)
+            Button("Retry", action: retry)
+                .font(.stexxSub.weight(.semibold))
+                .foregroundStyle(Theme.ice)
+                .buttonStyle(.borderless)
+        }
+        .padding(Theme.Spacing.m)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+                .fill(Theme.ink1)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+                .strokeBorder(Theme.line, lineWidth: 0.5)
+        )
+        .padding(.horizontal, Theme.Spacing.screen)
+        .padding(.top, Theme.Spacing.s)
+        .accessibilityElement(children: .combine)
     }
 }
 
