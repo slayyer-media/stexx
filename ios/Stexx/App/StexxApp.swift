@@ -9,6 +9,9 @@ struct StexxApp: App {
     private let api: any APIClient
 
     init() {
+        // Before anything loads: delete profile photos older builds left in
+        // the on-disk URL cache, and keep that cache off the disk from now on.
+        SharedURLCacheHygiene.installAtLaunch()
         let configuration = APIConfiguration.fromBundle()
         // In memory for this launch, persisted to the Keychain best-effort,
         // so a failed Keychain write can't leave the app signed in without

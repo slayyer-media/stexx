@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Shows a profile's primary photo, or a generated placeholder (cool ink
 /// gradient + silhouette) when there is none. The placeholder is
@@ -11,19 +12,51 @@ struct ProfilePhotoView: View {
         ZStack {
             PhotoPlaceholder(seed: profile.id)
             if let url = profile.photos[safe: photoIndex]?.url {
-                AsyncImage(url: url, transaction: Transaction(animation: .easeOut(duration: 0.2))) { phase in
-                    if let image = phase.image {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        Color.clear
-                    }
-                }
+                ProfilePhotoImage(url: url)
             }
         }
         .clipped()
         .accessibilityHidden(true)
+    }
+}
+
+/// A remote profile photo through `ProfilePhotoLoader`: no URL cache (nothing
+/// in `Library/Caches`), decoded copies in memory only. Use this, never
+/// `AsyncImage`, for any photo of a person.
+struct ProfilePhotoImage: View {
+    let url: URL
+    private let loader: ProfilePhotoLoader
+
+    @State private var image: UIImage?
+
+    init(url: URL, loader: ProfilePhotoLoader = .shared) {
+        self.url = url
+        self.loader = loader
+        // Already loaded this session: show it at once, no fade or flash.
+        _image = State(initialValue: loader.cached(url))
+    }
+
+    var body: some View {
+        ZStack {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .transition(.opacity)
+            } else {
+                Color.clear
+            }
+        }
+        .task(id: url) {
+            if let cached = loader.cached(url) {
+                image = cached
+                return
+            }
+            image = nil
+            let loaded = await loader.image(for: url)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) { image = loaded }
+        }
     }
 }
 
