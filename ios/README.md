@@ -237,6 +237,45 @@ own position, and won't pick while zoomed out past ~60 km.
 Screenshots on the mock backend: `-StexxScreenshotRoute app` opens the
 signed-in tabs, `-StexxScreenshotPlus YES` starts with Stexx+.
 
+## Nearby states
+
+`NearbyView` picks what to show with `NearbyContent.resolve`
+(`Features/Nearby/NearbyFeed.swift`), from the loaded tiles, the first
+page's state and the location state read from `LocationService` (never a
+coordinate):
+
+| State | When | Shows |
+| --- | --- | --- |
+| Grid | Any tiles | Tiles; a spinner cell at the end while the next page loads, or a **Retry** cell if it failed (no automatic retry loop) |
+| Finding you | Empty grid while the permission prompt is up, or before this session's first location upload (up to 20 s) | "Finding guys near you…". The grid reloads by itself once the first upload succeeds, and again when location is turned back on |
+| Location off | Empty grid and location denied, Location Services off, or restricted | Why, **Open Settings** (not for restricted), and travel mode, which works without device location (Stexx+; paywall otherwise) |
+| Error | The first page failed | A plain sentence ("You're offline…") and **Try again** |
+| Nobody nearby | Loaded and empty | "Nobody here yet", or with filters on "Nobody matches your filters" and **Clear filters** |
+
+Travel mode places you itself, so it skips the location states. If location
+is off but the server still has your last cell, the tiles show with a slim
+"Location is off" notice. A failed pull-to-refresh keeps the tiles and shows
+a notice with Retry; a failed filter change clears them (they were for other
+filters). The app only asks for when-in-use permission and works with
+approximate location; nothing here changes what is uploaded.
+
+`NearbyFeedModel` owns paging: a newer reload drops answers from older
+requests (including a page still loading), and repeats across pages are
+shown once.
+
+Accessibility: tiles read "name, age, online, 200 m away, favorite" with an
+"Opens the profile" hint; tile text follows Dynamic Type up to XXXL (the
+3:4 tile is capped there), the quick-filter row up to AX2. Quick filters,
+More filters and the filter sheet's steppers, slider and tag buttons have
+labels, values and hints. The Online chip's count is read as "N in the
+grid", since it only counts loaded tiles.
+
+Screenshots on the mock backend (Debug only): `-StexxScreenshotRoute app
+-StexxDebugNearby <state>` with `firstRun`, `denied`, `restricted`,
+`deniedWithGrid`, `empty`, `emptyFiltered` (starts on Online), `error`,
+`pageError` (pages of 9, the second fails once) or `grid`. The location
+service is left out while a state is forced, so no system prompt appears.
+
 ## Configuration
 
 Build settings in `project.yml` are exposed through `Info.plist`:
@@ -272,7 +311,7 @@ ios/
 │   ├── E2E/                    Signal Protocol client (see "End-to-end encryption")
 │   ├── Features/
 │   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up
-│   │   ├── Nearby/             Grid, filters, profile detail
+│   │   ├── Nearby/             Grid and its states (first run, location off, errors), filters, profile detail
 │   │   ├── Chat/               Conversation list and thread (key-change banner, encrypted placeholders)
 │   │   ├── Me/                 Own profile, edit profile, settings
 │   │   ├── Safety/             Block/report UI, blocked list
