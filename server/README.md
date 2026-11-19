@@ -70,6 +70,9 @@ deploy/                 VPS deployment: Caddy, systemd, Postgres hardening, back
 - **Media.** Uploads are decoded with a pixel cap, orientation-corrected, stripped of *all* metadata, resized to at most 2048 px and re-encoded as JPEG into `MEDIA_DIR/<32 hex>.jpg`. End-to-end encrypted chat photos (`application/octet-stream` uploads, only when `E2E_MODE` is not `off`) are opaque blobs the server can't read: they're stored verbatim as `<32 hex>.bin`, never decoded or classified, and deleted on the same schedule (see [security.md](../docs/security.md#encrypted-photos)).
   Database triggers queue a file for deletion whenever the row that owns it disappears (including cascades); the app unlinks the queue. Dev serves `/media`; production serves it with Caddy from `media.stexx.gay`.
 - **Stexx+.** `POST /v1/subscriptions/apple` verifies the StoreKit 2 JWS against Apple's root CA (`certs/`); without verification configured it returns 503 `subscriptions_unavailable`. It never grants on trust.
+  Apple's App Store Server Notifications V2 (`POST /v1/subscriptions/apple/notifications`, unauthenticated) are verified the same way and keep renewals,
+  cancellations, grace periods and refunds in sync while the app is closed; each notification UUID is applied once (`apple_notifications`, 30 days).
+  Tests sign real JWS with a test chain in `test/fixtures/storekit/`.
 
 ## Privacy guarantees and where each is enforced
 
@@ -117,7 +120,7 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `APPLE_BUNDLE_ID` | `gay.stexx.app` | |
 | `APPLE_ENVIRONMENT` | `Sandbox` | `Production` / `Sandbox` / `Xcode` / `LocalTesting`. |
 | `APPLE_APP_APPLE_ID` | unset | Required when `APPLE_ENVIRONMENT=Production`. |
-| `APPLE_ROOT_CA_DIR` | unset | Directory of Apple root `.cer` files (the repo ships `certs/`). Unset: `POST /subscriptions/apple` returns 503. |
+| `APPLE_ROOT_CA_DIR` | unset | Directory of Apple root `.cer` files (the repo ships `certs/`). Unset: `POST /subscriptions/apple` and `/subscriptions/apple/notifications` return 503. |
 | `APPLE_PLUS_PRODUCT_ID` | `gay.stexx.app.plus.monthly` | |
 | `ATTESTATION_MODE` | `dev` (prod: `enforce` if `APPLE_TEAM_ID` set, else `off`) | `off` / `dev` / `enforce`. `dev` accepts the simulator bypass header and is refused in production. See [`docs/security.md`](../docs/security.md). |
 | `APPLE_TEAM_ID` | unset | App Attest app ID is `TEAMID.APPLE_BUNDLE_ID`. |
