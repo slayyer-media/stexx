@@ -534,8 +534,8 @@ chatRoutes.post("/conversations/:id/messages", requireAuth, rateLimit("messages"
       }
       // Spam heuristics (lib/abuse/spam.ts): may hold the message (shadow limit). Same transaction, so a held message
       // is never visible to the recipient, not even for a moment.
+      // A held message keeps its delivered_at, so its sender's status can't tell it apart from a delivered one.
       held = (await screenSentMessage(tx, { messageId: inserted.id, senderId: me, conversationId, otherId, features })).held;
-      if (held) inserted.delivered_at = null;
       // A held message leaves no trace for the recipient, not even a re-sorted list (loadConversations re-sorts the
       // sender's own list from the held message itself; delivery on clear bumps updated_at).
       if (!held) await tx`UPDATE conversations SET updated_at = now() WHERE id = ${conversationId}`;

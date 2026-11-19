@@ -11,7 +11,11 @@
  *     first_contact_rate           1  >= SPAM_FIRST_CONTACT_MIN unanswered cold starts, and they are at least
  *                                     SPAM_FIRST_CONTACT_RATIO of all conversations it wrote in during the window
  *     blocked_after_first_contact  3  >= SPAM_BLOCKED_MIN people blocked or reported it within SPAM_BLOCKED_HOURS of
- *                                     its first message to them (it wrote first), over SPAM_BLOCKED_DAYS
+ *                                     its first message to them (it wrote first), over SPAM_BLOCKED_DAYS. Only
+ *                                     trusted, independent people count, as for auto-hide (lib/moderation.ts): at
+ *                                     least REPORT_REPORTER_MIN_AGE_HOURS old, not on the trust ramp, not hidden,
+ *                                     banned or spam-limited themselves, and one per device / report connection, so
+ *                                     a few throwaway accounts can't limit someone who wrote to them.
  *   Content (plaintext only, via ContentPolicy.features; encrypted envelopes are never read):
  *     duplicate_text               3  near-identical text (keyed MinHash, similarity >= SPAM_DUPLICATE_SIMILARITY)
  *                                     to >= SPAM_DUPLICATE_RECIPIENTS people
@@ -26,7 +30,8 @@
  * Shadow limit (users.spam_limited_at, one spam_flags episode): the account's messages to people who haven't written
  * to it are held (stored and shown to the sender as sent, never delivered), its taps are dropped, it is left out of
  * nearby and viewers, and a system report (reports.source = 'spam') puts it in the existing moderation queue with the
- * signal names. The account is never told. It ends:
+ * signal names. The account is never told, and its own view stays the same as an unlimited one's (a held message to a connected
+ * recipient shows "delivered" just as a delivered one would; the recipient can't see it). It ends:
  *   - moderator clears (dismiss, or spam-clear): limit lifted, held messages delivered;
  *   - moderator bans: held messages dropped (the ban hides the account everywhere anyway);
  *   - moderator actions the reports: held messages dropped, limit stays until the cooldown (or --unhide lifts it);
@@ -36,7 +41,9 @@
  * After a lift only activity after it counts (users.spam_cleared_at), so the same messages never limit twice.
  *
  * Stored: counters and signal names (spam_flags), keyed MinHash signatures and rule kinds per plaintext message for
- * SPAM_HASH_TTL_HOURS (spam_message_features). Never message text.
+ * SPAM_HASH_TTL_HOURS (spam_message_features), and who wrote in which conversation when (spam_contacts, the ledger the
+ * metadata signals read, so a message that expires right after it is read, or a cleared thread, doesn't erase them).
+ * Never message text.
  */
 import { config, type SpamConfig } from "../../config.ts";
 import { sql, type Sql } from "../../db/sql.ts";
@@ -46,6 +53,7 @@ import { drainMediaTrash } from "../media.ts";
 import { DAY, HOUR, MINUTE } from "../time.ts";
 import type { ContentFeatures } from "./content.ts";
 import { signatureSimilarity } from "./minhash.ts";
+import { trustState } from "./trust.ts";
 
 // ---- Settings ------------------------------------------------------------------------------------------------
 
@@ -209,6 +217,73 @@ function windowStart(s: SpamSettings, now: Date, clearedAt: Date | null): Date {
   return later(new Date(now.getTime() - s.windowHours * HOUR), clearedAt);
 }
 
+/** How long a spam_contacts row is kept after the sender's last message in that conversation. */
+function contactTtlMs(s: SpamSettings): number {
+  return Math.max(s.windowHours * HOUR, s.blockedDays * DAY);
+}
+
+/** Blockers and reporters assessed per account (oldest first). */
+const MAX_BLOCKERS_ASSESSED = 200;
+
+/**
+ * People who blocked or reported `userId` within SPAM_BLOCKED_HOURS of its first message to them (it wrote first),
+ * counting only trusted, independent ones, the same way auto-hide counts reporters (lib/moderation.ts): at least
+ * REPORT_REPORTER_MIN_AGE_HOURS old, not restricted by the trust ramp, not hidden, banned or spam-limited, and at most
+ * one per device (device_accounts) and per report connection (reports.reporter_ip_hash); earlier ones win.
+ */
+async function trustedBlockersAfterFirstContact(
+  db: Sql,
+  userId: string,
+  blockedSince: Date,
+  now: Date,
+): Promise<number> {
+  const s = spamSettings();
+  const minAgeCutoff = new Date(now.getTime() - config.moderation.autoHide.reporterMinAgeHours * HOUR);
+  const rows = await db<{ who: string; ips: string[] }[]>`
+    SELECT x.who, min(x.at) AS at,
+           COALESCE(array_agg(DISTINCT x.ip) FILTER (WHERE x.ip IS NOT NULL), '{}') AS ips
+      FROM (
+        SELECT blocker_id AS who, created_at AS at, NULL::text AS ip
+          FROM blocks WHERE blocked_id = ${userId} AND created_at > ${blockedSince}
+        UNION ALL
+        SELECT reporter_id, created_at, reporter_ip_hash FROM reports
+         WHERE reported_id = ${userId} AND reporter_id IS NOT NULL AND source = 'user' AND created_at > ${blockedSince}
+      ) x
+      JOIN users w ON w.id = x.who
+      JOIN spam_contacts me ON me.sender_id = ${userId} AND me.other_id = x.who AND me.expires_at > ${now}
+      LEFT JOIN spam_contacts o ON o.conversation_id = me.conversation_id AND o.sender_id = x.who
+     WHERE me.first_at > ${blockedSince}
+       AND x.at >= me.first_at AND x.at <= me.first_at + ${s.blockedHours} * interval '1 hour'
+       -- It wrote first: nothing the other person could see came before its first message.
+       AND (o.first_visible_at IS NULL OR o.first_visible_at >= me.first_at)
+       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = me.conversation_id AND m.sender_id = x.who
+                                                 AND m.held_at IS NULL AND m.sent_at < me.first_at)
+       -- Trusted: old enough, and not moderated or limited itself.
+       AND w.created_at <= ${minAgeCutoff}
+       AND w.hidden_at IS NULL AND w.banned_at IS NULL AND w.spam_limited_at IS NULL
+     GROUP BY x.who
+     ORDER BY at, x.who
+     LIMIT ${MAX_BLOCKERS_ASSESSED}`;
+  if (rows.length === 0) return 0;
+  const devicesOf = new Map<string, string[]>();
+  for (const d of await db<{ user_id: string; device_id: string }[]>`
+    SELECT user_id, device_id FROM device_accounts WHERE user_id = ANY(${rows.map((r) => r.who)})`) {
+    devicesOf.set(d.user_id, [...(devicesOf.get(d.user_id) ?? []), d.device_id]);
+  }
+  const devices = new Set<string>();
+  const ips = new Set<string>();
+  let n = 0;
+  for (const r of rows) {
+    if ((await trustState(r.who, db, now)).restricted) continue;
+    const mine = devicesOf.get(r.who) ?? [];
+    if (mine.some((d) => devices.has(d)) || r.ips.some((h) => ips.has(h))) continue;
+    for (const d of mine) devices.add(d);
+    for (const h of r.ips) ips.add(h);
+    n += 1;
+  }
+  return n;
+}
+
 export async function gatherSpamFacts(userId: string, db: Sql = sql, now = new Date()): Promise<SpamFacts | null> {
   const s = spamSettings();
   const u = await accountRow(db, userId);
@@ -216,33 +291,22 @@ export async function gatherSpamFacts(userId: string, db: Sql = sql, now = new D
   const since = windowStart(s, now, u.spam_cleared_at);
   const blockedSince = later(new Date(now.getTime() - s.blockedDays * DAY), u.spam_cleared_at);
 
+  // From the ledger (spam_contacts), not from `messages`, so self-expiring messages and cleared threads still count.
+  // The other person's first visible message comes from the ledger or, for messages it never saw, from `messages`.
   const convs = await db<{ my_first: Date; their_first: Date | null }[]>`
-    WITH recent AS (
-      SELECT DISTINCT conversation_id FROM messages WHERE sender_id = ${userId} AND sent_at > ${since}
-    )
-    SELECT (SELECT min(m.sent_at) FROM messages m
-             WHERE m.conversation_id = r.conversation_id AND m.sender_id = ${userId}) AS my_first,
-           (SELECT min(o.sent_at) FROM messages o
-             WHERE o.conversation_id = r.conversation_id AND o.sender_id <> ${userId} AND o.held_at IS NULL) AS their_first
-      FROM recent r`;
+    SELECT me.first_at AS my_first,
+           LEAST(o.first_visible_at,
+                 (SELECT min(m.sent_at) FROM messages m
+                   WHERE m.conversation_id = me.conversation_id AND m.sender_id = me.other_id AND m.held_at IS NULL)
+           ) AS their_first
+      FROM spam_contacts me
+      LEFT JOIN spam_contacts o ON o.conversation_id = me.conversation_id AND o.sender_id = me.other_id
+     WHERE me.sender_id = ${userId} AND me.last_at > ${since} AND me.expires_at > ${now}`;
   const started = convs
     .filter((c) => c.my_first > since && (c.their_first === null || c.their_first > c.my_first))
     .map((c) => ({ at: new Date(c.my_first), replied: c.their_first !== null }));
 
-  const [blocked] = await db<{ n: number }[]>`
-    SELECT count(DISTINCT x.who)::int AS n FROM (
-      SELECT blocker_id AS who, created_at AS at FROM blocks WHERE blocked_id = ${userId} AND created_at > ${blockedSince}
-      UNION ALL
-      SELECT reporter_id, created_at FROM reports
-       WHERE reported_id = ${userId} AND reporter_id IS NOT NULL AND source = 'user' AND created_at > ${blockedSince}
-    ) x
-    JOIN conversations c ON (c.user_a = ${userId} AND c.user_b = x.who) OR (c.user_b = ${userId} AND c.user_a = x.who)
-    CROSS JOIN LATERAL (SELECT min(m.sent_at) AS my_first FROM messages m
-                         WHERE m.conversation_id = c.id AND m.sender_id = ${userId}) f
-    WHERE f.my_first IS NOT NULL AND f.my_first > ${blockedSince}
-      AND x.at >= f.my_first AND x.at <= f.my_first + ${s.blockedHours} * interval '1 hour'
-      AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = c.id AND o.sender_id = x.who
-                                                AND o.held_at IS NULL AND o.sent_at < f.my_first)`;
+  const blocked = await trustedBlockersAfterFirstContact(db, userId, blockedSince, now);
 
   const [content] = await db<{ dup: number; payment: number; redirect: number; link: number }[]>`
     SELECT COALESCE(max(near_dupes + 1) FILTER (WHERE minhash IS NOT NULL), 0)::int AS dup,
@@ -256,7 +320,7 @@ export async function gatherSpamFacts(userId: string, db: Sql = sql, now = new D
     ageMs: now.getTime() - new Date(u.created_at).getTime(),
     started,
     active: convs.length,
-    blockedAfterFirstContact: blocked?.n ?? 0,
+    blockedAfterFirstContact: blocked,
     duplicateRecipients: content?.dup ?? 0,
     paymentRecipients: content?.payment ?? 0,
     redirectRecipients: content?.redirect ?? 0,
@@ -290,6 +354,39 @@ async function recordFeatures(
                                        has_link, has_payment, has_redirect, cold)
     VALUES (${opts.senderId}, ${opts.conversationId}, ${opts.now}, ${new Date(opts.now.getTime() + s.hashTtlHours * HOUR)},
             ${f.signature}, ${nearDupes}, ${f.hasLink}, ${f.hasPayment}, ${f.hasRedirect}, ${opts.cold})`;
+}
+
+/**
+ * Note in the ledger (spam_contacts) that the sender wrote in this conversation. A new row starts at the sender's
+ * first message still in `messages` (so an old conversation isn't a fresh start), and its first visible message, not
+ * counting this one (whether it is held is decided after the assessment; see markVisible).
+ */
+async function recordContact(
+  db: Sql,
+  opts: { messageId: string; senderId: string; conversationId: string; otherId: string; now: Date },
+): Promise<void> {
+  const expires = new Date(opts.now.getTime() + contactTtlMs(spamSettings()));
+  await db`
+    INSERT INTO spam_contacts (sender_id, conversation_id, other_id, first_at, first_visible_at, last_at, expires_at)
+    VALUES (${opts.senderId}, ${opts.conversationId}, ${opts.otherId},
+            LEAST(${opts.now}::timestamptz,
+                  (SELECT min(sent_at) FROM messages WHERE conversation_id = ${opts.conversationId}
+                                                       AND sender_id = ${opts.senderId})),
+            (SELECT min(sent_at) FROM messages WHERE conversation_id = ${opts.conversationId}
+                                                AND sender_id = ${opts.senderId} AND held_at IS NULL
+                                                AND id <> ${opts.messageId}),
+            ${opts.now}, ${expires})
+    ON CONFLICT (sender_id, conversation_id) DO UPDATE
+      SET last_at = GREATEST(spam_contacts.last_at, EXCLUDED.last_at),
+          expires_at = GREATEST(spam_contacts.expires_at, EXCLUDED.expires_at)`;
+}
+
+/** The sender's message `messageId` reached the other person (it wasn't held): note its first visible message. */
+async function markVisible(db: Sql, senderId: string, conversationId: string, messageId: string): Promise<void> {
+  await db`
+    UPDATE spam_contacts
+       SET first_visible_at = LEAST(first_visible_at, (SELECT sent_at FROM messages WHERE id = ${messageId}))
+     WHERE sender_id = ${senderId} AND conversation_id = ${conversationId}`;
 }
 
 // ---- Applying an assessment ---------------------------------------------------------------------------------------
@@ -382,6 +479,7 @@ export async function screenSentMessage(tx: Sql, input: ScreenInput): Promise<{ 
   const cold = c?.cold ?? true;
   let limited = u.spam_limited_at !== null;
   if (s.enabled) {
+    await recordContact(tx, { ...input, now });
     if (input.features) {
       await recordFeatures(tx, {
         senderId: input.senderId,
@@ -395,8 +493,13 @@ export async function screenSentMessage(tx: Sql, input: ScreenInput): Promise<{ 
     const out = await assessAndApply(tx, input.senderId, now);
     if (out?.result === "limited") limited = true;
   }
-  if (!limited || !cold) return { held: false };
-  await tx`UPDATE messages SET held_at = now(), delivered_at = NULL WHERE id = ${input.messageId}`;
+  if (!limited || !cold) {
+    if (s.enabled) await markVisible(tx, input.senderId, input.conversationId, input.messageId);
+    return { held: false };
+  }
+  // delivered_at is left as the send set it (now() if the recipient was connected), so the sender's status looks
+  // exactly like a delivered message's. The recipient never sees a held message (every recipient query skips held_at).
+  await tx`UPDATE messages SET held_at = now() WHERE id = ${input.messageId}`;
   return { held: true };
 }
 
@@ -494,6 +597,12 @@ async function deliverHeld(tx: Sql, userId: string): Promise<number> {
     RETURNING id, conversation_id`;
   if (released.length === 0) return 0;
   const convs = [...new Set(released.map((r) => r.conversation_id))];
+  // The other person can see them now: the ledger's "first visible message" follows.
+  await tx`
+    UPDATE spam_contacts sc SET first_visible_at = LEAST(sc.first_visible_at, r.first)
+      FROM (SELECT conversation_id, min(sent_at) AS first FROM messages
+             WHERE id = ANY(${released.map((r) => r.id)}) GROUP BY conversation_id) r
+     WHERE sc.sender_id = ${userId} AND sc.conversation_id = r.conversation_id`;
   await tx`UPDATE conversations SET updated_at = now() WHERE id = ANY(${convs})`;
   await tx`
     UPDATE conversation_members SET hidden = false
@@ -615,6 +724,8 @@ export interface SpamJobsResult {
   heldDropped: number;
   /** Ended episodes past SPAM_FLAG_RETENTION_DAYS, deleted. */
   flags: number;
+  /** Ledger rows (spam_contacts) past their expiry, deleted. */
+  contacts: number;
 }
 
 /** Slow-job housekeeping (jobs/retention.ts runSlowJobs). */
@@ -643,7 +754,13 @@ export async function runSpamJobs(now = new Date()): Promise<SpamJobsResult> {
         SELECT id FROM spam_flags WHERE lifted_at IS NOT NULL AND lifted_at <= ${flagCutoff} LIMIT ${BATCH})`;
     return r.count;
   });
-  return { cooldownLifted, features, heldDropped, flags };
+  const contacts = await inBatches(async () => {
+    const r = await sql`
+      DELETE FROM spam_contacts WHERE (sender_id, conversation_id) IN (
+        SELECT sender_id, conversation_id FROM spam_contacts WHERE expires_at <= ${now} LIMIT ${BATCH})`;
+    return r.count;
+  });
+  return { cooldownLifted, features, heldDropped, flags, contacts };
 }
 
 // ---- Read-only views for the moderator CLI ----------------------------------------------------------------------------

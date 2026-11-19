@@ -161,6 +161,10 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   A held message doesn't bump `conversations.updated_at` (loadConversations dates the sender's own list from it). A clear
   `pg_notify`s `RELEASED_CHANNEL` with the released message ids; index.ts runs `listenForReleasedMessages()` (chat.ts),
   which pushes them to connected recipients.
+  Metadata signals read the `spam_contacts` ledger (one row per sender+conversation, written in `screenSentMessage`,
+  updated by `deliverHeld`, purged by `runSpamJobs`), never live `messages` alone: messages can expire 1 s after being
+  read. Blockers/reporters only count for `blocked_after_first_contact` if trusted and independent (as auto-hide). A held
+  message keeps `delivered_at` (don't null it: the sender's status must look normal).
   `handles.ts` loads the shared pattern table `content-rules.json` (copy it to `ios/Stexx/E2E/` after editing).
   Tests: `overrideSpamForTests`.
 ### photocheck/ (profile photo checks, see docs/security.md §6; migration 106)

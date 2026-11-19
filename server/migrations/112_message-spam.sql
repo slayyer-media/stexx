@@ -67,3 +67,25 @@ CREATE TABLE spam_flags (
 CREATE UNIQUE INDEX spam_flags_active_idx ON spam_flags (user_id) WHERE lifted_at IS NULL;
 CREATE INDEX spam_flags_user_idx ON spam_flags (user_id, created_at DESC);
 CREATE INDEX spam_flags_lifted_idx ON spam_flags (lifted_at) WHERE lifted_at IS NOT NULL;
+
+-- A content-free ledger of who wrote in which conversation and when, for the metadata signals (fan-out, bursts, cold
+-- starts, blocked after first contact) and the trust ramp's first-contact count. The same facts are in `messages`, but
+-- a message can expire seconds after it is read (expiresAfterSeconds) and a thread can be cleared, which would erase
+-- them; this ledger isn't touched by either. One row per sender and conversation: when it first wrote (held or not),
+-- when it first wrote something the other person could see (not held), and when it last wrote. No text, no message
+-- ids. Written only while the heuristics are on; deleted SPAM_WINDOW_HOURS / SPAM_BLOCKED_DAYS (whichever is longer)
+-- after the sender's last message there, and with either account. conversation_id is deliberately not a foreign key:
+-- the row outlives a deleted thread for that time.
+CREATE TABLE spam_contacts (
+  sender_id         text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conversation_id   text NOT NULL CHECK (char_length(conversation_id) <= 64),
+  other_id          text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  first_at          timestamptz NOT NULL,
+  first_visible_at  timestamptz,
+  last_at           timestamptz NOT NULL,
+  expires_at        timestamptz NOT NULL,
+  PRIMARY KEY (sender_id, conversation_id)
+);
+CREATE INDEX spam_contacts_conversation_idx ON spam_contacts (conversation_id, sender_id);
+CREATE INDEX spam_contacts_expires_idx ON spam_contacts (expires_at);
+CREATE INDEX spam_contacts_other_fk_idx ON spam_contacts (other_id);
