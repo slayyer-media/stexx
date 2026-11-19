@@ -21,7 +21,12 @@
  * reported it.
  *
  * Moderator actions (scripts/moderate.ts) each run in one transaction under the same lock and write an audit row to
- * moderation_actions: hide, unhide, dismiss, action, ban, unban.
+ * moderation_actions: hide, unhide, dismiss, action, ban, unban, purge, lift_email_ban.
+ *
+ * Banned accounts are kept intact for BANNED_RETENTION_DAYS (the appeal window; `unban` during it cancels everything),
+ * then purged by the slow retention job, or at once with `purge`: deleted exactly like DELETE /me (lib/account.ts),
+ * keeping only what stops the same person signing up again (the email HMAC in banned_emails, the device bans). See
+ * purgeBannedAccount and docs/security.md ("Banned accounts: review window and purge").
  */
 import { config, type ModerationConfig } from "../config.ts";
 import { sql, type Sql } from "../db/sql.ts";
@@ -29,11 +34,12 @@ import { banDevicesOfUser } from "./abuse/attestation.ts";
 import { deleteKeysOf } from "./e2e/keys.ts";
 import { trustState } from "./abuse/trust.ts";
 import { clearSpamLimit, confirmSpam, decisionDetails, includesSpamReport } from "./abuse/spam.ts";
-import { revokeAllSessions } from "./auth.ts";
+import { deleteAccountRows, forgetDeletedAccount } from "./account.ts";
+import { emailHmac, normalizeEmail, revokeAllSessions } from "./auth.ts";
 import { accountUnderReview, ApiError, notFound } from "./errors.ts";
 import { logInfo } from "./logger.ts";
-import { isStorageKey, mediaPath } from "./media.ts";
-import { DAY, HOUR } from "./time.ts";
+import { drainMediaTrash, isStorageKey, mediaPath } from "./media.ts";
+import { DAY, HOUR, isoDate } from "./time.ts";
 
 export type ReportReason =
   | "underage"
@@ -52,6 +58,8 @@ export type ModerationActionKind =
   | "action"
   | "ban"
   | "unban"
+  | "purge"
+  | "lift_email_ban"
   // Photo-flag decisions (lib/photocheck/review.ts, migration 114).
   | "photo_clear"
   | "photo_hide"
@@ -237,7 +245,8 @@ export async function audit(
   entry: {
     actor: string;
     action: ModerationActionKind;
-    userId: string;
+    /** Null only for lift_email_ban, which concerns an address with no account. */
+    userId: string | null;
     reportIds?: string[];
     note?: string | null;
     details?: Record<string, unknown>;
@@ -473,12 +482,15 @@ export function actionReports(input: ActionInput & { unhide?: boolean }): Promis
  * Ban: the account disappears from every surface (lib/visibility.ts), its sessions are revoked, sign-in is refused
  * (403 account_banned), its end-to-end encryption keys are deleted, every device it was created on is banned (refused at sign-up and sign-in, and the
  * DeviceCheck ban bit is written on that device's next request), and its open reports are closed as actioned.
- * The row is kept so its email hash and devices keep blocking a new sign-up.
+ * The rest of the account is kept intact for BANNED_RETENTION_DAYS (the appeal window), then purged
+ * (purgeBannedAccount); its email hash and devices keep blocking a new sign-up after that.
  */
 export function banAccount(input: ActionInput): Promise<ActionResult> {
   return moderate(input, "ban", async (tx, state) => {
     if (state === "banned") throw new ModerationError("Account is already banned.");
-    await tx`UPDATE users SET banned_at = now(), reviewed_at = now() WHERE id = ${input.userId}`;
+    const [banned] = await tx<{ banned_at: Date }[]>`
+      UPDATE users SET banned_at = now(), purge_window_start = NULL, reviewed_at = now()
+       WHERE id = ${input.userId} RETURNING banned_at`;
     const closedReports = await closeOpenReports(tx, input.userId, "actioned");
     await revokeAllSessions(input.userId, tx);
     const devices = await banDevicesOfUser(input.userId, tx);
@@ -487,20 +499,30 @@ export function banAccount(input: ActionInput): Promise<ActionResult> {
     const e2eDevices = await deleteKeysOf(input.userId, tx);
     // Held messages (spam shadow limit) are dropped, never delivered.
     const spam = await confirmSpam(tx, input.userId, input.actor, "banned", { lift: true });
-    return { closedReports, details: { devicesBanned: devices, e2eKeysDeleted: e2eDevices, ...decisionDetails(spam) } };
+    return {
+      closedReports,
+      details: {
+        devicesBanned: devices,
+        e2eKeysDeleted: e2eDevices,
+        ...decisionDetails(spam),
+        purgeDue: isoDate(purgeDueAt(banned!.banned_at)),
+      },
+    };
   });
 }
 
 /**
- * Undo a ban (a mistake). Clears the account's ban and hide, and the server-side ban on its devices unless another
- * banned account was created on the same device. A DeviceCheck
- * ban bit already written at Apple is not cleared (see docs/security.md).
+ * Undo a ban (a mistake, or an appeal upheld inside the review window). Clears the account's ban and hide, which
+ * cancels its purge, and the server-side ban on its devices unless another banned account was created on the same
+ * device (still present, or already purged: devices.ban_from_purged). A DeviceCheck ban bit already written at Apple is
+ * not cleared (see docs/security.md).
  */
 export function unbanAccount(input: ActionInput): Promise<ActionResult> {
   return moderate(input, "unban", async (tx, state) => {
     if (state !== "banned") throw new ModerationError("Account is not banned.");
     await tx`
-      UPDATE users SET banned_at = NULL, hidden_at = NULL, hidden_reason = NULL, reviewed_at = now()
+      UPDATE users SET banned_at = NULL, purge_window_start = NULL, hidden_at = NULL, hidden_reason = NULL,
+                       reviewed_at = now()
        WHERE id = ${input.userId}`;
     // Lift device bans only where no other banned account was created on the same device.
     const devices = await tx`
@@ -509,8 +531,150 @@ export function unbanAccount(input: ActionInput): Promise<ActionResult> {
          AND d.id IN (SELECT device_id FROM device_accounts WHERE user_id = ${input.userId})
          AND NOT EXISTS (SELECT 1 FROM device_accounts da JOIN users o ON o.id = da.user_id
                           WHERE da.device_id = d.id AND da.user_id <> ${input.userId} AND o.banned_at IS NOT NULL)
+         AND NOT d.ban_from_purged
        RETURNING d.id`;
-    return { details: { devicesUnbanned: devices.length } };
+    // The account was still intact (purged accounts no longer exist), so this also cancels its purge.
+    return { details: { devicesUnbanned: devices.length, purgeCancelled: true } };
+  });
+}
+
+// ---- Banned accounts: review window and purge ----------------------------------------------------------------
+
+let retentionDaysOverride: number | null = null;
+/** Days a banned account is kept intact before it is purged (BANNED_RETENTION_DAYS). */
+export function bannedRetentionDays(): number {
+  return retentionDaysOverride ?? config.moderation.bannedRetentionDays;
+}
+/** Tests only. Returns a restore function. */
+export function setBannedRetentionDaysForTests(days: number | null): () => void {
+  if (config.isProduction) throw new Error("not in production");
+  const prev = retentionDaysOverride;
+  retentionDaysOverride = days;
+  return () => {
+    retentionDaysOverride = prev;
+  };
+}
+
+/**
+ * When the review window of a banned account starts: the ban, or the deploy of the purge for bans made before it
+ * (users.purge_window_start, set by migration 123 so existing bans are not all purged on the first run).
+ */
+export function purgeWindowStart(bannedAt: Date, purgeWindowStartAt: Date | null): Date {
+  return purgeWindowStartAt && purgeWindowStartAt > bannedAt ? purgeWindowStartAt : bannedAt;
+}
+
+/** When an account whose review window started at `windowStart` (see purgeWindowStart) becomes due for the purge. */
+export function purgeDueAt(windowStart: Date): Date {
+  return new Date(windowStart.getTime() + bannedRetentionDays() * DAY);
+}
+
+export type PurgeReason = "retention" | "moderator";
+
+export interface PurgeResult {
+  userId: string;
+  reason: PurgeReason;
+  /** The email HMAC was moved to banned_emails (false for passkey-only accounts). */
+  emailKept: boolean;
+  /** Device bans kept (and marked so no unban lifts them). */
+  devicesKept: number;
+  /** Free-text moderator notes cleared from the account's audit rows. */
+  notesCleared: number;
+}
+
+/**
+ * Purge one banned account, in one transaction under the moderation lock (so it can't interleave with an unban):
+ *   1. its device bans are re-asserted and marked `ban_from_purged` (devices rows outlive accounts; the mark keeps an
+ *      unban of another account on the same device from lifting them once device_accounts is gone);
+ *   2. the free-text notes on its audit rows are cleared (they may describe the person); actor, action, dates, report
+ *      ids and the numeric details stay, and the account id goes with the SET NULL foreign key;
+ *   3. a `purge` audit row is written (no note; reason and counts only);
+ *   4. the account is deleted exactly like DELETE /me (lib/account.ts): every table cascades, reports about it and by
+ *      it are anonymized and keep their own evidence clock (never extended), files are queued in media_trash;
+ *   5. its email HMAC, if any, goes to banned_emails, so the address still gets 403 account_banned.
+ * Returns null, doing nothing, when the account is gone or no longer banned (an unban cancelled the purge), or when
+ * `dueBefore` is given and its review window (purgeWindowStart) started after that. The caller drains the media trash after the commit.
+ */
+export async function purgeBannedAccount(
+  userId: string,
+  opts: { actor: string; reason: PurgeReason; dueBefore?: Date },
+): Promise<PurgeResult | null> {
+  const result = await sql.begin(async (tx) => {
+    await lockAccount(tx, userId);
+    const [u] = await tx<{ banned_at: Date | null; purge_window_start: Date | null }[]>`
+      SELECT banned_at, purge_window_start FROM users WHERE id = ${userId} FOR UPDATE`;
+    if (!u?.banned_at) return null;
+    if (opts.dueBefore && purgeWindowStart(u.banned_at, u.purge_window_start) > opts.dueBefore) return null;
+
+    const devices = await tx`
+      UPDATE devices SET banned_at = COALESCE(banned_at, now()), ban_from_purged = true
+       WHERE id IN (SELECT device_id FROM device_accounts WHERE user_id = ${userId}) RETURNING id`;
+    const notes = await tx`
+      UPDATE moderation_actions SET note = NULL WHERE user_id = ${userId} AND note IS NOT NULL RETURNING id`;
+    const [hmac] = await tx<{ email_hmac: Buffer | null }[]>`SELECT email_hmac FROM users WHERE id = ${userId}`;
+    const out: PurgeResult = {
+      userId,
+      reason: opts.reason,
+      emailKept: Boolean(hmac?.email_hmac),
+      devicesKept: devices.length,
+      notesCleared: notes.length,
+    };
+    await audit(tx, {
+      actor: opts.actor,
+      action: "purge",
+      userId,
+      details: {
+        reason: out.reason,
+        retentionDays: bannedRetentionDays(),
+        emailKept: out.emailKept,
+        devicesKept: out.devicesKept,
+        notesCleared: out.notesCleared,
+      },
+    });
+    const deleted = await deleteAccountRows(tx, userId);
+    if (deleted?.emailHmac) {
+      await tx`
+        INSERT INTO banned_emails (email_hmac, banned_at) VALUES (${deleted.emailHmac}, date_trunc('day', ${u.banned_at}::timestamptz, 'UTC'))
+        ON CONFLICT (email_hmac) DO NOTHING`;
+    }
+    return out;
+  });
+  if (result) forgetDeletedAccount(userId);
+  return result;
+}
+
+/**
+ * `purge`: a moderator purges a banned account now instead of waiting for the window (clear-cut cases). Refused unless
+ * the account is banned. Irreversible. Audited like every action; takes no note (notes about a purged account are not
+ * kept).
+ */
+export async function purgeNow(input: { actor: string; userId: string }): Promise<PurgeResult> {
+  checkActor(input.actor);
+  const state = await sql.begin((tx) => stateOf(tx, input.userId));
+  if (state !== "banned") throw new ModerationError("Account is not banned; ban it first (purge only removes banned accounts).");
+  const res = await purgeBannedAccount(input.userId, { actor: input.actor, reason: "moderator" });
+  if (!res) throw new ModerationError("Account is no longer banned or already gone; nothing purged.");
+  await drainMediaTrash();
+  logInfo("moderation.purge", { reason: res.reason, accounts: 1 });
+  return res;
+}
+
+/**
+ * `lift-email-ban`: remove the banned_emails row of a purged banned account, so the address can sign up again (an
+ * appeal upheld after the purge). The moderator types the address (the CLI reads it from stdin, never argv, so it stays
+ * out of shell history); only its HMAC is looked up. The audit row has no account, no address and no hash. Returns
+ * whether a ban was lifted (false: that address was not banned).
+ */
+export async function liftEmailBan(input: { actor: string; email: string; note?: string | null }): Promise<boolean> {
+  checkActor(input.actor);
+  checkNote(input.note);
+  const email = normalizeEmail(input.email);
+  if (!/^[^\s@]+@[^\s@]+$/.test(email)) throw new ModerationError("That is not an email address.");
+  const hmac = emailHmac(email);
+  return sql.begin(async (tx) => {
+    const r = await tx`DELETE FROM banned_emails WHERE email_hmac = ${hmac}`;
+    if (r.count === 0) return false;
+    await audit(tx, { actor: input.actor, action: "lift_email_ban", userId: null, note: input.note });
+    return true;
   });
 }
 
@@ -624,6 +788,8 @@ export interface AccountReview {
   hiddenReason: HideReason | null;
   hiddenAt: Date | null;
   bannedAt: Date | null;
+  /** When a banned account is purged by the retention job (null unless banned). */
+  purgeDueAt: Date | null;
   reviewedAt: Date | null;
   devices: number;
   reports: ReportDetail[];
@@ -648,13 +814,14 @@ export async function accountReview(userId: string, db: Sql = sql, now = new Dat
       hidden_at: Date | null;
       hidden_reason: HideReason | null;
       banned_at: Date | null;
+      purge_window_start: Date | null;
       reviewed_at: Date | null;
       photos: number;
       devices: number;
     }[]
   >`
     SELECT u.id, u.display_name, u.age, u.headline, u.about, u.created_at, u.hidden_at, u.hidden_reason,
-           u.banned_at, u.reviewed_at,
+           u.banned_at, u.purge_window_start, u.reviewed_at,
            (SELECT count(*)::int FROM photos p WHERE p.owner_id = u.id) AS photos,
            (SELECT count(*)::int FROM device_accounts da WHERE da.user_id = u.id) AS devices
       FROM users u WHERE u.id = ${userId}`;
@@ -714,6 +881,7 @@ export async function accountReview(userId: string, db: Sql = sql, now = new Dat
     hiddenReason: u.hidden_reason,
     hiddenAt: u.hidden_at,
     bannedAt: u.banned_at,
+    purgeDueAt: u.banned_at ? purgeDueAt(purgeWindowStart(u.banned_at, u.purge_window_start)) : null,
     reviewedAt: u.reviewed_at,
     devices: u.devices,
     reports: reports.map((r) => ({

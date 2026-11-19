@@ -725,7 +725,10 @@ While hidden, the account's own requests to start a chat
 (`POST /conversations`), write first in a thread where the other person hasn't
 written, or tap get **403 `account_under_review`** with a message to show.
 A banned account's sessions stop working (401) and sign-in returns
-**403 `account_banned`**.
+**403 `account_banned`**. After the review window the banned account is deleted,
+but signing in or up with its email address (`/auth/email/verify`, and the dev
+`/auth/register`) still returns **403 `account_banned`**, and its devices stay
+banned (`device_banned`).
 
 ### Stexx+
 

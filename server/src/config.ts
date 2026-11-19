@@ -94,6 +94,8 @@ const envSchema = z.object({
   REPORT_REPORTER_MIN_AGE_HOURS: z.coerce.number().min(0).max(24 * 365).optional(),
   REPORT_EVIDENCE_RETENTION_DAYS: z.coerce.number().min(1).max(365).default(30),
   REPORT_EVIDENCE_MAX_DAYS: z.coerce.number().min(1).max(3650).default(180),
+  /** Days a banned account is kept intact (appeal/review window) before the retention job purges it. Owner decision. */
+  BANNED_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
 
   // Spam heuristics on messages, shadow limits pending review (src/lib/abuse/spam.ts, docs/security.md section 8).
   SPAM_HEURISTICS_ENABLED: flag.default(true),
@@ -330,6 +332,8 @@ export interface ModerationConfig {
   evidenceRetentionDays: number;
   /** Hard cap for evidence on reports that stay open. */
   evidenceMaxDays: number;
+  /** A banned account is kept intact this many days after the ban (appeal window), then purged like DELETE /me. */
+  bannedRetentionDays: number;
 }
 
 export const DEFAULT_APP_ATTEST_ROOT_CA = new URL("../certs/app-attest/Apple_App_Attestation_Root_CA.pem", import.meta.url)
@@ -553,6 +557,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       },
       evidenceRetentionDays: e.REPORT_EVIDENCE_RETENTION_DAYS,
       evidenceMaxDays: e.REPORT_EVIDENCE_MAX_DAYS,
+      bannedRetentionDays: e.BANNED_RETENTION_DAYS,
     },
     spam: {
       enabled: e.SPAM_HEURISTICS_ENABLED,

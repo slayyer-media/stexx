@@ -5,6 +5,8 @@ import { sql } from "../db/sql.ts";
 import { drainMediaTrash, isStorageKey } from "../lib/media.ts";
 import { runSpamJobs } from "../lib/abuse/spam.ts";
 import { purgeModeratorAlertSent } from "../lib/moderator-alerts.ts";
+import { logError, logInfo } from "../lib/logger.ts";
+import { bannedRetentionDays, purgeBannedAccount, SYSTEM_ACTOR } from "../lib/moderation.ts";
 import { DAY, HOUR, MINUTE, SECOND } from "../lib/time.ts";
 
 /**
@@ -258,6 +260,51 @@ export async function purgeReportEvidence(now: Date = new Date()): Promise<Repor
   return { evidence, scrubbed };
 }
 
+/** Banned accounts purged per selection (each in its own transaction). */
+export const BANNED_PURGE_BATCH = 100;
+
+export interface BannedPurgeOptions {
+  /** Tests only: restrict to these accounts (the test database is shared with other suites). */
+  userIds?: readonly string[];
+}
+
+/**
+ * Banned accounts whose review window (BANNED_RETENTION_DAYS after the ban) has passed are purged: deleted like
+ * DELETE /me, keeping only the email HMAC and the device bans (lib/moderation.ts purgeBannedAccount). Bans made before
+ * migration 123 have their window start at that deploy instead (users.purge_window_start; GREATEST ignores NULL), so
+ * the first run never purges old bans in one go. An unban during the window clears banned_at, so the account is never
+ * selected. Each account is its own transaction under the
+ * moderation lock and re-checked inside it, so concurrent runs and a racing unban are safe; an account that fails is
+ * logged (no id, no data) and retried on the next run. Returns how many accounts were purged.
+ */
+export async function purgeBannedAccounts(now: Date = new Date(), opts: BannedPurgeOptions = {}): Promise<number> {
+  const cutoff = new Date(now.getTime() - bannedRetentionDays() * DAY);
+  const failed: string[] = [];
+  let purged = 0;
+  for (;;) {
+    const rows = await sql<{ id: string }[]>`
+      SELECT id FROM users
+       WHERE banned_at IS NOT NULL AND GREATEST(banned_at, purge_window_start) <= ${cutoff}
+         ${opts.userIds ? sql`AND id = ANY(${opts.userIds as string[]}::text[])` : sql``}
+         AND NOT (id = ANY(${failed}::text[]))
+       ORDER BY banned_at, id LIMIT ${BANNED_PURGE_BATCH}`;
+    let batch = 0;
+    for (const { id } of rows) {
+      try {
+        if (await purgeBannedAccount(id, { actor: SYSTEM_ACTOR, reason: "retention", dueBefore: cutoff })) batch++;
+      } catch (err) {
+        failed.push(id);
+        logError("moderation.purge_failed", err);
+      }
+    }
+    purged += batch;
+    if (batch > 0) await drainMediaTrash();
+    if (rows.length < BANNED_PURGE_BATCH) break;
+  }
+  if (purged > 0) logInfo("moderation.purge", { reason: "retention", accounts: purged });
+  return purged;
+}
+
 /** Clear finished boosts so the column only holds live ones. */
 export async function clearEndedBoosts(now: Date = new Date()): Promise<number> {
   return inBatches(async () => {
@@ -344,7 +391,7 @@ export async function runFastJobs(now: Date = new Date()) {
   return { expired, viewOnce, trashed };
 }
 
-/** Every 10 min: the caps (unread expiring messages after 14 days, unopened view-once photos after 3), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows, old report evidence. */
+/** Every 10 min: the caps (unread expiring messages after 14 days, unopened view-once photos after 3), unsent uploads, profile views, expired credentials, finished boosts, idle devices, old abuse-limit windows, old report evidence, banned accounts past their review window. */
 export async function runSlowJobs(now: Date = new Date()) {
   const unreadCapped = await purgeUnreadExpiringMessages(now);
   const unopenedViewOnce = await purgeUnopenedViewOnceAttachments(now);
@@ -357,6 +404,7 @@ export async function runSlowJobs(now: Date = new Date()) {
   const reports = await purgeReportEvidence(now);
   // Spam heuristics: cooldown lifts, expired content hashes, unreviewed held messages, old episodes.
   const spam = await runSpamJobs(now);
+  const bannedPurged = await purgeBannedAccounts(now);
   // Debounce state of moderator alerts (ids only); also purged here in case alerts were switched off.
   const moderatorAlertsSent = await purgeModeratorAlertSent(now);
   return {
@@ -371,5 +419,6 @@ export async function runSlowJobs(now: Date = new Date()) {
     reports,
     spam,
     moderatorAlertsSent,
+    bannedPurged,
   };
 }

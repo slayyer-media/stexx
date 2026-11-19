@@ -34,6 +34,7 @@ import {
   type SignupCheck,
 } from "../lib/abuse/attestation.ts";
 import { assertNotDisposable } from "../lib/abuse/email.ts";
+import { assertEmailNotBanned } from "../lib/account.ts";
 import { hitAbuseLimits, subjectOf } from "../lib/abuse/limits.ts";
 import { MINUTE, inMs } from "../lib/time.ts";
 import { displayNameSchema, parseJson } from "../lib/validation.ts";
@@ -249,6 +250,7 @@ authRoutes.post("/auth/register", rateLimit("auth"), attest("signup"), async (c)
     if (!body.email) throw badRequest("email: required for email sign-up.");
     assertNotDisposable(body.email);
     hmac = emailHmac(body.email);
+    await assertEmailNotBanned(hmac);
   }
   await hitAbuseLimits("signup", subjectOf(c, { deviceId: device.deviceId }));
   const check = await assertSignupAllowed(device);
@@ -474,6 +476,8 @@ async function redeemEmailSignIn(
       const [existing] = await tx<{ id: string }[]>`SELECT id FROM users WHERE email_hmac = ${link.email_hmac}`;
       let userId = existing?.id;
       if (!userId) {
+        // The address of a banned account that was purged: refused like the account was (rolls back, link not burnt).
+        await assertEmailNotBanned(link.email_hmac, tx);
         // First sign-in for this address: needs the pending registration that travelled with the link.
         if (!link.display_name || link.confirmed_adult !== true) throw new NeedsRegistration();
         // Throwing here rolls the transaction back, so a refused sign-up doesn't burn the link.

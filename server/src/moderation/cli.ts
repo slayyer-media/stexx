@@ -7,6 +7,8 @@
  *   bun scripts/moderate.ts dismiss <profileID> [--report <reportID>] --as <handle> [--note "..."]
  *   bun scripts/moderate.ts action <profileID> [--unhide] --as <handle> [--note "..."]
  *   bun scripts/moderate.ts hide|unhide|ban|unban <profileID> --as <handle> [--note "..."]
+ *   bun scripts/moderate.ts purge <profileID> --as <handle> --yes
+ *   echo 'address@example.com' | bun scripts/moderate.ts lift-email-ban --as <handle> [--note "..."]
  *   bun scripts/moderate.ts log [<profileID>] [--limit N] [--json]
  *   bun scripts/moderate.ts photos list|show|clear|hide|blocklist|hide-account|ban …   (photos-cli.ts)
  *   bun scripts/moderate.ts alerts status|test                                         (photos-cli.ts)
@@ -22,6 +24,8 @@ import {
   dismissReports,
   hideAccount,
   ModerationError,
+  liftEmailBan,
+  purgeNow,
   reviewQueue,
   unbanAccount,
   unhideAccount,
@@ -42,13 +46,18 @@ export const USAGE = `Stexx moderation
   action <profileID> [--unhide]                 reports valid, handled without a ban: close them (stays hidden unless --unhide)
   hide <profileID>                              hide pending review
   unhide <profileID>                            make visible again (only reports filed later count towards auto-hide)
-  ban <profileID>                               remove everywhere, revoke sessions, ban its devices
-  unban <profileID>                             undo a ban
+  ban <profileID>                               remove everywhere, revoke sessions, ban its devices; purged after
+                                                BANNED_RETENTION_DAYS (default 30) unless unbanned
+  unban <profileID>                             undo a ban (also cancels the purge)
+  purge <profileID> --yes                       delete a banned account now (keeps only its email hash and device bans)
+  lift-email-ban                                let a purged banned account's address sign up again; reads the
+                                                address from stdin (never an argument, so not in shell history)
   log [<profileID>] [--limit N] [--json]        audit log${SPAM_USAGE}
 
 ${PHOTOS_USAGE}
 
-Write commands need --as <handle> (or STEXX_MODERATOR) and take an optional --note "...".`;
+Write commands need --as <handle> (or STEXX_MODERATOR) and take an optional --note "..." (except purge: notes about a
+purged account are not kept).`;
 
 interface Parsed {
   command: string;
@@ -57,7 +66,7 @@ interface Parsed {
 }
 
 const VALUE_FLAGS = new Set(["--as", "--note", "--report", "--limit"]);
-const BOOL_FLAGS = new Set(["--json", "--unhide", "--help"]);
+const BOOL_FLAGS = new Set(["--json", "--unhide", "--help", "--yes"]);
 const WRITE_FLAGS = ["--as", "--note", "--json"];
 /** Flags each command accepts; anything else is refused so a mistyped command never acts on more than intended. */
 const ALLOWED: Record<string, string[]> = {
@@ -70,6 +79,8 @@ const ALLOWED: Record<string, string[]> = {
   unhide: WRITE_FLAGS,
   ban: WRITE_FLAGS,
   unban: WRITE_FLAGS,
+  purge: ["--as", "--json", "--yes"],
+  "lift-email-ban": WRITE_FLAGS,
   ...SPAM_ALLOWED,
 };
 
@@ -156,6 +167,7 @@ function printReview(r: AccountReview, out: (line: string) => void, now: Date, a
   if (r.headline) out(`  headline: ${oneLine(r.headline)}`);
   if (r.about) out(`  about: ${oneLine(r.about, 600)}`);
   out(`  hidden ${day(r.hiddenAt)} · banned ${day(r.bannedAt)} · last review ${day(r.reviewedAt)}`);
+  if (r.purgeDueAt) out(`  purge due ${day(r.purgeDueAt)} (unban before then to keep the account; \`purge\` does it now)`);
   const a = r.assessment;
   out("");
   out(
@@ -212,6 +224,8 @@ export async function runModerationCli(
   out: (line: string) => void = (l) => console.log(l),
   env: Record<string, string | undefined> = process.env,
   now = new Date(),
+  /** Reads what the moderator pipes in (lift-email-ban). Injectable for tests. */
+  readStdin: () => Promise<string> = () => Bun.stdin.text(),
 ): Promise<number> {
   if (argv[0] === "photos" || argv[0] === "alerts") return runPhotoAndAlertCli(argv[0], argv.slice(1), out, env, now, USAGE);
   let p: Parsed;
@@ -262,7 +276,8 @@ export async function runModerationCli(
           return 0;
         }
         for (const e of entries) {
-          out(`${day(e.at)} ${e.actor} ${e.action} ${e.userId ?? "(deleted)"}${e.note ? ` · ${oneLine(e.note)}` : ""}`);
+          const who = e.userId ?? (e.action === "lift_email_ban" ? "(an address)" : "(deleted)");
+          out(`${day(e.at)} ${e.actor} ${e.action} ${who}${e.note ? ` · ${oneLine(e.note)}` : ""}`);
         }
         return 0;
       }
@@ -287,6 +302,36 @@ export async function runModerationCli(
         if (json) emit(res);
         else printResult(res, out);
         return 0;
+      }
+      case "purge": {
+        const actor = actorOf(p, env);
+        const userId = profileArg(p)!;
+        if (!p.flags.has("--yes")) {
+          throw new ModerationError(
+            "purge deletes the banned account for good, keeping only its email hash and device bans. Re-run with --yes.",
+          );
+        }
+        const res = await purgeNow({ actor, userId });
+        if (json) emit(res);
+        else {
+          out(
+            `purge: ${res.userId} is deleted; kept ${res.emailKept ? "its email hash and " : ""}${res.devicesKept} device ban(s); ` +
+              `cleared ${res.notesCleared} audit note(s)`,
+          );
+        }
+        return 0;
+      }
+      case "lift-email-ban": {
+        const actor = actorOf(p, env);
+        if (p.positional.length > 0) {
+          throw new ModerationError("Pass the address on stdin, not as an argument (it would stay in shell history).");
+        }
+        const email = (await readStdin()).trim();
+        if (!email) throw new ModerationError("No address on stdin.");
+        const lifted = await liftEmailBan({ actor, email, note: str(p, "--note") });
+        if (json) emit({ lifted });
+        else out(lifted ? "lift-email-ban: that address can sign up again" : "lift-email-ban: that address is not banned");
+        return lifted ? 0 : 1;
       }
       default: {
         const spam = await runSpamCommand(p, out, env, now);

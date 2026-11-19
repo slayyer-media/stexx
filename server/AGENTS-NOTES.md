@@ -184,6 +184,16 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Actions (one tx + `moderation_actions` audit row each): `hideAccount`, `unhideAccount`, `dismissReports`,
   `actionReports`, `banAccount`, `unbanAccount`; read: `reviewQueue`, `accountReview`, `auditLog`. CLI:
   `src/moderation/cli.ts` (`scripts/moderate.ts`). Tests: `overrideAutoHideForTests`.
+- Banned-account purge (migration 123): a ban keeps the account for `BANNED_RETENTION_DAYS` (`bannedRetentionDays()`,
+  `purgeDueAt(purgeWindowStart(banned_at, purge_window_start))`; `users.purge_window_start` is the deploy-time grace
+  for bans older than migration 123, cleared by ban/unban), then `purgeBannedAccount(id, {actor, reason, dueBefore?})` deletes it via `lib/account.ts`
+  `deleteAccountRows` (the DELETE /me code), keeping the email HMAC in `banned_emails` and the device bans
+  (`devices.ban_from_purged`, which `unbanAccount` never lifts), and clearing the account's audit notes. Callers drain the
+  media trash. `purgeNow` is the CLI's `purge --yes`; `purgeBannedAccounts(now, {userIds?})` is in the slow jobs
+  (tests must scope it with `userIds`: the DB is shared). `assertEmailNotBanned(hmac)` (account.ts) guards account
+  creation by email; `liftEmailBan({actor, email})` (CLI `lift-email-ban`, address on stdin) removes a row, audited
+  with `user_id` NULL. Tests: `setBannedRetentionDaysForTests`. A new table that references `users` must CASCADE or be
+  added to the SET NULL list in `test/banned-purge.test.ts` (schema guard).
 - `spam.ts` (spam heuristics, shadow limits; docs/security.md section 8; migration 112): `screenSentMessage(tx, …)` runs in
   the send transaction after the insert (records `ContentPolicy.features` for plaintext, re-assesses, holds the message
   via `messages.held_at` if the sender is limited and the recipient hasn't written). `reassessAfterSafetyEvent(id)` after
@@ -314,7 +324,9 @@ photos.hidden_at, photo_hash_blocklist, moderator_alert_channels/moderator_alert
 format CHECK (`^[a-z][a-z_]{0,31}$`) instead of a fixed list (photo_clear, photo_hide, photo_blocklist, photo_escalate). Migration 117:
 `travel_locations_cell_idx`; `locations.hide_distance` / `travel_locations.hide_distance` = a trigger-maintained copy of
 `users.hide_distance` (never write it yourself; partial indexes `*_hidden_cell_idx` for the nearby hideDistance arm);
-distance functions made inlinable.
+distance functions made inlinable. Migration 123:
+banned_emails (email_hmac PK, banned_at day), devices.ban_from_purged, users.purge_window_start, users_banned_at_idx,
+moderation actions `purge` and `lift_email_ban`.
 
 ## Tests
 
