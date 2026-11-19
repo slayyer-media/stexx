@@ -100,6 +100,13 @@ protocol APIClient: Sendable {
     /// `POST /v1/dev/plus`). Debug builds only.
     func debugGrantPlus() async throws
     #endif
+
+    // MARK: Taps
+    /// `GET /me/taps`: taps you received in the retention window, newest
+    /// first, one per sender. `before` is the previous page's `nextCursor`.
+    func taps(before cursor: String?) async throws -> TapsPage
+    /// `POST /me/taps/seen`: everything received so far is no longer new.
+    func markTapsSeen() async throws
 }
 
 extension APIClient {

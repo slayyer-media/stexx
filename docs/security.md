@@ -358,6 +358,7 @@ Rolling back from `optional` to `off` keeps stored envelopes readable by the app
 | `E2E_MODE` | `off` (production), `optional` (otherwise) | `off` / `optional` / `required`, see section 7. |
 | `E2E_MAX_PREKEYS` | `100` | One-time EC prekeys stored per account (and per upload), 10–1000. |
 | `E2E_MAX_PQ_PREKEYS` | `25` | One-time Kyber prekeys stored per account (and per upload), 0–200. |
+| `TAP_RETENTION_DAYS` | `30` | ⚠️ Proposed default, owner to confirm. Received taps are listed by `GET /v1/me/taps` for this many days and then deleted (`purgeOldTaps`, hourly, in batches), so tap history is never kept forever. 1–365; an invalid value stops the boot. |
 iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev-bypass` in the Local configuration) and `STEXX_APP_ATTEST_ENVIRONMENT` (`development`; `production` in Release), which feeds the `com.apple.developer.devicecheck.appattest-environment` entitlement in the generated `Stexx/Stexx.entitlements`.
 
 ## Turning it on for production (manual steps)
@@ -378,6 +379,7 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Reports add two things: the messages and photos a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Evidence photos are files in `MEDIA_DIR` with random names that no API response contains; only the moderation CLI prints their path. Nothing in moderation stores or shows a location.
 - Encrypted chat photos add nothing readable: a blob, its size bucket and the usual message metadata.
 - Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read.
+- Taps (who tapped whom, and when) are deleted `TAP_RETENTION_DAYS` (30) after they were sent; before this they were kept forever. The taps inbox adds one timestamp per account, `users.taps_seen_at` (when you last opened your taps). Blocked, hidden and banned senders never appear in it.
 
 ## Not done yet
 

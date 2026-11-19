@@ -260,4 +260,7 @@ struct E2EAPIClient: APIClient {
     #if DEBUG
     func debugGrantPlus() async throws { try await base.debugGrantPlus() }
     #endif
+
+    func taps(before cursor: String?) async throws -> TapsPage { try await base.taps(before: cursor) }
+    func markTapsSeen() async throws { try await base.markTapsSeen() }
 }

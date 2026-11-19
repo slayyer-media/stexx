@@ -14,6 +14,11 @@ import SwiftUI
 /// once the thread has loaded. See `ios/README.md`.
 enum ScreenshotRoute: String {
     case profile, chat, reportFromChat, reportPicker, reportSent, liveChat
+    /// Taps inbox: the tab bar (Chats badge counts new taps), the chat list
+    /// with its Taps row, the list failing with nothing cached / with cached
+    /// chats, and the taps screen with and without taps. Each gets its own
+    /// fresh mock backend.
+    case tabs, chatList, chatListError, chatListStale, taps, tapsEmpty
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -40,6 +45,35 @@ struct ScreenshotRouteView: View {
     private let profile = MockData.profiles[0]
 
     var body: some View {
+        switch route {
+        case .tabs:
+            MockChatsRoute { MainTabView() }
+        case .chatList:
+            MockChatsRoute { ChatListView() }
+        case .chatListError:
+            MockChatsRoute(setup: { api, _ in await api.setFailsConversationList(true) }) { ChatListView() }
+        case .chatListStale:
+            MockChatsRoute(setup: { api, store in
+                await store.load()
+                await api.setFailsConversationList(true)
+                await store.load()
+            }) { ChatListView() }
+        case .taps, .tapsEmpty:
+            MockChatsRoute(setup: { api, _ in
+                if route == .tapsEmpty { await api.removeAllTaps() }
+            }) {
+                NavigationStack {
+                    TapsView()
+                        .navigationDestination(for: Profile.self) { ProfileDetailView(profile: $0) }
+                }
+                .tint(Theme.ice)
+            }
+        default:
+            legacyRoutes
+        }
+    }
+
+    private var legacyRoutes: some View {
         NavigationStack {
             switch route {
             case .profile:
@@ -51,6 +85,31 @@ struct ScreenshotRouteView: View {
             }
         }
         .tint(Theme.ice)
+    }
+}
+
+/// A fresh mock backend and chat store for one screenshot: `setup` runs
+/// before the screen appears (and before its first load).
+private struct MockChatsRoute<Content: View>: View {
+    var setup: @MainActor (MockAPIClient, ChatStore) async -> Void = { _, _ in }
+    @ViewBuilder let content: () -> Content
+
+    @State private var api = MockAPIClient(latency: .milliseconds(100))
+    @State private var store: ChatStore?
+
+    var body: some View {
+        if let store {
+            content()
+                .environment(store)
+                .environment(\.apiClient, api)
+        } else {
+            Color.clear
+                .task {
+                    let store = ChatStore(api: api)
+                    await setup(api, store)
+                    self.store = store
+                }
+        }
     }
 }
 

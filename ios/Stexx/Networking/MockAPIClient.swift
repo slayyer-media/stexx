@@ -241,6 +241,12 @@ actor MockAPIClient: APIClient {
 
     func conversations() async throws -> [Conversation] {
         try await pause()
+        #if DEBUG
+        if failsConversationList {
+            // What URLSession reports when the phone is offline.
+            throw URLError(.notConnectedToInternet, userInfo: [NSLocalizedDescriptionKey: "The Internet connection appears to be offline."])
+        }
+        #endif
         return conversationStore.values
             .filter { !blocked.contains($0.participant.id) }
             .sorted { $0.updatedAt > $1.updatedAt }
@@ -422,4 +428,60 @@ actor MockAPIClient: APIClient {
         defer { nextID += 1 }
         return "\(prefix)-\(nextID)-\(UUID().uuidString.prefix(8))"
     }
+
+    // MARK: Taps
+
+    /// Taps received: sender and time, newest first (one per sender, like
+    /// the server's list).
+    private var receivedTaps: [(from: Profile.ID, sentAt: Date)] = MockData.seedTaps.map {
+        ($0.0, Date.now.addingTimeInterval(-$0.1 * 60))
+    }
+    private var tapsSeenAt: Date? = Date.now.addingTimeInterval(-MockData.tapsSeenMinutesAgo * 60)
+    static let tapsPageSize = 30
+
+    func taps(before cursor: String?) async throws -> TapsPage {
+        try await pause()
+        let all = receivedTaps
+            .filter { !blocked.contains($0.from) }
+            .sorted { $0.sentAt > $1.sentAt }
+            .compactMap { tap in
+                profiles[tap.from].map { profile in
+                    ReceivedTap(from: profile, sentAt: tap.sentAt, isNew: tapsSeenAt.map { tap.sentAt > $0 } ?? true)
+                }
+            }
+        let start = cursor.flatMap(Int.init) ?? 0
+        let end = min(all.count, start + Self.tapsPageSize)
+        let page = start < end ? Array(all[start..<end]) : []
+        return TapsPage(
+            items: page,
+            nextCursor: end < all.count ? String(end) : nil,
+            unseenCount: all.filter(\.isNew).count
+        )
+    }
+
+    func markTapsSeen() async throws {
+        try await pause()
+        tapsSeenAt = .now
+    }
+
+    #if DEBUG
+    /// Screenshots and tests: `conversations()` fails like a dropped
+    /// connection while this is on.
+    private var failsConversationList = false
+
+    func setFailsConversationList(_ fails: Bool) {
+        failsConversationList = fails
+    }
+
+    /// Screenshots and tests: nobody has tapped you.
+    func removeAllTaps() {
+        receivedTaps = []
+    }
+
+    /// Tests: someone taps you now (what `tap.received` reports live).
+    func receiveTap(from profileID: Profile.ID, at date: Date = .now) {
+        receivedTaps.removeAll { $0.from == profileID }
+        receivedTaps.insert((profileID, date), at: 0)
+    }
+    #endif
 }

@@ -43,6 +43,12 @@ The `.xcodeproj` and generated `Info.plist` are git-ignored. Change
 Every screen has SwiftUI previews (`#Preview`) that inject mock dependencies
 via `.previewEnvironment()`.
 
+Debug builds also open single screens on a fresh mock backend for
+screenshots: `xcrun simctl launch booted gay.stexx.app -StexxScreenshotRoute <name>`
+with `chatList`, `tabs` (the Chats badge counts new taps), `taps`, `tapsEmpty`,
+`chatListError` (load failed, nothing cached) or `chatListStale` (refresh
+failed, cached chats with a banner); see `App/ScreenshotRoute.swift`.
+
 ## End-to-end encryption
 
 Chat text and photos are end-to-end encrypted with the Signal Protocol (PQXDH, then the
@@ -241,6 +247,7 @@ ios/
 │   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up
 │   │   ├── Nearby/             Grid, filters, profile detail
 │   │   ├── Chat/               Conversation list and thread (key-change banner, encrypted placeholders)
+│   │   ├── Taps/               Received taps inbox (opened from the Taps row in Chats)
 │   │   ├── Me/                 Own profile, edit profile, settings
 │   │   ├── Safety/             Block/report UI, blocked list
 │   │   └── Paywall/            Stexx+ placeholder
@@ -284,7 +291,7 @@ ios/
   `webcredentials:stexx.gay`); email links are handled in the API layer and
   via `onOpenURL`, but there's no "sign in" screen yet
 - Travel mode UI (`APIClient.setTravelLocation` is ready)
-- Push notifications
+- Push notifications (taps and messages reach an offline user only through the lists when they next open the app)
 - Discreet alternate app icons, localization
 - Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)
 - End-to-end encryption for chat photos (they're still sent as plain

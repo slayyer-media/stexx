@@ -316,6 +316,8 @@ struct FakeE2EClient: APIClient {
     #if DEBUG
     func debugGrantPlus() async throws { throw Self.unused }
     #endif
+    func taps(before cursor: String?) async throws -> TapsPage { throw Self.unused }
+    func markTapsSeen() async throws { throw Self.unused }
 }
 
 /// One person's app: engine + E2E-wrapped client, with in-memory secrets

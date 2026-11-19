@@ -195,6 +195,26 @@ Non-2xx responses carry:
 | DELETE | `/profiles/{id}/favorite` | → 204 | |
 | POST | `/profiles/{id}/tap` | → 204 | One "tap" per pair per 24 h. |
 
+### Taps
+
+| Method | Path | Body → Response | Notes |
+| --- | --- | --- | --- |
+| GET | `/me/taps` | → `TapsPage` | Taps you received in the last `TAP_RETENTION_DAYS` (30), newest first, **one entry per sender** (their latest tap). Query: `before` (the previous page's `nextCursor`), `limit` (1–100, default 30). Blocked senders (either direction), accounts hidden after reports and banned accounts are left out. A sender who taps again while you page moves to the top, so a later page can repeat them: dedupe by `from.id`. |
+| POST | `/me/taps/seen` | → 204 | Marks everything received so far as seen (moves `taps_seen_at` to now; never back). Idempotent. Call it when the taps screen opens. |
+
+```json
+{
+  "items": [{ "from": { "...": "Profile" }, "sentAt": "2026-11-17T20:30:00Z", "isNew": true }],
+  "nextCursor": "…" ,
+  "unseenCount": 3
+}
+```
+
+- `isNew`: sent after you last called `POST /me/taps/seen` (everything is new before the first call).
+- `unseenCount`: how many entries (senders) are new across the whole window, not just this page. The app adds it to the Chats badge.
+- `from` is built exactly like the `tap.received` profile (bucketed distance, no coordinates).
+- Both routes use the general rate limit (300/min).
+
 ### Chat
 
 | Method | Path | Body → Response | Notes |
@@ -212,7 +232,8 @@ pushing `message.created`, `message.read`, `conversation.updated`, `tap.received
 events using the same JSON models. Each frame is `{ "type": "…", "data": … }`:
 `message.created` → `Message`, `conversation.updated` → `Conversation`,
 `message.read` → `{ conversationID, readerID, messageIDs, readAt }`,
-`tap.received` → `{ from: Profile, sentAt }`, and for end-to-end encryption
+`tap.received` → `{ from: Profile, sentAt }` (a live hint only: the tap is stored and
+listed by `GET /me/taps`, so someone offline when you tapped sees it there), and for end-to-end encryption
 `identity.changed` → `{ userID, identityKeyChangedAt }` and
 `keys.low` → `{ preKeyCount, pqPreKeyCount }`. Control frames (`ready`, `pong`,
 `error`) carry no `data`; clients ignore unknown types. APNs pushes carry no message content,
