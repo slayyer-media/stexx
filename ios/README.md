@@ -286,7 +286,6 @@ ios/
 - Travel mode UI (`APIClient.setTravelLocation` is ready)
 - Push notifications
 - Discreet alternate app icons, localization
-- Fill in `NSPrivacyCollectedDataTypes` in `PrivacyInfo.xcprivacy` once the live backend collects data (it currently only declares the UserDefaults API)
 - End-to-end encryption for chat photos (they're still sent as plain
   attachments), the safety-number comparison screen, and multi-device
 - A run of the E2E client on a physical iPhone (Keychain classes, App Attest

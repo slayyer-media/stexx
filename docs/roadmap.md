@@ -66,3 +66,17 @@ Chat text and chat photos are end-to-end encrypted with the Signal Protocol, usi
 - [x] **Server CI.** Every pull request and push to `main` lints the migrations, typechecks, migrates a fresh Postgres 18 and runs the server tests ([`server/README.md`](../server/README.md#ci)). Schema guards fail the tests when a new table keeps an account's data after `DELETE /me` (a foreign key to `users` without `ON DELETE CASCADE`, unless allowlisted with a reason).
 - [x] **Advisory checks.** shellcheck on the deploy scripts, `caddy validate` on both Caddyfiles, and a guard that fails while the iOS Release configuration still uses the mock API. They report without failing the run.
 - [ ] **Owner decisions.** Make the server job a required check with branch protection on `main`. Make the Release-config guard blocking once Release talks to the real API. Decide whether the iOS build (manual only today, on a macOS runner) should run on pull requests.
+
+## Launch readiness
+
+What stands between the app and the App Store. Details, answers and owner decisions: [`app-store.md`](app-store.md).
+
+- [x] **Privacy manifest.** `PrivacyInfo.xcprivacy` declares every data type the app collects (all linked to the account, none used for tracking) and the required-reason APIs, including libsignal's `fstat`.
+- [x] **Launch checklist.** App Privacy label answers, age rating, review notes, subscription metadata, TestFlight steps ([`app-store.md`](app-store.md)).
+- [ ] **Legal pages.** Drafts of the Terms, Privacy Policy and Community Guidelines are in [`legal/`](legal/); they still need a lawyer's review, the owner's details, and hosting at `stexx.gay/{terms,privacy,guidelines}`.
+- [ ] **Export compliance.** `ITSAppUsesNonExemptEncryption` is still `false`; owner decision on the mass-market / publicly-available path and France.
+- [ ] **Real backend in Release.** `STEXX_USE_MOCK_API` to `NO` once the API is live; production App Attest and DeviceCheck keys on the server.
+- [ ] **Passkeys on device.** Associated Domains and the `apple-app-site-association` file on `stexx.gay`.
+- [ ] **Sandbox purchases on the production server**, so TestFlight and App Review can buy Stexx+.
+- [ ] **Demo access for App Review** (a review sign-in, labelled team accounts, a screen recording).
+- [ ] **Owner actions:** organization developer account, Sensitive Content Analysis entitlement, Declared Age Range, support contact, final price.
