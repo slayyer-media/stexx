@@ -43,6 +43,54 @@ The `.xcodeproj` and generated `Info.plist` are git-ignored. Change
 Every screen has SwiftUI previews (`#Preview`) that inject mock dependencies
 via `.previewEnvironment()`.
 
+## Passkeys
+
+New accounts are created with a passkey (Face ID / Touch ID, kept in iCloud
+Keychain) or an email sign-in link; nothing else identifies the user. Returning
+users tap **I already have an account** on the welcome screen (after the 18+
+gate, which is per device) and sign in with their passkey or request a new
+email link.
+
+How it works (`Services/Passkeys.swift`, `Services/SystemPasskeyAuthenticator.swift`):
+
+1. `POST /v1/auth/passkey/register/options` (or `login/options`) returns
+   WebAuthn options from the server (SimpleWebAuthn JSON, binary fields in
+   base64url). `PasskeyWire` decodes them and refuses options for another
+   relying party than the build's (`STEXX_PASSKEY_RP_ID`).
+2. `SystemPasskeyAuthenticator` shows the system sheet with
+   `ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier:)`,
+   user verification required, no attestation.
+3. The attestation (or assertion) goes to `…/finish` as
+   `RegistrationResponseJSON` / `AuthenticationResponseJSON`, with the
+   device attestation headers like every sign-up and sign-in. The session is
+   stored like the email path's (Keychain, this device only).
+
+The system sheet sits behind the `PasskeyAuthenticating` protocol, so unit
+tests (`StexxTests/PasskeyTests.swift`) cover decoding, request building,
+payloads, error mapping and the flow with a fake. Closing the sheet is silent
+on sign-up; on sign-in it shows a hint (iOS reports "no passkey on this
+iPhone" the same way). An unknown passkey (server 401) says so instead of
+"session expired".
+
+**Where passkeys work.** iOS only creates or uses a passkey for a domain that
+lists the app in `https://<domain>/.well-known/apple-app-site-association`
+(`webcredentials`), and only if the app has the matching
+`com.apple.developer.associated-domains` entitlement. So:
+
+| Configuration | Entitlement | Passkeys |
+| --- | --- | --- |
+| `Debug` (mock API) | `webcredentials:stexx.gay` | Simulated: no system sheet, `MockAPIClient` checks the payloads and signs in. |
+| `Local` (`http://127.0.0.1:8787`) | none (`Stexx/Entitlements/StexxLocal.entitlements`) | Unavailable: the buttons are disabled with an explanation. A dev server on 127.0.0.1 has no domain or AASA file, so sign in with email (the dev server's `/auth/register` shortcut or an email link). |
+| `Release` | `webcredentials:stexx.gay` | Simulated while `STEXX_USE_MOCK_API` is still `YES` there. With the live API: real passkeys, once `stexx.gay` serves the AASA file (see [`../server/deploy/README.md`](../server/deploy/README.md), step 8) and the App ID has the Associated Domains capability (automatic signing adds it). |
+
+`PasskeyAvailability.resolve` decides at launch: available only when the API
+base URL is `https` on the relying party or a subdomain of it (so
+`-StexxAPIBaseURL` pointing at a local server also degrades). To try real
+passkeys from a development build on a device, point it at a server whose
+`WEBAUTHN_RP_ID` serves an AASA listing your team's App ID; Apple's CDN can
+take a while to pick up changes (`?mode=developer` on the entitlement skips
+it, with Developer Mode on).
+
 ## End-to-end encryption
 
 Chat text and photos are end-to-end encrypted with the Signal Protocol (PQXDH, then the
@@ -212,6 +260,7 @@ Build settings in `project.yml` are exposed through `Info.plist`:
 | --- | --- | --- |
 | `STEXX_API_BASE_URL` | `https://api.stexx.gay` | Backend base URL (`/v1` is appended) |
 | `STEXX_USE_MOCK_API` | `YES` | `YES` uses `MockAPIClient`; `NO` uses `HTTPAPIClient` |
+| `STEXX_PASSKEY_RP_ID` | `stexx.gay` (`Local`: empty) | Passkey relying party: the `webcredentials:` associated domain and `StexxPasskeyRelyingParty` (see [Passkeys](#passkeys)) |
 
 Build configurations:
 
@@ -221,7 +270,7 @@ Build configurations:
 | `Local` (scheme **Stexx Local**) | `http://127.0.0.1:8787` | Run `../server` in dev mode. ATS allows plain HTTP to local hosts only in this configuration. Purchases use `StoreKit/Stexx.storekit`; see [`STOREKIT-LOCAL.md`](STOREKIT-LOCAL.md). Sends the `dev-bypass` attestation header, which only a dev server accepts. |
 | `Release` | As configured | ATS is not relaxed. App Attest uses the production environment. |
 
-Device attestation (App Attest with a DeviceCheck fallback) is described in [`../docs/security.md`](../docs/security.md). `xcodegen` writes the App Attest entitlement to `Stexx/Stexx.entitlements` (generated, git-ignored).
+Device attestation (App Attest with a DeviceCheck fallback) is described in [`../docs/security.md`](../docs/security.md). Entitlements are committed in `Stexx/Entitlements/`: `Stexx.entitlements` (App Attest + the passkey associated domain) for Debug and Release, `StexxLocal.entitlements` (App Attest only) for Local. Keep the two in sync.
 
 The API contract lives in [`../docs/api.md`](../docs/api.md).
 
@@ -238,7 +287,7 @@ ios/
 │   ├── Networking/             APIClient protocol, HTTP client, mock client & data, Keychain session store
 │   ├── E2E/                    Signal Protocol client (see "End-to-end encryption")
 │   ├── Features/
-│   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up
+│   │   ├── Onboarding/         Welcome, 18+ gate, anonymous sign-up, sign-in (passkey or email link)
 │   │   ├── Nearby/             Grid, filters, profile detail
 │   │   ├── Chat/               Conversation list and thread (key-change banner, encrypted placeholders)
 │   │   ├── Me/                 Own profile, edit profile, settings
@@ -280,9 +329,12 @@ ios/
 
 ## Not done yet
 
-- Real passkey auth (`AuthenticationServices`, associated domain
-  `webcredentials:stexx.gay`); email links are handled in the API layer and
-  via `onOpenURL`, but there's no "sign in" screen yet
+- Passkeys against the live server haven't run on a device yet: that needs
+  `stexx.gay` serving the apple-app-site-association file and a signed build
+  (the simulator has no real domain to associate with)
+- Email links open the app only once it also has the `applinks:stexx.gay`
+  entitlement (the server's AASA file already lists `/auth/email`); until then
+  they open in the browser
 - Travel mode UI (`APIClient.setTravelLocation` is ready)
 - Push notifications
 - Discreet alternate app icons, localization

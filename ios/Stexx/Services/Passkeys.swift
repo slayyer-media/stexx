@@ -124,7 +124,7 @@ enum PasskeyError: LocalizedError, Hashable, Sendable {
         case .wrongServer, .invalidOptions:
             String(localized: "Passkeys aren't set up correctly on this server. Use email for now.")
         case .deviceNotSetUp:
-            String(localized: "To use a passkey, set a passcode and turn on iCloud Keychain (Settings › Passwords), or use email instead.")
+            String(localized: "To use a passkey, set a passcode on this iPhone and turn on iCloud Keychain, or use email instead.")
         case .alreadyRegistered:
             String(localized: "This iPhone already has a Stexx passkey. Sign in with it instead.")
         case .notRecognized:

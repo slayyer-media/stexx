@@ -160,15 +160,22 @@ Non-2xx responses carry:
 | Method | Path | Body → Response | Notes |
 | --- | --- | --- | --- |
 | POST | `/auth/register` | `RegistrationRequest` → `Session` | `{ displayName, method: "passkey"\|"email", email?, confirmedAdult: true }`. No real name or phone number, ever. Birth dates are never sent. |
-| POST | `/auth/passkey/register/options` | `{ displayName }` → WebAuthn creation options | RP ID `stexx.gay` |
-| POST | `/auth/passkey/register/finish` | attestation → `Session` | |
-| POST | `/auth/passkey/login/options` | → WebAuthn request options | |
-| POST | `/auth/passkey/login/finish` | assertion → `Session` | |
+| POST | `/auth/passkey/register/options` | `{ displayName, confirmedAdult? }` → WebAuthn creation options | RP ID `stexx.gay` (`WEBAUTHN_RP_ID`). SimpleWebAuthn `PublicKeyCredentialCreationOptionsJSON`: binary fields base64url, `user.id` is an opaque handle (not the user ID). Challenge single use, 5 min. |
+| POST | `/auth/passkey/register/finish` | `RegistrationResponseJSON` + `confirmedAdult?` → `Session` | `{ id, rawId, type: "public-key", authenticatorAttachment?, clientExtensionResults, response: { clientDataJSON, attestationObject, transports? } }`, all base64url. 18+ must be confirmed at options or here. Attested (`signup`). 400 `invalid_challenge` / `invalid_credential`, 409 `credential_exists`. |
+| POST | `/auth/passkey/login/options` | → WebAuthn request options | `{ rpId, challenge, timeout, userVerification }`; no `allowCredentials` (discoverable passkeys pick the account). Body ignored. |
+| POST | `/auth/passkey/login/finish` | `AuthenticationResponseJSON` → `Session` | `response: { clientDataJSON, authenticatorData, signature, userHandle? }`. Attested (`login`). 401 `invalid_credential` for an unknown passkey, a bad signature, a used or expired challenge. |
 | POST | `/auth/email/link` | `{ email }` → 204 | Sends a one-time sign-in link. Same response whether or not the address exists. |
 | POST | `/auth/email/verify` | `{ token }` → `Session` | Token from the link (universal link to the app). |
 | POST | `/auth/refresh` | `{ refreshToken }` → `Session` | Rotates the refresh token. |
 | POST | `/auth/logout` | → 204 | Revokes the current session. |
 | DELETE | `/me` | → 204 | Deletes the account and all data. |
+
+Outside `/v1`: `GET /.well-known/apple-app-site-association` → the
+apple-app-site-association JSON for `APPLE_TEAM_ID.APPLE_BUNDLE_ID`
+(`webcredentials` for passkeys, `applinks` for `/auth/email` links), served as
+`application/json` with `Cache-Control: public, max-age=3600`; 404 while
+`APPLE_TEAM_ID` is unset. The relying-party domain (`stexx.gay`) must serve the
+same file ([`server/deploy/README.md`](../server/deploy/README.md), step 8).
 
 ### Me
 
