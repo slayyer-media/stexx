@@ -46,7 +46,9 @@ enum PlusProduct {
 }
 
 /// Stexx+ paywall. Purchases use StoreKit 2 with server-side verification
-/// (`POST /v1/subscriptions/apple`); see `PurchaseService`.
+/// (`POST /v1/subscriptions/apple`); see `PurchaseService`. Subscribers see
+/// when Stexx+ renews or ends and can manage the subscription; everyone sees
+/// the Terms of Use and Privacy Policy (App Store Guideline 3.1.2).
 struct PaywallView: View {
     @Environment(AppState.self) private var appState
     @Environment(PurchaseService.self) private var purchases
@@ -56,6 +58,7 @@ struct PaywallView: View {
 
     @State private var hasAppeared = false
     @State private var purchaseTaps = 0
+    @State private var isManagingSubscription = false
 
     var body: some View {
         ScrollView {
@@ -85,7 +88,17 @@ struct PaywallView: View {
         } message: {
             Text(purchases.errorMessage ?? "")
         }
-        .task { await purchases.loadProducts() }
+        .task {
+            await purchases.loadProducts()
+            // Subscribers: pick up a renewal-status change made elsewhere.
+            if appState.hasPlus { await purchases.refreshEntitlement() }
+        }
+        .manageSubscriptionsSheet(isPresented: $isManagingSubscription)
+        .onChange(of: isManagingSubscription) { _, isShowing in
+            // Back from the App Store sheet: the user may have cancelled or
+            // resubscribed, so re-read the server's view.
+            if !isShowing { Task { await purchases.refreshEntitlement() } }
+        }
         .onAppear { hasAppeared = true }
         .sensoryFeedback(.impact(weight: .medium), trigger: purchaseTaps)
         .sensoryFeedback(.success, trigger: appState.hasPlus) { old, new in !old && new }
@@ -206,10 +219,27 @@ struct PaywallView: View {
     private var purchaseBar: some View {
         VStack(spacing: Theme.Spacing.m) {
             if appState.hasPlus {
-                Label("You have Stexx+. Thank you!", systemImage: "heart.fill")
-                    .font(.stexxHeadline)
-                    .foregroundStyle(Theme.frost)
-                    .padding(.vertical, Theme.Spacing.m)
+                VStack(spacing: Theme.Spacing.xs) {
+                    Label("You have Stexx+. Thank you!", systemImage: "heart.fill")
+                        .font(.stexxHeadline)
+                        .foregroundStyle(Theme.frost)
+                    if let renewal = appState.plusRenewal {
+                        Text(verbatim: renewal.label())
+                            .font(.stexxSub)
+                            .foregroundStyle(Theme.steel)
+                    }
+                }
+                .multilineTextAlignment(.center)
+                .accessibilityElement(children: .combine)
+
+                Button {
+                    isManagingSubscription = true
+                } label: {
+                    WideLabel("Manage subscription")
+                }
+                .stexxSecondaryButton()
+
+                legalLinks
             } else {
                 Button {
                     purchaseTaps += 1
@@ -242,10 +272,13 @@ struct PaywallView: View {
                 .foregroundStyle(Theme.slate)
                 #endif
 
-                Text("Cancel anytime in Settings. Billed monthly through the App Store.")
+                Text("Billed monthly through the App Store. Renews automatically until you cancel in Settings, at least 24 hours before the renewal date.")
                     .font(.caption)
                     .foregroundStyle(Theme.slate)
                     .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                legalLinks
             }
         }
         .padding(.horizontal, Theme.Spacing.screen)
@@ -258,6 +291,22 @@ struct PaywallView: View {
                 .blackGlass(in: Rectangle())
                 .ignoresSafeArea(edges: .bottom)
         }
+    }
+}
+
+extension PaywallView {
+    /// Terms of Use and Privacy Policy, opened in the browser.
+    fileprivate var legalLinks: some View {
+        HStack(spacing: Theme.Spacing.s) {
+            Link("Terms of Use", destination: LegalLinks.terms)
+            Text(verbatim: "·")
+                .foregroundStyle(Theme.slate)
+                .accessibilityHidden(true)
+            Link("Privacy Policy", destination: LegalLinks.privacy)
+        }
+        .font(.caption.weight(.medium))
+        .tint(Theme.steel)
+        .underline()
     }
 }
 

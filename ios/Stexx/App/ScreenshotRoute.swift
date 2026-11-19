@@ -12,8 +12,12 @@ import SwiftUI
 /// written to the Keychain), `-StexxScreenshotPeer <profileID>` and
 /// `-stexx.ageConfirmed YES`; `-StexxScreenshotDraft <text>` sends that text
 /// once the thread has loaded. See `ios/README.md`.
+///
+/// `paywall` / `paywallPlus` open the app with the Stexx+ paywall sheet up,
+/// for a free user and for a subscriber (mock Plus, auto-renew on).
 enum ScreenshotRoute: String {
     case profile, chat, reportFromChat, reportPicker, reportSent, liveChat
+    case paywall, paywallPlus
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -40,6 +44,14 @@ struct ScreenshotRouteView: View {
     private let profile = MockData.profiles[0]
 
     var body: some View {
+        if route == .paywall || route == .paywallPlus {
+            PaywallRoute(plus: route == .paywallPlus)
+        } else {
+            stack
+        }
+    }
+
+    private var stack: some View {
         NavigationStack {
             switch route {
             case .profile:
@@ -51,6 +63,28 @@ struct ScreenshotRouteView: View {
             }
         }
         .tint(Theme.ice)
+    }
+}
+
+/// The app with the paywall sheet up; `plus` grants mock Stexx+ first.
+private struct PaywallRoute: View {
+    let plus: Bool
+    @Environment(AppState.self) private var appState
+    @Environment(PurchaseService.self) private var purchases
+    @Environment(\.apiClient) private var api
+
+    var body: some View {
+        MainTabView()
+            .task {
+                if plus {
+                    try? await api.debugGrantPlus()
+                    await purchases.refreshEntitlement()
+                    // Sign-in's own status fetch may land after ours; settle on the latest.
+                    try? await Task.sleep(for: .seconds(1))
+                    await purchases.refreshEntitlement()
+                }
+                appState.isPaywallPresented = true
+            }
     }
 }
 

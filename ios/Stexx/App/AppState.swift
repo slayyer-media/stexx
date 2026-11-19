@@ -14,6 +14,11 @@ final class AppState {
     /// 402 responses); StoreKit purchases only trigger a server re-check.
     var hasPlus = false
     private(set) var plusExpiresAt: Date?
+    /// Auto-renew status of the current Stexx+ period (`nil`: unknown or
+    /// not active), for "renews on" / "ends on".
+    private(set) var plusWillRenew: Bool?
+    /// End of the running boost, so it survives a relaunch.
+    private(set) var boostEndsAt: Date?
     /// Profiles blocked during this session; hidden everywhere immediately,
     /// even before the server round-trip finishes.
     private(set) var blockedIDs: Set<Profile.ID> = []
@@ -87,6 +92,8 @@ final class AppState {
         me = nil
         hasPlus = false
         plusExpiresAt = nil
+        plusWillRenew = nil
+        boostEndsAt = nil
         blockedIDs = []
     }
 
@@ -96,7 +103,14 @@ final class AppState {
     func applySubscription(_ status: SubscriptionStatus) {
         hasPlus = status.isActive
         plusExpiresAt = status.isActive ? status.expiresAt : nil
+        plusWillRenew = status.isActive ? status.willRenew : nil
+        boostEndsAt = status.boostEndsAt
         if !status.isActive { dropPlusOnlySettings() }
+    }
+
+    /// "Renews on" / "ends on" for the paywall; `nil` without Stexx+.
+    var plusRenewal: SubscriptionStatus.Renewal? {
+        SubscriptionStatus(isActive: hasPlus, expiresAt: plusExpiresAt, willRenew: plusWillRenew).renewal
     }
 
     /// The server answered 402 `requires_plus`: the entitlement is gone (or
@@ -104,6 +118,7 @@ final class AppState {
     func handleRequiresPlus() {
         hasPlus = false
         plusExpiresAt = nil
+        plusWillRenew = nil
         dropPlusOnlySettings()
         isPaywallPresented = true
     }
