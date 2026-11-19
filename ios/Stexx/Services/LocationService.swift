@@ -40,7 +40,10 @@ final class LocationService {
     enum Status: Equatable {
         case idle
         case waitingForPermission
+        /// The user said no, or Location Services are off.
         case denied
+        /// Screen Time or a device profile doesn't allow location for Stexx.
+        case restricted
         case active
     }
 
@@ -132,18 +135,20 @@ final class LocationService {
         case .notDetermined:
             status = .waitingForPermission
             manager.requestWhenInUseAuthorization()
-        case .denied, .restricted:
-            deny()
+        case .denied:
+            deny(.denied)
+        case .restricted:
+            deny(.restricted)
         @unknown default:
-            deny()
+            deny(.denied)
         }
     }
 
-    private func deny() {
+    private func deny(_ reason: Status) {
         manager.stopUpdates()
         heartbeat?.cancel()
         heartbeat = nil
-        status = .denied
+        status = reason
     }
 
     /// Asks for a fresh reading every `refreshInterval` so a stationary user

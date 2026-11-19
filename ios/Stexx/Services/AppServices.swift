@@ -86,6 +86,8 @@ final class AppServices {
         #if DEBUG
         // Screenshot route on a live server: no location prompt over the chat.
         if ScreenshotRoute.current == .liveChat { location = nil }
+        // Forced Nearby states say what the location is themselves.
+        if NearbyDebugScenario.current != nil { location = nil }
         #endif
         let services = AppServices(
             appState: appState,
