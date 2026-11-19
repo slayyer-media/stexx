@@ -24,6 +24,8 @@ import {
   privacyJson,
   profileColumns,
   profilesFor,
+  travelJson,
+  type OwnProfileJson,
   type PhotoRow,
   type PrivacyRow,
   type ProfileRow,
@@ -54,11 +56,24 @@ const VIEWERS_LIMIT = 200;
 
 // ---- GET /me ---------------------------------------------------------------------
 
-meRoutes.get("/me", async (c) => {
-  const me = c.get("userId");
-  const [profile] = await profilesFor(me, [me]);
+/**
+ * The own profile: a Profile plus `travel`, so the app learns after a relaunch whether travel mode is on
+ * (and whether it is paused because Stexx+ lapsed). No coordinates, as everywhere else on /me.
+ */
+async function ownProfile(me: string): Promise<OwnProfileJson> {
+  const [[profile], [travel]] = await Promise.all([
+    profilesFor(me, [me]),
+    sql<{ is_active: boolean }[]>`
+      SELECT COALESCE(u.plus_expires_at > now(), false) AS is_active
+        FROM travel_locations t JOIN users u ON u.id = t.user_id
+       WHERE t.user_id = ${me}`,
+  ]);
   if (!profile) throw notFound();
-  return c.json(profile);
+  return { ...profile, travel: travelJson(travel) };
+}
+
+meRoutes.get("/me", async (c) => {
+  return c.json(await ownProfile(c.get("userId")));
 });
 
 // ---- PATCH /me -------------------------------------------------------------------
@@ -127,9 +142,7 @@ meRoutes.patch("/me", async (c) => {
        WHERE id = ${me}`;
   });
 
-  const [profile] = await profilesFor(me, [me]);
-  if (!profile) throw notFound();
-  return c.json(profile);
+  return c.json(await ownProfile(me));
 });
 
 // ---- DELETE /me ------------------------------------------------------------------
@@ -455,8 +468,8 @@ meRoutes.get("/me/export", async (c) => {
   const checks = new Map(
     (
       await sql<
-        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null }[]
-      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels FROM photos WHERE owner_id = ${me}`
+        { id: string; phash: string | null; nsfw_checked_at: Date | null; nsfw_model: string | null; nsfw_score: number | null; nsfw_labels: Record<string, number> | null; hidden_at: Date | null }[]
+      >`SELECT id, phash, nsfw_checked_at, nsfw_model, nsfw_score, nsfw_labels, hidden_at FROM photos WHERE owner_id = ${me}`
     ).map((r) => [r.id, r]),
   );
 
@@ -491,6 +504,7 @@ meRoutes.get("/me/export", async (c) => {
          WHERE m.conversation_id = ANY(${convs.map((x) => x.id)})
            AND (cm.cleared_before IS NULL OR m.sent_at > cm.cleared_before)
            AND (m.expires_at IS NULL OR m.expires_at > now())
+           AND (m.held_at IS NULL OR m.sender_id = ${me})
          ORDER BY m.sent_at, m.id`
     : [];
   const byConv = new Map<string, (typeof msgRows)[number][]>();
@@ -558,6 +572,7 @@ meRoutes.get("/me/export", async (c) => {
           model: ck?.nsfw_model ?? null,
           explicitScore: ck?.nsfw_score ?? null,
           labels: ck?.nsfw_labels ?? null,
+          hiddenByModeratorAt: isoDate(ck?.hidden_at ?? null),
         },
       };
     }),

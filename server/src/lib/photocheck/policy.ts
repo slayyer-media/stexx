@@ -44,8 +44,11 @@ export function explicitVerdict(
   return { score, isExplicit: score >= policy.threshold };
 }
 
-/** Is this photo shown to people other than its owner? */
-export function visibleToOthers(p: { is_explicit: boolean; is_checked: boolean }, policy = photoPolicy()): boolean {
-  return !p.is_explicit && (p.is_checked || !policy.hideUnchecked);
+/** Is this photo shown to people other than its owner? Never when explicit or hidden by a moderator (photos.hidden_at). */
+export function visibleToOthers(
+  p: { is_explicit: boolean; is_checked: boolean; is_hidden?: boolean },
+  policy = photoPolicy(),
+): boolean {
+  return !p.is_explicit && !p.is_hidden && (p.is_checked || !policy.hideUnchecked);
 }
 

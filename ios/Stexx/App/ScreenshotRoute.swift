@@ -18,8 +18,11 @@ import UIKit
 /// newest incoming view-once photo in the viewer (`openAndClose` closes it
 /// again once it counts as opened). `-StexxShowPrivacyCover YES` keeps the
 /// app-switcher cover up (`PrivacyCover`). See `ios/README.md`.
+///
+/// `app` opens the whole signed-in app (tabs) on the mock backend.
+/// `-StexxScreenshotPlus YES` starts any mock route with Stexx+.
 enum ScreenshotRoute: String {
-    case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, settings
+    case profile, chat, reportFromChat, reportPicker, reportSent, liveChat, app, settings
 
     static var current: ScreenshotRoute? {
         UserDefaults.standard.string(forKey: "StexxScreenshotRoute").flatMap(ScreenshotRoute.init)
@@ -27,6 +30,14 @@ enum ScreenshotRoute: String {
 
     /// Mock routes swap in a preview `AppState`; `liveChat` uses the real one.
     var usesMockData: Bool { self != .liveChat }
+
+    /// Shown in place of the normal root (`app` is the normal root).
+    var replacesRoot: Bool { self != .app }
+
+    /// Mock routes start with Stexx+ (`-StexxScreenshotPlus YES`).
+    static var startsWithPlus: Bool {
+        current?.usesMockData == true && UserDefaults.standard.bool(forKey: "StexxScreenshotPlus")
+    }
 
     static var peerID: Profile.ID? { UserDefaults.standard.string(forKey: "StexxScreenshotPeer") }
     static var draft: String? { UserDefaults.standard.string(forKey: "StexxScreenshotDraft") }

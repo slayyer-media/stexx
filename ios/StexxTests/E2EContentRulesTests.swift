@@ -56,4 +56,82 @@ struct E2EContentRulesTests {
             try E2EContentRules.check("www.example.com", conversationID: "c1", rules: Self.restricted, recentSends: [])
         }
     }
+
+    // MARK: Shared table (content-rules.json, a copy of the server's)
+
+    private struct Vectors: Decodable {
+        struct Handle: Decodable {
+            let text: String
+            let matches: [String]
+        }
+
+        struct Links: Decodable {
+            let match: [String]
+            let noMatch: [String]
+        }
+
+        let handles: [Handle]
+        let links: Links
+    }
+
+    private struct TableFile: Decodable {
+        let handleRules: [E2EContentRules.HandleRule]
+        let vectors: Vectors
+    }
+
+    private static func table() throws -> TableFile {
+        let url = try #require(E2EContentRules.tableURL, "content-rules.json is missing from the app bundle")
+        return try JSONDecoder().decode(TableFile.self, from: Data(contentsOf: url))
+    }
+
+    @Test("Every rule in the shared table compiles with ICU")
+    func rulesCompile() throws {
+        let table = try Self.table()
+        #expect(table.handleRules.count > 10)
+        #expect(E2EContentRules.handleRules.map(\.rule) == table.handleRules)
+    }
+
+    @Test("The server's handle vectors match exactly the same rules here")
+    func handleVectors() throws {
+        let table = try Self.table()
+        #expect(table.vectors.handles.count > 30)
+        for vector in table.vectors.handles {
+            #expect(
+                E2EContentRules.matchingHandleRules(vector.text).sorted() == vector.matches.sorted(),
+                "\(vector.text)"
+            )
+        }
+    }
+
+    @Test("The server's link vectors agree with containsLink")
+    func linkVectors() throws {
+        let table = try Self.table()
+        for text in table.vectors.links.match { #expect(E2EContentRules.containsLink(text), "\(text)") }
+        for text in table.vectors.links.noMatch { #expect(!E2EContentRules.containsLink(text), "\(text)") }
+    }
+
+    @Test("Handles are refused for restricted accounts when the server says so, and only then")
+    func handlesRefused() throws {
+        var rules = Self.restricted
+        try E2EContentRules.check("venmo me @jake-b", conversationID: "c1", rules: rules, recentSends: [])
+        rules.noHandles = true
+        #expect(throws: E2EContentRules.Violation.handlesNotAllowed) {
+            try E2EContentRules.check("venmo me @jake-b", conversationID: "c1", rules: rules, recentSends: [])
+        }
+        #expect(throws: E2EContentRules.Violation.handlesNotAllowed) {
+            try E2EContentRules.check("btc: 1BoatSLRHtKNngkdXEeobR76b53LETtpyT", conversationID: "c1", rules: rules, recentSends: [])
+        }
+        try E2EContentRules.check("drinks are $5 at happy hour", conversationID: "c1", rules: rules, recentSends: [])
+        var open = E2EConfig.ContentRules.unrestricted
+        open.noHandles = false
+        try E2EContentRules.check("venmo me @jake-b", conversationID: "c1", rules: open, recentSends: [])
+    }
+
+    @Test("contentRules decode with and without noHandles")
+    func decodeNoHandles() throws {
+        let old = #"{"restricted":true,"noLinks":true,"duplicateRecipients":3,"duplicateMinLength":16}"#
+        let new = #"{"restricted":true,"noLinks":true,"noHandles":true,"duplicateRecipients":3,"duplicateMinLength":16}"#
+        #expect(try JSONDecoder().decode(E2EConfig.ContentRules.self, from: Data(old.utf8)).noHandles == false)
+        #expect(try JSONDecoder().decode(E2EConfig.ContentRules.self, from: Data(new.utf8)).noHandles == true)
+    }
 }
