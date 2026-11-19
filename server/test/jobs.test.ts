@@ -302,7 +302,7 @@ describe("job runners", () => {
       expect(gone).toBe(true);
       expect(exists(key)).toBe(false);
     } finally {
-      stop();
+      await stop();
     }
     // After stop() nothing runs any more.
     const id2 = await message(conv, { readAt: T0, expiresAfter: 1, expiresAt: at(T0, 1 * SEC) });

@@ -8,7 +8,7 @@ import { SECOND } from "./time.ts";
  *   1. stop accepting connections (`server.stop()`; in-flight requests keep running)
  *   2. close every websocket with 1012 "restarting" (clients reconnect with backoff)
  *   3. await the jobs (timers cleared, a running tick finishes; jobs bound this at 8 s)
- *   4. if requests still linger after a short grace, `server.stop(true)` closes them
+ *   4. if requests still linger after a short grace, `server.stop(true)` closes them (at once when none is in flight)
  *   5. close the Postgres pool (`sql.end({ timeout: 5 })`)
  *   6. exit 0 (or exit 1 from the hard guard if a step hangs)
  *
@@ -81,10 +81,12 @@ export function createShutdown(deps: ShutdownDeps): (signal?: string) => Promise
       logError("shutdown.jobs", err);
     }
 
-    // 4. Requests that still linger after the grace period are closed.
-    if (!drained) await Promise.race([drain, sleep(graceMs)]);
+    // 4. Requests that still linger after the grace period are closed. With no request in flight there is nothing
+    // to wait for: Bun can keep counting a websocket that was already closed, so close what's left right away.
+    if (!drained && (deps.server.pendingRequests ?? -1) !== 0) await Promise.race([drain, sleep(graceMs)]);
     if (!drained) {
-      logInfo("shutdown.force_close", { pending: deps.server.pendingRequests ?? -1 });
+      const pending = deps.server.pendingRequests ?? -1;
+      if (pending !== 0) logInfo("shutdown.force_close", { pending });
       try {
         await Promise.race([Promise.resolve(deps.server.stop(true)), sleep(graceMs)]);
       } catch (err) {
