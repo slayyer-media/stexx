@@ -17,7 +17,8 @@ export function registerDevRoutes(r: AdminRoutes): void {
 
   r.get("/dev/login", "public", async (c) => {
     const handles = await sql<{ handle: string; role: string }[]>`
-      SELECT handle, role FROM staff_accounts WHERE disabled_at IS NULL ORDER BY handle LIMIT 50`;
+      SELECT handle, role FROM staff_accounts WHERE disabled_at IS NULL
+       ORDER BY (handle LIKE 'dev-%') DESC, created_at DESC LIMIT 50`;
     return render(c, DevLoginPage({ handles }));
   });
 

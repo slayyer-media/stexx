@@ -73,6 +73,7 @@ export function registerStaffRoutes(r: AdminRoutes): void {
     if (!STAFF_ID_RE.test(id)) throw notFound();
     const target = await findStaff(id);
     if (!target || target.id !== id) throw notFound();
+    if (target.id === staff.id) return staffPage(c, { error: "You can't disable yourself. Ask another admin.", status: 400 });
     const body = await c.req.parseBody();
     if (target.role === "admin") {
       const spent = await spendActionStepUp(sql, {
