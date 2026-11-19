@@ -207,7 +207,7 @@ Options that don't belong to a command are refused rather than ignored. Write co
 
 A ban takes the account out of circulation at once, but deleting it at once would leave no room to correct a mistake, and keeping it forever would keep someone's photos, messages and location indefinitely, with no way for them to delete it (they can't sign in, so `DELETE /me` is out of reach). So:
 
-1. **Review window.** For `BANNED_RETENTION_DAYS` (default **30**, an owner decision: long enough for an appeal through support and a second look, short enough that a banned person's data doesn't linger) the account stays exactly as the ban left it. `unban` during the window restores it and cancels the purge; a later ban starts a new window.
+1. **Review window.** For `BANNED_RETENTION_DAYS` (default **30**: long enough for an appeal through support and a second look, short enough that a banned person's data doesn't linger) the account stays exactly as the ban left it. `unban` during the window restores it and cancels the purge; a later ban starts a new window.
    **Bans made before the purge shipped** (migration 123) get a full window from the deploy, not from the ban: the migration sets `users.purge_window_start` to the deploy time for every account banned then, and the window starts at whichever is later. So the first run after the deploy purges nothing; existing bans are purged `BANNED_RETENTION_DAYS` after the deploy unless unbanned. `ban` and `unban` clear the column, so it only ever applies to those older bans. `show` prints the actual due date.
 2. **Purge.** After the window the slow retention job (every 10 minutes, `purgeBannedAccounts`) deletes the account with the same code as `DELETE /me` (`lib/account.ts`): every table that references the account cascades, its photo and attachment files are unlinked, pending sign-in links for its address are dropped. Accounts are purged one per transaction, under the moderation lock, re-checked inside it (a racing `unban` wins), in batches of 100; a run is idempotent and safe from several processes, an account that fails is retried on the next run, and the log line carries only counts (`moderation.purge {reason, accounts}`), never an id. `purge <profileID> --yes` does the same at once.
 3. **What survives**, and nothing else:
@@ -543,7 +543,7 @@ stexx-mod spam-clear p_abc… --as mod-a --note "busy night, real person"
 | `REPORT_REPORTER_MIN_AGE_HOURS` | `TRUST_RAMP_HOURS` | |
 | `REPORT_EVIDENCE_RETENTION_DAYS` | `30` | After the report is closed. |
 | `REPORT_EVIDENCE_MAX_DAYS` | `180` | Cap for reports that stay open. |
-| `BANNED_RETENTION_DAYS` | `30` | 1–3650. Review/appeal window: a banned account is kept intact this long, then purged (section 5). Owner decision. |
+| `BANNED_RETENTION_DAYS` | `30` | 1–3650. Review/appeal window: a banned account is kept intact this long, then purged (section 5). |
 | `SPAM_HEURISTICS_ENABLED` | `1` | `0` stops new limits and storing content features; existing limits run their course. |
 | `SPAM_WINDOW_HOURS` | `24` | Window for fan-out, first-contact rate, duplicates, links and handles. |
 | `SPAM_FANOUT_MIN`, `SPAM_FANOUT_MAX_REPLY_RATE` | `20`, `0.1` | `fan_out_no_replies`. |
@@ -572,7 +572,7 @@ stexx-mod spam-clear p_abc… --as mod-a --note "busy night, real person"
 | `E2E_MODE` | `off` (production), `optional` (otherwise) | `off` / `optional` / `required`, see section 7. |
 | `E2E_MAX_PREKEYS` | `100` | One-time EC prekeys stored per account (and per upload), 10–1000. |
 | `E2E_MAX_PQ_PREKEYS` | `25` | One-time Kyber prekeys stored per account (and per upload), 0–200. |
-| `TAP_RETENTION_DAYS` | `30` | ⚠️ Proposed default, owner to confirm. Received taps are listed by `GET /v1/me/taps` for this many days and then deleted (`purgeOldTaps`, hourly, in batches), so tap history is never kept forever. 1–365; an invalid value stops the boot. |
+| `TAP_RETENTION_DAYS` | `30` | Received taps are listed by `GET /v1/me/taps` for this many days and then deleted (`purgeOldTaps`, hourly, in batches), so tap history is never kept forever. 1–365; an invalid value stops the boot. |
 iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev-bypass` in the Local configuration) and `STEXX_APP_ATTEST_ENVIRONMENT` (`development`; `production` in Release), which feeds the `com.apple.developer.devicecheck.appattest-environment` entitlement in the generated `Stexx/Stexx.entitlements`.
 
 ## Turning it on for production (manual steps)
