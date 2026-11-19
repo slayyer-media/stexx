@@ -128,7 +128,10 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `REPORT_*` | see security.md | Auto-hide thresholds (`REPORT_AUTOHIDE_THRESHOLD` 3, window 14 days, underage 1 trusted / 2 any) and evidence retention (30 days after closing, 180 max). |
 | `PHOTO_CLASSIFIER`, `PHOTO_NSFW_MODEL`, `PHOTO_NSFW_THREADS`, `PHOTO_NSFW_THRESHOLD`, `PHOTO_NSFW_LABELS` | `auto`, `models/nudenet-320n.onnx`, `1`, `0.5`, genitals/anus/buttocks | Profile photo nudity classifier. Missing model: photos stay unchecked. See security.md. |
 | `PHOTO_HIDE_UNCHECKED` | `0` | `1` hides not-yet-classified photos from others (fail closed). |
-| `PHOTO_DUPLICATE_MAX_DISTANCE`, `PHOTO_HASH_BLOCKLIST` | `6`, unset | Cross-account duplicate and stock-photo flags (`photo_flags`). `-1` turns them off. |
+| `PHOTO_DUPLICATE_MAX_DISTANCE`, `PHOTO_HASH_BLOCKLIST` | `6`, unset | Cross-account duplicate and stock-photo flags (`photo_flags`). `-1` turns them off. Moderators review flags and add hashes with `bun run moderate -- photos …`. |
+| `MODERATOR_ALERT_EMAIL` | unset | Moderator alert digests by email (up to 5, comma-separated). Needs `SMTP_URL`. See security.md section 5, "Alerts". |
+| `MODERATOR_ALERT_WEBHOOK_URL` | unset | Alert digests as a JSON POST (e.g. a self-hosted ntfy topic or Matrix bridge). https in production unless loopback. Never logged. |
+| `MODERATOR_ALERT_INTERVAL_MINUTES`, `MODERATOR_ALERT_REASONS` | `15`, `underage,threatsOrViolence,illegalContent` | At most one digest per channel per interval; which report reasons are alerted (auto-hides and blocklist photo flags always are). |
 | `TRUST_PROXY` | `1` | Trust `CF-Connecting-IP` / `X-Forwarded-For` only from a loopback peer; used transiently for hashed rate-limit keys. |
 | `STEXX_DEV_AUTH` | off | `/auth/register` returns a session; mounts `/v1/dev/*`. **Production refuses to boot if set.** |
 | `STEXX_DEV_DEFAULT_LOCATION` | unset | `lat,lon`; new dev users get this (snapped) cell. Production refuses. |

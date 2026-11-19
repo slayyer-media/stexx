@@ -2,13 +2,14 @@
 
 Stexx is anonymous: no phone numbers, no real names, no ID checks. So instead of asking people who they are, the server checks that requests come from a real iPhone running the real app, and that new accounts act like people rather than scripts. This doc covers the four "Before launch" controls from [`roadmap.md`](roadmap.md), plus reporting, auto-hide and moderator review (section 5), profile photo checks (section 6) and the server side of end-to-end encrypted chat (section 7): how they work, how to configure them, and what they store.
 
-The anti-spam code lives in `server/src/lib/abuse/` (plus `server/src/routes/attest.ts`) and `ios/Stexx/Services/AttestationService.swift`; its schema is in `server/migrations/104_anti-spam.sql` and `105_abuse-counters.sql`. Reports and moderation are in `server/src/lib/moderation.ts`, `server/src/routes/safety.ts`, `server/src/moderation/cli.ts` and `server/migrations/107_report-autohide.sql`.
+The anti-spam code lives in `server/src/lib/abuse/` (plus `server/src/routes/attest.ts`) and `ios/Stexx/Services/AttestationService.swift`; its schema is in `server/migrations/104_anti-spam.sql` and `105_abuse-counters.sql`. Reports and moderation are in `server/src/lib/moderation.ts`, `server/src/routes/safety.ts`, `server/src/moderation/cli.ts` and `server/migrations/107_report-autohide.sql`; moderator alerts and photo-flag review in `server/src/lib/moderator-alerts.ts`, `server/src/lib/photocheck/review.ts`, `server/src/moderation/photos-cli.ts` and `server/migrations/114_mod-tools.sql`.
 
 ## Cost and footprint
 
 Everything runs on the single VPS with what is already there: the Bun API and Postgres. No paid third-party service and no extra daemon (no Redis):
 
 - Rate-limit state is in Postgres.
+- Moderator alerts go out through the SMTP relay already used for sign-in links, or to a webhook you host (e.g. ntfy or a Matrix bridge on the same box). Their debounce state is in Postgres.
 - The disposable-email list is a file bundled in the repo and loaded at boot; there are no lookups to an outside API.
 - App Attest is verified locally against Apple's root certificate (shipped in the repo). DeviceCheck calls go to Apple's free API, and only if a DeviceCheck key is configured: on signup, login and account deletion (the per-device bits), and on each protected request from the rare device that can't use App Attest (token validation).
 
@@ -167,6 +168,9 @@ stexx-mod list                                   # queue: underage first, then h
 stexx-mod show p_abc…                            # profile text, reports, shared messages, how each reporter was judged, history
 stexx-mod dismiss p_abc… --as mod-a --note "brigading"
 stexx-mod ban p_abc… --as mod-a --note "illegal content"
+stexx-mod photos list                            # photo flags: blocklist hits first, then duplicates
+stexx-mod photos blocklist 12 --as mod-a --label "stock set"
+stexx-mod alerts status                          # alert channels: last digest, failures, pending items
 ```
 
 Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show` and `log` for machine-readable output.
@@ -181,8 +185,49 @@ Locally: `cd server && bun run moderate -- list`. Add `--json` to `list`, `show`
 | `ban <profileID>` | See the table above. The account row is kept so its email hash and devices keep blocking a new sign-up |
 | `unban <profileID>` | Undo a ban: clears the ban, the hide and the server-side ban on its devices (unless another banned account was created on the same device). A DeviceCheck ban bit already written at Apple stays set |
 | `log [<profileID>]` | Audit log |
+| `photos …` | Review `photo_flags`, see [section 6](#reviewing-photo-flags) |
+| `alerts status` / `alerts test` | Alert channels, last digest, pending items / send a test alert now, see [Alerts](#alerts) |
 
 Options that don't belong to a command are refused rather than ignored. Write commands need `--as <handle>` (or `STEXX_MODERATOR`): letters, digits, `.`, `-`, `_`; use a handle, never a real name. `system` is reserved for automatic hides.
+
+### Alerts
+
+So nobody has to keep running `list`, the server can tell moderators when something urgent arrives. It is off unless a channel is configured:
+
+- **Email:** `MODERATOR_ALERT_EMAIL` (one address, or up to five comma-separated) through the same SMTP relay as sign-in links. It needs `SMTP_URL`; the boot refuses one without the other.
+- **Webhook:** `MODERATOR_ALERT_WEBHOOK_URL` receives a JSON `POST` (10 s timeout, redirects count as failures). It suits a self-hosted [ntfy](https://ntfy.sh) topic or a Matrix webhook bridge. In production it must be `https`, unless it points at a loopback address on the same box. The URL is never logged, so a token in its path or query stays private.
+
+**What is high priority.** An item is alerted once, per channel:
+
+| Item | Alerted when |
+| --- | --- |
+| Report | It is still open and its reason is in `MODERATOR_ALERT_REASONS` (default `underage`, `threatsOrViolence`, `illegalContent`) |
+| Auto-hide | An account crossed an auto-hide rule (either one) and is still hidden, not banned |
+| Photo flag | A profile photo matched the hash blocklist (`kind = 'blocklist'`), and the flag is still open |
+
+Duplicate-photo flags and other report reasons wait for the normal `list`. Items a moderator already closed before the digest went out are skipped.
+
+**Batching.** A job checks every minute. Each channel gets at most one digest per `MODERATOR_ALERT_INTERVAL_MINUTES` (15). A burst of 100 reports is one message with a count, and anything arriving during the cooldown goes into the next digest. The state lives in Postgres (`moderator_alert_channels`, `moderator_alert_sent`), so a restart neither re-sends a digest nor resets the cooldown. A short lease on each channel means two processes (say, during a deploy) can't send the same digest. A channel only alerts items created after it was first switched on, and only from the last 48 hours: anything older is still in the queue, just not pushed.
+
+**Failures.** A failed send is retried after 1, 2, 4… up to 60 minutes, and the items stay pending. The log gets `moderator_alerts.failed` with the channel and a short code (`http_503`, `timeout`, `error_EAUTH`), never the message, the address or the URL. `stexx-mod alerts status` shows each channel's last digest, failures, next retry and pending count; `stexx-mod alerts test` sends a test alert right away.
+
+**What an alert contains:** profile, report and flag ids, reason codes, counts, times, the size of the review queue, and the command to run (`stexx-mod show p_…`, `stexx-mod photos show 12`). It never holds a display name, profile text, report details, shared messages or photos, reporter ids, email addresses or locations; the tests check this. The webhook body:
+
+```json
+{
+  "type": "stexx.moderation.alert", "version": 1, "test": false, "sentAt": "2026-11-19T21:04:00Z",
+  "title": "Stexx moderation: 3 new high-priority items",
+  "message": "New: 2 report(s), 1 auto-hidden account(s).\nQueue now: …",
+  "counts": { "total": 3, "reports": 2, "autoHides": 1, "photoFlags": 0 },
+  "reasons": { "underage": 1, "threatsOrViolence": 1 },
+  "queue": { "highPriorityAccounts": 2, "hiddenAccounts": 4, "openPhotoFlags": 7, "openBlocklistFlags": 1 },
+  "items": [{ "kind": "report", "id": "r_…", "profileID": "p_…", "reason": "underage", "at": "2026-11-19T21:03:12Z", "command": "stexx-mod show p_…" }],
+  "moreItems": 0,
+  "commands": ["stexx-mod list", "stexx-mod photos list"]
+}
+```
+
+The email has the same content as plain text. Up to 20 items are listed one by one; the rest are counted in `moreItems`.
 
 ### Retention
 
@@ -209,7 +254,26 @@ On the 61 seed photos (clothed and shirtless men) nothing reaches 0.5; the highe
 
 **Blocklist.** `PHOTO_HASH_BLOCKLIST` points at a file of known stock or scraped photos, one entry per line: `<16 hex pHash> [label]`, with `#` for comments. A match adds a `photo_flags` row with `kind = 'blocklist'` and the label. Hashes made with Python's `str(imagehash.phash(Image.open(path)))` work as is.
 
-**Moderation queue.** Nothing reads `photo_flags` automatically yet. A moderator runs `SELECT * FROM photo_flags WHERE status = 'open' ORDER BY created_at` and sets `status` to `actioned` or `dismissed`. Flags go with the flagged photo or account (cascade). If the matched account is deleted, its columns become NULL.
+Flags go with the flagged photo or account (cascade). If the matched account is deleted, its columns become NULL. Blocklist hits also trigger a moderator alert (section 5, [Alerts](#alerts)).
+
+### Reviewing photo flags
+
+Moderators review flags with the same CLI as reports (section 5), over SSH. Every decision is one transaction and adds a `moderation_actions` row (the moderator's handle, the photo's owner as the account, a note, and details: flag id, photo id, kind, distance, status and photo visibility before and after).
+
+| Command | Effect |
+| --- | --- |
+| `photos list [--status open\|actioned\|dismissed\|all] [--kind duplicate\|blocklist] [--limit N]` | Open flags first, blocklist hits before duplicates, newest first. Each line: flag id, photo and owner (with the account's state), whether the photo is hidden, distance, what it matched, and how many other accounts have a photo within the duplicate distance |
+| `photos show <flagID>` | The flag; the photo (position, upload date, classifier result, hash, whether a moderator hid it) and its **file path under `MEDIA_DIR`**; for a duplicate, the matched photo and its path; every other account with a photo within the duplicate distance (closest 20, with paths); the blocklist entries it matches (file or moderator); other flags on the photo; the flag's audit history |
+| `photos clear <flagID>` | False positive: the flag is dismissed. If the photo is hidden and no other flag on it is still actioned, it is shown again. A blocklist entry added from this flag is removed (flags it already raised on other photos stay open for review) |
+| `photos hide <flagID>` | Hide the photo: the flag is actioned and the photo is kept from everyone but its owner (below) |
+| `photos blocklist <flagID> [--label "..."]` | Known stock or scraped photo: its hash goes into `photo_hash_blocklist`, the photo is hidden, and every other photo already within the duplicate distance gets a new open `blocklist` flag (not hidden: each one is reviewed). Later uploads of it are flagged at upload. The label defaults to the moderator handle and flag id |
+| `photos hide-account <flagID>` / `photos ban <flagID>` | Escalate to the account actions above (`hide` / `ban`, each with its own audit row and the note `photo flag <id>` unless `--note` is given), then mark the flag actioned (`photo_escalate`) |
+
+All take `--json`; the write commands need `--as` and take `--note`. The path printed is the file the server already serves for that profile photo; nothing is copied, uploaded or sent anywhere, and `--json` output is the only other place it appears.
+
+**A photo hidden by a moderator** (`photos.hidden_at`, migration 114) behaves like an explicit one: other people never see it, on any surface, and its owner still sees it, badged "Hidden" (the API returns it to the owner with `isExplicit: true`), and can still send it in a chat. The classifier's own label is left alone, so `clear` restores exactly what was there. The data export shows it as `checks.hiddenByModeratorAt`.
+
+**Moderator blocklist.** `photo_hash_blocklist` holds only 64-bit hashes, the label, the moderator handle and the flag it came from; it is matched at upload and by the background job together with the `PHOTO_HASH_BLOCKLIST` file. Entries stay until a moderator clears the flag they came from (or you delete the row).
 
 **When the model is missing.** On dev machines, in CI and tests, or if the download failed, uploads work exactly as before. Photos are stored unchecked (`nsfw_checked_at` NULL) and stay visible. Every minute a background job retries unchecked photos (up to 5 attempts each) and backfills hashes for older photos. So dropping the model in place later fixes everything without a restart: the API retries loading a missing model every 5 minutes, and the job then works through the backlog. Set `PHOTO_HIDE_UNCHECKED=1` to fail closed instead: unchecked photos are then hidden from others until the classifier has seen them. Busy or slow inference (more than 8 queued, or 15 s) also leaves a photo unchecked for the job.
 
@@ -354,7 +418,11 @@ Rolling back from `optional` to `off` keeps stored envelopes readable by the app
 | `PHOTO_NSFW_LABELS` | genitals, anus, buttocks (exposed) | Comma list of NudeNet labels that count as explicit. |
 | `PHOTO_HIDE_UNCHECKED` | `0` | `1` hides unchecked photos from others (fail closed). |
 | `PHOTO_DUPLICATE_MAX_DISTANCE` | `6` | Hamming bits out of 64, 0–32; `-1` turns duplicate and blocklist flags off. |
-| `PHOTO_HASH_BLOCKLIST` | unset | Path to the stock/scraped hash list, read at boot. An unreadable or malformed file stops the boot (and fails deploy's boot check). |
+| `PHOTO_HASH_BLOCKLIST` | unset | Path to the stock/scraped hash list, read at boot. An unreadable or malformed file stops the boot (and fails deploy's boot check). Moderators add hashes from the CLI too (`photos blocklist`, stored in Postgres). |
+| `MODERATOR_ALERT_EMAIL` | unset | Alert digests by email, up to 5 comma-separated addresses. Needs `SMTP_URL` (the boot refuses it otherwise). |
+| `MODERATOR_ALERT_WEBHOOK_URL` | unset | Alert digests as a JSON `POST`. `https` in production unless it's a loopback address. Never logged. |
+| `MODERATOR_ALERT_INTERVAL_MINUTES` | `15` | At most one digest per channel per interval, 1–1440. |
+| `MODERATOR_ALERT_REASONS` | `underage,threatsOrViolence,illegalContent` | Report reasons that are high priority. Auto-hides and blocklist photo flags are always alerted. |
 | `E2E_MODE` | `off` (production), `optional` (otherwise) | `off` / `optional` / `required`, see section 7. |
 | `E2E_MAX_PREKEYS` | `100` | One-time EC prekeys stored per account (and per upload), 10–1000. |
 | `E2E_MAX_PQ_PREKEYS` | `25` | One-time Kyber prekeys stored per account (and per upload), 0–200. |
@@ -378,13 +446,15 @@ iOS build settings (`ios/project.yml`): `STEXX_ATTESTATION_MODE` (`attest`; `dev
 - Reports add two things: the messages and photos a reporter chooses to share, and a keyed hash of the reporter's IP at report time (to tell reports from one connection apart). Both are deleted within 30 days of the report closing (180 days at most). Evidence photos are files in `MEDIA_DIR` with random names that no API response contains; only the moderation CLI prints their path. Nothing in moderation stores or shows a location.
 - Encrypted chat photos add nothing readable: a blob, its size bucket and the usual message metadata.
 - Photo checks store a 64-bit hash and label scores per profile photo, never an extra image copy. The duplicate check links two accounts only inside `photo_flags`, which only moderators read.
+- Moderator alerts leave the server (by email or webhook) but carry only ids, reason codes, counts and commands: no names, profile text, report content, photos, reporter ids or locations. The alert tables store which items were alerted (kind and id) for a few days, and each channel's retry state.
 
 ## Not done yet
 
 - Report evidence photos are re-uploaded by the reporter's app, so the server can't prove a photo is the one that was in the chat (same as evidence text).
-- No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Review turnaround depends on someone running `list`; there are no notifications for new high-priority reports yet.
+- No web moderation UI or admin HTTP API: the CLI over SSH is deliberate (no new network surface). Alerts (section 5) say when to look; acting still means logging in.
 - The "Report" and "Block" menus were checked by hand; there are no UI tests for them.
-- A moderator screen for `photo_flags`, and a way for a person to contest an "explicit" label. Today a moderator fixes a wrong label with SQL: `UPDATE photos SET is_explicit = false, nsfw_model = 'manual' WHERE id = …`.
+- A way for a person to contest an "explicit" label or a moderator hide. Today a moderator fixes a wrong classifier label with SQL: `UPDATE photos SET is_explicit = false, nsfw_model = 'manual' WHERE id = …` (a moderator hide is undone with `photos clear`).
+- The app's footer under a hidden photo says hidden photos "look explicit"; a photo hidden by a moderator gets the same badge and footer. Separate wording needs an API field and an app change.
 - The classifier hasn't been measured on explicit photos in this repo: there are none to test with, so only its false-positive rate on the seed set was checked. Watch the scores of the first real uploads before trusting the threshold.
 - Moderator tooling to ban an account's devices (`banDevicesOfUser` exists, nothing calls it).
 - Tests against a real-device attestation: the suite uses a synthetic root and devices generated by `server/test/fixtures/app-attest/generate.ts`. Do one manual sign-up on a physical iPhone against a staging server before enforcing.

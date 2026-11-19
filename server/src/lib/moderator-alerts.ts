@@ -87,6 +87,8 @@ export const SENT_RETENTION_MS = 4 * DAY;
 /** A run holds the channel this long at most (sends time out well before). */
 export const LEASE_MS = 2 * MINUTE;
 export const SEND_TIMEOUT_MS = 10_000;
+/** Whole-delivery cap (SMTP has its own, much longer, timeouts); well inside LEASE_MS. */
+export const DELIVERY_TIMEOUT_MS = 30_000;
 export const MAX_BACKOFF_MS = 60 * MINUTE;
 /** Items collected per digest; the rest wait for the next one. */
 export const MAX_ITEMS = 1000;
@@ -170,6 +172,21 @@ async function postWebhook(url: string, payload: AlertPayload): Promise<void> {
   });
   await res.body?.cancel().catch(() => {});
   if (res.status < 200 || res.status > 299) throw new AlertDeliveryError(`http_${res.status}`);
+}
+
+/** Run one delivery with an overall time limit. A late success after the limit may still arrive (at-least-once). */
+async function deliver(send: AlertSender, message: AlertMessage): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      send(message),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new AlertDeliveryError("timeout")), DELIVERY_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** A short, content-free code for a failed send (stored in last_error and logged). */
@@ -378,7 +395,7 @@ export async function runModeratorAlerts(opts: { now?: Date; profileIds?: string
       }
       const message = buildAlert(items, await queueSnapshot({ reasons: s.reasons }), now);
       try {
-        await ch.send(message);
+        await deliver(ch.send, message);
       } catch (err) {
         const code = errorCode(err);
         const failures = row.failures + 1;
@@ -452,7 +469,7 @@ export async function sendTestAlert(now = new Date()): Promise<{ channel: Channe
   const out: { channel: ChannelName; ok: boolean; error?: string }[] = [];
   for (const ch of alertChannels()) {
     try {
-      await ch.send(message);
+      await deliver(ch.send, message);
       out.push({ channel: ch.name, ok: true });
     } catch (err) {
       out.push({ channel: ch.name, ok: false, error: errorCode(err) });

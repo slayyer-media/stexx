@@ -77,7 +77,8 @@ ReadWritePaths=/srv/stexx/media
 InaccessiblePaths=-/etc/stexx/rclone.conf -/etc/stexx/migrate.env -/etc/stexx/backup-recipients.txt
 # NOT set: MemoryDenyWriteExecute=. Bun (JavaScriptCore) and sharp (libvips) JIT-compile and need W+X mappings.
 # Optional: block all egress except loopback + SMTP by adding IPAddressDeny=any and IPAddressAllow= entries
-# for your SMTP relay (Postgres is on 127.0.0.1, so loopback must stay allowed).
+# for your SMTP relay (Postgres is on 127.0.0.1, so loopback must stay allowed). If MODERATOR_ALERT_WEBHOOK_URL
+# points off the box, allow its address too.
 
 [Install]
 WantedBy=multi-user.target
