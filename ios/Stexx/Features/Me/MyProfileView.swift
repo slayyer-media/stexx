@@ -3,11 +3,21 @@ import SwiftUI
 /// The "You" tab: your profile at a glance, Stexx+, and quick privacy.
 struct MyProfileView: View {
     enum Route: Hashable {
-        case edit, settings, blocked
+        case settings, blocked
     }
 
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
+
+    /// Why the last `fetchMe` failed, shown until a retry succeeds.
+    @State private var loadError: String?
+    @State private var isLoading = false
+    /// The profile being edited (a snapshot of the loaded one).
+    @State private var editing: Profile?
+
+    private var loadState: MyProfileLoadState {
+        MyProfileLoadState(me: appState.me, loadError: loadError)
+    }
 
     var body: some View {
         @Bindable var bindable = appState
@@ -59,23 +69,105 @@ struct MyProfileView: View {
             .navigationTitle("You")
             .navigationDestination(for: Route.self) { route in
                 switch route {
-                case .edit:
-                    EditProfileView(profile: appState.me ?? MockData.me)
                 case .settings:
                     SettingsView()
                 case .blocked:
                     BlockedProfilesView()
                 }
             }
-            .task {
-                if appState.me == nil { appState.me = try? await api.fetchMe() }
+            .sheet(item: $editing) { profile in
+                NavigationStack {
+                    EditProfileView(profile: profile)
+                }
             }
+            .task {
+                if appState.me == nil { await loadMe() }
+            }
+        }
+    }
+
+    /// Fetches your profile. Never falls back to sample data: until the real
+    /// profile arrives the tab shows a skeleton, or an error with Retry.
+    private func loadMe() async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            appState.me = try await api.fetchMe()
+            loadError = nil
+        } catch {
+            guard let message = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't load your profile.")) else { return }
+            // Another fetch (the tab bar's) may have won meanwhile.
+            if appState.me == nil { loadError = message }
         }
     }
 
     @ViewBuilder
     private var header: some View {
-        let me = appState.me ?? MockData.me
+        switch loadState {
+        case .loaded(let me):
+            loadedHeader(me)
+        case .loading:
+            MyProfileSkeleton(editButton: editButton)
+        case .failed(let message):
+            loadFailed(message)
+        }
+    }
+
+    private var editButton: some View {
+        Button {
+            editing = appState.me
+        } label: {
+            Label("Edit profile", systemImage: "pencil")
+        }
+        .buttonStyle(.stexxSecondary)
+        .fixedSize()
+        .disabled(!loadState.canEdit)
+    }
+
+    private func loadFailed(_ message: String) -> some View {
+        VStack(spacing: Theme.Spacing.l) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 34, weight: .regular))
+                .foregroundStyle(Theme.steel)
+                .frame(width: 136, height: 136)
+                .background(Theme.ink1, in: RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous))
+                .hairlineBorder(RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous))
+                .cellCorners(outset: 6)
+                .padding(.top, Theme.Spacing.xl)
+                .padding(.bottom, Theme.Spacing.xs)
+                .accessibilityHidden(true)
+            VStack(spacing: Theme.Spacing.s) {
+                Text("Couldn't load your profile")
+                    .stexxTitleStyle(.title)
+                    .multilineTextAlignment(.center)
+                    .accessibilityAddTraits(.isHeader)
+                Text(message)
+                    .font(.stexxSub)
+                    .foregroundStyle(Theme.steel)
+                    .multilineTextAlignment(.center)
+            }
+            HStack(spacing: Theme.Spacing.s) {
+                Button {
+                    Task { await loadMe() }
+                } label: {
+                    if isLoading {
+                        ProgressView().tint(Theme.ink)
+                    } else {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                }
+                .buttonStyle(.stexxPrimary)
+                .fixedSize()
+                .disabled(isLoading)
+                editButton
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private func loadedHeader(_ me: Profile) -> some View {
         let photoShape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
         VStack(spacing: Theme.Spacing.l) {
             // The photo others see first (an explicit one is hidden from them).
@@ -108,11 +200,7 @@ struct MyProfileView: View {
                         .multilineTextAlignment(.center)
                 }
             }
-            NavigationLink(value: Route.edit) {
-                Label("Edit profile", systemImage: "pencil")
-            }
-            .buttonStyle(.stexxSecondary)
-            .fixedSize()
+            editButton
         }
         .frame(maxWidth: .infinity)
     }
@@ -180,6 +268,59 @@ struct MyProfileView: View {
             }
         }
         .contentShape(.rect)
+    }
+}
+
+/// What the header of the You tab shows. Editing needs the real profile:
+/// there is no sample-data fallback that could be saved over the account.
+enum MyProfileLoadState: Equatable {
+    case loading
+    case failed(String)
+    case loaded(Profile)
+
+    init(me: Profile?, loadError: String?) {
+        if let me {
+            self = .loaded(me)
+        } else if let loadError {
+            self = .failed(loadError)
+        } else {
+            self = .loading
+        }
+    }
+
+    /// Edit is enabled only once the real profile has loaded.
+    var canEdit: Bool {
+        if case .loaded = self { return true }
+        return false
+    }
+}
+
+/// Placeholder shapes in the header's layout while the profile loads.
+/// Static (no shimmer: the design language has no pulsing).
+private struct MyProfileSkeleton<EditButton: View>: View {
+    let editButton: EditButton
+
+    var body: some View {
+        let photoShape = RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+        VStack(spacing: Theme.Spacing.l) {
+            photoShape
+                .fill(Theme.ink1)
+                .frame(width: 136, height: 136)
+                .hairlineBorder(photoShape)
+                .overlay { ProgressView().tint(Theme.steel) }
+                .cellCorners(outset: 6)
+                .padding(.top, Theme.Spacing.xl)
+                .padding(.bottom, Theme.Spacing.xs)
+            VStack(spacing: Theme.Spacing.s) {
+                Capsule().fill(Theme.ink2).frame(width: 150, height: 30)
+                Capsule().fill(Theme.ink1).frame(width: 200, height: 14)
+            }
+            .accessibilityHidden(true)
+            editButton
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Loading your profile")
     }
 }
 

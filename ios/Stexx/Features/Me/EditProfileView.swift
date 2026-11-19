@@ -3,6 +3,10 @@ import SwiftUI
 import UIKit
 
 /// Edit your public profile. Everything except the nickname is optional.
+///
+/// Shown in a sheet. With unsaved changes, Cancel and swipe-down ask
+/// "Discard changes?" first; a failed save keeps the sheet open with the
+/// error in a toast.
 struct EditProfileView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.apiClient) private var api
@@ -14,6 +18,9 @@ struct EditProfileView: View {
     @State private var isSaving = false
     @State private var newTag = ""
     @State private var errorMessage: String?
+    @State private var isConfirmingDiscard = false
+    /// The profile as it was when editing started.
+    private let initial: Profile
 
     private let maxPhotos = 6
     private let maxTags = 10
@@ -21,8 +28,27 @@ struct EditProfileView: View {
     @State private var photoSync: ProfilePhotoSync
 
     init(profile: Profile) {
+        initial = profile
         _draft = State(initialValue: profile)
         _photoSync = State(initialValue: ProfilePhotoSync(photos: profile.photos))
+    }
+
+    private var isDirty: Bool {
+        Self.hasUnsavedChanges(initial: initial, draft: draft, pendingTag: newTag)
+    }
+
+    /// Whether leaving now would lose something: any field, the photo set
+    /// or order (uploads count, they're removed again on discard), or a tag
+    /// typed but not yet added.
+    nonisolated static func hasUnsavedChanges(initial: Profile, draft: Profile, pendingTag: String) -> Bool {
+        var before = ProfileUpdate(initial)
+        var after = ProfileUpdate(draft)
+        // The order of "looking for" toggles doesn't matter.
+        before.lookingFor = before.lookingFor.sorted { $0.rawValue < $1.rawValue }
+        after.lookingFor = after.lookingFor.sorted { $0.rawValue < $1.rawValue }
+        return before != after
+            || initial.photos.map(\.id) != draft.photos.map(\.id)
+            || !pendingTag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var isValid: Bool {
@@ -120,15 +146,6 @@ struct EditProfileView: View {
                 EditFooter("Up to \(maxTags). Nerd out.")
             }
             .editRows()
-
-            if let errorMessage {
-                Section {
-                    Text(errorMessage)
-                        .font(.stexxSub)
-                        .foregroundStyle(Theme.danger)
-                }
-                .editRows()
-            }
         }
         .listSectionSpacing(Theme.Spacing.xl)
         .foregroundStyle(Theme.frost)
@@ -136,8 +153,29 @@ struct EditProfileView: View {
         .stexxBackground(intensity: 0.5)
         .navigationTitle("Edit profile")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarVisibility(.hidden, for: .tabBar)
+        .errorToast($errorMessage)
+        // Swipe-down only closes a sheet with nothing to lose; otherwise it
+        // asks, like Cancel.
+        .interactiveDismissDisabled(isDirty || isSaving)
+        .background {
+            SheetDismissAttemptObserver {
+                if !isSaving { isConfirmingDiscard = true }
+            }
+            .accessibilityHidden(true)
+        }
+        .confirmationDialog("Discard changes?", isPresented: $isConfirmingDiscard, titleVisibility: .visible) {
+            Button("Discard changes", role: .destructive) { dismiss() }
+            Button("Keep editing", role: .cancel) {}
+        } message: {
+            Text("Your edits to your profile won't be saved.")
+        }
         .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel", role: .cancel) {
+                    if isDirty { isConfirmingDiscard = true } else { dismiss() }
+                }
+                .disabled(isSaving)
+            }
             ToolbarItem(placement: .principal) {
                 Text(verbatim: "edit profile")
                     .font(.stexxHeadline.weight(.heavy))
@@ -292,7 +330,7 @@ struct EditProfileView: View {
                 photoSync.didUpload(photo)
                 draft.photos.append(photo)
             } catch {
-                errorMessage = error.localizedDescription
+                errorMessage = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't add that photo."))
             }
         }
     }
@@ -346,7 +384,69 @@ struct EditProfileView: View {
             appState.me = updated
             dismiss()
         } catch {
-            errorMessage = error.localizedDescription
+            // Stay open with the edits intact; Save can be tried again.
+            errorMessage = UserFacingError.message(for: error, failedAction: String(localized: "Couldn't save your profile."))
+        }
+    }
+}
+
+/// Calls `onAttempt` when someone swipes down on a sheet whose dismissal is
+/// disabled (`interactiveDismissDisabled(true)`), so it can ask before
+/// discarding. SwiftUI has no hook for this; this wraps the sheet's
+/// presentation-controller delegate and forwards everything else to it.
+private struct SheetDismissAttemptObserver: UIViewControllerRepresentable {
+    let onAttempt: () -> Void
+
+    func makeUIViewController(context: Context) -> Controller {
+        Controller(onAttempt: onAttempt)
+    }
+
+    func updateUIViewController(_ controller: Controller, context: Context) {
+        controller.onAttempt = onAttempt
+    }
+
+    final class Controller: UIViewController {
+        var onAttempt: () -> Void
+        private var proxy: DelegateProxy?
+
+        init(onAttempt: @escaping () -> Void) {
+            self.onAttempt = onAttempt
+            super.init(nibName: nil, bundle: nil)
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            guard let presentation = presentationController,
+                  !(presentation.delegate is DelegateProxy)
+            else { return }
+            let proxy = DelegateProxy(original: presentation.delegate) { [weak self] in self?.onAttempt() }
+            self.proxy = proxy
+            presentation.delegate = proxy
+        }
+    }
+
+    final class DelegateProxy: NSObject, UIAdaptivePresentationControllerDelegate {
+        private weak var original: (any UIAdaptivePresentationControllerDelegate)?
+        private let onAttempt: () -> Void
+
+        init(original: (any UIAdaptivePresentationControllerDelegate)?, onAttempt: @escaping () -> Void) {
+            self.original = original
+            self.onAttempt = onAttempt
+        }
+
+        func presentationControllerDidAttemptToDismiss(_ presentationController: UIPresentationController) {
+            original?.presentationControllerDidAttemptToDismiss?(presentationController)
+            onAttempt()
+        }
+
+        override func responds(to aSelector: Selector!) -> Bool {
+            super.responds(to: aSelector) || (original?.responds(to: aSelector) ?? false)
+        }
+
+        override func forwardingTarget(for aSelector: Selector!) -> Any? {
+            original?.responds(to: aSelector) == true ? original : super.forwardingTarget(for: aSelector)
         }
     }
 }
@@ -395,8 +495,11 @@ enum ImageSanitizer {
 }
 
 #Preview {
-    NavigationStack {
-        EditProfileView(profile: MockData.profiles[0])
-    }
-    .previewEnvironment()
+    Color.clear
+        .sheet(isPresented: .constant(true)) {
+            NavigationStack {
+                EditProfileView(profile: MockData.profiles[0])
+            }
+        }
+        .previewEnvironment()
 }
