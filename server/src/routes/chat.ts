@@ -49,7 +49,8 @@ import type { AppEnv } from "../types.ts";
  *    realtime events or the conversation list, and never to the sender. Listing does NOT open the photo: the
  *    recipient's app calls POST .../messages/:messageID/open when the photo is actually shown, which stamps
  *    attachment_opened_at (the retention job deletes the file a grace window later) and, if the opener sends read
- *    receipts, tells the sender (`message.updated`). Never-opened ones fall under the 14-day cap.
+ *    receipts, tells the sender (`message.updated`). Never-opened ones are deleted 3 days after sending
+ *    (VIEW_ONCE_UNOPENED_CAP_MS); until then the URL works for anyone holding it, like any chat photo's.
  *  - Mute (PUT/DELETE /conversations/:id/mute) is the caller's own flag (conversation_members.muted): idempotent,
  *    never visible to the other person, and only the caller's other connections get `conversation.updated`.
  *  - DELETE /conversations/:id hides the thread for the caller only (cleared_before = now); a new message
@@ -342,7 +343,7 @@ chatRoutes.get("/conversations/:id/messages", requireAuth, async (c) => {
  * The recipient opened a view-once photo: stamp `attachment_opened_at` (the retention job deletes the file
  * VIEW_ONCE_GRACE_MS later) and return the message as the recipient sees it (with the URL while the file exists).
  * Idempotent: a second call changes nothing and returns the same message. A photo that is already gone (opened
- * earlier, or hit the 14-day cap unopened) is returned with `url: null` and never stamped late.
+ * earlier, or hit the 3-day cap unopened) is returned with `url: null` and never stamped late.
  * 404 for anything else: not a participant, blocked either way, a banned partner, the sender, a message that isn't a
  * view-once photo, or one the caller can no longer see (cleared, expired).
  * The sender gets `message.updated` (and `conversation.updated`) only if the opener sends read receipts.

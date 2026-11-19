@@ -17,8 +17,8 @@ import {
   purgeUnopenedViewOnceAttachments,
   purgeViewedOnceAttachments,
   sweepOrphanMedia,
-  UNREAD_EXPIRING_CAP_MS,
   VIEW_ONCE_GRACE_MS,
+  VIEW_ONCE_UNOPENED_CAP_MS,
 } from "../src/jobs/retention.ts";
 import { resetAbuseLimits } from "../src/lib/abuse/limits.ts";
 import { setE2eModeForTests } from "../src/lib/e2e/keys.ts";
@@ -429,9 +429,9 @@ describe("encrypted blobs are deleted on the same schedule", () => {
     expect((await mediaRoute(openedUrl)).status).toBe(404);
     expect(onDisk(unopenedUrl)).toBe(true); // listed, never opened: not touched by the grace purge
 
-    await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS - 1000));
+    await purgeUnopenedViewOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS - 1000));
     expect(onDisk(unopenedUrl)).toBe(true);
-    await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS + 1000));
+    await purgeUnopenedViewOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS + 1000));
     expect(onDisk(unopenedUrl)).toBe(false);
 
     const after = await expectJson(await as(b).get(`/v1/conversations/${conv}/messages`));

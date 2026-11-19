@@ -256,13 +256,17 @@ recipient, then the server deletes it.
   open can finish; the job runs every 15 s), for plaintext and end-to-end
   encrypted photos alike. The message stays, with `url: null`.
   - Idempotent: calling it again returns the same message and changes
-    nothing. A photo already gone unopened (14-day cap) comes back with
+    nothing. A photo already gone unopened (3-day cap) comes back with
     `url: null` and `openedAt: null` and is not marked opened.
   - **404 `not_found`** for anyone but the recipient: the sender, other
     users, a block either way, a banned sender, a thread the recipient
     deleted, an expired message, or a message that isn't a view-once photo.
   - 60 per minute per account (**429** with `Retry-After`).
-- **Never opened.** 14 days after sending, the file is deleted anyway.
+- **Never opened.** 3 days after sending, the file is deleted anyway
+  (shorter than the 14 days for unread expiring messages). Until it is
+  opened or capped, the `url` works for anyone who has it, like any chat
+  photo's: media is served without auth and protected only by its
+  unguessable name.
 - **The sender** never gets the `url` of their own view-once photo (seeing
   the file disappear would tell them it was opened). The upload's `url` from
   `POST /me/attachments` stops working when the photo is sent view-once: the
@@ -275,7 +279,7 @@ recipient, then the server deletes it.
   `conversation.updated`.
 - **Older apps** that predate the open call still see the `url` in
   `GET …/messages` and can show the photo, but never mark it opened: their
-  view-once photos stay on the server until the 14-day cap, and the sender
+  view-once photos stay on the server until the 3-day cap, and the sender
   never sees "Opened". That's the safe direction (nothing is deleted before
   the recipient saw it, nothing is revealed).
 
@@ -548,7 +552,7 @@ View-once and expiring photos work as for plaintext ones: the server deletes
 the blob on the same schedule (an expiring photo at `expiresAt`; a view-once
 photo about 30 s after the recipient opens it with
 `POST …/messages/{messageID}/open` ([View-once photos](#view-once-photos)), or
-14 days after sending if never opened; an unsent upload after 1 h; with the
+3 days after sending if never opened; an unsent upload after 1 h; with the
 conversation or the account), and the app drops the key when the photo
 expires, as soon as a view-once photo has been opened, or when the server says
 it's gone. Spent photos have `attachment.url: null`.

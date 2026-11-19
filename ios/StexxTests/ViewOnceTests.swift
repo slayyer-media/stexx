@@ -158,7 +158,7 @@ struct ViewOnceTests {
         let (server, alice, bob) = await pair()
         _ = try await alice.sendPhoto(jpeg, isViewOnce: true)
         let listed = try #require(try await bob.thread().last)
-        let store = ChatStore(api: bob.client)
+        let store = ChatStore(api: bob.client, defaults: Self.freshDefaults())
 
         await server.failNextOpenOnce()
         let failed = await store.openViewOnce(listed.id, in: FakeE2EServer.conversationID)
@@ -184,11 +184,85 @@ struct ViewOnceTests {
     func chatStoreDropsNotFound() async throws {
         let (server, alice, _) = await pair()
         let sent = try await alice.sendPhoto(jpeg, isViewOnce: true)
-        let store = ChatStore(api: alice.client)
+        let store = ChatStore(api: alice.client, defaults: Self.freshDefaults())
         #expect(await store.openViewOnce(sent.id, in: FakeE2EServer.conversationID) == nil)
         store.retryPendingViewOnceOpens()
         try await Task.sleep(for: .milliseconds(50))
         #expect(await server.count("open") == 1)
+    }
+
+    private static func freshDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "stexx.tests.\(UUID().uuidString)")!
+    }
+
+    @MainActor
+    @Test("A failed open survives a relaunch: still Opened on this phone, and the call is retried on the next load")
+    func pendingOpenSurvivesRelaunch() async throws {
+        // Plaintext (E2E off): the case where nothing but this phone's record stops a second viewing.
+        let server = FakeE2EServer()
+        await server.set(mode: .off)
+        let alice = FakeDevice("alice", peer: "bob", server: server)
+        let bob = FakeDevice("bob", peer: "alice", server: server)
+        let sent = try await alice.sendPhoto(jpeg, isViewOnce: true)
+        #expect(sent.attachment?.isEncrypted == false)
+        let listed = try #require(try await bob.thread().last)
+        #expect(listed.attachment?.url != nil)
+        let defaults = Self.freshDefaults()
+
+        await server.failNextOpenOnce()
+        #expect(await ChatStore(api: bob.client, defaults: defaults).openViewOnce(listed.id, in: FakeE2EServer.conversationID) == nil)
+        #expect(await server.messages.last?.attachment?.openedAt == nil)
+
+        // "Relaunch": a new store on the same defaults, before anything loads.
+        let relaunched = ChatStore(api: bob.client, defaults: defaults)
+        #expect(relaunched.hasOpenedViewOnce(listed.id))
+        await relaunched.load()
+        for _ in 0..<200 {
+            if await server.messages.last?.attachment?.openedAt != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await server.messages.last?.attachment?.openedAt != nil)
+        #expect(await server.count("open") == 2)
+
+        // Confirmed: a later launch has nothing left to send, but still knows it was opened here.
+        let later = ChatStore(api: bob.client, defaults: defaults)
+        #expect(later.hasOpenedViewOnce(listed.id))
+        later.retryPendingViewOnceOpens()
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await server.count("open") == 2)
+    }
+
+    @MainActor
+    @Test("The record of opens is dropped at sign-out and after the server's cap, and holds IDs only")
+    func openRecordLifetime() async throws {
+        let (server, alice, bob) = await pair()
+        _ = try await alice.sendPhoto(jpeg, isViewOnce: true)
+        let listed = try #require(try await bob.thread().last)
+        let defaults = Self.freshDefaults()
+
+        await server.failNextOpenOnce()
+        let store = ChatStore(api: bob.client, defaults: defaults)
+        _ = await store.openViewOnce(listed.id, in: FakeE2EServer.conversationID)
+        let stored = try #require(defaults.dictionary(forKey: "chat.viewOnce.opened") as? [String: Date])
+        #expect(Array(stored.keys) == [listed.id])
+        #expect(defaults.dictionary(forKey: "chat.viewOnce.pendingOpens") as? [String: String] == [listed.id: FakeE2EServer.conversationID])
+
+        // Past the cap the server has deleted the photo anyway: forgotten, and not retried.
+        let muchLater = Date.now.addingTimeInterval(ChatStore.viewOnceMemory + 60)
+        let aged = ChatStore(api: bob.client, defaults: defaults, now: muchLater)
+        #expect(!aged.hasOpenedViewOnce(listed.id))
+        #expect(defaults.dictionary(forKey: "chat.viewOnce.pendingOpens")?.isEmpty == true)
+
+        // Sign-out wipes it.
+        let fresh = Self.freshDefaults()
+        await server.failNextOpenOnce()
+        let signedIn = ChatStore(api: bob.client, defaults: fresh)
+        _ = await signedIn.openViewOnce(listed.id, in: FakeE2EServer.conversationID)
+        signedIn.reset()
+        #expect(!signedIn.hasOpenedViewOnce(listed.id))
+        #expect(fresh.dictionary(forKey: "chat.viewOnce.opened") == nil)
+        #expect(fresh.dictionary(forKey: "chat.viewOnce.pendingOpens") == nil)
+        #expect(!ChatStore(api: bob.client, defaults: fresh).hasOpenedViewOnce(listed.id))
     }
 
     @MainActor

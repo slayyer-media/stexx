@@ -1,7 +1,8 @@
 /**
  * View-once photos are opened explicitly: POST /conversations/{id}/messages/{messageID}/open (docs/api.md
  * "View-once photos"). Listing the thread no longer opens them; the retention job deletes the file (plaintext `.jpg`
- * and encrypted `.bin` alike) a grace window after the open, and the 14-day cap still covers never-opened ones.
+ * and encrypted `.bin` alike) a grace window after the open, and never-opened ones go 3 days after sending
+ * (VIEW_ONCE_UNOPENED_CAP_MS, shorter than the 14-day cap on unread expiring messages).
  * Shared-DB rules from helpers.ts apply: unique users, and purge clocks moved to 1999 (rows re-dated there first), so
  * these jobs never touch other suites' rows (their clocks are 2000 and 2001).
  */
@@ -12,6 +13,7 @@ import {
   purgeViewedOnceAttachments,
   UNREAD_EXPIRING_CAP_MS,
   VIEW_ONCE_GRACE_MS,
+  VIEW_ONCE_UNOPENED_CAP_MS,
 } from "../src/jobs/retention.ts";
 import { resetAbuseLimits } from "../src/lib/abuse/limits.ts";
 import { setE2eModeForTests } from "../src/lib/e2e/keys.ts";
@@ -26,6 +28,7 @@ import {
   expectError,
   expectJson,
   expectNoContent,
+  get,
   makeJpeg,
   post,
   sql,
@@ -420,7 +423,7 @@ describe("retention: deleted a grace window after the open, not after the listin
       expect(onDisk(opened.url)).toBe(false);
       expect((await row(opened.msg.id)).attachment_key).toBeNull();
       // Listing alone never starts the timer: still there at any grace-purge time before the cap.
-      await purgeViewedOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS - 1000));
+      await purgeViewedOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS - 1000));
       expect(onDisk(listedOnly.url)).toBe(true);
 
       // The recipient sees "opened, gone"; the row stays.
@@ -431,7 +434,7 @@ describe("retention: deleted a grace window after the open, not after the listin
       expect((await expectJson(await open(b, conv, opened.msg.id))).attachment.url).toBeNull();
     });
 
-    test(`${kind}: the 14-day cap for never-opened photos is unchanged (listed or not)`, async () => {
+    test(`${kind}: never-opened photos go after 3 days, listed or not (not 14 like unread expiring ones)`, async () => {
       const [a, b] = await Promise.all([createUser(), createUser()]);
       const conv = await conversation(a, b);
       const send = kind === "plaintext" ? sendPhoto : sendEncryptedPhoto;
@@ -440,12 +443,18 @@ describe("retention: deleted a grace window after the open, not after the listin
       await expectJson(await as(b).get(`/v1/conversations/${conv}/messages?limit=1`)); // lists only the newest
       await sql`UPDATE messages SET sent_at = ${T0} WHERE id IN ${sql([listed.msg.id, never.msg.id])}`;
 
-      await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS - 1000));
+      expect(VIEW_ONCE_UNOPENED_CAP_MS).toBe(3 * 86_400_000);
+      expect(VIEW_ONCE_UNOPENED_CAP_MS).toBeLessThan(UNREAD_EXPIRING_CAP_MS);
+      // Until then the URL works for whoever has it, no account needed (unguessable name, like any chat photo's);
+      // docs/security.md says so. The dev /media route stands in for Caddy here.
+      await purgeUnopenedViewOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS - 1000));
       expect(onDisk(listed.url)).toBe(true);
       expect(onDisk(never.url)).toBe(true);
-      await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS + 1000));
+      expect((await get(`/media/${keyOf(listed.url)}`)).status).toBe(200);
+      await purgeUnopenedViewOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS + 1000));
       expect(onDisk(listed.url)).toBe(false);
       expect(onDisk(never.url)).toBe(false);
+      expect((await get(`/media/${keyOf(listed.url)}`)).status).toBe(404);
       for (const id of [listed.msg.id, never.msg.id]) {
         const r = await row(id);
         expect(r.attachment_key).toBeNull();
@@ -461,7 +470,7 @@ describe("retention: deleted a grace window after the open, not after the listin
     await expectJson(await open(b, conv, msg.id));
     // Opened "in the future" relative to the clock, so only the cap rule could reach it.
     await sql`UPDATE messages SET sent_at = ${T0}, attachment_opened_at = ${at(T0, 30 * 86_400_000)} WHERE id = ${msg.id}`;
-    await purgeUnopenedViewOnceAttachments(at(T0, UNREAD_EXPIRING_CAP_MS + 1000));
+    await purgeUnopenedViewOnceAttachments(at(T0, VIEW_ONCE_UNOPENED_CAP_MS + 1000));
     expect(onDisk(url)).toBe(true);
     await sql`UPDATE messages SET attachment_opened_at = ${T0} WHERE id = ${msg.id}`;
     await purgeViewedOnceAttachments(at(T0, VIEW_ONCE_GRACE_MS + 1000));

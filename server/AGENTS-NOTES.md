@@ -101,7 +101,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - View-once photos are opened only by `POST /conversations/:id/messages/:messageID/open` (recipient only, idempotent,
   `viewOnceOpens` 60/min): it stamps `attachment_opened_at` (retention deletes the file VIEW_ONCE_GRACE_MS later) and
   pushes `message.updated` (+ `conversation.updated`) to the sender when receipts allow. GET .../messages only marks
-  delivery; it must never stamp the open again.
+  delivery; it must never stamp the open again. Never-opened ones are deleted `VIEW_ONCE_UNOPENED_CAP_MS` (3 days)
+  after sending, not after the 14-day unread-expiring cap.
 - `conversationJson({id, participant, lastMessage, unreadCount, updatedAt, isMuted})` · `privacyJson(row)`.
 - `ONLINE_WINDOW_MS` (5 min).
 
