@@ -5,7 +5,9 @@ import SwiftUI
 /// black-glass action bar. Block and report
 /// are always one tap away in the menu.
 struct ProfileDetailView: View {
-    @State private var profile: Profile
+    /// The profile plus favorite / tap / block and their error states.
+    @State private var actions: ProfileActions
+    private var profile: Profile { actions.profile }
 
     @Environment(AppState.self) private var appState
     @Environment(ChatStore.self) private var chatStore
@@ -13,7 +15,6 @@ struct ProfileDetailView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var photoIndex = 0
-    @State private var didTap = false
     @State private var isConfirmingBlock = false
     @State private var isReporting = false
     @State private var isShowingChat = false
@@ -22,7 +23,7 @@ struct ProfileDetailView: View {
     @State private var hasAppeared = false
 
     init(profile: Profile) {
-        _profile = State(initialValue: profile)
+        _actions = State(initialValue: ProfileActions(profile: profile))
     }
 
     var body: some View {
@@ -84,8 +85,10 @@ struct ProfileDetailView: View {
                     onBlock: { isConfirmingBlock = true },
                     onReport: { isReporting = true }
                 )
+                .disabled(actions.isBlocking)
             }
         }
+        .errorToast($actions.toast)
         .navigationDestination(isPresented: $isShowingChat) {
             ChatThreadView(route: ChatRoute(participant: profile))
         }
@@ -98,6 +101,20 @@ struct ProfileDetailView: View {
         } message: {
             Text("They won't be able to see you or message you, and won't be notified.")
         }
+        // A failed block must never look like it worked: the profile stays,
+        // and this says so and offers Retry.
+        .alert(
+            "Couldn't block \(profile.displayName)",
+            isPresented: Binding(
+                get: { actions.blockFailure != nil },
+                set: { if !$0 { actions.blockFailure = nil } }
+            )
+        ) {
+            Button("Retry") { Task { await block() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\(profile.displayName) isn't blocked yet. \(actions.blockFailure ?? "")")
+        }
         .sheet(isPresented: $isReporting) {
             ReportSheet(profile: profile) { didBlock in
                 if didBlock { dismiss() }
@@ -108,7 +125,7 @@ struct ProfileDetailView: View {
         }
         .task {
             if let fresh = try? await api.profile(id: profile.id) {
-                profile = fresh
+                actions.profile = fresh
             }
         }
     }
@@ -266,15 +283,18 @@ struct ProfileDetailView: View {
                     isProminent: profile.isFavorite
                 ) {
                     favoriteTaps += 1
-                    Task { await toggleFavorite() }
+                    Task { await actions.toggleFavorite(using: api) }
                 }
                 .sensoryFeedback(.selection, trigger: favoriteTaps)
 
-                GlassIconButton(didTap ? "Tapped" : "Send a tap", systemImage: didTap ? "hand.wave.fill" : "hand.wave") {
-                    Task { await sendTap() }
+                GlassIconButton(
+                    actions.didTap ? "Tapped" : "Send a tap",
+                    systemImage: actions.didTap ? "hand.wave.fill" : "hand.wave"
+                ) {
+                    Task { await actions.sendTap(using: api) }
                 }
-                .disabled(didTap)
-                .sensoryFeedback(.success, trigger: didTap)
+                .disabled(actions.didTap)
+                .sensoryFeedback(.success, trigger: actions.didTap) { _, didTap in didTap }
 
                 Button {
                     isShowingChat = true
@@ -293,34 +313,13 @@ struct ProfileDetailView: View {
         .padding(.bottom, Theme.Spacing.s)
     }
 
-    private func toggleFavorite() async {
-        let newValue = !profile.isFavorite
-        profile.isFavorite = newValue
-        do {
-            try await api.setFavorite(newValue, profileID: profile.id)
-        } catch {
-            profile.isFavorite = !newValue
-        }
-    }
-
-    private func sendTap() async {
-        didTap = true
-        do {
-            try await api.sendTap(to: profile.id)
-        } catch {
-            didTap = false
-        }
-    }
-
+    /// Hides the profile and leaves only once the server confirmed the
+    /// block; otherwise `ProfileActions` raises the "Couldn't block" alert.
     private func block() async {
-        do {
-            try await api.block(profileID: profile.id)
-            appState.markBlocked(profile.id)
-            chatStore.removeConversations(with: profile.id)
-            dismiss()
-        } catch {
-            // Keep the profile visible; the user can retry from the menu.
-        }
+        guard await actions.block(using: api) else { return }
+        appState.markBlocked(profile.id)
+        chatStore.removeConversations(with: profile.id)
+        dismiss()
     }
 }
 

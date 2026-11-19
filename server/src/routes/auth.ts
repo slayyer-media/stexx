@@ -50,6 +50,13 @@ export const authRoutes = new Hono<AppEnv>();
 const CHALLENGE_TTL_MS = 5 * MINUTE;
 const LINK_TTL_MS = 15 * MINUTE;
 const UNIQUE_VIOLATION = "23505";
+/**
+ * The account label a new passkey is saved under (WebAuthn `user.name` / `user.displayName`). Deliberately not
+ * the nickname: passkeys sync through the platform's password manager (iCloud Keychain) to every device on the
+ * account and show up in its password list and shared password groups next to the relying party. The domain
+ * can't be hidden; the nickname can. One account per device means there's no list of accounts to tell apart.
+ */
+export const PASSKEY_ACCOUNT_LABEL = "Stexx account";
 
 // ---- Schemas ---------------------------------------------------------------
 
@@ -240,7 +247,8 @@ authRoutes.post("/auth/passkey/register/options", rateLimit("auth"), async (c) =
   const options = await generateRegistrationOptions({
     rpName: config.webauthn.rpName,
     rpID: config.webauthn.rpId,
-    userName: body.displayName,
+    userName: PASSKEY_ACCOUNT_LABEL,
+    userDisplayName: PASSKEY_ACCOUNT_LABEL,
     userID: webauthnUserId,
     attestationType: "none",
     authenticatorSelection: { residentKey: "required", userVerification: "required" },

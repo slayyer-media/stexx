@@ -131,6 +131,8 @@ final class LocationService {
             startHeartbeat()
         case .notDetermined:
             status = .waitingForPermission
+            // The permission alert deactivates the app: not the app switcher.
+            PrivacyCover.shared.expectSystemPrompt()
             manager.requestWhenInUseAuthorization()
         case .denied, .restricted:
             deny()

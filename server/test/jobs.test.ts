@@ -27,7 +27,7 @@ import {
 } from "../src/jobs/index.ts";
 import { createSession } from "../src/lib/auth.ts";
 import { newId } from "../src/lib/ids.ts";
-import { mediaPath, newStorageKey, storeJpeg } from "../src/lib/media.ts";
+import { mediaPath, newStorageKey, storeJpeg, unlinkMedia } from "../src/lib/media.ts";
 import { orderedPair } from "../src/lib/visibility.ts";
 import { createUser, makeJpeg, sql, uniq } from "./helpers.ts";
 
@@ -294,15 +294,26 @@ describe("job runners", () => {
     const id = await message(conv, { attachmentKey: key, readAt: T0, expiresAfter: 1, expiresAt: at(T0, 1 * SEC) });
     const stop = startJobs();
     try {
+      // The row is deleted first and the file is unlinked later in the same tick (drainMediaTrash), so wait for both.
+      // The test DB is shared with other checkouts running their own drainers, each unlinking in its own MEDIA_DIR:
+      // one of them may claim this trash row (missing file there) before our timer does. Either way the trash row
+      // being consumed proves the drain ran; the file itself is checked when our own drainer got it.
+      const queued = async () => (await sql`SELECT 1 FROM media_trash WHERE storage_key = ${key}`).length > 0;
       let gone = false;
-      for (let i = 0; i < 40 && !gone; i++) {
+      let drained = false;
+      for (let i = 0; i < 80 && !(gone && drained); i++) {
         await Bun.sleep(100);
-        gone = !(await messageExists(id));
+        gone = gone || !(await messageExists(id));
+        drained = gone && (!exists(key) || !(await queued()));
       }
       expect(gone).toBe(true);
-      expect(exists(key)).toBe(false);
+      expect(drained).toBe(true);
+      if (exists(key)) {
+        // Claimed by another checkout's drainer: tidy up our copy.
+        await unlinkMedia(key);
+      }
     } finally {
-      stop();
+      await stop();
     }
     // After stop() nothing runs any more.
     const id2 = await message(conv, { readAt: T0, expiresAfter: 1, expiresAt: at(T0, 1 * SEC) });

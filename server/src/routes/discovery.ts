@@ -7,6 +7,7 @@ import { badRequest, notFound } from "../lib/errors.ts";
 import { logError } from "../lib/logger.ts";
 import { isConnected, publishUnlessBlocked } from "../lib/realtime.ts";
 import { assertMayTap } from "../lib/moderation.ts";
+import { isSpamLimited } from "../lib/abuse/spam.ts";
 import { requirePlus } from "../lib/plus.ts";
 import { rateLimit } from "../lib/ratelimit.ts";
 import { nearbyPage } from "../lib/nearby.ts";
@@ -155,6 +156,8 @@ discoveryRoutes.post("/profiles/:id/tap", requireAuth, rateLimit("taps"), async 
   const id = idParam(c, "id", "user");
   await assertVisibleUser(me, id);
   await assertMayTap(me);
+  // Shadow limit (lib/abuse/spam.ts): a spam-limited account's taps are accepted and silently dropped.
+  if (await isSpamLimited(me)) return c.body(null, 204);
 
   // One tap per (from,to) per 24 h; a repeat inside the window is an idempotent no-op.
   const created = await sql.begin(async (tx) => {

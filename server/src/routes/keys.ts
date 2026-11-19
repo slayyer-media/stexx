@@ -171,6 +171,8 @@ keysRoutes.get("/e2e/config", requireAuth, async (c) => {
       /** The trust ramp restricts this account: run the link and duplicate-text checks before encrypting. */
       restricted: trust.restricted,
       noLinks: trust.restricted,
+      /** Refuse payment/crypto handles and off-platform redirects (content-rules.json, shared with the app). */
+      noHandles: trust.restricted,
       duplicateRecipients: trustSettings().duplicateRecipients,
       duplicateMinLength: DUPLICATE_MIN_LENGTH,
     },

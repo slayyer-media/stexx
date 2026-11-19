@@ -22,11 +22,15 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Each route file exports a router `xxxRoutes = new Hono<AppEnv>()` mounted at `/v1`. **Write full paths**:
   `meRoutes.get("/me", ...)`, `chatRoutes.post("/conversations/:id/messages", ...)`.
   Owners: `auth.ts` (/auth/*), `me.ts` (/me, /me/photos*, /me/privacy, /me/location, /me/viewers, /me/export, DELETE /me),
-  `discovery.ts` (/nearby, /profiles/:id[/favorite|/tap]), `chat.ts` (/conversations*), `safety.ts` (/blocks*, /reports),
+  `discovery.ts` (/nearby, /profiles/:id[/favorite|/tap]), `chat.ts` (/conversations*, incl. the view-once
+  `POST /conversations/:id/messages/:messageID/open`), `safety.ts` (/blocks*, /reports),
   `plus.ts` (/subscriptions/*, /me/travel, /boosts), `ws.ts` (/ws; exports `websocket` for Bun.serve).
 - `src/dev/routes.ts` `devRoutes` is dynamically imported only when `config.devAuth`. Keep all dev-only code
   in `src/dev/*` and never import it statically from non-dev code.
-- `src/jobs/index.ts` `startJobs(): () => void` is called by `src/index.ts` (stub today).
+- `src/jobs/index.ts` `startJobs(): () => Promise<void>` is called by `src/index.ts`; timers live in `jobs/scheduler.ts`
+  (`createScheduler`: skip-while-running ticks, `jobs.heartbeat` every 10 min, `stop()` awaits a running tick ≤ 8 s).
+  Shutdown: `lib/shutdown.ts` `createShutdown(deps)` (stop listening → websockets 1012 → jobs → force-close after 2 s →
+  `sql.end` → exit; hard exit at 18 s; idempotent).
 - `src/types.ts` `AppEnv = { Variables: { userId: string; sessionId: string } }`.
 
 ## Conventions
@@ -61,7 +65,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `badRequest(message, code="validation_error")` 400 · `unauthorized(message?, code="unauthorized")` 401 ·
   `requiresPlus(message?)` 402 `requires_plus` · `forbidden()` 403 · `notFound()` 404 `not_found` ·
   `conflict(message, code="conflict")` 409 · `tooManyRequests(retryAfterSec)` 429 + `Retry-After` ·
-  `serviceUnavailable(code, message)` 503 (e.g. `subscriptions_unavailable`, `email_unavailable`).
+  `serviceUnavailable(code, message)` 503 (e.g. `subscriptions_unavailable`, `email_unavailable`) ·
+  `storageUnavailable()` 503 `storage_unavailable` + `Retry-After: 60` (media disk full / below its floor).
 - `onError` maps ZodError → 400 `validation_error` (message `path: issue`), Hono 413 → `payload_too_large`,
   unknown → 500 `internal_error` (no details in prod). `onNotFound` → 404.
 
@@ -98,8 +103,17 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   missing + blocked unless `includeBlocked` — only GET /blocks uses that). `profileFor(viewerId, id, opts) → ProfileJson|null`.
   Pass `rows` (from your own `profileColumns` query, e.g. nearby) to avoid a second users query.
 - `viewerCell(userId, db?) → Cell|null` (effective cell) · `photosFor(ownerIds, db?)`.
+- `OwnProfileJson` = Profile + `travel` (`travelJson(row)`: null | `{isActive}`), only for GET/PATCH /me (`ownProfile`
+  in me.ts); never put it on other people's profiles, and never add coordinates to it.
 - `messageJson(row, viewerId)` — status: recipient sees `read` when `read_at`; sender sees `read` only if
-  `read_receipt`; else `delivered` (delivered_at or read_at) else `sent`. Attachment `{kind:"photo", url|null, isViewOnce}`.
+  `read_receipt`; else `delivered` (delivered_at or read_at) else `sent`. Attachment
+  `{kind:"photo", url|null, isViewOnce, isEncrypted, openedAt|null}`. View-once: the sender never gets the `url`, and
+  gets `openedAt` only if `attachment_open_receipt` (the opener's sendReadReceipts at open time, migration 113).
+- View-once photos are opened only by `POST /conversations/:id/messages/:messageID/open` (recipient only, idempotent,
+  `viewOnceOpens` 60/min): it stamps `attachment_opened_at` (retention deletes the file VIEW_ONCE_GRACE_MS later) and
+  pushes `message.updated` (+ `conversation.updated`) to the sender when receipts allow. GET .../messages only marks
+  delivery; it must never stamp the open again. Never-opened ones are deleted `VIEW_ONCE_UNOPENED_CAP_MS` (3 days)
+  after sending, not after the 14-day unread-expiring cap.
 - `conversationJson({id, participant, lastMessage, unreadCount, updatedAt, isMuted})` · `privacyJson(row)`.
 - `ONLINE_WINDOW_MS` (5 min).
 
@@ -138,8 +152,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - `encodeCursor(value)` base64url JSON · `decodeCursor(raw, zodSchema)` → value | null; 400 `invalid_cursor`.
 
 ### ratelimit.ts
-- `LIMITS`: `auth` 10/min, `emailLink` 3/15 min, `messages` 60/min, `taps` 30/h, `reports` 10/h,
-  `photoUploads` 20/h, `general` 300/min.
+- `LIMITS`: `auth` 10/min, `emailLink` 3/15 min, `messages` 60/min, `taps` 30/h, `viewOnceOpens` 60/min,
+  `reports` 10/h, `photoUploads` 20/h, `general` 300/min.
 - `rateLimit(name, {key?, cost?})` middleware (key = userId if set, else `clientKey(c)`).
 - `consume(name, key, cost?)` throws 429; `tryConsume(...) → retryAfterSec|0`. For per-address email limits:
   `consume("emailLink", emailHmac(email).toString("base64url"))`.
@@ -170,6 +184,31 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Actions (one tx + `moderation_actions` audit row each): `hideAccount`, `unhideAccount`, `dismissReports`,
   `actionReports`, `banAccount`, `unbanAccount`; read: `reviewQueue`, `accountReview`, `auditLog`. CLI:
   `src/moderation/cli.ts` (`scripts/moderate.ts`). Tests: `overrideAutoHideForTests`.
+- `spam.ts` (spam heuristics, shadow limits; docs/security.md section 8; migration 112): `screenSentMessage(tx, …)` runs in
+  the send transaction after the insert (records `ContentPolicy.features` for plaintext, re-assesses, holds the message
+  via `messages.held_at` if the sender is limited and the recipient hasn't written). `reassessAfterSafetyEvent(id)` after
+  blocks/reports. Pure rules: `assessSpam(facts, settings)`. Moderator hooks `clearSpamLimit` / `confirmSpam` are called
+  by `dismissReports` / `actionReports` / `banAccount`; `runSpamJobs` is in the slow jobs. Any query that shows messages
+  to someone other than their sender must exclude held ones (`held_at IS NULL OR sender_id = viewer`; chat.ts
+  `visibleTo` does it). `notModerated` also hides limited accounts. System reports have `reports.source = 'spam'`.
+  A held message doesn't bump `conversations.updated_at` (loadConversations dates the sender's own list from it). A clear
+  `pg_notify`s `RELEASED_CHANNEL` with the released message ids; index.ts runs `listenForReleasedMessages()` (chat.ts),
+  which pushes them to connected recipients.
+  Metadata signals read the `spam_contacts` ledger (one row per sender+conversation, written in `screenSentMessage`,
+  updated by `deliverHeld`, purged by `runSpamJobs`), never live `messages` alone: messages can expire 1 s after being
+  read. Blockers/reporters only count for `blocked_after_first_contact` if trusted and independent (as auto-hide). A held
+  message keeps `delivered_at` (don't null it: the sender's status must look normal).
+  `handles.ts` loads the shared pattern table `content-rules.json` (copy it to `ios/Stexx/E2E/` after editing).
+  Tests: `overrideSpamForTests`.
+### moderator-alerts.ts (docs/security.md §5 "Alerts"; migration 114)
+- Off unless `MODERATOR_ALERT_EMAIL` (+ `SMTP_URL`) or `MODERATOR_ALERT_WEBHOOK_URL`. `runModeratorAlerts({now?, profileIds?})`
+  (jobs, every minute): per channel, a lease in `moderator_alert_channels`, debounce `MODERATOR_ALERT_INTERVAL_MINUTES`,
+  items = open reports with an alerted reason, still-hidden `auto_hide`s, open `blocklist` photo flags, created after the
+  channel was switched on and within 48 h, not yet in `moderator_alert_sent`. Retry backoff 1..60 min, failures logged
+  as a code only. `buildAlert(items, queue, now)` is pure: ids, reason codes, counts, commands. Never add names or content.
+- Tests: `setModeratorAlertsForTests({settings, senders, namespace})` (namespace keeps test channel rows apart).
+- Not wired into the write paths: the job reads `reports`, `moderation_actions`, `photo_flags` directly.
+
 ### photocheck/ (profile photo checks, see docs/security.md §6; migration 106)
 - `checkPhoto(jpeg) → {phash, nsfw}` never throws (null parts = unchecked). `checkColumns(check)` → INSERT values.
   `flagPhotoMatches(tx, {id, ownerId, phash})` → rows in `photo_flags` (duplicates on other accounts, blocklist).
@@ -179,6 +218,14 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Classifier: NudeNet 320n via onnxruntime-node, loaded lazily (`photoClassifier()` → null if off/missing).
   Tests: `setPhotoClassifierForTests(fake|null)`, `setPhotoPolicyForTests({...})`, `setHashBlocklistForTests`.
   Tests run with `PHOTO_CLASSIFIER=off`; `photo-checks.test.ts` also runs the real model if `models/` has it.
+- `review.ts` (migration 114): `listPhotoFlags`, `photoFlagReview` (prints file paths: CLI only, never an API), and the
+  audited decisions `clearPhotoFlag`, `hidePhotoForFlag`, `blocklistPhotoForFlag` (DB blocklist `photo_hash_blocklist`,
+  also matched by `flagPhotoMatches`; take `lockPhotoFlagging(tx)` first), `escalatePhotoFlag` (hide/ban account). CLI:
+  `src/moderation/photos-cli.ts` (`photos …`, `alerts …`), dispatched from `cli.ts`.
+- `photos.hidden_at` = hidden by a moderator: `visibleToOthers` excludes it; `photoJson` returns it to the owner with
+  `isExplicit: true`; chat refuses it as an attachment (400 `photo_hidden`). Hiding (`hide`/`blocklist`) copies the
+  file to a new key and trashes the old one so an already-shared URL dies. Select photos with `photoColumns` (it
+  includes `is_hidden`). `purgeModeratorAlertSent` also runs in `runSlowJobs`.
 
 ### e2e/ (end-to-end encryption keys and envelopes; docs/security.md section 7, contract in docs/api.md)
 - `keys.ts`: `e2eMode()` (`E2E_MODE` off|optional|required; tests `setE2eModeForTests`), `assertE2eEnabled()` (404
@@ -217,10 +264,15 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
   queue the file on delete or key change. `POST /reports` evidence `photoID` = the reporter's own pending **plaintext**
   upload (consumed in the report tx; encrypted/foreign/unknown id → 404). `accountReview` returns `photoPath`; only
   `moderation/cli.ts show` prints it. `purgeReportEvidence` drains the trash; the orphan sweep keeps `photo_key`s.
+- Write safety: stores and `copyMedia` write `<key>.<8 hex>.tmp` then rename; any failure deletes the temp file.
+  ENOSPC/EDQUOT → 503 `storage_unavailable` (`isOutOfSpace`). `assertMediaSpace()` (cached `statfs`, 10 s) fails
+  closed below `MEDIA_MIN_FREE_PERCENT`/`MEDIA_MIN_FREE_MB` (0 in tests). `sweepStaleTempFiles(now, {dir?})` (job
+  `mediaTmp`) unlinks `*.tmp` older than 1 h and logs `disk.low` under 15 %. Tests: `setMediaIoForTests({write, copy,
+  statfs})`, `setMediaMinFreeForTests`.
 - Caddy serves `.bin` only after `deploy.sh --sync-config`; do that before switching `E2E_MODE` to `optional`.
 - Dev peer: `scripts/e2e-peer.ts send --to <id> --photo f.jpg [--text …] [--expires s] [--view-once]` encrypts with
   `scripts/e2e-media-crypto.ts` (the format v1 reference, shared with `test/e2e-media.test.ts` and its shared test
-  vector); `read` decrypts and prints `photo: ok <n> bytes | tampered | gone`. With `--expires`, `send` also puts `expiresAfterSeconds` (integer 1..2592000) in the payload (the recipient key deadline); `read` prints it and tolerates its absence.
+  vector); `read` decrypts and prints `photo: ok <n> bytes | tampered | gone`; `read --open` also opens incoming view-once photos. With `--expires`, `send` also puts `expiresAfterSeconds` (integer 1..2592000) in the payload (the recipient key deadline); `read` prints it and tolerates its absence.
 
 ### plus.ts
 - `hasPlus(userId, db?)` · `requirePlus(userId, db?)` (402) · `plusStatus(userId) → {isActive, expiresAt}`.
@@ -232,7 +284,8 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 
 ### logger.ts
 - `requestLogger`, `logInfo(event, fields)`, `logError(event, err)`, `setLogSilent(bool)` (tests are silent unless
-  `STEXX_TEST_LOGS=1`).
+  `STEXX_TEST_LOGS=1`). `logError` logs class, pg `code`/`routine` and `redactMessage(err)` (quoted literals, emails,
+  tokens, coordinates, 7+ digit numbers stripped; ≤ 200 chars). Tests capture lines with `setLogSinkForTests(fn|null)`.
 
 ### time.ts / ids.ts / config.ts / db
 - `isoDate(d)`, `inMs(ms, from?)`, `SECOND/MINUTE/HOUR/DAY`, `FRACTIONAL_SECONDS_RE`.
@@ -255,7 +308,10 @@ expires_at; UNIQUE(sender_id, client_id)), reports (SET NULL FKs, priority norma
 (PK original_transaction_id), dev_bots (dev seed markers). Migration 107: users.hidden_at/hidden_reason/banned_at/reviewed_at, reports.closed_at/
 reporter_ip_hash, report_evidence (cascades with the report), moderation_actions (audit, SET NULL). Migration 109:
 e2e_devices (PK user_id, device_id=1), e2e_one_time_prekeys (kind ec|kyber), messages.envelope_type/envelope_body. Migration 111:
-attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers). Migration 117:
+attachment_uploads.encrypted, messages.attachment_encrypted, report_evidence.photo_key (+ trash triggers). Migration 113:
+messages.attachment_open_receipt. Migration 114:
+photos.hidden_at, photo_hash_blocklist, moderator_alert_channels/moderator_alert_sent; moderation_actions.action is a
+format CHECK (`^[a-z][a-z_]{0,31}$`) instead of a fixed list (photo_clear, photo_hide, photo_blocklist, photo_escalate). Migration 117:
 `travel_locations_cell_idx`; `locations.hide_distance` / `travel_locations.hide_distance` = a trigger-maintained copy of
 `users.hide_distance` (never write it yourself; partial indexes `*_hidden_cell_idx` for the nearby hideDistance arm);
 distance functions made inlinable.
@@ -272,3 +328,8 @@ Rules: the test DB is shared with concurrently running suites — **never trunca
 use `randomCell()` for anything location-based (helpers' users have no location unless given). Each request gets a
 random fake IP so unauthenticated rate limits don't collide; pass `ip` to test a limit. Test env: devAuth on,
 dev welcome/bots off, no dev default location.
+DDL in tests goes in a scratch schema (`test/scratch-schema.ts`: `createScratchSchema(purpose)` → `{name, url, db, drop}`,
+`url` pins `search_path` to it), never in `public`. `schema-guards.test.ts` fails when a migration adds a key to `users` (or to a
+table deleted with an account) that doesn't `ON DELETE CASCADE`, or a text column named like an id or a person (`ACCOUNT_COLUMN`)
+without a key; allowlist deliberate exceptions there with a reason. Ids under other names, in composite keys or jsonb aren't seen.
+`bun scripts/lint-migrations.ts` (CI) checks names, unique numbers, new numbers above `origin/main`'s, and warns on non-additive SQL.

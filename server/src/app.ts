@@ -2,6 +2,7 @@ import { Hono, type MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { config } from "./config.ts";
 import { sql } from "./db/sql.ts";
+import { AASA_PATH, appSiteAssociation } from "./lib/aasa.ts";
 import { authenticateAccessToken, bearerToken } from "./lib/auth.ts";
 import { ApiError, onError, onNotFound, tooManyRequests } from "./lib/errors.ts";
 import { requestLogger } from "./lib/logger.ts";
@@ -15,6 +16,7 @@ import { keysRoutes } from "./routes/keys.ts";
 import { meRoutes } from "./routes/me.ts";
 import { plusRoutes } from "./routes/plus.ts";
 import { safetyRoutes } from "./routes/safety.ts";
+import { tapsRoutes } from "./routes/taps.ts";
 import { wsRoutes } from "./routes/ws.ts";
 import type { AppEnv } from "./types.ts";
 
@@ -98,6 +100,15 @@ export async function createApp(): Promise<Hono<AppEnv>> {
     }
   });
 
+  // Passkeys: lets the iOS app use credentials for WEBAUTHN_RP_ID (lib/aasa.ts). Public, so cacheable; 404 until
+  // APPLE_TEAM_ID is set. Outside /v1, so neither the general rate limit nor the body limits apply (GET only).
+  app.get(AASA_PATH, (c) => {
+    const body = appSiteAssociation(config.apple.appId);
+    if (!body) return onNotFound(c);
+    c.header("Cache-Control", "public, max-age=3600");
+    return c.json(body, 200);
+  });
+
   if (!config.isProduction) {
     // Dev only: in production Caddy serves MEDIA_DIR at media.stexx.gay.
     app.get("/media/:key", async (c) => {
@@ -121,6 +132,7 @@ export async function createApp(): Promise<Hono<AppEnv>> {
   v1.route("/", chatRoutes);
   v1.route("/", keysRoutes);
   v1.route("/", safetyRoutes);
+  v1.route("/", tapsRoutes);
   v1.route("/", plusRoutes);
   v1.route("/", wsRoutes);
   if (config.devAuth) {

@@ -74,11 +74,12 @@ export function visibleToViewerInScan(viewerId: string, t: string): Fragment {
 
 /**
  * Moderation gate for LISTS of other users (nearby grid, viewers): TRUE unless the target row `t` is hidden pending
- * review (auto-hidden after reports, or by a moderator) or banned. No exceptions: a hidden account disappears from
- * discovery for everyone.
+ * review (auto-hidden after reports, or by a moderator), banned, or shadow-limited by the spam heuristics
+ * (lib/abuse/spam.ts). No exceptions: such an account disappears from discovery for everyone.
  */
 export function notModerated(t: string): Fragment {
-  return sql`(${sql(t + ".hidden_at")} IS NULL AND ${sql(t + ".banned_at")} IS NULL)`;
+  return sql`(${sql(t + ".hidden_at")} IS NULL AND ${sql(t + ".banned_at")} IS NULL
+              AND ${sql(t + ".spam_limited_at")} IS NULL)`;
 }
 
 /**
