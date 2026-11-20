@@ -295,10 +295,15 @@ describe("passkey login", () => {
     const second = await assertion(21);
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const lockHeld = new Promise<void>((r) => (locked = r));
     const holding = sql.begin(async (tx) => {
       await tx`SELECT id FROM staff_accounts WHERE id = ${s.id} FOR UPDATE`;
+      locked();
       await released;
     });
+    // Fire the requests only once the lock is held: otherwise one can reach the row first and never wait.
+    await Promise.race([lockHeld, holding]);
     const a = adminPost("/login/verify", { json: second });
     const b = adminPost("/login/verify", { json: first });
     await waitForLockWait(["staff_accounts", "FOR NO KEY UPDATE"], 2);
@@ -357,13 +362,18 @@ describe("passkey login", () => {
     const assertion = s.auth.assert((await optsRes.json()) as { challenge: string });
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const lockHeld = new Promise<void>((r) => (locked = r));
     // Plays disableStaff: lock the account row, disable it, commit once the sign-in is waiting on that row.
     const disabling = sql.begin(async (tx) => {
       await tx`SELECT id FROM staff_accounts WHERE id = ${s.id} FOR UPDATE`;
+      locked();
       await released;
       await tx`UPDATE staff_accounts SET disabled_at = now() WHERE id = ${s.id}`;
       await tx`UPDATE staff_sessions SET revoked_at = now() WHERE staff_id = ${s.id} AND revoked_at IS NULL`;
     });
+    // Fire the requests only once the lock is held: otherwise one can reach the row first and never wait.
+    await Promise.race([lockHeld, disabling]);
     const signingIn = adminPost("/login/verify", { json: assertion });
     await waitForLockWait(["staff_accounts", "FOR NO KEY UPDATE"]);
     release();
@@ -671,11 +681,16 @@ describe("step-up", () => {
     const mod = await makeStaff("moderator");
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const lockHeld = new Promise<void>((r) => (locked = r));
     const raising = sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('stexx staff accounts'))`;
+      locked();
       await released;
       await tx`UPDATE staff_accounts SET role = 'admin' WHERE id = ${mod.id}`;
     });
+    // Fire the requests only once the lock is held: otherwise one can reach the row first and never wait.
+    await Promise.race([lockHeld, raising]);
     const disabling = adminPost(`/staff/${mod.id}/disable`, { cookie: admin.session.cookie, csrf: admin.session.csrf, form: {} });
     await waitForLockWait(["pg_advisory_xact_lock", "stexx staff accounts"]);
     release();
@@ -694,12 +709,17 @@ describe("step-up", () => {
     // (which already passed the session check) are waiting on that lock.
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const lockHeld = new Promise<void>((r) => (locked = r));
     const disabling = sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('stexx staff accounts'))`;
+      locked();
       await released;
       await tx`UPDATE staff_accounts SET disabled_at = now() WHERE id = ${admin.id}`;
       await tx`UPDATE staff_sessions SET revoked_at = now() WHERE staff_id = ${admin.id} AND revoked_at IS NULL`;
     });
+    // Fire the requests only once the lock is held: otherwise one can reach the row first and never wait.
+    await Promise.race([lockHeld, disabling]);
     const inviting = adminPost("/staff/invite", { cookie: session.cookie, csrf: session.csrf, form: { handle: newHandle, role: "admin" } });
     const disablingMod = adminPost(`/staff/${mod.id}/disable`, { cookie: session.cookie, csrf: session.csrf, form: {} });
     await waitForLockWait(["pg_advisory_xact_lock", "stexx staff accounts"], 2);
@@ -909,11 +929,16 @@ describe("step-up", () => {
     const assertion = admin.auth.assert((await o.json()) as { challenge: string }, { counter: 12 });
     let release!: () => void;
     const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const lockHeld = new Promise<void>((r) => (locked = r));
     const signIn = sql.begin(async (tx) => {
       await tx`SELECT id FROM staff_passkeys WHERE staff_id = ${admin.id} FOR UPDATE`;
+      locked();
       await released;
       await tx`UPDATE staff_passkeys SET counter = 13 WHERE staff_id = ${admin.id}`;
     });
+    // Fire the requests only once the lock is held: otherwise one can reach the row first and never wait.
+    await Promise.race([lockHeld, signIn]);
     const verifying = adminPost("/step-up/verify", { cookie: admin.session.cookie, csrf: admin.session.csrf, json: assertion });
     await waitForLockWait(["UPDATE staff_passkeys", "counter"]);
     release();
