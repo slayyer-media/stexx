@@ -37,6 +37,8 @@ const SET_NULL_ALLOWLIST: Record<string, string> = {
   "moderation_actions.user_id": "the moderation audit trail survives account deletion, anonymized (107)",
   "photo_hash_blocklist.source_flag_id":
     "a moderator's blocklist entry outlives the flag (and account) it came from: that is what a blocklist is for; only the hash, a label and the moderator handle are kept (114)",
+  "staff_audit.target_user_id":
+    "the staff audit trail (who looked at or acted on an account) survives account deletion, anonymized like moderation_actions; the table is append-only apart from this (124)",
 };
 
 /**
@@ -62,6 +64,13 @@ const UNLINKED_ID_ALLOWLIST: Record<string, string> = {
   "photo_hash_blocklist.added_by": "a moderator's handle, never an account id (114)",
   "spam_contacts.conversation_id":
     "not a FK on purpose: the ledger row outlives a cleared thread or an expired message for its short TTL; it cascades through sender_id and other_id and expires after SPAM_BLOCKED_DAYS / SPAM_WINDOW_HOURS (112)",
+  "staff_audit.session_id": "a staff console session id (staff_sessions), never an account id; no FK because sessions are pruned and the append-only record stays (124)",
+  "staff_audit.target_ref":
+    "a report, photo flag, staff or session id; reports and flags may be deleted first and the append-only record stays; account ids go in target_user_id (124)",
+  "staff_audit.target_kind": "the kind of target (a closed list: account, report, photo_flag, staff, session), not an id (124)",
+  "staff_audit.ticket_ref": "an opaque external support ticket number, never an account id or an email (124)",
+  "staff_challenges.bound_target":
+    "the target id a per-action step-up is bound to (an account, report or staff id); the challenge expires after 5 minutes and is pruned (124)",
 };
 
 /**

@@ -250,6 +250,49 @@ Build spec is authoritative. This file documents the shared foundation. **Do not
 - Routes in `routes/keys.ts` (`/e2e/config`, `/keys*`). Tests: `test/e2e-helpers.ts` has a libsignal test client
   (`SignalDevice`) that registers, builds bundles, encrypts and decrypts, and `captureRealtime(userId)`.
 
+### src/admin/ and lib/staff/ (staff console; docs/security.md section 9; migration 124)
+- The console is its own process (`bun run admin`, `src/admin/index.ts`, 127.0.0.1:8788, no jobs, no websocket) built by
+  `createAdminApp()` in `src/admin/app.ts`. The public `createApp()` has no admin route and nothing outside `src/admin/`
+  may import it (`test/admin-guards.test.ts` checks both). Middleware order: headers, request log, network check
+  (loopback peer + forwarded address in `ADMIN_ALLOWED_CIDRS`, never stored), body limit, Origin check, session, route guard.
+- Every route is registered through `AdminRoutes` (`guard.ts`) as `"public"`, `"signed_in"` or a permission name from
+  `lib/staff/permissions.ts`. Add roles and step-up there, never an inline role check. Writes get the Origin and CSRF
+  checks for free; `stepUp: "recent"` is enforced for writes (a verified bound step-up also counts as recent); an
+  `"action"` step-up (`ACTION_STEP_UPS`, `auth/stepup.ts`) is spent with `spendActionStepUp(tx, ...)` inside the change's
+  own transaction, on the locked row (the `authorize`/`authorizeReinvite` hooks of `disableStaff`/`inviteStaff`), so a
+  refused change keeps the proof. The matrix test walks every route for every role.
+- Pages are `hono/jsx` in `views/`: no inline script or style (the CSP forbids both), no CDN, one vendored `static/passkey.js`.
+  Plain forms with a redirect after each write.
+- `lib/staff/accounts.ts` (invite, re-invite, disable, list; the rules for last admin and never yourself) is shared by the
+  console and `stexx-mod staff ...` (`src/moderation/staff-cli.ts`). `lib/staff/audit.ts` `staffAudit(tx, entry)` is the only
+  writer of `staff_audit`: no free text, refs are short ids, new action names go in `StaffAuditAction`. Write it in the same
+  transaction as the change it records. The table is append-only by trigger, so tests can't clean up: give staff in tests
+  unique handles and never truncate. A second trigger stamps `at` on insert; to backdate a row in a test, insert it with
+  `SET LOCAL session_replication_role = replica` (tests run as a superuser; production can't). The CLI's `--as` must be
+  an active admin once one exists (`cliActorRefusal`); the shared test database always has admins, so CLI tests act as a
+  `makeStaff("admin")` handle. `purgeStaffConsole` (jobs/retention.ts) is the staff retention job; its cutoffs are clamped
+  to the database clock, so a test can pass a future `now` without deleting other runs' sessions or links.
+  `readStaffAudit` (same module) is the reader, behind `stexx-mod staff audit`; record the read (`audit_view`).
+- Staff changes re-check the acting admin under the advisory lock (`StaffActorError`, a 403 in the console). The
+  passkey ceremonies pass SimpleWebAuthn counter 0 and check `counterWentBack` themselves after the signature: a
+  regression locks the passkey out (`lockOutCopiedPasskey`). Sign-in locks the account row FOR NO KEY UPDATE (FOR SHARE
+  deadlocked two overlapping sign-ins). Look up keyed tables with a `Map` or `Object.hasOwn`, never `obj[userInput]`.
+- Lock order: a transaction that writes a staff member's sessions, passkeys or challenges takes the staff_accounts row
+  FIRST (staff changes FOR UPDATE, sign-in and lockout FOR NO KEY UPDATE, step-up/logout/session revoke
+  `lockStaffAccountFirst` = FOR SHARE), because the closing `staffAudit` insert takes a key-share lock on that row and
+  would otherwise close a cycle with a concurrent disable or re-invite. New staff routes follow it; the "lock order"
+  tests race the real `disableStaff`/`inviteStaff` (their `authorize` hook) against a request.
+- Passkeys are removed only through `removeStaffPasskeys` (re-invite, lockout), which keeps the credential id in
+  `staff_removed_passkeys`; login's failure path resolves unknown credential ids there (`removedPasskeyOwner`), so a
+  copied key keeps showing up under its account. The last-admin rule's count takes a test-only `adminScope` (the shared
+  database always has other admins); the app never passes it.
+- Config is `config.admin` (`ADMIN_*`, docs/security.md section 9); `test/setup.ts` strips `ADMIN_*` from the environment.
+  A console-only mistake never throws from `loadConfig`: it sets `config.admin.error` (and `configured: false`), so the
+  API and `stexx-mod` keep working; `src/admin/index.ts`, `staff invite` and the deploy boot check report it.
+  Test helpers: `test/admin-helpers.ts` (`adminGet`/`adminPost`, `makeStaff(role)`, `signInDirect`, `enrolledStaff`, `auditActions`), `test/soft-authenticator.ts` (software passkey).
+- Production runs it as `stexx-admin.service` with settings in `/etc/stexx/admin.env`; `deploy.sh` leaves `src/admin/dev.ts`
+  (the passkey-less dev login, `ADMIN_DEV_AUTH`) out of the upload.
+
 ### media.ts
 - `sanitizeImage(bytes) → Buffer` (jpeg/png/webp/heif-if-supported → 400 `invalid_image` otherwise; 40 MP cap,
   rotate, strip metadata, ≤2048 px, JPEG q82 mozjpeg) · `storeJpeg(buf) → key` · `storeImage(bytes) → key`.

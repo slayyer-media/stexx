@@ -40,6 +40,7 @@ explicit or not at upload (see [Photo checks](../docs/security.md#6-photo-checks
 | `bun test [file]` | tests against a real Postgres database (`stexx_test`); the preload migrates it |
 | `bun run typecheck` / `check` | `tsc --noEmit` / typecheck + tests |
 | `bun run bench:nearby [-- --users 100000 --compare]` | benchmark `GET /v1/nearby` against `stexx_test` (synthetic users go in a throwaway schema; see [Performance](#performance)) |
+| `bun run admin` | the staff console, a separate process on `127.0.0.1:8788` ([`docs/security.md` section 9](../docs/security.md#9-staff-console)). Set `ADMIN_DEV_AUTH=1` in `.env` and run `db:seed` to sign in as `dev-admin` without a passkey |
 | `bun run moderate -- <command>` | moderator CLI: `list`, `show`, `dismiss`, `action`, `hide`, `unhide`, `ban`, `unban`, `purge`, `lift-email-ban`, `log` (see [`docs/security.md`](../docs/security.md#5-reports-auto-hide-and-moderation)) |
 
 Tests share one database with each other: they never truncate tables, they create unique users and use random location cells (`test/helpers.ts`).
@@ -58,7 +59,9 @@ src/lib/                errors, ids, time (isoDate), auth (tokens, sessions), se
                         logger, media (sharp pipeline, storage, trash), mailer, plus, realtime, validation
 src/routes/             auth, me, discovery, chat, safety, plus, ws   (one Hono router per group, mounted at /v1)
 src/jobs/               in-process retention jobs: expiry every 15 s, session/challenge/token and profile-view purges, boosts, report evidence, banned accounts past their review window, orphan media sweep
-src/moderation/         moderator CLI (entry point scripts/moderate.ts); rules in src/lib/moderation.ts
+src/moderation/         moderator CLI (entry point scripts/moderate.ts), incl. `staff invite|list|disable`; rules in src/lib/moderation.ts
+src/admin/              the staff console: its own Hono app and process (entry point index.ts), loopback only, reached over Tailscale; nothing outside it imports it
+src/lib/staff/          staff accounts, the permission matrix and the audit writer, shared by the console and the CLI
 src/dev/                dev-only: seed, welcome conversations, bot replies, /v1/dev/*  (dynamically imported only when STEXX_DEV_AUTH=1)
 migrations/NNN_*.sql    plain SQL, applied in order, one transaction each, tracked in schema_migrations
 test/                   bun test, real Postgres
@@ -191,6 +194,13 @@ Loaded from the process environment (Bun also reads `.env` in dev). `.env.exampl
 | `MODERATOR_ALERT_WEBHOOK_URL` | unset | Alert digests as a JSON POST (e.g. a self-hosted ntfy topic or Matrix bridge). https in production unless loopback. Never logged. |
 | `MODERATOR_ALERT_INTERVAL_MINUTES`, `MODERATOR_ALERT_REASONS` | `15`, `underage,threatsOrViolence,illegalContent` | At most one digest per channel per interval; which report reasons are alerted (auto-hides and blocklist photo flags always are). |
 | `TRUST_PROXY` | `1` | Trust `CF-Connecting-IP` / `X-Forwarded-For` only from a loopback peer; used transiently for hashed rate-limit keys. |
+| `ADMIN_HOST`, `ADMIN_PORT` | `127.0.0.1`, `8788` | Staff console bind address (its own process, `bun run admin`). Must be loopback in production; `ADMIN_PORT` must differ from `PORT`. In production the unit pins both, so `stexx.env` and `admin.env` must not set them. |
+| `ADMIN_ORIGIN` | dev: `http://localhost:8788` | The console's origin (`https`, no path), checked against `Origin` on every write. Required in production: without it the console refuses to start and the API is unaffected. |
+| `ADMIN_RP_ID`, `ADMIN_RP_NAME` | host of `ADMIN_ORIGIN`, `Stexx staff` | Staff passkey relying party. The id must equal `ADMIN_ORIGIN`'s host and differ from `WEBAUTHN_RP_ID`. Changing it means every staff member enrolls again. |
+| `ADMIN_ALLOWED_CIDRS` | Tailscale ranges (`100.64.0.0/10,fd7a:115c:a1e0::/48`); dev adds loopback | The forwarded client address must be inside one of these. Checked and dropped, never stored. |
+| `ADMIN_SESSION_IDLE_MINUTES`, `ADMIN_SESSION_ABSOLUTE_HOURS` | `30`, `8` | Console session limits (5..120 and 1..24; idle may not exceed absolute). |
+| `ADMIN_STEP_UP_MINUTES` | `5` | 1..15. How long a fresh passkey check counts for sensitive staff actions. |
+| `ADMIN_DEV_AUTH` | off | Dev only: sign in to the console as a seeded staff handle without a passkey. Needs a loopback `ADMIN_HOST`. **Production refuses to boot if set.** |
 | `STEXX_DEV_AUTH` | off | `/auth/register` returns a session; mounts `/v1/dev/*`. **Production refuses to boot if set.** |
 | `STEXX_DEV_DEFAULT_LOCATION` | unset | `lat,lon`; new dev users get this (snapped) cell. Production refuses. |
 | `STEXX_DEV_WELCOME`, `STEXX_DEV_BOTS` | off | Seeded accounts say hello / reply to messages. Production refuses. |
@@ -239,6 +249,6 @@ in the migration how such rows go away when the account does, and check it in re
 
 ## Deploying
 
-See [`deploy/README.md`](deploy/README.md): one-time `deploy.sh --bootstrap`, then `DEPLOY_HOST=you@host ./deploy/deploy.sh`. It type-checks and tests locally, uploads an immutable release,
+See [`deploy/README.md`](deploy/README.md): one-time `deploy.sh --bootstrap`, then `DEPLOY_HOST=you@host ./deploy/deploy.sh`. The staff console is optional and installed separately (`deploy.sh --sync-config --with-admin`, [Staff console](deploy/README.md#staff-console)); production settings for it live in `/etc/stexx/admin.env`, not `stexx.env`. It type-checks and tests locally, uploads an immutable release,
 installs dependencies with a frozen lockfile and no install scripts, validates the production config as the service user, takes a full encrypted snapshot (kept on the box for 24 h), migrates as the schema owner, flips a
 symlink, health-checks, and rolls back by itself on failure.

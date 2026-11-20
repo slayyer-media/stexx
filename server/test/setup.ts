@@ -39,6 +39,10 @@ for (const k of ["PHOTO_NSFW_MODEL", "PHOTO_NSFW_THRESHOLD", "PHOTO_NSFW_LABELS"
 for (const k of ["MODERATOR_ALERT_EMAIL", "MODERATOR_ALERT_WEBHOOK_URL", "MODERATOR_ALERT_INTERVAL_MINUTES", "MODERATOR_ALERT_REASONS"]) {
   delete process.env[k];
 }
+// Staff console: defaults (http://localhost:8788, RP id localhost), whatever the dev .env says.
+for (const k of Object.keys(process.env)) {
+  if (k.startsWith("ADMIN_")) delete process.env[k];
+}
 process.env.EMAIL_PEPPER ??= "test-pepper-test-pepper-test-pepper-0000";
 
 await migrate(testUrl, { quiet: true });

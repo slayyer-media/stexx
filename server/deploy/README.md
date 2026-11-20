@@ -19,17 +19,19 @@ watchdog every 5 minutes (`stexx-watch.timer`).
 | `Caddyfile.apex` | Optional: `stexx.gay` serving only `/.well-known/apple-app-site-association` (passkeys, email links) and the `/auth/email` fallback page, when the apex points at this box. Installed by hand as `/etc/caddy/sites/stexx-apex.caddy` (step 8). |
 | `Caddyfile.main` | Global options (Cloudflare trusted proxies, log filtering) + `import sites/*.caddy`. The whole `/etc/caddy/Caddyfile` on a dedicated box. |
 | `stexx-api.service` | The API, with strong systemd sandboxing. |
+| `stexx-admin.service` | Optional: the staff console (`src/admin`), same sandboxing plus no network except loopback. Settings in `/etc/stexx/admin.env`. See [Staff console](#staff-console-optional). |
+| `Caddyfile.admin` | Optional: the console's private site (its own port, tailnet only, no access log). Installed as `/etc/caddy/sites/stexx-admin.caddy` by `deploy.sh --sync-config --with-admin`; the public `Caddyfile` never mentions it. |
 | `stexx-backup.service` / `.timer` / `backup.sh` | Encrypted nightly backup; `backup.sh --pre-migrate` is the snapshot `deploy.sh` takes before migrating. |
 | `restore-drill.sh` | Runs on your laptop: fetch, decrypt, restore into a scratch database, sanity checks. Also the real restore. |
 | `stexx-watch.service` / `.timer` / `stexx-watch.sh` | Watchdog every 5 minutes, and the alert sender. |
 | `stexx-alert@.service` | `OnFailure=` target of the API, backup and watchdog units: alerts with the unit name. |
 | `selftest.sh` | Rehearses all of the above on a laptop (stubs, a fake SMTP/webhook, and a real database if you give it one). |
 | `postgres/` | `90-stexx.conf` (settings), `pg_hba-stexx.conf` (access), `roles.sql` (roles, once), `grants.sql` (re-applied each deploy). |
-| `system/` | journald retention, unattended-upgrades, fail2ban, sshd key-only, tmpfiles. |
-| `ufw-cloudflare.sh` | Firewall: ssh + Cloudflare-only 80/443. |
+| `system/` | journald retention, unattended-upgrades, fail2ban, sshd key-only, tmpfiles, and the Caddy drop-in for the optional console. |
+| `ufw-cloudflare.sh` | Firewall: ssh + Cloudflare-only 80/443. `--tailscale-admin` (opt-in) also opens the console's port on `tailscale0` only. |
 | `bootstrap.sh` | One-time provisioning. Idempotent. |
 | `deploy.sh` | Release, migrate, flip, health-check, roll back. |
-| `*.example` | `stexx.env`, `migrate.env`, `backup.env`, `watch.env`, `rclone.conf` references. |
+| `*.example` | `stexx.env`, `migrate.env`, `backup.env`, `watch.env`, `rclone.conf` references; `admin.env.example` and `caddy-admin.env.example` for the optional console. |
 
 ## First-time setup
 
@@ -69,9 +71,11 @@ watchdog every 5 minutes (`stexx-watch.timer`).
    - Verify what Apple sees: `curl -s https://app-site-association.cdn-apple.com/a/v1/stexx.gay` (the CDN caches for up to a day; a device
      re-checks on install and app update). Cloudflare must not redirect, challenge (bot fight mode, WAF) or rewrite that path.
 
+9. **Staff console** (optional, any time after the first deploy): private web console for moderators and support, reachable over Tailscale only. `bootstrap.sh` installs nothing of it; see [Staff console](#staff-console-optional).
+
 Day to day: `DEPLOY_HOST=you@host ./deploy/deploy.sh` (runs `bun run check` locally first), `--status`, `--list-releases`, `--rollback`.
 Config-only changes (units, Caddy site file, backup and watchdog scripts, tmpfiles rule): `--sync-config`. It also enables
-`stexx-watch.timer`.
+`stexx-watch.timer`. If the staff console is installed, deploy, rollback, `--status` and `--sync-config` cover it too.
 
 ## What each control protects
 
@@ -80,9 +84,10 @@ Config-only changes (units, Caddy site file, backup and watchdog scripts, tmpfil
 | Edge | Only Cloudflare can reach 80/443; ssh rate-limited; ufw logging **off** (blocked-packet logs would hold source IPs) | `ufw-cloudflare.sh` |
 | Edge | Caddy trusts `CF-Connecting-IP` only from Cloudflare's ranges, and overwrites the header it forwards, so clients cannot spoof the address the app hashes for rate limits (verified locally with a spoofed header) | `Caddyfile.main`, `Caddyfile` |
 | Edge | **No access logs.** No `log` directive in any site block; runtime error logs exclude `http.log.error` / `http.log.access` | `Caddyfile`, `Caddyfile.main` |
-| Edge | `/media*` and `/v1/dev*` return 404 on the API host even if the app ever mounted them; request bodies capped at 11 MB | `Caddyfile` |
+| Edge | `/media*`, `/v1/dev*` and `/admin*` return 404 on the API host even if the app ever mounted them; request bodies capped at 11 MB | `Caddyfile` |
 | Media | Only `GET`/`HEAD` of `/<32 lowercase hex>.jpg` (served `image/jpeg`) and `/<32 lowercase hex>.bin` (end-to-end encrypted chat photos, served `application/octet-stream`); everything else is a flat 404 (no listing, no dotfiles, no other extensions, case-sensitive). `nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, no `Last-Modified`/`ETag` (would leak upload time) | `Caddyfile` |
 | Process | `NoNewPrivileges`, empty `CapabilityBoundingSet`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, kernel/cgroup/clock protections, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `SystemCallFilter=@system-service` minus `@privileged`, `RestrictNamespaces`, `LockPersonality`, memory/task limits. Only `/srv/stexx/media` is writable. **`MemoryDenyWriteExecute` is intentionally absent** (Bun's JIT and libvips need W+X). Release code is root-owned and read-only to the service | `stexx-api.service` |
+| Console | Optional second unit `stexx-admin`: same sandbox as the API, `IPAddressDeny=any` except loopback, nothing writable, no jobs. Private site on its own port, open on `tailscale0` only, non-tailnet peers dropped by Caddy and again by the app; no access log | `stexx-admin.service`, `Caddyfile.admin`, `ufw-cloudflare.sh --tailscale-admin` |
 | Config | Production refuses to boot with any `STEXX_DEV_*` flag, a missing/short/default `EMAIL_PEPPER`, non-https URLs, `WEBAUTHN_RP_ID=localhost`, or the dev DB password. `deploy.sh` runs this validation as the service user *before* touching the live release, and never uploads `src/dev/` | `src/config.ts`, `deploy.sh` |
 | Database | Loopback only (`listen_addresses='localhost'`), scram-sha-256, `pg_hba` rules per role, `host stexx all all reject` as the catch-all. `stexx_app`: no DDL, cannot read `schema_migrations`, no superuser/createdb/createrole, connection limit 20, 30 s statement timeout. Migrations run as a different role (`stexx_owner`) from the deploy script only | `postgres/` |
 | Database | `log_statement=none`, `log_min_duration_statement=-1`, `log_error_verbosity=terse`: Postgres logs never contain values (checked: a unique-violation produced a bare `ERROR:` line with no `DETAIL`/`STATEMENT`) | `postgres/90-stexx.conf` |
@@ -93,7 +98,7 @@ Verify on the box after the first deploy:
 ```sh
 systemd-analyze verify /etc/systemd/system/stexx-api.service
 systemd-analyze security stexx-api            # expect a low exposure score; review anything flagged
-ss -tlnp | grep -E ':(22|80|443|5432|8787)\b'  # 5432 and 8787 must be 127.0.0.1 / ::1 only
+ss -tlnp | grep -E ':(22|80|443|5432|8787|8788)\b'  # 5432, 8787 and 8788 must be 127.0.0.1 / ::1 only
 sudo ufw status verbose                         # 80/443 only from Cloudflare ranges; logging: off
 sudo -u postgres psql -c '\du'                  # stexx_app has no Superuser/Create role/Create DB
 curl -sI https://api.stexx.gay/healthz          # 204 through Cloudflare
@@ -103,6 +108,52 @@ sudo journalctl -u caddy --since today | grep -c remote_ip           # 0: no add
 
 Not run on a real host while writing this: the unit sandbox (no Linux box was touched). If the service fails to start after a sandbox change, look for
 `EPERM`/`Operation not permitted` in `journalctl -u stexx-api` (denied syscalls return EPERM instead of killing the process) and relax one directive at a time.
+
+## Staff console (optional)
+
+A private web console for moderators and support (docs/security.md, section 9). It is a second systemd unit, `stexx-admin`, running the same release as the API on `127.0.0.1:8788`, with no jobs. People reach it over **Tailscale only**, through a Caddy site on its own port. A box that doesn't opt in is deployed exactly as before: `deploy.sh` touches nothing of the console unless the unit is installed.
+
+```
+staff laptop (Tailscale) -> https://<name>.<tailnet>.ts.net:8443 -> Caddy (cert from tailscaled, non-tailnet peers dropped)
+                         -> 127.0.0.1:8788 stexx-admin -> Postgres on 127.0.0.1
+```
+
+**Why port 8443 and not 443, and why no `bind`.** A Caddy site bound to the Tailscale address on 443 can't coexist with the unbound public sites: both want 443 and 80 (the automatic redirect), and Caddy fails with "address already in use". `caddy validate` passes; a reload fails; the next boot would leave Caddy, and the public API, down. So `Caddyfile.admin` listens on its own port and `selftest.sh` fails if anyone adds `bind` or moves it to 443. The private network is enforced by ufw (the port is open on `tailscale0` only), by Caddy (peers outside Tailscale's ranges are closed without an answer) and again by the app.
+
+**Pick the hostname once, and make it neutral.** Staff passkeys are bound to it (`ADMIN_RP_ID`). Renaming means every staff member enrolls again. It is also public: the certificate tailscaled gets for it is in Certificate Transparency logs, and `*.ts.net` names can resolve in public DNS (to the tailnet address, which only the tailnet reaches). Name the machine something that doesn't say "Stexx staff console" before the first invite.
+
+**Install** (after the first deploy; the server needs Tailscale installed and up):
+
+1. **Tailscale.** `tailscale up --advertise-tags=tag:stexx-server` (create the tag in the ACL first), enable **HTTPS certificates** for the tailnet (admin console, DNS page), and let Caddy ask tailscaled for the certificate: `TS_PERMIT_CERT_UID=caddy` in `/etc/default/tailscaled`, then `sudo systemctl restart tailscaled`. ACL: allow only tagged staff devices to reach the server's console port, for example
+   `{"acls": [{"action": "accept", "src": ["tag:stexx-staff"], "dst": ["tag:stexx-server:8443"]}]}`, and turn on tailnet lock (`tailscale lock init`). This is configured in Tailscale, not by anything in this repo.
+2. **Unit and example files.** From your machine: `DEPLOY_HOST=you@host ./deploy/deploy.sh --sync-config --with-admin`. The first run installs `stexx-admin.service` (not enabled or started: the first deploy enables it once its settings pass the boot check, so a reboot before `admin.env` exists can't crash-loop it) and puts `admin.env.example` and `caddy-admin.env.example` in `/etc/stexx/`. It does **not** install the Caddy site yet, and says so: that site needs a hostname first.
+3. **Settings on the server.** `sudo install -m 0644 /etc/stexx/caddy-admin.env.example /etc/stexx/caddy-admin.env` and `sudo install -m 0600 /etc/stexx/admin.env.example /etc/stexx/admin.env`, then fill them in: the tailnet name in `STEXX_ADMIN_HOST`, and `ADMIN_ORIGIN=https://<same name>:8443` in `admin.env`. A typo there only stops the console: the API and `stexx-mod` (which reads `admin.env` too) keep working, and the deploy's console boot check prints what is wrong. `stexx.env` and `admin.env` must not set `NODE_ENV`, `HOST`, `PORT`, `MEDIA_DIR`, `ADMIN_HOST` or `ADMIN_PORT`; the unit pins them.
+4. **Firewall and Caddy site.** Set `IPV6=yes` in `/etc/default/ufw` (the script refuses otherwise: ufw would leave IPv6 unfiltered), then `sudo ./ufw-cloudflare.sh --apply --tailscale-admin` on the server: it adds one rule, the console's port (read from `caddy-admin.env`) in on `tailscale0`, replacing any earlier one. Caddy listens on that port on every interface, so this rule is what keeps it off the public interface. Then run `deploy.sh --sync-config --with-admin` again: now it installs the private Caddy site and a systemd drop-in that gives Caddy `caddy-admin.env`, validates, and reloads, restoring the previous site files if either step fails. It installs the site only while ufw is active, filters IPv6 and has that rule for the port (and takes an installed site out again when that stops being true).
+5. **Start it.** `DEPLOY_HOST=you@host ./deploy/deploy.sh` enables and restarts the console next to the API and checks that it answers on loopback; it also boot-checks the console's settings first (a problem is a warning there and a failed start later, never a failed API). After that, `--status`, `--rollback` and every deploy include it.
+6. **First admin** (the one step that needs SSH). On the server, with the `stexx-mod` wrapper from docs/security.md (it reads `admin.env` too):
+   `stexx-mod staff invite admin-1 --role admin --as admin-1` prints a single-use link valid for 30 minutes. Open it on that person's own device over the tailnet and create a passkey. Invite everyone else from the console, and keep at least two admins: each person has one passkey today, and there is no self-service recovery. After this first admin exists, the CLI's `--as` must be an active admin's handle.
+
+**Check it** (from a tailnet device, then from outside):
+
+```sh
+sudo systemctl status stexx-admin --no-pager
+ss -tlnp | grep -E ':(8788|8443)\b'                     # 8788 on 127.0.0.1 only; 8443 is Caddy
+sudo ufw status | grep -E 'stexx-admin-tailscale'         # the one tailscale0 rule
+curl -s -o /dev/null -w '%{http_code}\n' https://<name>.<tailnet>.ts.net:8443/login   # 200 from a staff device
+curl -sk --max-time 5 https://<server public ip>:8443/ ; echo $?                       # from outside: no answer (timeout or reset)
+curl -6 -sk --max-time 5 'https://[<server public ipv6>]:8443/' ; echo $?              # same over IPv6, if the server has an address
+curl -s -o /dev/null -w '%{http_code}\n' https://api.stexx.gay/admin                  # 404: the public API has no console
+sudo journalctl -u stexx-admin --since today | grep -c -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'  # 0: no addresses in its logs
+systemd-analyze security stexx-admin
+```
+
+Not run against a real host while writing this: the unit, the Caddy site with a real tailscaled certificate, the ufw rule and the Tailscale ACL (no Linux box or tailnet was touched). Caddy's config validates and the site's listener and drop-peer logic were exercised locally; the `deploy.sh` and `selftest.sh` paths run against stubs.
+
+**Reading the audit log** (on the server): `stexx-mod staff audit --as <your admin handle>` prints the newest 50 rows; add a handle to see only what that account did and what was done to it (`stexx-mod staff audit mod-a --as admin-1 --limit 200`), or `--json`. Reading it is recorded too.
+
+**Turning it off:** `sudo systemctl disable --now stexx-admin`, remove `/etc/caddy/sites/stexx-admin.caddy`, `/etc/systemd/system/caddy.service.d/stexx-admin.conf` and `/etc/stexx/caddy-admin.env`, `sudo systemctl daemon-reload && sudo systemctl reload caddy`, and delete the ufw rule (`sudo ufw status numbered`, `sudo ufw delete N`). The staff tables stay (the audit log is kept). If only `caddy-admin.env` goes missing, Caddy still starts (the drop-in's env file is optional, so the public sites never depend on it), and the next `deploy.sh --sync-config` removes the console's site and drop-in.
+
+**Deploy safety nets:** the console is restarted only after the API passed its health check, so a deploy that rolls the API back leaves the console on the previous release too (a failed first deploy stops both). `--rollback` to a release from before the console stops and disables `stexx-admin` (no crash loop at the next boot); the next forward deploy enables it again. The console's boot check also compares `admin.env` with `caddy-admin.env` (same host, same port, no `CHANGE_ME` left) and fails the run at the end if they disagree, because a mismatch boots fine but refuses every sign-in, and a wrong host binds passkeys to the wrong name. In production `ADMIN_ORIGIN` must be a hostname (WebAuthn refuses an IP address) and not one of the public hosts.
 
 ## Postgres notes
 
@@ -136,6 +187,7 @@ Not run on a real host while writing this: the unit sandbox (no Linux box was to
 | Rows | In the backup? | Why |
 | --- | --- | --- |
 | `sessions`, `email_link_tokens`, `auth_challenges`, `attest_challenges` | **never** (fixed in `backup.sh`) | Credentials. A restore must not bring back live sessions or sign-in links, including those of accounts deleted after the backup. |
+| `staff_sessions`, `staff_challenges`, `staff_enrollments` | **never** (fixed in `backup.sh`) | Staff console credentials: sessions, WebAuthn challenges and single-use invite links. A restore must not bring back a live staff session or an invite that was spent after the backup. `staff_audit`, `staff_accounts` and `staff_passkeys` **are** backed up: the audit log is the accountability record, and staff need their accounts after a restore. |
 | `abuse_counters` | **never** | Rate-limit windows keyed by IP HMACs; they expire within two windows anyway. |
 | `e2e_one_time_prekeys` | **never** | A restored one-time prekey may already have been handed out and used. Bundles fall back to the last-resort prekey (in `e2e_devices`) until apps top up on launch. |
 | `report_evidence` | **never** | Plaintext a reporter chose to share, on its own 30-day clock; a restore never needs it. Fixed rather than configurable, so an older `backup.env` that sets `STEXX_BACKUP_EXCLUDE_DATA` can't put it back. |
@@ -246,6 +298,7 @@ access, and this repo.
      used the app.
    - **blocks:** a block placed after the backup is gone, so the two people can see and message each other again. Re-block.
    - **moderation bans:** a ban placed after the backup is gone and the account is live again. Re-run the ban through the moderation CLI (`bun run moderate`, on the box).
+   - **staff changes** (if the console is installed): a staff member disabled after the backup can sign in again, and one invited after it is missing. Check `stexx-mod staff list --as <your admin handle>` and re-run the disables and invites.
 
    If the old database is still reachable (undoing a migration, or a box that is broken but readable), compare before dropping it:
    `SELECT * FROM blocks WHERE created_at > '<backup time>'` and `SELECT * FROM moderation_actions WHERE created_at > '<backup time>'`, then re-apply them and re-run deletions
@@ -254,7 +307,7 @@ access, and this repo.
    `curl -sI https://api.stexx.gay/healthz` should show 204. (Same IP: `sudo systemctl start stexx-api` instead.)
 8. **Sessions and keys:** `--restore-into` already revoked every restored session and deleted pending sign-in links, and emptied the one-time prekeys, attestation challenges and
    rate-limit counters. Nightly backups contain none of these, so this matters for a pre-migrate snapshot or an older backup, but it happens on every real restore: a restore must
-   never bring back a live login or a used prekey. If the old box may be compromised, also follow "Suspected key leak" below (B2 key, age recipient, database passwords).
+   never bring back a live login, a used prekey or a live staff session (it also deletes pending staff invite links). If the old box may be compromised, also follow "Suspected key leak" below (B2 key, age recipient, database passwords).
 
 **What is lost:** everything after the backup (up to about a day with the nightly schedule), all **messages and chat photos**, all **media files** (profile photos show as broken until
 re-uploaded), every **location** (repopulates as apps report in), profile views, **taps**, report **free text and evidence**, and every **login** (people sign in again). One-time prekeys are
@@ -297,7 +350,8 @@ Rehearse it all on your laptop with `./deploy/selftest.sh` (fake HTTP, SMTP, TLS
 | --- | --- | --- |
 | `stexx-watch`, `stexx-alert` (journald) | check names, statuses, counts, paths and certificate dates. No user data | 7 days / 500 MB |
 | `stexx-api` (journald) | method, route *pattern*, status, duration; job counters; error events without request data. No bodies, query strings, tokens, IPs, user agents, emails, coordinates or message text | 7 days / 500 MB |
-| Caddy | startup/warning events only. No access log, no error-request log | 7 days |
+| `stexx-admin` (journald) | method, route *pattern*, status, duration; error events without request data. No bodies, paths with ids, query strings, tokens, IPs, user agents, handles or form values | 7 days / 500 MB |
+| Caddy | startup/warning events only. No access log, no error-request log (the console's site has none either) | 7 days |
 | Postgres | connection-less, statement-less, `terse` error lines | weekly rotation (see above) |
 | ufw | disabled | none |
 | fail2ban | ssh attackers' IPs for the ban window | `bantime` 1 h (7 d for repeat offenders) |
@@ -331,8 +385,8 @@ loading a missing model every 5 minutes) or restart. A malformed `PHOTO_HASH_BLO
 - **Bun:** change `BUN_VERSION` and re-run `bootstrap.sh` (it verifies the release checksum), then `systemctl restart stexx-api`.
 - **Dependencies:** `bun.lock` is installed with `--frozen-lockfile --ignore-scripts`; bump versions in a PR, run `bun run check`, deploy.
 - **OS / Postgres minors:** unattended. Majors: manual, with a backup first.
-- **Caddy site file / units / backup and watchdog scripts:** edit in the repo, `deploy.sh --sync-config` (validates the Caddy config and restores the previous site file if invalid).
-- **Secrets:** `/etc/stexx/stexx.env` edits take effect on `systemctl restart stexx-api`. Rotating a database password: `ALTER ROLE ... PASSWORD`, edit the env file, restart.
+- **Caddy site file / units / backup and watchdog scripts:** edit in the repo, `deploy.sh --sync-config` (validates the Caddy config and restores the previous site file if it is invalid or the reload fails).
+- **Secrets:** `/etc/stexx/stexx.env` edits take effect on `systemctl restart stexx-api` (and `stexx-admin`, if installed: it reads the same file). `/etc/stexx/admin.env` edits: `systemctl restart stexx-admin`. Rotating a database password: `ALTER ROLE ... PASSWORD`, edit the env file, restart.
   `EMAIL_PEPPER` cannot be rotated without orphaning email accounts.
 
 ## Incident notes
@@ -340,8 +394,9 @@ loading a missing model every 5 minutes) or restart. A malformed `PHOTO_HASH_BLO
 - API unhealthy after a deploy: `deploy.sh` already flipped back; read `journalctl -u stexx-api -n 100`.
 - A migration went wrong: [Undoing a bad migration](#before-a-migration-the-pre-migrate-snapshot). Lost box: [Disaster recovery runbook](#disaster-recovery-runbook).
 - Suspected key leak: rotate the B2 key and age recipient (new `backup-recipients.txt`; old dumps stay readable only with the old private key until they age out in 30 days),
-  rotate `stexx_app`/`stexx_owner` passwords, revoke all sessions (`UPDATE sessions SET revoked_at = now()` as `stexx_owner`).
-- Report handling lives in the `reports` table (`priority = 'high'` for under-18 reports); there is no admin UI in this repo yet.
+  rotate `stexx_app`/`stexx_owner` passwords, revoke all sessions (`UPDATE sessions SET revoked_at = now()` as `stexx_owner`, and `UPDATE staff_sessions SET revoked_at = now()` if the console is installed).
+- Report handling lives in the `reports` table (`priority = 'high'` for under-18 reports). Moderators use the CLI over SSH; the staff console (optional, below) covers sign-in and staff management so far, not moderation pages yet.
+- A staff member lost their device, or you suspect a console session: `stexx-mod staff disable <handle> --as <your admin handle> --yes` signs them out everywhere at once, or re-invite them to replace their passkey (another admin from the console, or `stexx-mod staff invite <handle> --role <role> --as <your admin handle> --yes`). If every admin is locked out, the CLI is the way back in: an admin re-invites their own handle, `stexx-mod staff invite admin-1 --role admin --as admin-1 --yes`, and opens the new link.
 
 ## App Store Server Notifications (Stexx+)
 

@@ -216,4 +216,6 @@ Next steps (see deploy/README.md):
   4. Alerts: copy /etc/stexx/watch.env.example -> watch.env (chmod 0600), set ALERT_EMAIL and/or ALERT_WEBHOOK_URL,
      then: /usr/local/sbin/stexx-watch --test-alert
   5. Restore drill from your laptop (deploy/restore-drill.sh) once backups run; see deploy/README.md.
+  6. Optional, later: the staff console (private, Tailscale only). Nothing of it is installed here. After the first deploy
+     see deploy/README.md, "Staff console", then: DEPLOY_HOST=user@host ./deploy/deploy.sh --sync-config --with-admin
 MSG

@@ -11,6 +11,9 @@ export const ID_PREFIX = {
   report: "r",
   challenge: "ch",
   device: "dv",
+  /** Staff console accounts and sessions (src/lib/staff, src/admin). Never linked to users. */
+  staff: "st",
+  staffSession: "ss",
 } as const;
 export type IdKind = keyof typeof ID_PREFIX;
 

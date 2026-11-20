@@ -59,6 +59,8 @@ export const LIMITS = {
    * so a flood of made-up tokens cannot buy itself fresh buckets or unlimited database lookups.
    */
   invalidAuth: { capacity: 120, windowMs: MINUTE },
+  /** Staff console passkey ceremonies (login, enrollment, step-up), per client. Staff sign in a few times a day. */
+  staffAuth: { capacity: 10, windowMs: MINUTE },
 } as const satisfies Record<string, LimitSpec>;
 export type LimitName = keyof typeof LIMITS;
 

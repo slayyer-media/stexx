@@ -40,6 +40,13 @@
 #   taps                                                             who tapped whom and when, deleted after
 #                                                                   TAP_RETENTION_DAYS (30); a restore starts with an
 #                                                                   empty taps inbox
+#   staff_sessions staff_challenges staff_enrollments                staff console credentials (migration 124): console
+#                                                                   sessions, WebAuthn challenges and the single-use
+#                                                                   invite tokens. A restore must not bring back a live
+#                                                                   staff session or a spent invite.
+#   (staff_audit, staff_accounts, staff_passkeys and staff_removed_passkeys ARE backed up: the audit log is the
+#   accountability record, the accounts and public passkey keys are what lets staff sign in again after a restore, and
+#   removed credential ids keep attempts with a copied passkey attributed to its account.)
 #   A name here that is not a table (yet) is fine: pg_dump ignores exclude patterns that match nothing (no
 #   --strict-names). The fixed list is not in EXCLUDE_DATA so an old backup.env that sets EXCLUDE_DATA can't put
 #   these back.
@@ -91,7 +98,7 @@ esac
 REMOTE="${STEXX_BACKUP_REMOTE:-b2:stexx-backups/db}"
 DB="${STEXX_BACKUP_DB:-stexx}"
 KEEP_DAYS="${STEXX_BACKUP_KEEP_DAYS:-28}"
-ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys report_evidence spam_message_features spam_contacts taps"
+ALWAYS_EXCLUDE="sessions email_link_tokens auth_challenges attest_challenges abuse_counters e2e_one_time_prekeys report_evidence spam_message_features spam_contacts taps staff_sessions staff_challenges staff_enrollments"
 EXCLUDE_DATA="${STEXX_BACKUP_EXCLUDE_DATA-messages media_trash locations travel_locations profile_views}"
 REDACT_REPORTS="${STEXX_BACKUP_REDACT_REPORTS:-1}"
 RECIPIENTS="${STEXX_BACKUP_RECIPIENTS:-/etc/stexx/backup-recipients.txt}"

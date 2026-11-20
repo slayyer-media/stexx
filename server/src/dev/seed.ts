@@ -3,13 +3,14 @@
  * AI-generated portraits of people who don't exist (DreamShaper 8, CreativeML OpenRAIL-M, made locally with
  * scripts/generate-seed-photos.py). Slots without a file, and "explicit" slots, get an abstract placeholder.
  *
- *   bun run db:seed            idempotent: only creates the profiles that don't exist yet
+ *   bun run db:seed            idempotent: only creates the profiles (and dev staff accounts) that don't exist yet
  *   bun run db:seed --reset    wipes every previously seeded profile (dev_bots) first, then reseeds
  *
  * Seeded accounts are marked in `dev_bots` (welcome conversations and bot replies use that table) and
  * carry a deterministic email_hmac (HMAC of `seed-<i>@stexx.dev`), which is what makes re-runs idempotent.
  * Never imported by production code paths; the CLI entry refuses to run unless config.devAuth.
  */
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import sharp from "sharp";
 import { config } from "../config.ts";
@@ -18,6 +19,7 @@ import { emailHmac } from "../lib/auth.ts";
 import { snapToCell, type Cell } from "../lib/distance.ts";
 import { newId } from "../lib/ids.ts";
 import { drainMediaTrash, storeJpeg } from "../lib/media.ts";
+import type { StaffRole } from "../lib/staff/permissions.ts";
 import { DAY, HOUR, MINUTE } from "../lib/time.ts";
 
 export const SF_CENTER = { latitude: 37.7749, longitude: -122.4194 };
@@ -294,6 +296,33 @@ export async function seedDevData(opts: SeedOptions = {}): Promise<SeedResult> {
   return result;
 }
 
+// ---- Staff console accounts ---------------------------------------------------
+
+/** One staff account per role, for the console's dev login (ADMIN_DEV_AUTH). Handles only, never names. */
+export const DEV_STAFF = [
+  { handle: "dev-support", role: "support" },
+  { handle: "dev-mod", role: "moderator" },
+  { handle: "dev-admin", role: "admin" },
+] as const;
+
+/**
+ * Create the dev staff accounts that don't exist yet (no passkeys: sign in with ADMIN_DEV_AUTH's dev login, or
+ * `stexx-mod staff invite <handle> --role <role> --as dev-admin --yes` for a passkey). Returns the handles created.
+ */
+export async function seedDevStaff(accounts: readonly { handle: string; role: StaffRole }[] = DEV_STAFF): Promise<string[]> {
+  if (config.isProduction) throw new Error("Refusing to seed in production");
+  const created: string[] = [];
+  for (const a of accounts) {
+    const rows = await sql`
+      INSERT INTO staff_accounts (id, handle, role, webauthn_user_id)
+      VALUES (${newId("staff")}, ${a.handle}, ${a.role}, ${randomBytes(32)})
+      ON CONFLICT DO NOTHING
+      RETURNING id`;
+    if (rows.length > 0) created.push(a.handle);
+  }
+  return created;
+}
+
 // ---- CLI ---------------------------------------------------------------------
 
 if (import.meta.main) {
@@ -304,8 +333,10 @@ if (import.meta.main) {
   const reset = process.argv.includes("--reset");
   try {
     const r = await seedDevData({ reset });
+    const staff = await seedDevStaff();
     console.log(
-      `Seed done: ${r.created.length} created, ${r.skipped} already present` + (reset ? `, ${r.removed} removed first` : "") + ".",
+      `Seed done: ${r.created.length} created, ${r.skipped} already present` + (reset ? `, ${r.removed} removed first` : "") +
+        `; ${staff.length} dev staff account(s) created.`,
     );
   } finally {
     await sql.end({ timeout: 5 });

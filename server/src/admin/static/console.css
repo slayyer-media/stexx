@@ -1,0 +1,58 @@
+/* Stexx staff console. Plain, readable, no external fonts or images. */
+:root {
+  color-scheme: light dark;
+  --bg: #fafafa;
+  --fg: #1b1b1f;
+  --muted: #5f6368;
+  --line: #d9d9de;
+  --accent: #5b3cc4;
+  --danger: #b3261e;
+  --ok-bg: #e8f5e9;
+  --warn-bg: #fff4e5;
+  --err-bg: #fdecea;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141417;
+    --fg: #ececf1;
+    --muted: #a0a0aa;
+    --line: #34343b;
+    --accent: #a48bff;
+    --danger: #ff8a80;
+    --ok-bg: #1e3a22;
+    --warn-bg: #3d2e12;
+    --err-bg: #4a1f1c;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header.top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 20px; border-bottom: 1px solid var(--line); }
+header.top .brand { font-weight: 600; }
+header.top nav { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+header.top a { color: var(--fg); text-decoration: none; }
+header.top a:hover { text-decoration: underline; }
+.who { color: var(--muted); }
+.role { font-size: 12px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+main { max-width: 960px; margin: 0 auto; padding: 16px 20px 48px; }
+h1 { font-size: 22px; margin: 8px 0 16px; }
+h2 { font-size: 17px; margin: 28px 0 8px; }
+table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+table.counts { max-width: 420px; }
+table.counts td { text-align: right; font-variant-numeric: tabular-nums; }
+form.inline { display: inline; margin: 0; }
+form label { display: inline-flex; gap: 6px; align-items: center; margin-right: 12px; }
+input, select, button { font: inherit; color: inherit; }
+input, select { padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: transparent; }
+button { padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: transparent; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--danger); border-color: var(--danger); }
+a.danger { color: var(--danger); }
+button.link { border: none; padding: 0; color: var(--fg); text-decoration: underline; }
+.flash, .notice, .error { padding: 8px 12px; border-radius: 6px; }
+.flash { background: var(--ok-bg); }
+.notice { background: var(--warn-bg); }
+.error { background: var(--err-bg); }
+.muted { color: var(--muted); }
+.tag { margin-left: 8px; font-size: 12px; color: var(--muted); }
+code.link-out { display: block; padding: 10px; border: 1px solid var(--line); border-radius: 6px; word-break: break-all; user-select: all; }

@@ -7,9 +7,14 @@
 #   ./deploy/deploy.sh --no-checks                        # skip local typecheck + tests
 #   ./deploy/deploy.sh --no-backup                        # skip the pre-migration snapshot (first deploy only)
 #   ./deploy/deploy.sh --sync-config                      # refresh systemd units, backup + watchdog scripts, Caddy site
+#   ./deploy/deploy.sh --sync-config --with-admin         # same, plus the staff console unit and its private Caddy site (opt-in)
 #   ./deploy/deploy.sh --bootstrap                        # one-time provisioning (runs deploy/bootstrap.sh as root)
 #   ./deploy/deploy.sh --list-releases | --status
 #   ./deploy/deploy.sh --rollback [NAME]                  # flip back to the previous (or named) release
+#
+# Staff console (stexx-admin, docs/security.md "Staff console"): optional and OFF until you install it once with
+# `--sync-config --with-admin` (STEXX_ADMIN=1 does the same). After that, every deploy, rollback and --status also
+# covers it: the same release, restarted next to the API. A box that never opted in is deployed exactly as before.
 #
 # Env: DEPLOY_HOST (required, user@host with passwordless sudo), APP_ROOT (/srv/stexx), KEEP_RELEASES (5),
 #      PUBLIC_HEALTH_URL (https://api.stexx.gay/healthz; set empty to skip), SSH_OPTS, BUN_LOCAL (bun).
@@ -22,7 +27,8 @@
 # /var/lib/stexx-premigrate/ (root-only, never uploaded, deleted after 24 h): that is what undoes a bad
 # migration (restore-drill.sh --restore-into, see README "Disaster recovery").
 #
-# Nothing here ships dev code: src/dev/ is excluded from the upload; tests and .env files never leave your machine.
+# Nothing here ships dev code: src/dev/ and src/admin/dev.ts (the console's passkey-less dev login) are excluded from the
+# upload; tests and .env files never leave your machine.
 
 set -euo pipefail
 
@@ -38,18 +44,21 @@ BUN="/usr/local/bin/bun"
 # shellcheck disable=SC2206  # intentional word splitting of user-supplied options
 SSH_OPTS_ARR=(-o BatchMode=yes -o ConnectTimeout=10 ${SSH_OPTS:-})
 
+ADMIN_SERVICE="stexx-admin"
 DRY=0 CHECKS=1 SYNC=0 BOOTSTRAP=0 LIST=0 STATUS=0 ROLLBACK=0 ROLLBACK_TO="" SKIP_BACKUP="${SKIP_BACKUP:-0}"
+WITH_ADMIN="${STEXX_ADMIN:-0}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)       DRY=1 ;;
     --no-checks)     CHECKS=0 ;;
     --no-backup)     SKIP_BACKUP=1 ;;
     --sync-config)   SYNC=1 ;;
+    --with-admin)    WITH_ADMIN=1 ;;
     --bootstrap)     BOOTSTRAP=1 ;;
     --list-releases) LIST=1 ;;
     --status)        STATUS=1 ;;
     --rollback)      ROLLBACK=1; case "${2:-}" in -*|"") ;; *) ROLLBACK_TO="$2"; shift ;; esac ;;
-    -h|--help)       sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
@@ -94,6 +103,39 @@ flip_to() { # flip_to <absolute release dir>: atomic symlink swap
   rrun "sudo ln -sfn '$1' '$CURRENT_LINK.new' && sudo mv -T '$CURRENT_LINK.new' '$CURRENT_LINK'"
 }
 
+# True when the staff console is installed on the server (its unit exists). Read-only, so it also runs under --dry-run.
+admin_installed() { rsh "systemctl cat $ADMIN_SERVICE >/dev/null 2>&1"; }
+
+# The console answers on loopback only. Any HTTP status means the process is up and listening (production answers 403
+# to a request without a tailnet forwarded address, 200 with one); 000 means nothing is listening. curl prints 000 AND
+# exits non-zero when the connection is refused, so its exit status is ignored and only a real 3-digit status counts
+# (a `|| echo 000` fallback would append to curl's own 000 and read as "up").
+admin_up() { # admin_up <tries>
+  local tries="${1:-15}" code i
+  for i in $(seq 1 "$tries"); do
+    code="$(rsh "curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H 'X-Forwarded-For: 100.64.0.1' 'http://127.0.0.1:8788/static/console.css' || true" 2>/dev/null || true)"
+    echo "  attempt $i: HTTP ${code:-none}"
+    [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# Restart the console without stopping the script (set -e): a console that fails to start (a bad admin.env, a start
+# limit) must never skip the API's health check and rollback. Sets ADMIN_FAILED=1 on failure; the run fails at the end.
+ADMIN_FAILED=0
+admin_restart() { # admin_restart [enable]
+  local enable=""
+  [ "${1:-}" = enable ] && enable="sudo systemctl enable $ADMIN_SERVICE >/dev/null 2>&1; "
+  if ! rrun "${enable}sudo systemctl restart $ADMIN_SERVICE"; then
+    ADMIN_FAILED=1
+    echo "  $ADMIN_SERVICE failed to start (see its journal below)" >&2
+  fi
+}
+
+# The console's entry point exists in a release (one from before the console has none). Read-only.
+admin_in_release() { rsh "sudo test -f '$1/src/admin/index.ts'"; } # admin_in_release <absolute release dir>
+
 preflight() {
   log "Preflight"
   rsh true || die "cannot reach $DEPLOY_HOST over ssh"
@@ -132,6 +174,7 @@ if [ "$STATUS" = 1 ]; then
   rsh "sudo bash -s" <<EOF
 echo "live release:   \$(readlink -f '$CURRENT_LINK' 2>/dev/null | xargs -r basename)"
 echo "$SERVICE:       \$(systemctl is-active $SERVICE)"
+if systemctl cat $ADMIN_SERVICE >/dev/null 2>&1; then echo "$ADMIN_SERVICE:    \$(systemctl is-active $ADMIN_SERVICE)"; else echo "$ADMIN_SERVICE:    not installed (optional: deploy.sh --sync-config --with-admin)"; fi
 echo "caddy:          \$(systemctl is-active caddy)"
 echo "postgresql:     \$(systemctl is-active postgresql)"
 echo "last backup:    \$(cat /var/lib/stexx-backup/last-success 2>/dev/null || echo NEVER)"
@@ -150,13 +193,24 @@ fi
 # --- sync config -------------------------------------------------------------------------------------------------
 if [ "$SYNC" = 1 ]; then
   preflight
-  log "Syncing systemd units, backup and watchdog scripts, tmpfiles rule and Caddy site file"
+  # The console is refreshed when it is already installed, or installed now with --with-admin. Otherwise nothing about it
+  # is touched (the public site file never mentions it either way).
+  ADMIN=0
+  if [ "$WITH_ADMIN" = 1 ] || admin_installed; then ADMIN=1; fi
+  log "Syncing systemd units, backup and watchdog scripts, tmpfiles rule and Caddy site file$([ "$ADMIN" = 1 ] && echo ", staff console unit and private site")"
   TMP_REMOTE="/tmp/stexx-config-$$"
-  if [ "$DRY" = 1 ]; then echo "  [dry-run] install units, stexx-backup, stexx-watch, tmpfiles rule, watch.env.example, sites/stexx.caddy; enable stexx-watch.timer; validate caddy; reload"; exit 0; fi
+  if [ "$DRY" = 1 ]; then
+    echo "  [dry-run] install units, stexx-backup, stexx-watch, tmpfiles rule, watch.env.example, sites/stexx.caddy; enable stexx-watch.timer; validate caddy; reload"
+    if [ "$ADMIN" = 1 ]; then echo "  [dry-run] plus stexx-admin.service, sites/stexx-admin.caddy, caddy drop-in for /etc/stexx/caddy-admin.env, admin.env.example"; fi
+    exit 0
+  fi
   rsh "mkdir -p $TMP_REMOTE"
-  rsync -az -e "ssh ${SSH_OPTS_ARR[*]}" deploy/stexx-api.service deploy/stexx-backup.service deploy/stexx-backup.timer \
-    deploy/stexx-watch.service deploy/stexx-watch.timer deploy/stexx-alert@.service deploy/stexx-watch.sh \
-    deploy/watch.env.example deploy/system/tmpfiles-stexx.conf deploy/backup.sh deploy/Caddyfile "$DEPLOY_HOST:$TMP_REMOTE/"
+  SYNC_FILES=(deploy/stexx-api.service deploy/stexx-backup.service deploy/stexx-backup.timer
+    deploy/stexx-watch.service deploy/stexx-watch.timer deploy/stexx-alert@.service deploy/stexx-watch.sh
+    deploy/watch.env.example deploy/system/tmpfiles-stexx.conf deploy/backup.sh deploy/Caddyfile)
+  if [ "$ADMIN" = 1 ]; then SYNC_FILES+=(deploy/stexx-admin.service deploy/Caddyfile.admin deploy/admin.env.example deploy/caddy-admin.env.example
+    deploy/system/caddy-admin-dropin.conf); fi
+  rsync -az -e "ssh ${SSH_OPTS_ARR[*]}" "${SYNC_FILES[@]}" "$DEPLOY_HOST:$TMP_REMOTE/"
   rscript <<EOF
 set -e
 cd '$TMP_REMOTE'
@@ -172,16 +226,73 @@ systemctl enable --now stexx-watch.timer >/dev/null 2>&1
 echo '  stexx-watch.timer enabled (alerting stays off until /etc/stexx/watch.env sets ALERT_EMAIL or ALERT_WEBHOOK_URL)'
 cp -p /etc/caddy/sites/stexx.caddy /etc/caddy/sites/stexx.caddy.prev 2>/dev/null || true
 install -m 0644 Caddyfile /etc/caddy/sites/stexx.caddy
-if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
-  systemctl reload caddy; echo '  caddy reloaded'
+SITE=0
+if [ '$ADMIN' = 1 ]; then
+  install -m 0644 stexx-admin.service /etc/systemd/system/stexx-admin.service
+  install -m 0644 admin.env.example /etc/stexx/admin.env.example
+  install -m 0644 caddy-admin.env.example /etc/stexx/caddy-admin.env.example
+  systemctl daemon-reload
+  # Not enabled here: until admin.env is filled in, a reboot (unattended upgrades reboot at 04:30) would start it into a
+  # crash loop and an alert. The first deploy enables it once its settings pass the boot check (admin_restart enable).
+  echo '  $ADMIN_SERVICE.service installed (not enabled or started yet: fill in /etc/stexx/admin.env, then deploy; the deploy enables it)'
+  # Caddy needs the console's tailnet hostname from /etc/stexx/caddy-admin.env (no secrets). Without it the site file
+  # would fail validation and block every Caddy reload, so the private site waits until that file exists.
+  # The site listens on every interface (no bind, see Caddyfile.admin), so it also waits for the firewall that keeps its
+  # port off the public interface: ufw active, filtering IPv6 too, with the tailscale0 rule for this very port
+  # (ufw-cloudflare.sh --apply --tailscale-admin). Without that, Caddy's abort and the app's checks would be all that is
+  # left, after a TLS handshake with anyone on the internet.
+  ADMIN_FIREWALL=''
+  if [ -s /etc/stexx/caddy-admin.env ]; then
+    ADMIN_SITE_PORT="\$(. /etc/stexx/caddy-admin.env; printf '%s' "\${STEXX_ADMIN_PORT:-8443}")"
+    if ! ufw status 2>/dev/null | head -1 | grep -q 'Status: active'; then
+      ADMIN_FIREWALL='ufw is not active'
+    elif ! grep -q '^IPV6=yes' /etc/default/ufw 2>/dev/null; then
+      ADMIN_FIREWALL='IPV6=yes is not set in /etc/default/ufw, so ufw leaves IPv6 unfiltered'
+    elif ! ufw status 2>/dev/null | grep -E "^\$ADMIN_SITE_PORT/tcp +on tailscale0 " | grep -q 'stexx-admin-tailscale'; then
+      ADMIN_FIREWALL="ufw has no stexx-admin-tailscale rule for port \$ADMIN_SITE_PORT on tailscale0"
+    fi
+  fi
+  if [ -s /etc/stexx/caddy-admin.env ] && [ -z "\$ADMIN_FIREWALL" ]; then
+    SITE=1
+    # A drop-in, so the stock caddy.service stays untouched.
+    install -D -m 0644 caddy-admin-dropin.conf /etc/systemd/system/caddy.service.d/stexx-admin.conf
+    systemctl daemon-reload
+    cp -p /etc/caddy/sites/stexx-admin.caddy /etc/caddy/sites/stexx-admin.caddy.prev 2>/dev/null || true
+    install -m 0644 Caddyfile.admin /etc/caddy/sites/stexx-admin.caddy
+    # The shell validating the config must see the same values Caddy gets, or {\$STEXX_ADMIN_HOST} is empty.
+    set -a; . /etc/stexx/caddy-admin.env; set +a
+  else
+    if [ -n "\$ADMIN_FIREWALL" ]; then
+      echo "  \$ADMIN_FIREWALL, so the private Caddy site is NOT installed (it would listen on the public interface too). On the server: sudo ./ufw-cloudflare.sh --apply --tailscale-admin (with IPV6=yes in /etc/default/ufw), then run --sync-config again." >&2
+    else
+      echo '  /etc/stexx/caddy-admin.env is missing, so the private Caddy site is NOT installed yet. Copy /etc/stexx/caddy-admin.env.example there, set STEXX_ADMIN_HOST, and run --sync-config again.' >&2
+    fi
+    # Installed earlier and the settings file removed since (turned off, or a restore without it), or the firewall
+    # turned off since: take the site and the drop-in out too, so nothing about the console is left listening or for
+    # Caddy to trip over at its next restart.
+    if [ -e /etc/caddy/sites/stexx-admin.caddy ] || [ -e /etc/systemd/system/caddy.service.d/stexx-admin.conf ]; then
+      rm -f /etc/caddy/sites/stexx-admin.caddy /etc/caddy/sites/stexx-admin.caddy.prev /etc/systemd/system/caddy.service.d/stexx-admin.conf
+      systemctl daemon-reload
+      echo '  removed the console'"'"'s Caddy site and drop-in (see above)'
+    fi
+  fi
+fi
+# validate does not open listeners, so a reload can still fail (a port clash): that restores the files too, because a
+# site file Caddy cannot start with would stop it at the next boot.
+if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 && systemctl reload caddy; then
+  echo '  caddy reloaded'
 else
-  echo '  caddy config INVALID; restoring previous site file' >&2
+  echo '  caddy config INVALID or reload failed; restoring previous site file(s)' >&2
   if [ -f /etc/caddy/sites/stexx.caddy.prev ]; then mv /etc/caddy/sites/stexx.caddy.prev /etc/caddy/sites/stexx.caddy; fi
+  if [ "\$SITE" = 1 ]; then
+    if [ -f /etc/caddy/sites/stexx-admin.caddy.prev ]; then mv /etc/caddy/sites/stexx-admin.caddy.prev /etc/caddy/sites/stexx-admin.caddy; else rm -f /etc/caddy/sites/stexx-admin.caddy; fi
+  fi
   exit 1
 fi
 rm -rf '$TMP_REMOTE'
 EOF
   echo "  units installed. The running API keeps its old sandbox until the next restart: sudo systemctl restart $SERVICE"
+  if [ "$ADMIN" = 1 ]; then echo "  The console is restarted by the next deploy (or: sudo systemctl restart $ADMIN_SERVICE)."; fi
   exit 0
 fi
 
@@ -200,14 +311,42 @@ if [ "$ROLLBACK" = 1 ]; then
   echo "  target: $TARGET"
   flip_to "$RELEASES_DIR/$TARGET"
   rrun "sudo systemctl restart $SERVICE"
+  # The console follows only when the target release has it; an older release predates it, so it is stopped (instead of
+  # crash-looping on a missing file). Its tables stay, like every migration.
+  ADMIN_ROLLBACK=none
+  if admin_installed; then
+    if admin_in_release "$RELEASES_DIR/$TARGET"; then
+      ADMIN_ROLLBACK=restart
+      admin_restart enable   # enabled again if an earlier rollback to a pre-console release disabled it
+    else
+      ADMIN_ROLLBACK=stop
+      # Disabled too, or it would crash-loop on the missing file at the next boot and page the operator. The next
+      # forward deploy enables it again (admin_restart enable).
+      echo "  $TARGET has no staff console (src/admin): stopping and disabling $ADMIN_SERVICE"
+      rrun "sudo systemctl disable --now $ADMIN_SERVICE" || true
+    fi
+  fi
   [ "$DRY" = 1 ] && exit 0
   health_ok || { rsh "sudo journalctl -u $SERVICE -n 40 --no-pager" >&2 || true; die "STILL UNHEALTHY after rollback to $TARGET"; }
+  if [ "$ADMIN_ROLLBACK" = restart ] && { [ "$ADMIN_FAILED" = 1 ] || ! admin_up 10; }; then
+    rsh "sudo journalctl -u $ADMIN_SERVICE -n 40 --no-pager" >&2 || true
+    die "rolled back to $TARGET and the API is healthy, but $ADMIN_SERVICE is not answering (journal above)"
+  fi
   log "Rolled back to $TARGET (database migrations were not reverted)"
   exit 0
 fi
 
 # --- deploy ------------------------------------------------------------------------------------------------------
 preflight
+
+# The console follows the API only on a box that installed it (--sync-config --with-admin). A first-time request
+# without the unit would fail at restart, so say so now.
+ADMIN=0
+if admin_installed; then
+  ADMIN=1
+elif [ "$WITH_ADMIN" = 1 ]; then
+  die "--with-admin: $ADMIN_SERVICE is not installed on $DEPLOY_HOST. Run once: DEPLOY_HOST=$DEPLOY_HOST $0 --sync-config --with-admin"
+fi
 
 if [ "$CHECKS" = 1 ]; then
   log "Local checks (typecheck + tests; needs the dev database: bun run db:up)"
@@ -226,7 +365,7 @@ rrun "sudo mkdir -p '$NEW'"
 # (scripts/moderate.ts is added below.)
 # certs/ holds Apple's public root CA for StoreKit verification (APPLE_ROOT_CA_DIR=/srv/stexx/current/certs).
 for item in src migrations certs; do
-  sync_to "$item" "$NEW/" --exclude='/src/dev/' --exclude='*.test.ts'
+  sync_to "$item" "$NEW/" --exclude='/src/dev/' --exclude='/src/admin/dev.ts' --exclude='*.test.ts'
 done
 for item in package.json bun.lock tsconfig.json bunfig.toml; do
   sync_to "$item" "$NEW/"
@@ -270,6 +409,51 @@ cd '$NEW'
 HOME=/nonexistent exec setpriv --reuid=stexx --regid=stexx --clear-groups $BUN -e 'await import("./src/config.ts"); console.log("  production config ok")'
 EOF
 
+if [ "$ADMIN" = 1 ]; then
+  log "Boot check for the staff console (its own settings from /etc/stexx/admin.env; a problem never stops the API, but fails the run at the end)"
+  # Also checks that admin.env and caddy-admin.env name the same host and port, and that no CHANGE_ME placeholder is
+  # left: a mismatch boots fine and passes every health check, but every sign-in is refused (wrong Origin), and a
+  # wrong host binds passkeys to the wrong relying party (a one-way door). Exit 3 = such a mismatch.
+  set +e
+  rscript <<EOF
+export NODE_ENV=production HOST=127.0.0.1 PORT=8787 MEDIA_DIR='$APP_ROOT/media' ADMIN_HOST=127.0.0.1 ADMIN_PORT=8788
+set -a; . /etc/stexx/stexx.env; [ -f /etc/stexx/admin.env ] && . /etc/stexx/admin.env; set +a
+if [ -f /etc/stexx/caddy-admin.env ]; then
+  STEXX_CHECK_CADDY_HOST="\$(. /etc/stexx/caddy-admin.env; printf '%s' "\${STEXX_ADMIN_HOST:-}")"
+  STEXX_CHECK_CADDY_PORT="\$(. /etc/stexx/caddy-admin.env; printf '%s' "\${STEXX_ADMIN_PORT:-8443}")"
+  export STEXX_CHECK_CADDY_HOST STEXX_CHECK_CADDY_PORT
+else
+  echo "  note: no /etc/stexx/caddy-admin.env yet, so the console has no Caddy site (deploy/README.md, Staff console)" >&2
+fi
+cd '$NEW'
+HOME=/nonexistent setpriv --reuid=stexx --regid=stexx --clear-groups $BUN -e '
+const { config } = await import("./src/config.ts");
+if (config.admin.error) { console.error("  console config refused: " + config.admin.error); process.exit(1); }
+if (!config.admin.configured) { console.error("  console config incomplete: set ADMIN_ORIGIN in /etc/stexx/admin.env"); process.exit(1); }
+const origin = new URL(config.admin.origin);
+const host = process.env.STEXX_CHECK_CADDY_HOST;
+const port = process.env.STEXX_CHECK_CADDY_PORT || "8443";
+const problems = [];
+if (/CHANGE_ME/i.test(origin.hostname)) problems.push("ADMIN_ORIGIN in admin.env still has the CHANGE_ME placeholder");
+if (host !== undefined) {
+  if (!host || /CHANGE_ME/i.test(host)) problems.push("STEXX_ADMIN_HOST in caddy-admin.env is unset or still CHANGE_ME");
+  else if (host.toLowerCase() !== origin.hostname.toLowerCase()) problems.push("ADMIN_ORIGIN host " + origin.hostname + " differs from STEXX_ADMIN_HOST " + host);
+  if ((origin.port || "443") !== port) problems.push("ADMIN_ORIGIN port " + (origin.port || "443") + " differs from STEXX_ADMIN_PORT " + port);
+}
+if (problems.length) { for (const p of problems) console.error("  " + p); process.exit(3); }
+console.log("  console config ok (" + config.admin.origin + ")");
+'
+EOF
+  rc=$?
+  set -e
+  if [ "$rc" = 3 ]; then
+    ADMIN_FAILED=1
+    echo "  WARNING: admin.env and caddy-admin.env disagree (above): sign-ins would fail. Fix them before anyone enrolls." >&2
+  elif [ "$rc" != 0 ]; then
+    echo "  WARNING: $ADMIN_SERVICE will refuse to start with this configuration (see above)" >&2
+  fi
+fi
+
 if [ "$SKIP_BACKUP" != 1 ]; then
   log "Full encrypted snapshot before migrating (local to the server, root-only, deleted after 24 h, never uploaded)"
   # The nightly backup leaves rows out (messages, sessions, locations, ...), so it cannot undo a migration; this can.
@@ -300,7 +484,8 @@ flip_to "$NEW"
 rrun "sudo systemctl enable $SERVICE >/dev/null 2>&1; sudo systemctl restart $SERVICE"
 
 if [ "$DRY" = 1 ]; then
-  echo "  [dry-run] health check, prune to $KEEP_RELEASES releases"
+  echo "  [dry-run] health check$([ "$ADMIN" = 1 ] && echo " (API, then $ADMIN_SERVICE)"), prune to $KEEP_RELEASES releases"
+  if [ "$ADMIN" = 1 ]; then admin_restart enable; fi
   exit 0
 fi
 
@@ -308,6 +493,8 @@ log "Health check"
 if ! health_ok 20; then
   echo "unhealthy: rolling back" >&2
   rsh "sudo journalctl -u $SERVICE -n 40 --no-pager" >&2 || true
+  # The console has not been restarted on this release (that waits for a healthy API below), so it is still running
+  # the previous release's code, which `current` points at again after the flip.
   if [ -n "$PREV" ]; then
     flip_to "$PREV"
     rsh "sudo systemctl restart $SERVICE"
@@ -315,7 +502,21 @@ if ! health_ok 20; then
     die "deploy of $STAMP failed AND the rollback is unhealthy; investigate now"
   else
     rsh "sudo systemctl stop $SERVICE" || true
-    die "first deploy failed; service stopped. Read the journal above."
+    if [ "$ADMIN" = 1 ]; then rsh "sudo systemctl stop $ADMIN_SERVICE" || true; fi
+    die "first deploy failed; service$([ "$ADMIN" = 1 ] && echo "s") stopped. Read the journal above."
+  fi
+fi
+
+# The console follows the API onto the new release only once the API is healthy, so the two always run the same
+# release. It is a separate process: a failure here never rolls the API back (the release is already live and
+# healthy), but it fails the run at the end so it is not missed (admin_restart sets ADMIN_FAILED).
+if [ "$ADMIN" = 1 ]; then
+  admin_restart enable
+  log "Staff console check ($ADMIN_SERVICE on 127.0.0.1:8788)"
+  if [ "$ADMIN_FAILED" = 1 ] || ! admin_up 15; then
+    ADMIN_FAILED=1
+    echo "  $ADMIN_SERVICE is not answering" >&2
+    rsh "sudo journalctl -u $ADMIN_SERVICE -n 40 --no-pager" >&2 || true
   fi
 fi
 
@@ -333,4 +534,5 @@ done
 true
 EOF
 
+[ "$ADMIN_FAILED" = 0 ] || die "deployed $STAMP and the API is healthy, but $ADMIN_SERVICE failed its config check or did not start (see above). Fix /etc/stexx/admin.env (and caddy-admin.env), then: sudo systemctl restart $ADMIN_SERVICE"
 log "Deployed $STAMP"

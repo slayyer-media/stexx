@@ -332,12 +332,17 @@ if command -v rclone >/dev/null; then
     bash "$HERE/backup.sh" > "$T/stub-nightly" 2>&1; echo $? > "$T/stub-nightly.rc"
   echo "  nightly with an old STEXX_BACKUP_EXCLUDE_DATA:"; show "$T/stub-nightly"
   check "nightly (stub) exits 0" has "$T/stub-nightly.rc" 0
-  for t in report_evidence sessions e2e_one_time_prekeys abuse_counters attest_challenges spam_message_features spam_contacts taps messages; do
+  for t in report_evidence sessions e2e_one_time_prekeys abuse_counters attest_challenges spam_message_features spam_contacts taps messages \
+           staff_sessions staff_challenges staff_enrollments; do
     check "old EXCLUDE_DATA still leaves out $t" grep -qx -- "--exclude-table-data=$t" "$T/stub-args"
+  done
+  # The staff audit log, accounts and passkeys are the accountability record: they stay in the backup.
+  for t in staff_audit staff_accounts staff_passkeys; do
+    check "backup keeps $t rows" bash -c "! grep -qx -- '--exclude-table-data=$t' '$T/stub-args'"
   done
   "${SB[@]}" STEXX_BACKUP_REMOTE="$T/stub-remote" STATE_DIRECTORY="$T/stub-state" RCLONE_CONFIG="$T/stub-rclone.conf" \
     STEXX_BACKUP_REDACT_REPORTS=0 STEXX_BACKUP_EXCLUDE_DATA="" bash "$HERE/backup.sh" > "$T/stub-empty" 2>&1
-  for t in report_evidence spam_message_features spam_contacts taps; do
+  for t in report_evidence spam_message_features spam_contacts taps staff_sessions staff_challenges staff_enrollments; do
     check "empty EXCLUDE_DATA still leaves out $t" grep -qx -- "--exclude-table-data=$t" "$T/stub-args"
   done
   check "backup.sh never passes --strict-names (an exclusion naming a table that doesn't exist yet must not fail)" \
@@ -399,7 +404,20 @@ cat > "$BIN/ssh" <<'SH'
 while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; -t|-T) shift ;; -*) shift ;; *) break ;; esac; done
 host="$1"; shift; cmd="$*"
 case "$cmd" in
-  *"bash -s"*) f="$(mktemp)"; cat > "$f"
+  # The optional staff console: "installed" unless STUB_NO_ADMIN is set (deploy.sh asks `systemctl cat stexx-admin`).
+  *"systemctl cat stexx-admin"*) [ -z "${STUB_NO_ADMIN:-}" ]; exit $? ;;
+  # Non-dry-run rollbacks: the API answers 204; the console answers 200, or (STUB_ADMIN_DOWN) is down the way curl
+  # reports it, "000" AND exit 7; STUB_OLD_RELEASE: the target release predates the console; STUB_ADMIN_START_FAIL:
+  # `systemctl restart stexx-admin` fails.
+  # STUB_API_DOWN: the API's health check fails (a real deploy then rolls back); STUB_PREV: a previous release exists.
+  *"127.0.0.1:8787/healthz"*) if [ -n "${STUB_API_DOWN:-}" ]; then printf 500; else printf 204; fi ;;
+  *"readlink -f"*) [ -n "${STUB_PREV:-}" ] && printf '/srv/stexx/releases/20260101-000000' ;;
+  *"127.0.0.1:8788"*) if [ -n "${STUB_ADMIN_DOWN:-}" ]; then printf 000; exit 7; fi; printf 200 ;;
+  *"src/admin/index.ts"*) [ -z "${STUB_OLD_RELEASE:-}" ]; exit $? ;;
+  *"systemctl restart stexx-admin"*) echo "    [stub ssh $host] $cmd" >&2; [ -z "${STUB_ADMIN_START_FAIL:-}" ]; exit $? ;;
+  *"bash -s"*|*"bash -se"*) f="$(mktemp)"; cat > "$f"
+               # STUB_SCRIPTS: keep a copy of every remote root script, so checks can read what would run on the box.
+               if [ -n "${STUB_SCRIPTS:-}" ]; then cat "$f" >> "$STUB_SCRIPTS"; fi
                if bash -n "$f"; then echo "    [stub ssh $host] remote root script: $(wc -l < "$f" | tr -d ' ') lines, bash -n ok"; else echo "    [stub ssh] SYNTAX ERROR in remote script" ; exit 1; fi
                rm -f "$f" ;;
   *) echo "    [stub ssh $host] $cmd" >&2 ;;
@@ -419,6 +437,74 @@ check "no remote script has a syntax error" bash -c "! grep -q 'SYNTAX ERROR' '$
 check "--sync-config --dry-run exits 0 and names the watchdog" bash -c "grep -q 0 '$T/sync.rc' && grep -q 'stexx-watch.timer' '$T/sync'"
 (cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid bash deploy/deploy.sh --status) > "$T/status" 2>&1; echo $? > "$T/status.rc"
 check "--status remote script parses" bash -c "grep -q 0 '$T/status.rc' && grep -q 'bash -n ok' '$T/status'"
+
+# The optional staff console (stexx-admin). With the unit installed, deploy and sync cover it; without it (and without
+# --with-admin) nothing about it is touched, so an existing box deploys exactly as before.
+check "deploy (console installed) restarts stexx-admin next to the API" has "$T/deploy" "systemctl restart stexx-admin"
+check "deploy (console installed) boot-checks its config" has "$T/deploy" "Boot check for the staff console"
+(cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid STUB_NO_ADMIN=1 PUBLIC_HEALTH_URL='' bash deploy/deploy.sh --dry-run --no-checks) > "$T/deploy-noadmin" 2>&1; echo $? > "$T/deploy-noadmin.rc"
+check "deploy without the console exits 0" has "$T/deploy-noadmin.rc" 0
+check "deploy without the console never mentions it" bash -c "! grep -qi 'stexx-admin' '$T/deploy-noadmin'"
+(cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid STUB_NO_ADMIN=1 bash deploy/deploy.sh --dry-run --no-checks --with-admin) > "$T/deploy-withadmin" 2>&1; echo $? > "$T/deploy-withadmin.rc"
+check "deploy --with-admin refuses when the unit is not installed" bash -c "! grep -qx 0 '$T/deploy-withadmin.rc' && grep -q 'sync-config --with-admin' '$T/deploy-withadmin'"
+(cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid STUB_NO_ADMIN=1 bash deploy/deploy.sh --sync-config) > "$T/sync-noadmin" 2>&1; echo $? > "$T/sync-noadmin.rc"
+check "--sync-config on a box without the console installs nothing of it" bash -c "grep -qx 0 '$T/sync-noadmin.rc' && grep -q 'bash -n ok' '$T/sync-noadmin' && ! grep -qi 'stexx-admin' '$T/sync-noadmin'"
+(cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid STUB_NO_ADMIN=1 STUB_SCRIPTS="$T/sync-withadmin.sh" bash deploy/deploy.sh --sync-config --with-admin) > "$T/sync-withadmin" 2>&1; echo $? > "$T/sync-withadmin.rc"
+check "--sync-config --with-admin installs the unit, and its remote script parses" bash -c "grep -qx 0 '$T/sync-withadmin.rc' && grep -q 'bash -n ok' '$T/sync-withadmin' && grep -q 'stexx-admin.service' '$T/sync-withadmin'"
+# Enabled only by the first deploy whose boot check passed: enabled before admin.env exists, an unattended reboot would
+# start it into a crash loop and an alert.
+check "--sync-config --with-admin installs the unit but does not enable it" bash -c "grep -q 'install -m 0644 stexx-admin.service' '$T/sync-withadmin.sh' && ! grep -Eq 'systemctl enable( --now)? stexx-admin' '$T/sync-withadmin.sh'"
+# The site listens on every interface: ufw must be on, filter IPv6, and open its port on tailscale0 before it goes in.
+check "--sync-config installs the private site only behind ufw (active, IPv6 on, the tailscale0 rule for its port)" bash -c "grep -q \"grep -q 'Status: active'\" '$T/sync-withadmin.sh' && grep -q \"grep -q '^IPV6=yes' /etc/default/ufw\" '$T/sync-withadmin.sh' && grep -q 'on tailscale0 \" | grep -q .stexx-admin-tailscale.' '$T/sync-withadmin.sh' && grep -q 'if \[ -s /etc/stexx/caddy-admin.env \] && \[ -z \"\$ADMIN_FIREWALL\" \]; then' '$T/sync-withadmin.sh'"
+(cd "$HERE/.." && DEPLOY_HOST=ops@stexx.invalid bash deploy/deploy.sh --rollback 20260101-000000 --dry-run) > "$T/rollback" 2>&1; echo $? > "$T/rollback.rc"
+check "--rollback (console installed) restarts it too" has "$T/rollback" "systemctl restart stexx-admin"
+# Real (not dry-run) rollbacks against the stub, with `sleep` stubbed out so the retry loops run instantly.
+mkdir -p "$T/fastsleep"; printf '#!/usr/bin/env bash\nexit 0\n' > "$T/fastsleep/sleep"; chmod +x "$T/fastsleep/sleep"
+rb() { # rb <outfile> [VAR=value ...]: a real --rollback against the stub ssh
+  local out="$1"; shift
+  (cd "$HERE/.." && env PATH="$T/fastsleep:$PATH" DEPLOY_HOST=ops@stexx.invalid "$@" bash deploy/deploy.sh --rollback 20260101-000000) > "$out" 2>&1
+  echo $? > "$out.rc"
+}
+rb "$T/rb-ok"
+check "--rollback with the console answering exits 0" has "$T/rb-ok.rc" 0
+rb "$T/rb-down" STUB_ADMIN_DOWN=1
+check "--rollback with the console down (curl: 000 and exit 7) fails, not 'HTTP 000000'" bash -c "! grep -qx 0 '$T/rb-down.rc' && grep -q 'stexx-admin is not answering' '$T/rb-down' && ! grep -q 'HTTP 000000' '$T/rb-down'"
+rb "$T/rb-startfail" STUB_ADMIN_START_FAIL=1
+check "--rollback whose console restart fails still runs the API health check, then fails" bash -c "! grep -qx 0 '$T/rb-startfail.rc' && grep -q 'attempt 1: HTTP 204' '$T/rb-startfail' && grep -q 'stexx-admin is not answering' '$T/rb-startfail'"
+rb "$T/rb-old" STUB_OLD_RELEASE=1
+check "--rollback to a release without the console stops and disables it (no crash loop at the next boot)" bash -c "grep -qx 0 '$T/rb-old.rc' && grep -q 'systemctl disable --now stexx-admin' '$T/rb-old' && ! grep -q 'systemctl restart stexx-admin' '$T/rb-old'"
+check "--rollback to a release with the console enables it again" bash -c "grep -q 'systemctl enable stexx-admin' '$T/rb-ok'"
+# Real (not dry-run) deploys against the stub: the console follows the API only once the API is healthy.
+dp() { # dp <outfile> [VAR=value ...]: a real deploy against the stub ssh/rsync
+  local out="$1"; shift
+  (cd "$HERE/.." && env PATH="$T/fastsleep:$PATH" DEPLOY_HOST=ops@stexx.invalid PUBLIC_HEALTH_URL='' "$@" bash deploy/deploy.sh --no-checks) > "$out" 2>&1
+  echo $? > "$out.rc"
+}
+dp "$T/dp-ok" STUB_PREV=1
+check "deploy restarts the console only after the API's health check passed" bash -c "grep -qx 0 '$T/dp-ok.rc' && awk '/Health check/{h=NR} /systemctl restart stexx-admin/{r=NR} END{exit !(h && r > h)}' '$T/dp-ok'"
+check "every remote root script of a real deploy parses" bash -c "! grep -q 'SYNTAX ERROR' '$T/dp-ok' && grep -q 'bash -n ok' '$T/dp-ok'"
+dp "$T/dp-bad" STUB_PREV=1 STUB_API_DOWN=1
+check "a deploy whose API fails its health check rolls back and never moves the console to the rejected release" bash -c "! grep -qx 0 '$T/dp-bad.rc' && grep -q \"ln -sfn '/srv/stexx/releases/20260101-000000'\" '$T/dp-bad' && grep -q 'deploy of .* failed' '$T/dp-bad' && ! grep -q 'restart stexx-admin' '$T/dp-bad'"
+dp "$T/dp-first" STUB_API_DOWN=1
+check "a failed first deploy stops the console too" bash -c "! grep -qx 0 '$T/dp-first.rc' && grep -q 'systemctl stop stexx-admin' '$T/dp-first' && ! grep -q 'restart stexx-admin' '$T/dp-first'"
+check "the Caddy drop-in's env file is optional (a missing caddy-admin.env must never stop Caddy)" grep -qx 'EnvironmentFile=-/etc/stexx/caddy-admin.env' "$HERE/system/caddy-admin-dropin.conf"
+check "--sync-config removes the console's Caddy site and drop-in when caddy-admin.env is gone" bash -c "grep -q 'rm -f /etc/caddy/sites/stexx-admin.caddy /etc/caddy/sites/stexx-admin.caddy.prev /etc/systemd/system/caddy.service.d/stexx-admin.conf' '$HERE/deploy.sh'"
+check "the console boot check compares admin.env with caddy-admin.env" bash -c "grep -q 'differs from STEXX_ADMIN_HOST' '$HERE/deploy.sh' && grep -q 'CHANGE_ME' '$HERE/deploy.sh'"
+
+# The public site file never names the console's host or address, and refuses /admin; the private one takes both
+# from the environment and has no access log.
+check "public Caddyfile 404s /admin and /admin/*" grep -q '@never path .*/admin /admin/\*' "$HERE/Caddyfile"
+check "public Caddyfile never mentions the console's host" bash -c "! grep -Eqi 'STEXX_ADMIN|ts\.net|tailscale|8788' '$HERE/Caddyfile' '$HERE/Caddyfile.main' '$HERE/Caddyfile.apex'"
+check "Caddyfile.admin takes its host from the environment and uses its own port, not 443" bash -c "grep -q '^{\$STEXX_ADMIN_HOST}:{\$STEXX_ADMIN_PORT:8443} {' '$HERE/Caddyfile.admin' && ! grep -v '^ *#' '$HERE/Caddyfile.admin' | grep -Eq ':443\\b'"
+# Caddy can't share a port between a `bind`ed site and the public sites (it refuses to start, taking the public API down).
+check "Caddyfile.admin has no bind directive (it would clash with the public sites' listeners)" bash -c "! grep -v '^ *#' '$HERE/Caddyfile.admin' | grep -Eq '^[[:space:]]*bind\\b'"
+check "Caddyfile.admin closes connections from outside the tailnet" bash -c "grep -Eq '^[[:space:]]*@outside not remote_ip 100\\.64\\.0\\.0/10' '$HERE/Caddyfile.admin' && grep -Eq '^[[:space:]]*abort @outside' '$HERE/Caddyfile.admin'"
+check "ufw-cloudflare.sh opens the console's port on tailscale0 only, and only with the flag" bash -c "grep -q 'ufw allow in on tailscale0 to any port \"\$ADMIN_PORT\"' '$HERE/ufw-cloudflare.sh' && grep -q 'TS_ADMIN=1' '$HERE/ufw-cloudflare.sh' && grep -q -- '--tailscale-admin)' '$HERE/ufw-cloudflare.sh'"
+check "ufw-cloudflare.sh takes the console's port from caddy-admin.env, replaces its old rule, and refuses without IPv6 filtering" bash -c "grep -q 'CADDY_ADMIN_ENV=\"\${STEXX_CADDY_ADMIN_ENV:-/etc/stexx/caddy-admin.env}\"' '$HERE/ufw-cloudflare.sh' && grep -q 'OURS=\"\$TAG|\$TS_TAG\"' '$HERE/ufw-cloudflare.sh' && grep -q -- \"--tailscale-admin: set IPV6=yes\" '$HERE/ufw-cloudflare.sh'"
+check "Caddyfile.admin's Referrer-Policy is same-origin (no-referrer makes browsers send Origin: null on form posts)" bash -c "grep -Eq '^[[:space:]]*Referrer-Policy \"same-origin\"' '$HERE/Caddyfile.admin' && ! grep -Ev '^[[:space:]]*#' '$HERE/Caddyfile.admin' | grep -q 'no-referrer'"
+check "Caddyfile.admin has no log directive and proxies to loopback 8788" bash -c "! grep -v '^ *#' '$HERE/Caddyfile.admin' | grep -Eq '^[[:space:]]*log\b' && grep -q 'reverse_proxy 127.0.0.1:8788' '$HERE/Caddyfile.admin'"
+check "stexx-admin.service runs the console as the stexx user, no jobs, loopback only" bash -c "grep -q '^User=stexx' '$HERE/stexx-admin.service' && grep -q 'ExecStart=/usr/local/bin/bun src/admin/index.ts' '$HERE/stexx-admin.service' && grep -q '^Environment=ADMIN_HOST=127.0.0.1' '$HERE/stexx-admin.service'"
+check "stexx-admin.service has the API unit's sandboxing" bash -c "for k in NoNewPrivileges=true ProtectSystem=strict PrivateDevices=true SystemCallFilter=@system-service RestrictAddressFamilies; do grep -q \"^\$k\" '$HERE/stexx-admin.service' || exit 1; done"
 
 # =================================================================================================================
 hdr "4. backup + restore drill against PostgreSQL"
@@ -481,7 +567,7 @@ PY
   check "drill on the nightly passes" has "$T/drill1" "RESULT: PASS"
   check "drill loaded the reports sidecar" has "$T/drill1" "reports:     ok"
   check "nightly restore has no sessions" bash -c "grep -q 'sessions=0' '$T/drill1'"
-  for t in spam_message_features spam_contacts taps; do
+  for t in spam_message_features spam_contacts taps staff_sessions staff_challenges staff_enrollments; do
     if [ -n "$(psql -X -At -d "$SELFTEST_DATABASE_URL" -c "SELECT to_regclass('$t')" 2>/dev/null)" ]; then
       check "nightly restore has no $t rows" grep -q " $t=0" "$T/drill1"
     else
